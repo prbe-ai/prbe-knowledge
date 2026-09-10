@@ -34,16 +34,27 @@ CREATE TABLE companion_observations (
     customer_id        TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
     mailbox_id         UUID NOT NULL,
     attempt_id         UUID NOT NULL,
-    -- true: the card body / trial nonce was seen where the model reads.
-    -- false: a bounded search ended without finding it.
+    -- Which fact this row asserts. 'context': the model-readable context
+    -- carried the card. 'behaviour': what the model did with it afterwards,
+    -- which only a local observer reading the transcript can say.
+    kind               TEXT NOT NULL DEFAULT 'context' CHECK (kind IN ('context', 'behaviour')),
+    -- context:   true = the card body / trial nonce was seen where the model
+    --            reads; false = a bounded search ended without finding it.
+    -- behaviour: true = the model followed the card (outcome 'followed').
     observed           BOOLEAN NOT NULL,
+    -- behaviour rows only: what the model did with the card.
+    outcome            TEXT CHECK (outcome IS NULL OR outcome IN
+                         ('followed', 'ignored', 'contradicted', 'overridden')),
     -- Who looked: 'tap:<device>:<harness>:<version>', 'driver:<user>', ...
     observer           TEXT NOT NULL CHECK (length(observer) BETWEEN 1 AND 200),
     observed_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     -- The observer's own wall clock, kept apart from the server's.
     client_observed_at TIMESTAMPTZ,
     evidence           JSONB NOT NULL DEFAULT '{}',
-    UNIQUE (customer_id, attempt_id),
+    CHECK ((kind = 'behaviour') = (outcome IS NOT NULL)),
+    CHECK (kind <> 'behaviour' OR observed = (outcome = 'followed')),
+    -- One verdict per attempt PER FACT: first write wins within a kind.
+    UNIQUE (customer_id, attempt_id, kind),
     FOREIGN KEY (customer_id, attempt_id) REFERENCES companion_deliveries (customer_id, attempt_id),
     FOREIGN KEY (customer_id, mailbox_id) REFERENCES companion_mailbox (customer_id, id)
 );

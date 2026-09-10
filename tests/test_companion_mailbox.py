@@ -22,6 +22,7 @@ Run with the isolated database:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from collections.abc import AsyncIterator
 from uuid import uuid4
 
@@ -30,6 +31,7 @@ import pytest_asyncio
 
 from engine.shared.companion.mailbox import (
     PREFIX,
+    AckRefused,
     Card,
     EnqueueConflict,
     EnqueueRefused,
@@ -40,6 +42,7 @@ from engine.shared.companion.mailbox import (
     enqueue,
     observe,
     pending,
+    register_local,
     report,
 )
 from engine.shared.db import raw_conn, with_tenant
@@ -121,10 +124,11 @@ async def test_expired_key_is_expired_not_reused(tenant) -> None:
         await conn.execute(
             """
             INSERT INTO companion_mailbox
-                (customer_id, recipient, session_id, class, body, dedupe_key, source,
-                 trial_id, created_at, expires_at)
-            VALUES ($1, $2, 'sess-1', 'seam', $3, 'k1', 'driver', $4,
-                    now() - interval '2 hours', now() - interval '1 hour')
+                (customer_id, recipient, session_id, class, body, body_sha256, dedupe_key,
+                 source, trial_id, created_at, expires_at)
+            VALUES ($1, $2, 'sess-1', 'seam', $3::text,
+                    encode(sha256(convert_to($3::text, 'UTF8')), 'hex'), 'k1',
+                    'driver', $4, now() - interval '2 hours', now() - interval '1 hour')
             """,
             TENANT,
             ALICE,
@@ -213,10 +217,10 @@ async def test_pending_excludes_expired(tenant) -> None:
         await conn.execute(
             """
             INSERT INTO companion_mailbox
-                (customer_id, recipient, session_id, class, body, dedupe_key, source,
-                 trial_id, created_at, expires_at)
-            VALUES ($1, $2, 'sess-1', 'seam', 'old', 'old', 'driver', $3,
-                    now() - interval '2 hours', now() - interval '1 hour')
+                (customer_id, recipient, session_id, class, body, body_sha256, dedupe_key,
+                 source, trial_id, created_at, expires_at)
+            VALUES ($1, $2, 'sess-1', 'seam', 'old', encode(sha256('old'::bytea), 'hex'), 'old',
+                    'driver', $3, now() - interval '2 hours', now() - interval '1 hour')
             """,
             TENANT,
             ALICE,
@@ -492,3 +496,165 @@ async def test_observe_negative_counts_separately_and_unknown_attempt_refused(te
     )
     agg = await report(TENANT, session_id=card.session_id)
     assert agg[0]["observed_in_context"] == 1
+
+
+# --------------------------------------------------------------------------
+# register_local: cards the device's own harness minted (brain design v10)
+# --------------------------------------------------------------------------
+
+
+async def _register(**kw) -> tuple[Card, bool]:
+    base = dict(
+        recipient=ALICE,
+        session_id="sess-1",
+        local_card_id=uuid4(),
+        class_="seam",
+        mode="live",
+        body="you tried this yesterday; see run tunneling-sambar-254",
+        body_sha256=None,
+        dedupe_key="local-k1",
+        ttl_seconds=600,
+    )
+    base.update(kw)
+    return await register_local(TENANT, **base)
+
+
+@pytest.mark.asyncio
+async def test_register_local_live_is_idempotent_and_never_served(tenant) -> None:
+    local_id = uuid4()
+    card, created = await _register(local_card_id=local_id)
+    assert created is True
+    assert card.source == "local-brain" and card.mode == "live"
+    assert card.local_card_id == local_id and card.body is not None
+    assert card.body.startswith(PREFIX)
+    assert card.body_sha256 == hashlib.sha256(card.body.encode("utf-8")).hexdigest()
+    again, created_again = await _register(local_card_id=local_id)
+    assert created_again is False and again.mailbox_id == card.mailbox_id
+    # Emitted where it was minted: poll must never serve it a second time.
+    assert await pending(TENANT, session_id="sess-1", recipient=ALICE) == []
+    # ... but its receipts and observations land in the one ledger.
+    attempt = uuid4()
+    await ack(
+        TENANT,
+        mailbox_id=card.mailbox_id,
+        attempt_id=attempt,
+        seam="push",
+        outcome="emitted",
+        receiving_instance="dev",
+    )
+    await observe(
+        TENANT, mailbox_id=card.mailbox_id, attempt_id=attempt, observed=True, observer="tap:t"
+    )
+    rows = await deliveries(TENANT, session_id="sess-1", source="local-brain")
+    assert [r["local_card_id"] for r in rows] == [local_id]
+    assert rows[0]["source"] == "local-brain" and rows[0]["observed_in_context"] is True
+    assert await deliveries(TENANT, session_id="sess-1", source="driver") == []
+    agg = await report(TENANT, session_id="sess-1", source="local-brain")
+    assert agg[0]["attempts"] == 1 and agg[0]["observed_in_context"] == 1
+    with pytest.raises(ValueError):
+        await report(TENANT, session_id="sess-1", source="brain")
+
+
+@pytest.mark.asyncio
+async def test_register_local_shadow_is_hash_only(tenant) -> None:
+    digest = hashlib.sha256(b"held back").hexdigest()
+    card, created = await _register(
+        mode="shadow", body=None, body_sha256=digest, dedupe_key="shadow-1"
+    )
+    assert created is True and card.body is None and card.body_sha256 == digest
+    assert card.mode == "shadow"
+    assert await pending(TENANT, session_id="sess-1", recipient=ALICE) == []
+    # shadow carries no text; live carries text whose hash, if given, must match
+    with pytest.raises(EnqueueRefused):
+        await _register(mode="shadow", body="text", body_sha256=digest, dedupe_key="s2")
+    with pytest.raises(EnqueueRefused):
+        await _register(mode="shadow", body=None, body_sha256="nothex", dedupe_key="s3")
+    with pytest.raises(EnqueueRefused):
+        await _register(mode="live", body=None, dedupe_key="s4")
+    with pytest.raises(EnqueueRefused):
+        await _register(body_sha256="0" * 64, dedupe_key="s5")
+    with pytest.raises(EnqueueRefused):
+        await _register(mode="dry-run", dedupe_key="s6")
+    with pytest.raises(EnqueueRefused):
+        await _register(session_id=None, dedupe_key="s7")
+
+
+@pytest.mark.asyncio
+async def test_register_local_conflicts(tenant) -> None:
+    local_id = uuid4()
+    card, _ = await _register(local_card_id=local_id, dedupe_key="c1")
+    with pytest.raises(EnqueueConflict) as err:
+        await _register(local_card_id=local_id, dedupe_key="c1", body="a different text")
+    assert err.value.reason == "conflict"
+    assert err.value.existing.mailbox_id == card.mailbox_id
+    # A second local card reusing the session's dedupe key is the dedupe rule firing.
+    with pytest.raises(EnqueueConflict) as err2:
+        await _register(local_card_id=uuid4(), dedupe_key="c1")
+    assert err2.value.reason == "conflict"
+    assert err2.value.existing.mailbox_id == card.mailbox_id
+    # The transaction survived the violation: a fresh key still registers.
+    fresh, created = await _register(local_card_id=uuid4(), dedupe_key="c2")
+    assert created is True and fresh.mailbox_id != card.mailbox_id
+
+
+# --------------------------------------------------------------------------
+# observe: two facts per attempt, one verdict each
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_observe_behaviour_is_a_second_verdict_per_attempt(tenant) -> None:
+    card, _ = await _enqueue()
+    attempt = uuid4()
+    await ack(
+        TENANT,
+        mailbox_id=card.mailbox_id,
+        attempt_id=attempt,
+        seam="stop",
+        outcome="emitted",
+        receiving_instance="dev",
+    )
+    ctx, created = await observe(
+        TENANT, mailbox_id=card.mailbox_id, attempt_id=attempt, observed=True, observer="tap:t"
+    )
+    beh, created_b = await observe(
+        TENANT,
+        mailbox_id=card.mailbox_id,
+        attempt_id=attempt,
+        observed=False,
+        observer="brain:t",
+        kind="behaviour",
+        outcome="ignored",
+    )
+    assert created and created_b and beh != ctx
+    again = await observe(
+        TENANT,
+        mailbox_id=card.mailbox_id,
+        attempt_id=attempt,
+        observed=True,
+        observer="brain:t",
+        kind="behaviour",
+        outcome="followed",
+    )
+    assert again == (beh, False), "the first behaviour verdict wins"
+    rows = await deliveries(TENANT, session_id=card.session_id)
+    assert rows[0]["observed_in_context"] is True
+    assert rows[0]["behaviour_outcome"] == "ignored" and rows[0]["behaviour_observer"] == "brain:t"
+    agg = await report(TENANT, session_id=card.session_id)
+    assert agg[0]["observed_in_context"] == 1
+    assert agg[0]["followed"] == 0 and agg[0]["not_followed"] == 1
+    for bad in (
+        dict(kind="vibes"),
+        dict(kind="behaviour"),
+        dict(kind="behaviour", outcome="shrugged"),
+        dict(outcome="followed"),
+    ):
+        with pytest.raises(AckRefused):
+            await observe(
+                TENANT,
+                mailbox_id=card.mailbox_id,
+                attempt_id=attempt,
+                observed=True,
+                observer="x",
+                **bad,
+            )

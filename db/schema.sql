@@ -1966,12 +1966,22 @@ CREATE TABLE companion_mailbox (
     -- Routing metadata from the driver's --seam; NULL means any seam may take it.
     intended_seam TEXT,
     -- The '[probe companion] ' prefix is applied at write time and counts
-    -- toward the cap.
-    body          TEXT NOT NULL CHECK (length(body) BETWEEN 1 AND 4000),
+    -- toward the cap. NULL only for a shadow registration: a local brain's
+    -- held-back card is recorded by hash, never by text.
+    body          TEXT CHECK (body IS NULL OR length(body) BETWEEN 1 AND 4000),
+    -- sha256 of the prefixed body: server-computed whenever the body is here,
+    -- client-supplied for a shadow registration.
+    body_sha256   TEXT NOT NULL CHECK (body_sha256 ~ '^[0-9a-f]{64}$'),
     clause_ids    UUID[],
     dedupe_key    TEXT NOT NULL CHECK (length(dedupe_key) BETWEEN 1 AND 200),
     mode          TEXT NOT NULL DEFAULT 'live' CHECK (mode IN ('live', 'shadow')),
-    source        TEXT NOT NULL CHECK (source IN ('driver', 'brain')),
+    -- 'driver': a person's card, served through poll. 'local-brain': a card
+    -- the device's own harness already emitted (or held, in shadow mode) and
+    -- registers here so its receipts and observations have a home; poll
+    -- never serves it.
+    source        TEXT NOT NULL CHECK (source IN ('driver', 'local-brain')),
+    -- The id the local harness minted; registration is idempotent on it.
+    local_card_id UUID,
     trial_id      UUID NOT NULL,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     expires_at    TIMESTAMPTZ NOT NULL,
@@ -1979,12 +1989,21 @@ CREATE TABLE companion_mailbox (
     -- A decision card belongs to a session's decision generation; an
     -- actor-keyed one has no session whose decision it could belong to.
     CHECK (class = 'seam' OR session_id IS NOT NULL),
+    -- A live card carries its text; only a shadow registration is hash-only.
+    CHECK (mode = 'shadow' OR body IS NOT NULL),
+    -- Local registrations carry the local id, always target a session, and
+    -- are the only rows that may be shadow; driver cards are live, no local id.
+    CHECK ((source = 'local-brain') = (local_card_id IS NOT NULL)),
+    CHECK (source = 'driver' OR session_id IS NOT NULL),
+    CHECK (source = 'local-brain' OR mode = 'live'),
     UNIQUE (customer_id, id)
 );
 CREATE UNIQUE INDEX companion_mailbox_session_dedupe_idx
     ON companion_mailbox (customer_id, session_id, dedupe_key) WHERE session_id IS NOT NULL;
 CREATE UNIQUE INDEX companion_mailbox_actor_dedupe_idx
     ON companion_mailbox (customer_id, recipient, dedupe_key) WHERE session_id IS NULL;
+CREATE UNIQUE INDEX companion_mailbox_local_card_idx
+    ON companion_mailbox (customer_id, local_card_id) WHERE local_card_id IS NOT NULL;
 CREATE INDEX companion_mailbox_pending_idx
     ON companion_mailbox (customer_id, session_id, expires_at);
 CREATE INDEX companion_mailbox_recipient_idx
@@ -2066,16 +2085,27 @@ CREATE TABLE companion_observations (
     customer_id        TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
     mailbox_id         UUID NOT NULL,
     attempt_id         UUID NOT NULL,
-    -- true: the card body / trial nonce was seen where the model reads.
-    -- false: a bounded search ended without finding it.
+    -- Which fact this row asserts. 'context': the model-readable context
+    -- carried the card. 'behaviour': what the model did with it afterwards,
+    -- which only a local observer reading the transcript can say.
+    kind               TEXT NOT NULL DEFAULT 'context' CHECK (kind IN ('context', 'behaviour')),
+    -- context:   true = the card body / trial nonce was seen where the model
+    --            reads; false = a bounded search ended without finding it.
+    -- behaviour: true = the model followed the card (outcome 'followed').
     observed           BOOLEAN NOT NULL,
+    -- behaviour rows only: what the model did with the card.
+    outcome            TEXT CHECK (outcome IS NULL OR outcome IN
+                         ('followed', 'ignored', 'contradicted', 'overridden')),
     -- Who looked: 'tap:<device>:<harness>:<version>', 'driver:<user>', ...
     observer           TEXT NOT NULL CHECK (length(observer) BETWEEN 1 AND 200),
     observed_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     -- The observer's own wall clock, kept apart from the server's.
     client_observed_at TIMESTAMPTZ,
     evidence           JSONB NOT NULL DEFAULT '{}',
-    UNIQUE (customer_id, attempt_id),
+    CHECK ((kind = 'behaviour') = (outcome IS NOT NULL)),
+    CHECK (kind <> 'behaviour' OR observed = (outcome = 'followed')),
+    -- One verdict per attempt PER FACT: first write wins within a kind.
+    UNIQUE (customer_id, attempt_id, kind),
     FOREIGN KEY (customer_id, attempt_id) REFERENCES companion_deliveries (customer_id, attempt_id),
     FOREIGN KEY (customer_id, mailbox_id) REFERENCES companion_mailbox (customer_id, id)
 );

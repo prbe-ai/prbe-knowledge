@@ -75,9 +75,10 @@ async def _seed_card(conn: asyncpg.Connection, customer_id: str, session_id: str
     return await conn.fetchval(
         """
         INSERT INTO companion_mailbox
-            (customer_id, recipient, session_id, class, body, dedupe_key, source,
-             trial_id, expires_at)
-        VALUES ($1, 'user:seed', $2, 'seam', '[probe companion] hello', $3, 'driver',
+            (customer_id, recipient, session_id, class, body, body_sha256, dedupe_key,
+             source, trial_id, expires_at)
+        VALUES ($1, 'user:seed', $2, 'seam', '[probe companion] hello',
+                encode(sha256('[probe companion] hello'::bytea), 'hex'), $3, 'driver',
                 $4, now() + interval '10 minutes')
         RETURNING id
         """,

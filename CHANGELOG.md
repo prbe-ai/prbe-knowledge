@@ -8,6 +8,23 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Added
 
+- **Companion: a home for locally minted cards and for the behaviour fact.**
+  The companion brain now runs on the device (brain design v10), so a card
+  it emits never passes through poll -- but its receipts and observations
+  still need the ledger. `POST /companion/register` records a card the
+  local harness minted, idempotent on `local_card_id`: `mode='live'` carries
+  the emitted body, `mode='shadow'` carries only `body_sha256` (the held-back
+  text stays on the device). Registered rows have `source='local-brain'`;
+  poll and the actor claim now serve `driver`/`live` rows only, so a
+  registered card is never served a second time. `companion_mailbox` gains
+  `body_sha256` (server-computed for every card that carries a body),
+  `local_card_id` and the source/mode/body consistency checks; `body` is
+  nullable for shadow registrations only. `companion_observations` gains
+  `kind` (`context`, the existing verdict; `behaviour`, what the model did
+  with the card: followed / ignored / contradicted / overridden) with one
+  verdict per attempt per kind; the report adds `followed` / `not_followed`,
+  and deliveries and report take a `source` filter. Migrations 0129/0130 are
+  edited in place (unreleased).
 - **Companion observations (spec §8).** Migration 0130 adds
   `companion_observations`, an append-only sidecar with at most one verdict
   per delivery attempt (first write wins), FK-bound to the delivery it

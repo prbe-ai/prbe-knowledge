@@ -48,12 +48,22 @@ CREATE TABLE companion_mailbox (
     -- Routing metadata from the driver's --seam; NULL means any seam may take it.
     intended_seam TEXT,
     -- The '[probe companion] ' prefix is applied at write time and counts
-    -- toward the cap.
-    body          TEXT NOT NULL CHECK (length(body) BETWEEN 1 AND 4000),
+    -- toward the cap. NULL only for a shadow registration: a local brain's
+    -- held-back card is recorded by hash, never by text.
+    body          TEXT CHECK (body IS NULL OR length(body) BETWEEN 1 AND 4000),
+    -- sha256 of the prefixed body: server-computed whenever the body is here,
+    -- client-supplied for a shadow registration.
+    body_sha256   TEXT NOT NULL CHECK (body_sha256 ~ '^[0-9a-f]{64}$'),
     clause_ids    UUID[],
     dedupe_key    TEXT NOT NULL CHECK (length(dedupe_key) BETWEEN 1 AND 200),
     mode          TEXT NOT NULL DEFAULT 'live' CHECK (mode IN ('live', 'shadow')),
-    source        TEXT NOT NULL CHECK (source IN ('driver', 'brain')),
+    -- 'driver': a person's card, served through poll. 'local-brain': a card
+    -- the device's own harness already emitted (or held, in shadow mode) and
+    -- registers here so its receipts and observations have a home; poll
+    -- never serves it.
+    source        TEXT NOT NULL CHECK (source IN ('driver', 'local-brain')),
+    -- The id the local harness minted; registration is idempotent on it.
+    local_card_id UUID,
     trial_id      UUID NOT NULL,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     expires_at    TIMESTAMPTZ NOT NULL,
@@ -61,12 +71,21 @@ CREATE TABLE companion_mailbox (
     -- A decision card belongs to a session's decision generation; an
     -- actor-keyed one has no session whose decision it could belong to.
     CHECK (class = 'seam' OR session_id IS NOT NULL),
+    -- A live card carries its text; only a shadow registration is hash-only.
+    CHECK (mode = 'shadow' OR body IS NOT NULL),
+    -- Local registrations carry the local id, always target a session, and
+    -- are the only rows that may be shadow; driver cards are live, no local id.
+    CHECK ((source = 'local-brain') = (local_card_id IS NOT NULL)),
+    CHECK (source = 'driver' OR session_id IS NOT NULL),
+    CHECK (source = 'local-brain' OR mode = 'live'),
     UNIQUE (customer_id, id)
 );
 CREATE UNIQUE INDEX companion_mailbox_session_dedupe_idx
     ON companion_mailbox (customer_id, session_id, dedupe_key) WHERE session_id IS NOT NULL;
 CREATE UNIQUE INDEX companion_mailbox_actor_dedupe_idx
     ON companion_mailbox (customer_id, recipient, dedupe_key) WHERE session_id IS NULL;
+CREATE UNIQUE INDEX companion_mailbox_local_card_idx
+    ON companion_mailbox (customer_id, local_card_id) WHERE local_card_id IS NOT NULL;
 CREATE INDEX companion_mailbox_pending_idx
     ON companion_mailbox (customer_id, session_id, expires_at);
 CREATE INDEX companion_mailbox_recipient_idx

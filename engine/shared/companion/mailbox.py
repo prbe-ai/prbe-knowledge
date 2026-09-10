@@ -22,13 +22,20 @@ toward the 4,000-character cap. Actuators do zero formatting; a body that
 arrives already prefixed is normalised rather than double-prefixed.
 
 Everything runs under `with_tenant`, so FORCE RLS applies on every statement.
-`source` and `mode` are pinned here (`driver` / `live`): no caller can claim
-to be the intelligent layer before it exists.
+`source` and `mode` are pinned per entry point, never taken from a request
+body: `enqueue` writes `driver`/`live` (a person's card, served through poll);
+`register_local` writes `local-brain` with `live` or `shadow` (a card the
+device's own harness already emitted or held, registered so its receipts and
+observations have a home). Poll and the actor claim serve driver/live rows
+only -- a registered card was emitted where it was minted and must never be
+served a second time.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import datetime
@@ -69,6 +76,13 @@ SEAMS: frozenset[str] = frozenset(
 )
 OUTCOMES: frozenset[str] = frozenset({"emitted", "expired", "canceled", "unknown", "unsupported"})
 SESSION_STATES: frozenset[str] = frozenset({"active", "idle"})
+SOURCES: frozenset[str] = frozenset({"driver", "local-brain"})
+MODES: frozenset[str] = frozenset({"live", "shadow"})
+OBSERVATION_KINDS: frozenset[str] = frozenset({"context", "behaviour"})
+BEHAVIOUR_OUTCOMES: frozenset[str] = frozenset(
+    {"followed", "ignored", "contradicted", "overridden"}
+)
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True)
@@ -78,10 +92,16 @@ class Card:
     session_id: str | None
     class_: str
     intended_seam: str | None
-    body: str
+    #: None only for a shadow registration, which is recorded by hash alone.
+    body: str | None
     trial_id: UUID
     created_at: datetime
     expires_at: datetime
+    body_sha256: str = ""
+    source: str = "driver"
+    mode: str = "live"
+    local_card_id: UUID | None = None
+    dedupe_key: str = ""
 
 
 class EnqueueRefused(ValueError):
@@ -106,7 +126,8 @@ class UnknownCard(AckRefused):
 
 
 _CARD_COLUMNS = (
-    "id, recipient, session_id, class, intended_seam, body, trial_id, created_at, expires_at"
+    "id, recipient, session_id, class, intended_seam, body, body_sha256, source, mode, "
+    "local_card_id, dedupe_key, trial_id, created_at, expires_at"
 )
 
 
@@ -121,7 +142,16 @@ def _card(row: asyncpg.Record) -> Card:
         trial_id=row["trial_id"],
         created_at=row["created_at"],
         expires_at=row["expires_at"],
+        body_sha256=row["body_sha256"],
+        source=row["source"],
+        mode=row["mode"],
+        local_card_id=row["local_card_id"],
+        dedupe_key=row["dedupe_key"],
     )
+
+
+def _sha256(body: str) -> str:
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
 def _normalise_body(body: object) -> str:
@@ -219,9 +249,9 @@ async def enqueue(
             f"""
             INSERT INTO companion_mailbox
                 (customer_id, recipient, session_id, class, intended_seam, body,
-                 dedupe_key, mode, source, trial_id, expires_at)
-            VALUES ($1, $2, $3::text, $4, $5::text, $6, $7, 'live', 'driver', $8,
-                    now() + make_interval(secs => $9))
+                 body_sha256, dedupe_key, mode, source, trial_id, expires_at)
+            VALUES ($1, $2, $3::text, $4, $5::text, $6, $7, $8, 'live', 'driver', $9,
+                    now() + make_interval(secs => $10))
             ON CONFLICT {conflict_target} DO NOTHING
             RETURNING {_CARD_COLUMNS}
             """,
@@ -231,6 +261,7 @@ async def enqueue(
             class_,
             intended_seam,
             full_body,
+            _sha256(full_body),
             dedupe_key,
             trial_id,
             ttl_seconds,
@@ -265,8 +296,147 @@ async def enqueue(
     return card, False
 
 
+async def register_local(
+    customer_id: str,
+    *,
+    recipient: str,
+    session_id: str,
+    local_card_id: UUID,
+    class_: str,
+    mode: str,
+    body: str | None,
+    body_sha256: str | None,
+    dedupe_key: str,
+    ttl_seconds: int,
+    intended_seam: str | None = None,
+) -> tuple[Card, bool]:
+    """Register a card the device's own harness minted, so its receipts and
+    observations land in the same ledger as driver cards. Idempotent on
+    `local_card_id`.
+
+    `mode='live'` carries the body (the card was emitted locally, and the
+    transcript that carries it is uploaded by capture anyway); `mode='shadow'`
+    carries only `body_sha256` (the card was held back, and its text stays on
+    the device). Neither is ever served by poll or the actor claim.
+
+    Returns `(card, created)`. Raises `EnqueueRefused` for a structurally bad
+    request and `EnqueueConflict` when the local id or the session dedupe key
+    already names a different card (`conflict`) or an expired one (`expired`).
+    """
+    _validate_enqueue(
+        recipient=recipient,
+        session_id=session_id,
+        class_=class_,
+        dedupe_key=dedupe_key,
+        ttl_seconds=ttl_seconds,
+        intended_seam=intended_seam,
+    )
+    if session_id is None:
+        raise EnqueueRefused("a local card is always session-targeted")
+    if mode not in MODES:
+        raise EnqueueRefused(f"mode must be one of {sorted(MODES)}")
+    full_body: str | None
+    if mode == "live":
+        if body is None:
+            raise EnqueueRefused("a live registration carries the emitted body")
+        full_body = _normalise_body(body)
+        sha = _sha256(full_body)
+        if body_sha256 is not None and body_sha256 != sha:
+            raise EnqueueRefused("body_sha256 does not match the body")
+    else:
+        if body is not None:
+            raise EnqueueRefused("a shadow registration carries only body_sha256")
+        if not isinstance(body_sha256, str) or not _SHA256.match(body_sha256):
+            raise EnqueueRefused("body_sha256 must be 64 lowercase hex characters")
+        full_body = None
+        sha = body_sha256
+    trial_id = uuid4()
+
+    async with with_tenant(customer_id) as conn:
+        try:
+            # A savepoint: `with_tenant` already holds the transaction, and a
+            # dedupe-key violation must not abort the readback that explains it.
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    f"""
+                    INSERT INTO companion_mailbox
+                        (customer_id, recipient, session_id, class, intended_seam, body,
+                         body_sha256, dedupe_key, mode, source, local_card_id, trial_id,
+                         expires_at)
+                    VALUES ($1, $2, $3, $4, $5::text, $6::text, $7, $8, $9, 'local-brain',
+                            $10, $11, now() + make_interval(secs => $12))
+                    ON CONFLICT (customer_id, local_card_id) WHERE local_card_id IS NOT NULL
+                        DO NOTHING
+                    RETURNING {_CARD_COLUMNS}
+                    """,
+                    customer_id,
+                    recipient,
+                    session_id,
+                    class_,
+                    intended_seam,
+                    full_body,
+                    sha,
+                    dedupe_key,
+                    mode,
+                    local_card_id,
+                    trial_id,
+                    ttl_seconds,
+                )
+        except asyncpg.UniqueViolationError:
+            # The session dedupe key is taken by a card with another local id.
+            other = await conn.fetchrow(
+                f"""
+                SELECT {_CARD_COLUMNS}
+                FROM companion_mailbox
+                WHERE customer_id = $1 AND session_id = $2 AND dedupe_key = $3
+                """,
+                customer_id,
+                session_id,
+                dedupe_key,
+            )
+            if other is None:  # pragma: no cover -- the violation named this key
+                raise EnqueueRefused(
+                    "dedupe key collided with a row that could not be read back"
+                ) from None
+            raise EnqueueConflict("conflict", _card(other)) from None
+        if row is not None:
+            return _card(row), True
+        existing = await conn.fetchrow(
+            f"""
+            SELECT {_CARD_COLUMNS}, expires_at <= now() AS expired
+            FROM companion_mailbox
+            WHERE customer_id = $1 AND local_card_id = $2
+            """,
+            customer_id,
+            local_card_id,
+        )
+    if existing is None:  # pragma: no cover -- append-only, so the row cannot have vanished
+        raise EnqueueRefused("local card id collided with a row that could not be read back")
+    card = _card(existing)
+    if existing["expired"]:
+        raise EnqueueConflict("expired", card)
+    same_ttl = round((card.expires_at - card.created_at).total_seconds()) == ttl_seconds
+    if (
+        card.body_sha256 != sha
+        or card.mode != mode
+        or card.class_ != class_
+        or card.intended_seam != intended_seam
+        or card.recipient != recipient
+        or card.session_id != session_id
+        or card.dedupe_key != dedupe_key
+        or not same_ttl
+    ):
+        raise EnqueueConflict("conflict", card)
+    return card, False
+
+
+#: Poll and the actor claim serve a person's live cards only. A registered
+#: local card was emitted (or held) where it was minted; serving it again
+#: would be a second exposure the local ledger never asked for.
 _PENDING_PREDICATE = """
     m.customer_id = $1
+    AND m.source = 'driver'
+    AND m.mode = 'live'
     AND m.expires_at > now()
     AND NOT EXISTS (
         SELECT 1 FROM companion_deliveries d
@@ -511,34 +681,52 @@ async def observe(
     attempt_id: UUID,
     observed: bool,
     observer: str,
+    kind: str = "context",
+    outcome: str | None = None,
     client_observed_at: datetime | None = None,
     evidence: dict[str, Any] | None = None,
 ) -> tuple[int, bool]:
-    """Qualify one delivery attempt with the model-context fact (spec §8).
+    """Qualify one delivery attempt with one fact (spec §8).
 
-    First write wins: an observation is a bounded search's verdict, and a
-    later contradicting row would make the catalog say two things. Returns
-    `(observation_id, created)`. Raises `UnknownAttempt` when no delivery row
-    of this tenant carries `attempt_id` (the composite FK is the guard), and
-    `AckRefused` for a malformed observer.
+    `kind='context'`: `observed` says whether the model-readable context
+    carried the card. `kind='behaviour'`: `outcome` says what the model did
+    with it (followed / ignored / contradicted / overridden) and `observed` is
+    derived as `outcome == 'followed'`; only a local observer reading the
+    transcript after delivery can assert this one.
+
+    First write wins PER KIND: an observation is a bounded search's verdict,
+    and a later contradicting row would make the catalog say two things.
+    Returns `(observation_id, created)`. Raises `UnknownAttempt` when no
+    delivery row of this tenant carries `attempt_id` (the composite FK is the
+    guard), and `AckRefused` for a malformed observer, kind or outcome.
     """
     if not isinstance(observer, str) or not observer.strip() or len(observer) > 200:
         raise AckRefused("observer is required (1..200 chars)")
+    if kind not in OBSERVATION_KINDS:
+        raise AckRefused(f"kind must be one of {sorted(OBSERVATION_KINDS)}")
+    if kind == "behaviour":
+        if outcome not in BEHAVIOUR_OUTCOMES:
+            raise AckRefused(f"a behaviour verdict needs outcome in {sorted(BEHAVIOUR_OUTCOMES)}")
+        observed = outcome == "followed"
+    elif outcome is not None:
+        raise AckRefused("outcome belongs to behaviour verdicts only")
     async with with_tenant(customer_id) as conn:
         try:
             new_id = await conn.fetchval(
                 """
                 INSERT INTO companion_observations
-                    (customer_id, mailbox_id, attempt_id, observed, observer,
+                    (customer_id, mailbox_id, attempt_id, kind, observed, outcome, observer,
                      client_observed_at, evidence)
-                VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
-                ON CONFLICT (customer_id, attempt_id) DO NOTHING
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
+                ON CONFLICT (customer_id, attempt_id, kind) DO NOTHING
                 RETURNING id
                 """,
                 customer_id,
                 mailbox_id,
                 attempt_id,
+                kind,
                 observed,
+                outcome,
                 observer,
                 client_observed_at,
                 json.dumps(evidence or {}),
@@ -548,11 +736,20 @@ async def observe(
         if new_id is not None:
             return int(new_id), True
         existing = await conn.fetchval(
-            "SELECT id FROM companion_observations WHERE customer_id = $1 AND attempt_id = $2",
+            """
+            SELECT id FROM companion_observations
+            WHERE customer_id = $1 AND attempt_id = $2 AND kind = $3
+            """,
             customer_id,
             attempt_id,
+            kind,
         )
     return int(existing), False
+
+
+def _validate_source(source: str | None) -> None:
+    if source is not None and source not in SOURCES:
+        raise ValueError(f"source must be null or one of {sorted(SOURCES)}")
 
 
 async def deliveries(
@@ -561,13 +758,22 @@ async def deliveries(
     session_id: str | None = None,
     recipient: str | None = None,
     limit: int = 200,
+    source: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Readback for the fault catalog: one dict per emission attempt."""
+    """Readback for the fault catalog: one dict per emission attempt.
+
+    Carries the card's `source`, `mode` and `local_card_id` so driver cards
+    and locally registered cards read from one ledger, and both verdict kinds:
+    `observed_in_context` (plus its observer and evidence) and
+    `behaviour_outcome` (plus its observer and evidence). `source` narrows to
+    one writer.
+    """
     if session_id is None and recipient is None:
         raise ValueError("filter by session_id or recipient")
     # 1001 so a caller may fetch one row past its own 1,000 bound to detect truncation.
     if not 1 <= limit <= 1_001:
         raise ValueError("limit must be in [1, 1001]")
+    _validate_source(source)
     async with with_tenant(customer_id) as conn:
         await _retire_lapsed_leases(conn, customer_id, recipient)
         rows = await conn.fetch(
@@ -577,17 +783,26 @@ async def deliveries(
                    d.session_state, d.client_received_at, d.client_emitted_at,
                    d.receipt_to_emission_ms, d.ack_received_at, d.evidence,
                    m.session_id, m.recipient, m.trial_id, m.intended_seam, m.class,
+                   m.source, m.mode, m.local_card_id,
                    m.created_at AS enqueued_at,
                    o.observed AS observed_in_context, o.observer, o.observed_at,
-                   o.client_observed_at, o.evidence AS observation_evidence
+                   o.client_observed_at, o.evidence AS observation_evidence,
+                   b.outcome AS behaviour_outcome, b.observer AS behaviour_observer,
+                   b.observed_at AS behaviour_observed_at,
+                   b.evidence AS behaviour_evidence
             FROM companion_deliveries d
             JOIN companion_mailbox m
               ON m.customer_id = d.customer_id AND m.id = d.mailbox_id
             LEFT JOIN companion_observations o
               ON o.customer_id = d.customer_id AND o.attempt_id = d.attempt_id
+             AND o.kind = 'context'
+            LEFT JOIN companion_observations b
+              ON b.customer_id = d.customer_id AND b.attempt_id = d.attempt_id
+             AND b.kind = 'behaviour'
             WHERE d.customer_id = $1
               AND ($2::text IS NULL OR m.session_id = $2)
               AND ($3::text IS NULL OR m.recipient = $3)
+              AND ($5::text IS NULL OR m.source = $5)
             ORDER BY d.ack_received_at, d.id
             LIMIT $4
             """,
@@ -595,14 +810,14 @@ async def deliveries(
             session_id,
             recipient,
             limit,
+            source,
         )
     out: list[dict[str, Any]] = []
     for r in rows:
         d = dict(r)
-        if isinstance(d.get("evidence"), str):
-            d["evidence"] = json.loads(d["evidence"])
-        if isinstance(d.get("observation_evidence"), str):
-            d["observation_evidence"] = json.loads(d["observation_evidence"])
+        for key in ("evidence", "observation_evidence", "behaviour_evidence"):
+            if isinstance(d.get(key), str):
+                d[key] = json.loads(d[key])
         out.append(d)
     return out
 
@@ -621,15 +836,21 @@ async def report(
     *,
     session_id: str | None = None,
     recipient: str | None = None,
+    source: str | None = None,
 ) -> list[dict[str, Any]]:
     """Per (seam, outcome) aggregates for the fault catalog.
 
-    Counts attempts and the two evidence facts, and summarises the monotonic
+    Counts attempts, the two context facts (`harness_accepted`,
+    `observed_in_context` / `not_observed`), the behaviour verdicts
+    (`followed` / `not_followed`), and summarises the monotonic
     receipt-to-emission latency (the only exact local latency; cross-clock
-    deltas are estimates and are deliberately not aggregated here).
+    deltas are estimates and are deliberately not aggregated here). `source`
+    narrows to one writer so driver trials and local-brain cards can be read
+    apart without a second report.
     """
     if session_id is None and recipient is None:
         raise ValueError("filter by session_id or recipient")
+    _validate_source(source)
     async with with_tenant(customer_id) as conn:
         await _retire_lapsed_leases(conn, customer_id, recipient)
         rows = await conn.fetch(
@@ -643,6 +864,10 @@ async def report(
                    count(*) FILTER (
                        WHERE o.observed IS FALSE AND (d.evidence -> $5) IS DISTINCT FROM 'true'::jsonb
                    )::int AS not_observed,
+                   count(*) FILTER (WHERE b.outcome = 'followed')::int AS followed,
+                   count(*) FILTER (
+                       WHERE b.outcome IN ('ignored', 'contradicted', 'overridden')
+                   )::int AS not_followed,
                    count(d.receipt_to_emission_ms)::int AS latency_n,
                    percentile_cont(0.5) WITHIN GROUP (ORDER BY d.receipt_to_emission_ms) AS latency_p50,
                    percentile_cont(0.95) WITHIN GROUP (ORDER BY d.receipt_to_emission_ms) AS latency_p95,
@@ -655,9 +880,14 @@ async def report(
               ON m.customer_id = d.customer_id AND m.id = d.mailbox_id
             LEFT JOIN companion_observations o
               ON o.customer_id = d.customer_id AND o.attempt_id = d.attempt_id
+             AND o.kind = 'context'
+            LEFT JOIN companion_observations b
+              ON b.customer_id = d.customer_id AND b.attempt_id = d.attempt_id
+             AND b.kind = 'behaviour'
             WHERE d.customer_id = $1
               AND ($2::text IS NULL OR m.session_id = $2)
               AND ($3::text IS NULL OR m.recipient = $3)
+              AND ($6::text IS NULL OR m.source = $6)
             GROUP BY d.seam, d.outcome
             ORDER BY d.seam, d.outcome
             """,
@@ -666,5 +896,6 @@ async def report(
             recipient,
             EVIDENCE_HARNESS_ACCEPTED,
             EVIDENCE_OBSERVED_IN_CONTEXT,
+            source,
         )
     return [dict(r) for r in rows]

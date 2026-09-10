@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -36,6 +36,7 @@ from engine.shared.companion.mailbox import (
     BODY_MAX,
     DEDUPE_KEY_MAX,
     SESSION_ID_MAX,
+    SOURCES,
     TTL_MAX,
     TTL_MIN,
     AckRefused,
@@ -50,6 +51,7 @@ from engine.shared.companion.mailbox import (
     enqueue,
     observe,
     pending,
+    register_local,
     report,
 )
 from engine.shared.logging import get_logger
@@ -99,7 +101,12 @@ class CardOut(BaseModel):
     session_id: str | None
     class_: str = Field(alias="class")
     intended_seam: str | None
-    body: str
+    #: None only for a shadow registration (hash-only); poll never serves those.
+    body: str | None
+    body_sha256: str
+    source: str
+    mode: str
+    local_card_id: UUID | None = None
     trial_id: UUID
     created_at: datetime
     expires_at: datetime
@@ -114,6 +121,10 @@ def _card_out(card: Card) -> CardOut:
             "class": card.class_,
             "intended_seam": card.intended_seam,
             "body": card.body,
+            "body_sha256": card.body_sha256,
+            "source": card.source,
+            "mode": card.mode,
+            "local_card_id": card.local_card_id,
             "trial_id": card.trial_id,
             "created_at": card.created_at,
             "expires_at": card.expires_at,
@@ -137,6 +148,28 @@ class EnqueueResponse(BaseModel):
     capability: CapabilityOut
     card: CardOut | None = None
     created: bool = False
+
+
+class RegisterRequest(_Strict):
+    """A card the device's own harness minted (brain design v10 §6.3).
+
+    `mode='live'` carries the emitted body; `mode='shadow'` carries only
+    `body_sha256`. `source` is never accepted: registration IS the local-brain
+    entry point, and a driver card cannot be re-labelled through it.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    recipient: str = Field(min_length=6, max_length=200)
+    session_id: str = Field(min_length=1, max_length=SESSION_ID_MAX)
+    local_card_id: UUID
+    class_: str = Field(alias="class")
+    mode: Literal["live", "shadow"] = "live"
+    body: str | None = Field(default=None, min_length=1, max_length=BODY_MAX)
+    body_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    dedupe_key: str = Field(min_length=1, max_length=DEDUPE_KEY_MAX)
+    ttl_seconds: int = Field(ge=TTL_MIN, le=TTL_MAX)
+    intended_seam: str | None = None
 
 
 class KnownCard(_Strict):
@@ -206,6 +239,10 @@ class ObserveRequest(_Strict):
     attempt_id: UUID
     observed: bool
     observer: str = Field(min_length=1, max_length=200)
+    #: 'context' (the existing verdict) or 'behaviour' (what the model did
+    #: with the card afterwards; `outcome` required, `observed` derived).
+    kind: Literal["context", "behaviour"] = "context"
+    outcome: Literal["followed", "ignored", "contradicted", "overridden"] | None = None
     client_observed_at: AwareDatetime | None = None
     evidence: dict[str, Any] = Field(default_factory=dict)
 
@@ -238,6 +275,9 @@ class DeliveryOut(BaseModel):
     trial_id: UUID
     intended_seam: str | None
     class_: str = Field(alias="class")
+    source: str = "driver"
+    mode: str = "live"
+    local_card_id: UUID | None = None
     enqueued_at: datetime
     #: None = nobody looked; True/False = an observer's bounded verdict.
     observed_in_context: bool | None = None
@@ -245,6 +285,11 @@ class DeliveryOut(BaseModel):
     observed_at: datetime | None = None
     client_observed_at: datetime | None = None
     observation_evidence: dict[str, Any] | None = None
+    #: None = nobody watched what the model did; else the behaviour verdict.
+    behaviour_outcome: str | None = None
+    behaviour_observer: str | None = None
+    behaviour_observed_at: datetime | None = None
+    behaviour_evidence: dict[str, Any] | None = None
 
 
 class DeliveriesResponse(BaseModel):
@@ -271,6 +316,10 @@ class SeamReportOut(BaseModel):
     observed_in_context: int
     #: An observer looked and did NOT find it: emitted-but-never-seen.
     not_observed: int = 0
+    #: Behaviour verdicts: the model followed the card / did not (ignored,
+    #: contradicted, or the person overrode it).
+    followed: int = 0
+    not_followed: int = 0
     latency_ms: LatencyOut
     first_at: datetime
     last_at: datetime
@@ -309,6 +358,43 @@ async def enqueue_card(
             session_id=req.session_id,
             class_=req.class_,
             body=req.body,
+            dedupe_key=req.dedupe_key,
+            ttl_seconds=req.ttl_seconds,
+            intended_seam=req.intended_seam,
+        )
+    except EnqueueRefused as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except EnqueueConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"reason": exc.reason, "mailbox_id": str(exc.existing.mailbox_id)},
+        ) from exc
+    return EnqueueResponse(capability=capability, card=_card_out(card), created=created)
+
+
+@companion_router.post("/companion/register", response_model=EnqueueResponse)
+async def register_card(
+    req: RegisterRequest,
+    customer_id: str = Depends(authenticate_query),
+) -> EnqueueResponse:
+    """Register a card the device's own harness minted, so its receipts and
+    observations land in the same ledger as driver cards. Idempotent on
+    `local_card_id`; never served by poll. 409 when the local id or the
+    session dedupe key already names a different card.
+    """
+    capability = await _envelope(customer_id)
+    if not capability.enabled:
+        return EnqueueResponse(capability=capability)
+    try:
+        card, created = await register_local(
+            customer_id,
+            recipient=req.recipient,
+            session_id=req.session_id,
+            local_card_id=req.local_card_id,
+            class_=req.class_,
+            mode=req.mode,
+            body=req.body,
+            body_sha256=req.body_sha256,
             dedupe_key=req.dedupe_key,
             ttl_seconds=req.ttl_seconds,
             intended_seam=req.intended_seam,
@@ -429,6 +515,8 @@ async def observe_delivery(
             attempt_id=req.attempt_id,
             observed=req.observed,
             observer=req.observer,
+            kind=req.kind,
+            outcome=req.outcome,
             client_observed_at=req.client_observed_at,
             evidence=req.evidence,
         )
@@ -444,15 +532,18 @@ async def list_deliveries(
     session_id: str | None = Query(default=None, min_length=1, max_length=SESSION_ID_MAX),
     recipient: str | None = Query(default=None, min_length=6, max_length=200),
     limit: int = Query(default=200, ge=1, le=1_000),
+    source: str | None = Query(default=None),
     customer_id: str = Depends(authenticate_query),
 ) -> DeliveriesResponse:
     if session_id is None and recipient is None:
         raise HTTPException(status_code=422, detail="filter by session_id or recipient")
+    if source is not None and source not in SOURCES:
+        raise HTTPException(status_code=422, detail=f"source must be one of {sorted(SOURCES)}")
     capability = await _envelope(customer_id)
     if not capability.enabled:
         return DeliveriesResponse(capability=capability)
     rows = await deliveries(
-        customer_id, session_id=session_id, recipient=recipient, limit=limit + 1
+        customer_id, session_id=session_id, recipient=recipient, limit=limit + 1, source=source
     )
     truncated = len(rows) > limit
     return DeliveriesResponse(
@@ -466,22 +557,26 @@ async def list_deliveries(
 async def seam_report(
     session_id: str | None = Query(default=None, min_length=1, max_length=SESSION_ID_MAX),
     recipient: str | None = Query(default=None, min_length=6, max_length=200),
+    source: str | None = Query(default=None),
     customer_id: str = Depends(authenticate_query),
 ) -> ReportResponse:
     """Per (seam, outcome) numbers for the fault catalog (spec §8).
 
     Attempts, the two evidence counts (`harness_accepted`, `observed_in_context`
-    -- JSON `true` in the ack's evidence), and the monotonic latency
-    distribution. Cross-clock enqueue-to-emission deltas are left to the
-    catalog author: they carry clock-offset uncertainty and should not be
-    aggregated as if exact.
+    -- JSON `true` in the ack's evidence), the behaviour verdicts (`followed`,
+    `not_followed`), and the monotonic latency distribution. Cross-clock
+    enqueue-to-emission deltas are left to the catalog author: they carry
+    clock-offset uncertainty and should not be aggregated as if exact.
+    `source` narrows to driver cards or locally registered ones.
     """
     if session_id is None and recipient is None:
         raise HTTPException(status_code=422, detail="filter by session_id or recipient")
+    if source is not None and source not in SOURCES:
+        raise HTTPException(status_code=422, detail=f"source must be one of {sorted(SOURCES)}")
     capability = await _envelope(customer_id)
     if not capability.enabled:
         return ReportResponse(capability=capability)
-    rows = await report(customer_id, session_id=session_id, recipient=recipient)
+    rows = await report(customer_id, session_id=session_id, recipient=recipient, source=source)
     return ReportResponse(
         capability=capability,
         seams=[
@@ -492,6 +587,8 @@ async def seam_report(
                 harness_accepted=r["harness_accepted"],
                 observed_in_context=r["observed_in_context"],
                 not_observed=r.get("not_observed", 0),
+                followed=r.get("followed", 0),
+                not_followed=r.get("not_followed", 0),
                 latency_ms=LatencyOut(
                     n=r["latency_n"],
                     p50=r["latency_p50"],

@@ -299,6 +299,7 @@ async def test_unknown_fields_are_422_on_every_route(enabled: str) -> None:
     cases = [
         ("/companion/enqueue", _enqueue_body(actor_ref="user:mallory")),
         ("/companion/enqueue", _enqueue_body(source="brain")),
+        ("/companion/register", _register_body(source="driver")),
         ("/companion/poll", {"recipient": ALICE, "session_id": "sess-http", "cursor": "x"}),
         ("/companion/claim", {"recipient": ALICE, "claimed_by": "user:m", "mode": "shadow"}),
         (
@@ -429,4 +430,123 @@ async def test_observe_route_qualifies_an_attempt_and_refuses_unknowns(enabled: 
         await _request(
             "POST", "/companion/observe", {**body, "client_observed_at": "2026-09-07T12:00:00"}
         )
+    ).status_code == 422
+
+
+def _register_body(**kw: Any) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "recipient": ALICE,
+        "session_id": "sess-http",
+        "local_card_id": str(uuid4()),
+        "class": "seam",
+        "mode": "live",
+        "body": "you already tried this; see run tunneling-sambar-254",
+        "dedupe_key": "local-1",
+        "ttl_seconds": 600,
+    }
+    base.update(kw)
+    return base
+
+
+@pytest.mark.asyncio
+async def test_register_route_records_local_cards_and_never_polls_them(enabled: str) -> None:
+    """A card the device's own harness minted (brain design v10): registered
+    for the ledger, idempotent on `local_card_id`, never served by poll."""
+    import hashlib
+
+    body = _register_body()
+    one = await _request("POST", "/companion/register", body)
+    assert one.status_code == 200, one.text
+    card = one.json()["card"]
+    assert one.json()["created"] is True
+    assert card["source"] == "local-brain" and card["mode"] == "live"
+    assert card["local_card_id"] == body["local_card_id"] and card["body"].startswith(PREFIX)
+    assert len(card["body_sha256"]) == 64
+    two = await _request("POST", "/companion/register", body)
+    assert two.status_code == 200 and two.json()["created"] is False
+    assert two.json()["card"]["mailbox_id"] == card["mailbox_id"]
+    poll = {"recipient": ALICE, "session_id": "sess-http"}
+    assert (await _request("POST", "/companion/poll", poll)).json()["cards"] == []
+    attempt = str(uuid4())
+    ack_body = {
+        "mailbox_id": card["mailbox_id"],
+        "attempt_id": attempt,
+        "seam": "push",
+        "outcome": "emitted",
+        "receiving_instance": "dev:claude-code",
+    }
+    assert (await _request("POST", "/companion/ack", ack_body)).status_code == 200
+    local = await _request("GET", "/companion/deliveries?session_id=sess-http&source=local-brain")
+    assert [r["local_card_id"] for r in local.json()["deliveries"]] == [body["local_card_id"]]
+    driver = await _request("GET", "/companion/deliveries?session_id=sess-http&source=driver")
+    assert driver.json()["deliveries"] == []
+    bad = await _request("GET", "/companion/report?session_id=sess-http&source=brain")
+    assert bad.status_code == 422
+    # A shadow registration is hash-only and equally invisible to poll.
+    digest = hashlib.sha256(b"held back").hexdigest()
+    shadow = await _request(
+        "POST",
+        "/companion/register",
+        _register_body(
+            local_card_id=str(uuid4()),
+            mode="shadow",
+            body=None,
+            body_sha256=digest,
+            dedupe_key="local-2",
+        ),
+    )
+    assert shadow.status_code == 200, shadow.text
+    assert shadow.json()["card"]["body"] is None
+    assert shadow.json()["card"]["body_sha256"] == digest
+    assert (await _request("POST", "/companion/poll", poll)).json()["cards"] == []
+    # Same local id, different payload -> 409; a live card without its body -> 422.
+    assert (
+        await _request("POST", "/companion/register", {**body, "body": "other"})
+    ).status_code == 409
+    missing = await _request(
+        "POST", "/companion/register", _register_body(body=None, dedupe_key="l3")
+    )
+    assert missing.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_observe_route_records_a_behaviour_verdict(enabled: str) -> None:
+    card = (await _request("POST", "/companion/enqueue", _enqueue_body())).json()["card"]
+    attempt = str(uuid4())
+    await _request(
+        "POST",
+        "/companion/ack",
+        {
+            "mailbox_id": card["mailbox_id"],
+            "attempt_id": attempt,
+            "seam": "stop",
+            "outcome": "emitted",
+            "receiving_instance": "dev",
+        },
+    )
+    body = {
+        "mailbox_id": card["mailbox_id"],
+        "attempt_id": attempt,
+        "observed": False,
+        "observer": "brain:dev",
+        "kind": "behaviour",
+        "outcome": "contradicted",
+        "evidence": {"events": [12, 19]},
+    }
+    resp = await _request("POST", "/companion/observe", body)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["created"] is True
+    rows = (await _request("GET", "/companion/deliveries?session_id=sess-http")).json()[
+        "deliveries"
+    ]
+    assert rows[0]["behaviour_outcome"] == "contradicted"
+    assert rows[0]["behaviour_evidence"] == {"events": [12, 19]}
+    assert rows[0]["observed_in_context"] is None, "the context fact is a separate verdict"
+    rep = (await _request("GET", "/companion/report?session_id=sess-http")).json()["seams"][0]
+    assert rep["followed"] == 0 and rep["not_followed"] == 1
+    assert (
+        await _request("POST", "/companion/observe", {**body, "kind": "context"})
+    ).status_code == 422
+    assert (
+        await _request("POST", "/companion/observe", {**body, "outcome": None})
     ).status_code == 422
