@@ -227,6 +227,8 @@ async def run_retrieval(
     req: QueryRequest,
     customer_id: str,
     request: Request | None = None,
+    *,
+    page: bool = False,
 ) -> RetrieveResponse:
     """Run the full retrieval pipeline.
 
@@ -235,11 +237,15 @@ async def run_retrieval(
     `run_router_phase` + `run_search_phase` separately to emit SSE
     progress events between grounding and the agent loop.
     """
-    if req.cursor:
+    # Paging belongs to `/retrieve`, and only there. `/query` synthesizes an
+    # ANSWER from these results and hands back no cursor, so trimming its
+    # evidence to `top_k` would quietly narrow what the synthesis model reads
+    # in exchange for a page nobody can ask for.
+    if page and req.cursor:
         return await _serve_stored_page(req, customer_id)
     async with optional_tenant_virtual_key_context(customer_id):
         resp = await run_gatherer(req, customer_id, request=request)
-    return await _page_surplus(resp, req, customer_id)
+    return await _page_surplus(resp, req, customer_id) if page else resp
 
 
 async def _serve_stored_page(req: QueryRequest, customer_id: str) -> RetrieveResponse:

@@ -42,13 +42,23 @@ def _clear(monkeypatch: pytest.MonkeyPatch):
 async def test_pipeline_binds_the_tenant_key_around_the_gatherer(entry: str) -> None:
     """The key must be bound *while* the gatherer runs, not merely fetched."""
     from engine.retrieval import pipeline as pipeline_mod
-    from engine.shared.models import QueryRequest
+    from engine.shared.models import QueryRequest, RetrieveResponse
 
     seen: dict[str, str | None] = {}
 
     async def fake_gatherer(req, customer_id, request=None):
         seen["key"] = current_tenant_virtual_key()
-        return "sentinel"
+        # A real response, not a sentinel string: `run_retrieval` reads the
+        # result now (it pages the surplus), so a stub that lies about the
+        # return type would fail here for a reason that has nothing to do with
+        # what this test is about.
+        return RetrieveResponse(
+            query=req.query,
+            results=[],
+            total_candidates=0,
+            router_hit_cache=False,
+            trace_id="q-test",
+        )
 
     def fake_ctx(customer_id, *, http=None):
         return litellm_key_mod.optional_tenant_virtual_key_context(
@@ -70,7 +80,7 @@ async def test_pipeline_binds_the_tenant_key_around_the_gatherer(entry: str) -> 
             args.append(None)  # phase
         result = await fn(*args)
 
-    assert result == "sentinel"
+    assert result.query == "hi"
     assert seen["key"] == "sk-tenant-x", (
         f"{entry} ran the gatherer without the tenant key bound — "
         "every LLM call inside it bills to the shared key"

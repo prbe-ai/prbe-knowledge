@@ -73,3 +73,21 @@ def test_the_last_page_has_no_cursor() -> None:
     items = list(range(10))
     window = items[8:16]
     assert 8 + len(window) >= len(items)
+
+
+def test_paging_is_a_retrieve_concern_only() -> None:
+    """`/query` synthesizes an answer and hands back no cursor.
+
+    Trimming its evidence to `top_k` would quietly narrow what the synthesis
+    model reads in exchange for a page nobody can ask for, so `run_retrieval`
+    pages only when the caller says it is serving `/retrieve`.
+    """
+    import inspect
+
+    from engine.retrieval import main, pipeline
+
+    sig = inspect.signature(pipeline.run_retrieval)
+    assert sig.parameters["page"].default is False, "the default must not page"
+    src = inspect.getsource(main.retrieve)
+    assert "page=True" in src, "/retrieve opts in"
+    assert "page=True" not in inspect.getsource(main.query), "/query does not"

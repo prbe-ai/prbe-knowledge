@@ -227,7 +227,7 @@ async def retrieve(
     request.state.usage_request_payload = req
     t_total = time.perf_counter()
     try:
-        resp = await run_retrieval(req, customer_id, request=request)
+        resp = await run_retrieval(req, customer_id, request=request, page=True)
     except CursorExpired as exc:
         # 410, not 404: the page EXISTED and the caller's cursor was good --
         # it aged out (or belongs to another tenant, which reads the same from
