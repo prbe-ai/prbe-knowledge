@@ -1174,6 +1174,24 @@ CREATE POLICY retrieve_pages_tenant_isolation ON retrieve_pages
     USING (customer_id = current_setting('app.current_customer_id', true))
     WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
 
+-- The app role is deployment-specific (`app` on research, `probe_app` on
+-- managed, neither on some self-hosts), so the grant is discovered rather than
+-- hardcoded -- same reason as migration 0112. Without it the engine's page
+-- writes fail quietly and pagination looks shipped-but-unused.
+DO $$
+DECLARE role_name text;
+BEGIN
+    FOR role_name IN
+        SELECT rolname FROM pg_roles WHERE rolname IN ('app', 'probe_app', 'probe_admin')
+    LOOP
+        EXECUTE format(
+            'GRANT SELECT, INSERT, UPDATE, DELETE ON retrieve_pages TO %I',
+            role_name
+        );
+    END LOOP;
+END
+$$;
+
 -- ---------------------------------------------------------------------------
 -- Custom Ingest Tokens (migration 0046)
 -- Self-serve bearer tokens for the Custom Ingest API. Customers mint a
