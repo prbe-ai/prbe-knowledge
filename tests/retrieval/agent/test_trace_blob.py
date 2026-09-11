@@ -238,14 +238,29 @@ def test_build_trace_blob_handles_none_status() -> None:
 
 def test_compute_blob_key_format() -> None:
     now = datetime(2026, 5, 17, 14, 30, tzinfo=UTC)
-    key = compute_blob_key("trace-abc-123", now)
-    assert key == "search-traces/2026-05-17/trace-abc-123.json.gz"
+    key = compute_blob_key("anthrogen", "trace-abc-123", now)
+    assert key == "anthrogen/search-traces/2026-05-17/trace-abc-123.json.gz"
 
 
 def test_compute_blob_key_uses_utc_date() -> None:
     # Same UTC-instant; key uses the UTC date portion.
     now = datetime(2026, 12, 31, 23, 59, tzinfo=UTC)
-    assert compute_blob_key("x", now) == "search-traces/2026-12-31/x.json.gz"
+    assert compute_blob_key("t", "x", now) == "t/search-traces/2026-12-31/x.json.gz"
+
+
+def test_two_tenants_never_share_a_key_prefix() -> None:
+    """The separation these blobs rely on is the PREFIX, not an unguessable id.
+
+    Every tenant on the research cluster resolves to the same bucket, so the
+    tenant segment is the whole of the isolation -- and it is what a lifecycle
+    rule or a scoped grant can be written against.
+    """
+    now = datetime(2026, 5, 17, tzinfo=UTC)
+    mine = compute_blob_key("anthrogen", "q-1", now)
+    theirs = compute_blob_key("strand-ai", "q-1", now)
+    assert mine != theirs
+    assert not mine.startswith("strand-ai/") and not theirs.startswith("anthrogen/")
+    assert mine.startswith("anthrogen/search-traces/")
 
 
 # ============================================================

@@ -102,7 +102,7 @@ async def test_happy_path_sets_trace_blob_key(monkeypatch: pytest.MonkeyPatch) -
     )
     monkeypatch.setattr(
         "engine.retrieval.agent.trace_blob.compute_blob_key",
-        lambda trace_id, now: canned_key,
+        lambda customer_id, trace_id, now: canned_key,
     )
 
     request = _mk_request(
