@@ -66,12 +66,22 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Start MinIO (S3-API store the tests use as R2)
+        # quay.io, NOT Docker Hub. `minio/minio` on Docker Hub started
+        # answering `pull access denied ... repository does not exist or may
+        # require 'docker login'` (exit 125) on 2026-09-11, and it is not a
+        # rate limit: an anonymous pull of quay.io/minio/minio succeeds from
+        # the same host in the same minute. quay.io is MinIO's own registry and
+        # is what their docs point at.
+        #
+        # The step fails BEFORE pytest, so the whole gate goes red and no test
+        # result is produced -- which reads as "the merge broke the tests"
+        # rather than "the image vanished". Worth knowing when this recurs.
         run: |
           docker run -d --name minio \
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio server /data
+            quay.io/minio/minio server /data
           for i in {1..30}; do
             curl -sf http://localhost:9000/minio/health/live && exit 0
             sleep 2
