@@ -8,6 +8,23 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Added
 
+- **A stalled provider no longer costs the whole 12-second deadline.** 3.6% of
+  searches hit a Cerebras turn that never answers; the loop waited out
+  `SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS` and only THEN started the fallback
+  from scratch, so those searches ran p50 11.5s against 4.8s for a clean one,
+  with avg 6.8s of generation thrown away. Waiting less has been tried twice
+  (5s, then 10s) and reverted both times: a cut fires on healthy traffic, and
+  cutting a healthy turn forces a sticky failover onto a cold prefix that makes
+  every later turn ~5x slower. So this cuts nothing. At
+  `SEARCH_AGENT_HEDGE_AFTER_SECONDS` (5.0s, p99 of healthy single turns
+  measured over 570 production retrievals) a second call starts ALONGSIDE the
+  primary and the first usable answer wins; the loser is cancelled so the
+  tokens it booked at admission are released. Behaviour is unchanged when the
+  primary answers or errors before the hedge, when no fallback is configured,
+  and once a run has already failed over. `agent.turn_hedged` plus
+  `agent_hedge_fired` / `agent_hedge_fallback_won` / `agent_hedge_discarded_ms`
+  make the duplicate-token rate measurable rather than assumed.
+
 - **The gatherer can say WHICH part of a chunk answers the query, and the
   reader opens there.** A consumer rendering a short preview had no choice but
   to show the first 400 characters of a matched chunk — on a 2,000-character

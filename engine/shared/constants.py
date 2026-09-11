@@ -1603,6 +1603,41 @@ SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS = 12.0
 # 30s total, so a 30s fallback turn cannot land there whatever this says.
 SEARCH_AGENT_FALLBACK_TIMEOUT_SECONDS = 12.0
 
+# When to start the fallback ALONGSIDE a primary that has not answered yet.
+#
+# This is not a cut. The primary keeps running on its own 12s deadline; this
+# only decides when to stop waiting alone. That distinction is the whole point:
+# `SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS` above records two attempts (5s, then
+# 10s) at making the loop FASTER by cutting earlier, both reverted, because a
+# cut forces a sticky failover onto a provider with no cached prefix and makes
+# every remaining turn ~5x slower. Hedging buys the same early escape without
+# ever abandoning a turn that was going to return.
+#
+# Sized at p99 of HEALTHY turns, measured 2026-09-11 over 570 production
+# retrievals that made zero tool calls and hit no provider error (so `agent_ms`
+# IS one turn), tenant anthrogen, `kb.query_traces`:
+#
+#     p50 1,909ms   p75 2,434ms   p90 3,075ms   p95 3,574ms
+#     p99 4,839ms   max 9,993ms
+#
+# So 5.0s fires on roughly 1 turn in 100. The distribution has tightened since
+# the 12s cut was sized in August (then p90 4.66s, p95 6.69s) -- re-measure
+# before moving this, and re-measure it the same way, because `agent_ms` only
+# equals one turn when tool_calls_count is 0.
+#
+# What it is worth: 3.6% of searches hit a stalled provider and run p50
+# 11,505ms against 4,796ms for a clean one, with avg 6,774ms (max 12,060ms --
+# the deadline) of generation that is thrown away. Those are the turns this
+# rescues ~7s earlier.
+#
+# The cost is duplicate tokens on the turns where it fires, so it must stay
+# well above p95: every 100ms taken off this number buys a little tail latency
+# and pays for it on healthy traffic. `agent.turn_hedged` logs the winner and
+# both latencies so the real duplicate-spend rate is measurable, not assumed.
+SEARCH_AGENT_HEDGE_AFTER_SECONDS = float(
+    os.getenv("SEARCH_AGENT_HEDGE_AFTER_SECONDS", "5.0")
+)
+
 # Where a stalled run finishes. Must be a model id the gateway's modelList
 # resolves -- `accounts/fireworks/*` expands to the upstream
 # `fireworks_ai/accounts/fireworks/...` route. Empty string disables failover

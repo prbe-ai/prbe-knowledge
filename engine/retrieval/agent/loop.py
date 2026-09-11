@@ -86,6 +86,7 @@ from engine.shared.constants import (
     SEARCH_AGENT_FALLBACK_TIMEOUT_SECONDS,
     SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS,
     SEARCH_AGENT_HARD_CAP,
+    SEARCH_AGENT_HEDGE_AFTER_SECONDS,
     SEARCH_AGENT_INFERENCE_MODEL,
     SEARCH_AGENT_LENGTH_RETRY_FREQUENCY_PENALTY,
     SEARCH_AGENT_LENGTH_RETRY_TEMPERATURE,
@@ -148,6 +149,16 @@ class LoopState:
     tool_calls_count: int = 0
     extensions_used: int = 0
     budget: int = SEARCH_AGENT_TOOL_BUDGET
+    # Hedging telemetry. `hedge_fired` counts turns where the primary was still
+    # running at SEARCH_AGENT_HEDGE_AFTER_SECONDS and a second call was started
+    # alongside it; `hedge_fallback_won` counts the subset the fallback
+    # actually won. The ratio IS the duplicate-token bill, so it is counted
+    # rather than estimated. `hedge_discarded_ms` is wall time spent on losing
+    # calls -- deliberately NOT folded into failed_turn_latencies_ms, which
+    # means "an LLM call that ERRORED" and feeds agent_failed_llm_ms.
+    hedge_fired: int = 0
+    hedge_fallback_won: int = 0
+    hedge_discarded_ms: float = 0.0
     # One entry per turn (None when the provider response omitted
     # `usage.prompt_tokens_details.cached_tokens`). Aligned by index
     # with turn_latencies_ms / reasoning_per_turn / system_fingerprints
@@ -1131,6 +1142,132 @@ def _finish_reason_of(resp: Any) -> str | None:
     return getattr(choices[0], "finish_reason", None) if choices else None
 
 
+async def _acompletion_hedged(call_kwargs: dict[str, Any], state: LoopState) -> Any:
+    """The turn's LLM call, with the fallback started ALONGSIDE a slow primary.
+
+    A stalled Cerebras turn is the single worst thing that happens to search
+    latency: 3.6% of searches hit one and run p50 11.5s against 4.8s for a
+    clean one, because the loop waits the full
+    `SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS` (12s) for a turn that is never
+    coming, THEN starts the fallback from scratch.
+
+    The obvious fix -- wait less -- has been tried twice (5s, then 10s) and
+    reverted both times, and the reasoning is recorded on that constant: a cut
+    fires on healthy traffic, and cutting a healthy turn forces a STICKY
+    failover onto a provider with no cached prefix, which makes every remaining
+    turn of the run ~5x slower. The cut is not the lever.
+
+    So this does not cut anything. The primary keeps its own deadline and is
+    never abandoned; at `SEARCH_AGENT_HEDGE_AFTER_SECONDS` a second call simply
+    starts beside it and the first usable answer wins. A turn that would have
+    returned still returns -- it just stops being the only hope.
+
+    Behaviour is deliberately unchanged in three cases, so the blast radius is
+    only the slow tail:
+
+    * no fallback configured, or the run already failed over -> the plain call;
+    * the primary answers before the hedge deadline -> the plain call;
+    * the primary RAISES before the hedge deadline -> the exception propagates
+      untouched into `_run_turn`'s existing sequential failover, which is the
+      right handler for a fast, hard error (a 400, say) that a second
+      concurrent call would only repeat.
+    """
+    if state.llm_failed_over or not SEARCH_AGENT_FALLBACK_INFERENCE_MODEL:
+        return await acompletion(**call_kwargs)
+
+    primary = asyncio.ensure_future(acompletion(**call_kwargs))
+    done, _ = await asyncio.wait(
+        {primary}, timeout=SEARCH_AGENT_HEDGE_AFTER_SECONDS
+    )
+    if done:
+        # Success returns; an exception re-raises here and lands in the
+        # caller's existing failover path. Either way, no hedge was spent.
+        return primary.result()
+
+    # Slow, not dead. Start the second horse; do NOT touch the first.
+    state.hedge_fired += 1
+    t_hedge = time.perf_counter()
+    fallback_kwargs = dict(call_kwargs)
+    fallback_kwargs["model"] = SEARCH_AGENT_FALLBACK_INFERENCE_MODEL
+    fallback_kwargs["timeout"] = SEARCH_AGENT_FALLBACK_TIMEOUT_SECONDS
+    fallback = asyncio.ensure_future(acompletion(**fallback_kwargs))
+
+    pending = {primary, fallback}
+    winner: asyncio.Future[Any] | None = None
+    primary_exc: BaseException | None = None
+    fallback_exc: BaseException | None = None
+    try:
+        while pending and winner is None:
+            finished, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in finished:
+                exc = task.exception()
+                if exc is None:
+                    winner = task
+                    break
+                if task is fallback:
+                    fallback_exc = exc
+                    # Record ONLY the fallback here. A failed primary is
+                    # recorded by the caller's own except-handler, which times
+                    # it from before the hedge and so measures the whole call
+                    # -- appending it here too would put one call in
+                    # agent_failed_llm_ms twice, and that metric is what this
+                    # feature is judged on.
+                    state.failed_turn_latencies_ms.append(
+                        (time.perf_counter() - t_hedge) * 1000
+                    )
+                else:
+                    primary_exc = exc
+    finally:
+        # Whoever lost is now pure waste: cancel it so the provider connection
+        # closes and the tokens it booked at admission are released. Cerebras
+        # books quota on `input + max_completion_tokens` BEFORE the request
+        # runs, so an uncancelled loser holds quota nothing will ever use.
+        #
+        # In a `finally` because the loop above is also where an OUTER
+        # cancellation lands: `_drive_loop` runs under `asyncio.wait_for(...,
+        # loop_budget)`, so a loop_timeout cancels us mid-race. Without this,
+        # that path orphans BOTH calls and the hedge turns a stall into two
+        # stalls.
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+            state.hedge_discarded_ms += (time.perf_counter() - t_hedge) * 1000
+
+    if winner is None:
+        # Both providers failed. Mark the run failed over BEFORE raising: the
+        # caller's sequential path would otherwise replay the fallback a third
+        # time, and its own comment says one retry is the rule.
+        state.llm_failed_over = True
+        # Prefer the primary's error: the caller logs `model=call_kwargs
+        # ["model"]`, which is the primary, so raising the fallback's would
+        # caption one provider's failure with the other's name.
+        last_exc = primary_exc or fallback_exc
+        assert last_exc is not None
+        raise last_exc
+
+    fallback_won = winner is fallback
+    if fallback_won:
+        state.hedge_fallback_won += 1
+        # Sticky, exactly as the error path is: the fallback now owns the run.
+        state.llm_failed_over = True
+        state.llm_model = SEARCH_AGENT_FALLBACK_INFERENCE_MODEL
+    log.warning(
+        "agent.turn_hedged",
+        customer_id=state.customer_id,
+        trace_id=state.trace_id,
+        turn=state.turn_count,
+        winner="fallback" if fallback_won else "primary",
+        hedge_after_s=SEARCH_AGENT_HEDGE_AFTER_SECONDS,
+        waited_ms=round((time.perf_counter() - t_hedge) * 1000, 1),
+        primary_model=call_kwargs["model"],
+        fallback_model=fallback_kwargs["model"],
+    )
+    return winner.result()
+
+
 async def _run_turn(state: LoopState) -> Any:
     """Run one LLM turn with tool_choice='required'. Records latency +
     cache hit rate on state. Returns the raw response."""
@@ -1214,7 +1351,7 @@ async def _run_turn(state: LoopState) -> Any:
 
     t_turn = time.perf_counter()
     try:
-        resp = await acompletion(**call_kwargs)
+        resp = await _acompletion_hedged(call_kwargs, state)
     except LLMError as exc:
         elapsed_ms = (time.perf_counter() - t_turn) * 1000
         state.failed_turn_latencies_ms.append(elapsed_ms)
@@ -2271,6 +2408,13 @@ def _finalize_agent_timing(
         sum(state.turn_latencies_ms) + timing["agent_failed_llm_ms"]
     )
     timing["agent_tools_ms"] = sum(state.tool_latencies_ms)
+    # Kept OUT of agent_loop_ms: a hedge loser runs concurrently with the
+    # winner, so adding it would double-count wall clock that was never spent
+    # serially. It rides its own key because it is a BILL, not a duration --
+    # the tokens a losing call booked. See SEARCH_AGENT_HEDGE_AFTER_SECONDS.
+    timing["agent_hedge_discarded_ms"] = state.hedge_discarded_ms
+    timing["agent_hedge_fired"] = float(state.hedge_fired)
+    timing["agent_hedge_fallback_won"] = float(state.hedge_fallback_won)
 
 
 # ============================================================
