@@ -392,7 +392,7 @@ async def _persist_trace_blob_r2(request: Request) -> None:
         )
         from datetime import UTC
         from datetime import datetime as _dt
-        key = compute_blob_key(trace_id, _dt.now(UTC))
+        key = compute_blob_key(customer_id, trace_id, _dt.now(UTC))
         result = await persist_trace_blob_to_r2(customer_id, key, payload)
         if result is not None:
             request.state.trace_blob_key = result

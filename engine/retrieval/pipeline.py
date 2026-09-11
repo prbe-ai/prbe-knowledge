@@ -33,8 +33,13 @@ from fastapi import HTTPException
 if TYPE_CHECKING:
     from starlette.requests import Request
 
+from uuid import uuid4
+
+from pydantic import TypeAdapter
+
 from engine.retrieval.agent.loop import run_gatherer
 from engine.retrieval.grounding import GroundingBundle, GroundingCandidate
+from engine.retrieval.paging import load_page, store_page
 from engine.retrieval.router import (
     Intent,
     RouterOutput,
@@ -46,6 +51,7 @@ from engine.shared.litellm_key import optional_tenant_virtual_key_context
 from engine.shared.logging import get_logger
 from engine.shared.models import (
     QueryRequest,
+    QueryResult,
     RetrieveResponse,
     TemporalMode,
     TemporalSpec,
@@ -221,6 +227,8 @@ async def run_retrieval(
     req: QueryRequest,
     customer_id: str,
     request: Request | None = None,
+    *,
+    page: bool = False,
 ) -> RetrieveResponse:
     """Run the full retrieval pipeline.
 
@@ -229,5 +237,61 @@ async def run_retrieval(
     `run_router_phase` + `run_search_phase` separately to emit SSE
     progress events between grounding and the agent loop.
     """
+    # Paging belongs to `/retrieve`, and only there. `/query` synthesizes an
+    # ANSWER from these results and hands back no cursor, so trimming its
+    # evidence to `top_k` would quietly narrow what the synthesis model reads
+    # in exchange for a page nobody can ask for.
+    if page and req.cursor:
+        return await _serve_stored_page(req, customer_id)
     async with optional_tenant_virtual_key_context(customer_id):
-        return await run_gatherer(req, customer_id, request=request)
+        resp = await run_gatherer(req, customer_id, request=request)
+    return await _page_surplus(resp, req, customer_id) if page else resp
+
+
+async def _serve_stored_page(req: QueryRequest, customer_id: str) -> RetrieveResponse:
+    """The next slice of an earlier search, with no search.
+
+    No grounding, no fan-out, no LLM turn: the ranking was decided when the
+    page was minted, and the whole point of a cursor is that asking for the
+    rest does not cost what asking the first time did.
+    """
+    window, next_cursor = await load_page(customer_id, req.cursor or "", req.top_k)
+    results = [TypeAdapter(QueryResult).validate_python(item) for item in window]
+    return RetrieveResponse(
+        query=req.query,
+        results=results,
+        score_semantics="ordinal_rank",
+        total_candidates=len(results),
+        router_hit_cache=False,
+        # Empty on purpose. The ranking this slice comes from was produced by
+        # a gatherer turn that already happened; reporting stage timings here
+        # would attribute that turn's cost to a request that did not pay it.
+        timing_ms={},
+        trace_id=f"q-page-{uuid4().hex[:12]}",
+        next_cursor=next_cursor,
+    )
+
+
+async def _page_surplus(
+    resp: RetrieveResponse,
+    req: QueryRequest,
+    customer_id: str,
+) -> RetrieveResponse:
+    """Keep `top_k`, store the rest, and say where the rest lives.
+
+    The gatherer routinely curates more documents than the caller asked for --
+    the recall floor alone backfills to ten. Those extras used to be handed
+    over for the caller to throw away; either way the work was done and then
+    discarded. Now they are a page, and the caller can have them for the price
+    of a SELECT instead of another 7-14 second pipeline.
+    """
+    surplus = resp.results[req.top_k :]
+    if not surplus:
+        return resp
+    resp.results = resp.results[: req.top_k]
+    resp.next_cursor = await store_page(
+        customer_id,
+        req.query,
+        [r.model_dump(mode="json") for r in surplus],
+    )
+    return resp

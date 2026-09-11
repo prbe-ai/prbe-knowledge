@@ -160,14 +160,25 @@ def build_trace_blob(
     return blob
 
 
-def compute_blob_key(trace_id: str, now: datetime) -> str:
+def compute_blob_key(customer_id: str, trace_id: str, now: datetime) -> str:
     """Return the R2 object key for this trace.
 
-    Customer isolation is implicit in the per-tenant bucket name — no
-    customer_id in the key. Date prefix lets the nightly trace-analyzer
-    list-by-prefix instead of scanning the whole bucket.
+    THE TENANT IS IN THE KEY. It used to be left out, on the reasoning that
+    isolation was implicit in the per-tenant bucket name — and on the research
+    cluster that reasoning does not hold: every tenant's `customers.r2_bucket`
+    is the same bucket, so a trace's only separation from another tenant's was
+    the unguessability of its id. These blobs carry verbatim chunk content, so
+    that is the wrong thing to lean on, and any per-tenant rule built on the old
+    comment (a lifecycle policy, a scoped read grant, a bulk delete) would have
+    been built on sand.
+
+    Old rows keep their old keys and stay readable: the analyzer reads
+    `trace_blob_key` off the `query_traces` row rather than listing the bucket,
+    so nothing has to be migrated for a reader to find them. The date segment
+    stays where it is, under the tenant, so list-by-prefix still works — now
+    per tenant, which is what a lifecycle rule actually wants.
     """
-    return f"search-traces/{now:%Y-%m-%d}/{trace_id}.json.gz"
+    return f"{customer_id}/search-traces/{now:%Y-%m-%d}/{trace_id}.json.gz"
 
 
 async def persist_trace_blob_to_r2(

@@ -51,6 +51,7 @@ from engine.retrieval.graph_explore import (
     graph_search_query,
 )
 from engine.retrieval.middleware import UsageLoggingMiddleware
+from engine.retrieval.paging import CursorExpired
 from engine.retrieval.pipeline import (
     run_retrieval,
     run_router_phase,
@@ -225,7 +226,17 @@ async def retrieve(
     request.state.usage_summary = req.query
     request.state.usage_request_payload = req
     t_total = time.perf_counter()
-    resp = await run_retrieval(req, customer_id, request=request)
+    try:
+        resp = await run_retrieval(req, customer_id, request=request, page=True)
+    except CursorExpired as exc:
+        # 410, not 404: the page EXISTED and the caller's cursor was good --
+        # it aged out (or belongs to another tenant, which reads the same from
+        # here and should). Saying "gone" tells an agent to search again; a 404
+        # would invite it to conclude the documents themselves are missing.
+        raise HTTPException(
+            status_code=410,
+            detail="cursor expired: re-run the search to get a fresh page",
+        ) from exc
     request.state.result_count = len(resp.results)
     request.state.usage_response_payload = resp
     total_ms = (time.perf_counter() - t_total) * 1000

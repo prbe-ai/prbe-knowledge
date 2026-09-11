@@ -27,6 +27,7 @@ import asyncio
 import json
 import math
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -94,7 +95,11 @@ from engine.shared.constants import (
     SEARCH_AGENT_MAX_OUTPUT_TOKENS,
     SEARCH_AGENT_PREFANOUT_MAX_SUBQUERIES,
     SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET,
+    SEARCH_AGENT_RULER_MIN_CHARS,
+    SEARCH_AGENT_RULER_STRIDE,
     SEARCH_AGENT_SOFT_TURN_CAP,
+    SEARCH_AGENT_SPAN_MAX_LEN,
+    SEARCH_AGENT_SPAN_MIN_LEN,
     SEARCH_AGENT_TOOL_BUDGET,
     SEARCH_AGENT_TRACE_SAMPLE_RATE,
     SourceSystem,
@@ -302,6 +307,78 @@ def _count_tokens(text: str) -> int:
     return len(_TOKEN_ENCODING.encode(text))
 
 
+def ruler(content: str, stride: int = SEARCH_AGENT_RULER_STRIDE) -> str:
+    """`content` with a position label printed before every `stride`-th char.
+
+    Pure, deterministic and total: same text in, same text out, so the cached
+    prompt prefix survives turn to turn. The labels are a COORDINATE SYSTEM, not
+    content -- they say where in the stored string each part sits, so the model
+    can answer "which part matters" with two integers instead of prose it would
+    have to copy.
+
+    The marker is ASCII on purpose. These payloads reach the model through
+    `json.dumps`, which escapes anything else: a `⟨` label ships as
+    `\u27e8`, so every position would cost ~10 tokens of backslash noise and
+    read as garbage in the one place the model has to parse precisely.
+
+    Positions are measured on the STORED text, before JSON escaping, because
+    that is the string every consumer of a span will index into.
+    """
+    if len(content) < SEARCH_AGENT_RULER_MIN_CHARS:
+        return content
+    out: list[str] = []
+    for start in range(0, len(content), stride):
+        out.append(f"[@{start}]")
+        out.append(content[start : start + stride])
+    return "".join(out)
+
+
+def _ruled_payload(value: Any) -> Any:
+    """The payload with every chunk body ruled, structure otherwise untouched.
+
+    Applied inside the serializer rather than at the call sites so the bytes
+    COSTED against the prefan-out budget are the bytes SENT. Measuring one shape
+    and emitting another is how a cap ends up wrong by exactly the difference,
+    silently.
+    """
+    if isinstance(value, dict):
+        out = {k: _ruled_payload(v) for k, v in value.items()}
+        content = out.get("content")
+        if isinstance(content, str) and content and "chunk_id" in out:
+            out["content"] = ruler(content)
+        return out
+    if isinstance(value, list):
+        return [_ruled_payload(v) for v in value]
+    return value
+
+
+def resolve_span(
+    content: str,
+    start: Any,
+    length: Any,
+) -> tuple[tuple[int, int] | None, str]:
+    """A model-supplied pointer, pulled into range. Returns (span, outcome).
+
+    ARITHMETIC ONLY -- no matching, no searching. The model read positions off
+    the ruler, so the numbers already mean something on this exact string; the
+    harness's whole job is to refuse to trust them blindly. Out of range is
+    CLAMPED rather than rejected, because a window in slightly the wrong place
+    is worth more to a reader than no window, and the outcome is logged either
+    way so the drift is measurable instead of invisible.
+    """
+    if isinstance(start, bool) or isinstance(length, bool):
+        return None, "missing"
+    if not isinstance(start, int) or not isinstance(length, int):
+        return None, "missing"
+    if not content:
+        return None, "missing"
+    clamped_start = max(0, min(start, len(content) - 1))
+    clamped_len = max(SEARCH_AGENT_SPAN_MIN_LEN, min(length, SEARCH_AGENT_SPAN_MAX_LEN))
+    clamped_len = min(clamped_len, len(content) - clamped_start)
+    outcome = "valid" if (clamped_start, clamped_len) == (start, length) else "clamped"
+    return (clamped_start, clamped_len), outcome
+
+
 def _dump_prefanout(payload: Any) -> str:
     """THE serializer for the pre-fan-out, used for both costing and output.
 
@@ -310,7 +387,7 @@ def _dump_prefanout(payload: Any) -> str:
     silently. NO indent -- pretty-printing spends input tokens on whitespace
     that carries no information, and this payload is re-sent on EVERY turn.
     """
-    return json.dumps(payload, default=str, separators=(",", ":"))
+    return json.dumps(_ruled_payload(payload), default=str, separators=(",", ":"))
 
 
 def _is_trimmable_hit(hit: Any) -> bool:
@@ -1638,6 +1715,87 @@ def _has_citable_prefanout_evidence(prefanout: dict[str, Any] | None) -> bool:
     return bool(_fuse_prefanout_docs(prefanout))
 
 
+def _prefanout_chunk_text(prefanout: dict[str, Any] | None) -> dict[str, str]:
+    """`chunk_id -> the chunk body as STORED`, from the pre-fan-out.
+
+    The one string a span can legally index. What the model emits as `content`
+    is its own rendering of the chunk -- verbatim only 12% of the time, an
+    excerpt 59%, reworded 29% -- so offsets read off the ruler mean nothing
+    against it. This is how a span gets matched back to the text it describes.
+    """
+    out: dict[str, str] = {}
+    for sq in (prefanout or {}).get("sub_queries") or []:
+        if not isinstance(sq, dict):
+            continue
+        for channel in ("vector", "bm25", "graph", "inferred_edge"):
+            for hit in sq.get(channel) or []:
+                if not isinstance(hit, dict):
+                    continue
+                chunk_id, content = hit.get("chunk_id"), hit.get("content")
+                if chunk_id and isinstance(content, str) and content.strip():
+                    out.setdefault(chunk_id, content)
+    return out
+
+
+def _resolve_spans(gathered: GathererOutput, state: LoopState, *, query: str) -> None:
+    """Pull every model-supplied span into range, and say how it landed.
+
+    A span indexes the chunk AS STORED -- that is the string the ruler labelled
+    -- and the model's own `content` is usually not that string. So a pointed
+    chunk is restored to the stored text before its span is resolved, and a
+    chunk whose stored text cannot be found keeps the model's text and loses
+    its span: a pointer into a string it does not describe is worse than none.
+
+    Nothing is ever DROPPED here. The last attempt to make the harness
+    authoritative for chunk content (#370) removed chunks whose lookup missed,
+    and search came back empty for whole queries (#371). A miss costs a pointer,
+    never a result.
+
+    Logged per chunk with the one thing arithmetic cannot tell us: whether the
+    window is ON TOPIC. An in-bounds span pointing at an irrelevant paragraph
+    passes every check here, so `window_has_query_term` and an 80-character
+    sample are what make a bad ruler stride visible -- `valid` alone would read
+    as healthy while previews opened in the wrong place.
+    """
+    terms = {t for t in re.split(r"[^0-9a-z]+", query.lower()) if len(t) >= 3}
+    stored = _prefanout_chunk_text(state.prefanout)
+    for chunk in gathered.chunks:
+        raw_start, raw_len = getattr(chunk, "start", None), getattr(chunk, "len", None)
+        if raw_start is None and raw_len is None:
+            continue
+        original = stored.get(chunk.chunk_id)
+        if original is None:
+            chunk.start = chunk.len = None
+            log.info(
+                "agent.span_resolved",
+                customer_id=state.customer_id,
+                trace_id=state.trace_id,
+                outcome="unanchored",
+                chunk_id=chunk.chunk_id,
+                asked=[raw_start, raw_len],
+            )
+            continue
+        chunk.content = original
+        span, outcome = resolve_span(chunk.content, raw_start, raw_len)
+        if span is None:
+            chunk.start = chunk.len = None
+        else:
+            chunk.start, chunk.len = span
+        window = chunk.content[chunk.start : (chunk.start or 0) + (chunk.len or 0)] if span else ""
+        log.info(
+            "agent.span_resolved",
+            customer_id=state.customer_id,
+            trace_id=state.trace_id,
+            outcome=outcome,
+            chunk_id=chunk.chunk_id,
+            asked=[raw_start, raw_len],
+            resolved=list(span) if span else None,
+            content_len=len(chunk.content),
+            window_has_query_term=any(t in window.lower() for t in terms) if window else None,
+            window_head=window[:80],
+        )
+
+
 def _backfill_recall_floor(
     gathered: GathererOutput, prefanout: dict[str, Any] | None
 ) -> int:
@@ -2874,6 +3032,8 @@ async def run_gatherer(
             total_chunks=len(gathered.chunks),
         )
 
+    _resolve_spans(gathered, state, query=state.query)
+
     _finalize_agent_timing(timing, state, started_at=t_agent)
 
     log.info(
@@ -3121,7 +3281,12 @@ async def _drive_loop(state: LoopState) -> GathererOutput | None:
 
         # Append each tool result as a `tool`-role message linked by id.
         for tc, (_name, payload) in zip(tool_calls, results, strict=True):
-            content_str = json.dumps(payload, default=str)
+            # Ruled here too, and for the same reason as the pre-fan-out: a
+            # chunk the model meets through `search` or `fetch_doc` is a chunk
+            # it may point into, and a coordinate system that covers only half
+            # the text it reads is worse than none -- the model cannot tell
+            # which half it is looking at.
+            content_str = json.dumps(_ruled_payload(payload), default=str)
             if len(content_str) > 60_000:
                 content_str = json.dumps({
                     "truncated": True,

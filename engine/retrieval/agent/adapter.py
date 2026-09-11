@@ -353,6 +353,12 @@ def _chunk_to_query_chunk(
         graph_evidence=graph_evidence,
         why_relevant=getattr(chunk, "why_relevant", "") or "",
         matched_via=chunk_provenance,
+        span=(
+            {"start": chunk.start, "len": chunk.len}
+            if getattr(chunk, "start", None) is not None
+            and getattr(chunk, "len", None) is not None
+            else None
+        ),
     )
 
 

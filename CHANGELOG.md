@@ -6,6 +6,55 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Added
+
+- **The gatherer can say WHICH part of a chunk answers the query, and the
+  reader opens there.** A consumer rendering a short preview had no choice but
+  to show the first 400 characters of a matched chunk — on a 2,000-character
+  chunk, usually the part nobody asked about. The model that read the chunk is
+  the only thing in the pipeline that knows better, and it had no way to say
+  so. Asking it for a character offset does not work: positional embeddings
+  give a model relative order, not indices, so an offset is an informed guess
+  and a wrong one is silent — every number parses, it just opens the passage
+  in the wrong place. So long chunk bodies now carry `[@0]`, `[@200]`, `[@400]`
+  position labels and the model reads one off instead of counting to it, the
+  same trade Anthropic's Citations API makes from the other side. `GatheredChunk`
+  gains `start` / `len`; the harness clamps rather than rejects (a window
+  slightly off beats no window) and `span` reaches consumers as
+  `{"start", "len"}` on `QueryChunk`. `agent.span_resolved` logs how each one
+  landed and — because in-bounds is not the same as on-topic — whether the
+  chosen window contains a query term, plus its first 80 characters. The ruler
+  costs ~855 tokens on a realistic bundle and the pre-fan-out budget rises by
+  1,100 to absorb it, so it buys its room instead of evicting candidates.
+
+- **`/retrieve` can hand back the rest of a search for the price of a SELECT.**
+  It ranks a pool and returns `top_k`; the surplus was dropped, and `QueryRequest`
+  had no `cursor` and `RetrieveResponse` no `next_cursor`, so "there were more"
+  was not something the API could say. A caller that wanted them re-ran the
+  whole search with a bigger number — grounding, four channels, an LLM turn,
+  7-14 seconds — for documents the server had already ranked and discarded.
+  The surplus is now written to `retrieve_pages` and named by an opaque cursor.
+  The page carries content rather than ids on purpose: paging by id over a
+  corpus that re-indexes continuously shows one result twice and never shows
+  another, so a page is deliberately a snapshot of what that search found. An
+  expired cursor is a 410 telling the caller to search again, never a silent
+  re-run. The write is synchronous (a cursor never names a row that does not
+  exist yet), best-effort (a failed store costs a cursor, never an answer), and
+  trims rows older than a day on the way in, so the store cleans itself.
+
+### Fixed
+
+- **Search trace blobs are keyed per tenant.** `compute_blob_key` left the
+  customer out, on the reasoning that isolation was implicit in the per-tenant
+  bucket name. On the research cluster it is not: all eleven tenants resolve to
+  the same bucket, so the only thing separating one tenant's search transcripts
+  — which carry verbatim chunk content — from another's was the unguessability
+  of a trace id, and any per-tenant lifecycle rule or scoped grant written
+  against that comment was written against something untrue. Keys are now
+  `<customer_id>/search-traces/<date>/<trace_id>.json.gz`. Nothing needs
+  migrating: the nightly analyzer reads `trace_blob_key` off the `query_traces`
+  row rather than listing the bucket, so old blobs stay readable where they are.
+
 ### Fixed
 
 - **The retry meant to rescue a truncated search was a no-op, because the

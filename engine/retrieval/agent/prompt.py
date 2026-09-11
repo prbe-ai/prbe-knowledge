@@ -162,6 +162,16 @@ relevant to the query, emit a `GatheredEntity` with `canonical_id`,
 one-line `why_relevant`. Chunk-only output is the common failure mode
 this rule prevents.
 
+POINT AT THE PART THAT ANSWERS. Long chunk bodies carry [@N] position
+labels: [@0] opens the chunk, [@200] is 200 characters in, and so on.
+They are a ruler, not content — never copy one into your output. When a
+chunk is long and one part of it answers the query, set `start` to the
+nearest label before that part and `len` to how much to show
+(120-800). The reader sees that window first, so a pointer is the
+difference between a result that looks relevant and one that looks
+like boilerplate. Omit both when the chunk is short or the whole thing
+answers — a wrong pointer is worse than none.
+
 Default to KEEPING candidates the consumer can filter further. Drop
 only when clearly off-topic. Each `gatherer_notes.dropped` entry is an
 OBJECT with two string fields: `canonical_id` -- the id you saw the
