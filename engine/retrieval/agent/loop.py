@@ -333,6 +333,28 @@ def ruler(content: str, stride: int = SEARCH_AGENT_RULER_STRIDE) -> str:
     return "".join(out)
 
 
+#: What `ruler` writes. Compiled once; used to take the labels back out of
+#: anything the model hands us.
+_RULER_LABEL_RE = re.compile(r"\[@(\d+)\]")
+
+
+def strip_ruler(text: str, stride: int = SEARCH_AGENT_RULER_STRIDE) -> str:
+    """`text` with ruler labels removed -- and only ruler labels.
+
+    `[@2]` is a pandoc citation and a legal subscript in several languages, so
+    the bracket-at-number shape alone is not proof the harness wrote it. A real
+    ruler label always sits at a multiple of the stride, so one of those is the
+    evidence that this text carries a ruler at all; without it the text is left
+    exactly as the model wrote it.
+    """
+    if not text:
+        return text
+    found = _RULER_LABEL_RE.findall(text)
+    if not any(int(n) % stride == 0 for n in found):
+        return text
+    return _RULER_LABEL_RE.sub("", text)
+
+
 def _ruled_payload(value: Any) -> Any:
     """The payload with every chunk body ruled, structure otherwise untouched.
 
@@ -1950,6 +1972,13 @@ def _coerce_lenient(raw: dict[str, Any], state: LoopState | None = None) -> dict
                     break
         if not ch_out.get("content"):
             continue  # No body to cite
+        # STRIP THE RULER. The labels are a coordinate system the harness prints
+        # into the text the model reads; the prompt says never to copy one, and
+        # a prompt is advice. If one is copied anyway it becomes `[@200]` litter
+        # in a user-visible search preview, which is the one place this feature
+        # must not show its own plumbing. Removing it costs nothing when the
+        # model behaved -- the pattern is ours and does not occur in real text.
+        ch_out["content"] = strip_ruler(ch_out["content"])
         # Fill doc-level pass-through fields. The prefanout meta is the
         # canonical record from the DB (titles, URLs, timestamps the
         # ingestion pipeline persisted), so it WINS over the model's

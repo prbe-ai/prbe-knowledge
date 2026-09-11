@@ -216,3 +216,50 @@ def test_no_chunk_is_ever_dropped() -> None:
     gathered = _gathered("c-unknown", "kept", 10, 200)
     _resolve_spans(gathered, _loop_state({}), query="x")
     assert len(gathered.chunks) == 1
+
+
+# -- the plumbing must never reach a reader ------------------------------------
+
+
+def test_a_copied_label_is_taken_back_out_of_emitted_content() -> None:
+    """The prompt says never to copy a label. A prompt is advice.
+
+    If one is copied anyway it lands as `[@200]` litter in a user-visible search
+    preview -- the one place this feature must not show its own plumbing.
+    """
+    from engine.retrieval.agent.loop import _parse_terminal_args
+
+    out = _parse_terminal_args(
+        {
+            "entities": [],
+            "chunks": [
+                {
+                    "doc_id": "d1",
+                    "chunk_id": "c1",
+                    "content": "[@0]Retain the deployed 0.5 MPP[@200] preprocessing.",
+                }
+            ],
+        }
+    )
+    assert out is not None
+    assert out.chunks[0].content == "Retain the deployed 0.5 MPP preprocessing."
+
+
+def test_stripping_leaves_real_text_alone() -> None:
+    """`[@2]` is a pandoc citation, not our plumbing.
+
+    The bracket-at-number shape alone is not proof the harness wrote it, so a
+    label at a multiple of the stride has to be present before anything is
+    removed -- otherwise a search preview quietly loses a real citation.
+    """
+    from engine.retrieval.agent.loop import strip_ruler
+
+    for text in ("array[@2] is not a label", "see [@17] and [@33]", "a@b.com", "", "prose"):
+        assert strip_ruler(text) == text
+
+
+def test_stripping_fires_once_a_real_label_proves_the_ruler() -> None:
+    from engine.retrieval.agent.loop import strip_ruler
+
+    # [@200] is ours; [@17] beside it goes too, because this text is ruled.
+    assert strip_ruler("[@200]a [@17]b") == "a b"
