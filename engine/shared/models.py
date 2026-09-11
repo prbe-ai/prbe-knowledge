@@ -275,6 +275,11 @@ class TemporalSpec(BaseModel):
 
 class QueryRequest(BaseModel):
     query: str
+    #: Ask for the REST of an earlier retrieval instead of running a new one.
+    #: Opaque: it names a stored page of that search's surplus. With it set,
+    #: `query` and every filter are ignored -- the ranking was decided when the
+    #: page was minted, and re-deciding it is how a walk skips and repeats rows.
+    cursor: str | None = None
     top_k: int = 20
     sources: list[SourceSystem] | None = None
     doc_types: list[str] | None = Field(
@@ -758,6 +763,10 @@ class RetrieveResponse(BaseModel):
     aggregation: dict[str, object] | None = None
     timing_ms: dict[str, float] = Field(default_factory=dict)
     trace_id: str
+    #: Pass back to `QueryRequest.cursor` for the results this response could
+    #: not carry. None means there is nothing more -- a real answer, not a
+    #: "pagination unsupported" placeholder.
+    next_cursor: str | None = None
     # Three-state contract per codex-B4:
     #   None        -> not requested (top_k_related == 0) OR walk failed
     #                 (also see related_entities_error below). Also None
