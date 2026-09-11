@@ -261,6 +261,21 @@ class GatheredChunk(BaseModel):
         description="One-line, agent-written rationale. For inferred-edge "
         "neighbors, quote the edge `why` string verbatim.",
     )
+    start: int | None = Field(
+        default=None,
+        description=(
+            "Where the part that answers the query STARTS, as the [@N] label "
+            "nearest to it in the chunk you read. Omit if the whole chunk "
+            "answers or you are unsure."
+        ),
+    )
+    len: int | None = Field(
+        default=None,
+        description=(
+            "How many characters from `start` to show, 120-800. Enough to "
+            "carry the point; the reader sees this window first."
+        ),
+    )
     source_system: str = Field(
         default="",
         description="Source system slug (github/slack/linear/notion/sentry/...). "

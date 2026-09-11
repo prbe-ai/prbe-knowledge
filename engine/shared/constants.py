@@ -1200,7 +1200,36 @@ CHUNK_RETENTION_BATCH_SIZE = max(100, _env_int("CHUNK_RETENTION_BATCH_SIZE", 500
 # regresses: `kubectl set env DEPLOY SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET=40000`
 # restores the old behaviour without a release.
 SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET = int(
-    os.getenv("SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET", "18000")
+    os.getenv("SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET", "19100")
+)
+
+# How often a position label is printed into a chunk the model reads.
+#
+# The model cannot count characters -- positional embeddings give it relative
+# order, not indices -- so asking it for an offset yields an informed guess, and
+# a wrong offset is SILENT: every number "works", it just opens the passage in
+# the wrong place. Printing the indices into the text turns counting into
+# reading, which is the one thing it is reliably good at. Anthropic's Citations
+# API makes the same trade from the other side: the model cites, the system
+# computes `start_char_index`.
+#
+# 200 characters is half the display window, so a labelled position is never
+# more than half a window from the sentence the model means. Tightening it to
+# 100 is the first dial if `agent.span_resolved` shows drift.
+SEARCH_AGENT_RULER_STRIDE = max(50, int(os.getenv("SEARCH_AGENT_RULER_STRIDE", "200")))
+
+# Chunks shorter than this get no ruler: the whole chunk is smaller than the
+# window a pointer would select, so there is nothing to point AT. Keeps the
+# labels off the ~60% of chunks that are short (median 215 characters) and the
+# cost proportional to the text that actually needs them.
+SEARCH_AGENT_RULER_MIN_CHARS = max(100, int(os.getenv("SEARCH_AGENT_RULER_MIN_CHARS", "400")))
+
+# What a span may ask for. The floor is a preview rather than a fragment; the
+# ceiling is what any consumer will render. Both are clamped, never rejected: a
+# window in slightly the wrong place beats no window, and the clamp is logged.
+SEARCH_AGENT_SPAN_MIN_LEN = max(20, int(os.getenv("SEARCH_AGENT_SPAN_MIN_LEN", "120")))
+SEARCH_AGENT_SPAN_MAX_LEN = max(
+    SEARCH_AGENT_SPAN_MIN_LEN, int(os.getenv("SEARCH_AGENT_SPAN_MAX_LEN", "800"))
 )
 
 # The model's hard context window. Providers admit a request on

@@ -543,6 +543,13 @@ class QueryChunk(BaseModel):
     # chunk-level fidelity read here. Empty list on the no-LLM /
     # harness-passthrough paths.
     matched_via: list[MatchProvenance] = Field(default_factory=list)
+    # Where in `content` the part that answers the query sits, as
+    # `{"start": int, "len": int}` -- character offsets into THIS string,
+    # chosen by the gatherer off the ruler it was shown and clamped by the
+    # harness. A consumer rendering a short preview should open it here rather
+    # than at character zero. None when the model pointed at nothing, which is
+    # every backfilled chunk: no model read those.
+    span: dict[str, int] | None = None
 
 
 class RelatedEntity(BaseModel):
