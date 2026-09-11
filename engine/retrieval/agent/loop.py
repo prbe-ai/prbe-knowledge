@@ -1715,8 +1715,41 @@ def _has_citable_prefanout_evidence(prefanout: dict[str, Any] | None) -> bool:
     return bool(_fuse_prefanout_docs(prefanout))
 
 
+def _prefanout_chunk_text(prefanout: dict[str, Any] | None) -> dict[str, str]:
+    """`chunk_id -> the chunk body as STORED`, from the pre-fan-out.
+
+    The one string a span can legally index. What the model emits as `content`
+    is its own rendering of the chunk -- verbatim only 12% of the time, an
+    excerpt 59%, reworded 29% -- so offsets read off the ruler mean nothing
+    against it. This is how a span gets matched back to the text it describes.
+    """
+    out: dict[str, str] = {}
+    for sq in (prefanout or {}).get("sub_queries") or []:
+        if not isinstance(sq, dict):
+            continue
+        for channel in ("vector", "bm25", "graph", "inferred_edge"):
+            for hit in sq.get(channel) or []:
+                if not isinstance(hit, dict):
+                    continue
+                chunk_id, content = hit.get("chunk_id"), hit.get("content")
+                if chunk_id and isinstance(content, str) and content.strip():
+                    out.setdefault(chunk_id, content)
+    return out
+
+
 def _resolve_spans(gathered: GathererOutput, state: LoopState, *, query: str) -> None:
     """Pull every model-supplied span into range, and say how it landed.
+
+    A span indexes the chunk AS STORED -- that is the string the ruler labelled
+    -- and the model's own `content` is usually not that string. So a pointed
+    chunk is restored to the stored text before its span is resolved, and a
+    chunk whose stored text cannot be found keeps the model's text and loses
+    its span: a pointer into a string it does not describe is worse than none.
+
+    Nothing is ever DROPPED here. The last attempt to make the harness
+    authoritative for chunk content (#370) removed chunks whose lookup missed,
+    and search came back empty for whole queries (#371). A miss costs a pointer,
+    never a result.
 
     Logged per chunk with the one thing arithmetic cannot tell us: whether the
     window is ON TOPIC. An in-bounds span pointing at an irrelevant paragraph
@@ -1725,10 +1758,24 @@ def _resolve_spans(gathered: GathererOutput, state: LoopState, *, query: str) ->
     as healthy while previews opened in the wrong place.
     """
     terms = {t for t in re.split(r"[^0-9a-z]+", query.lower()) if len(t) >= 3}
+    stored = _prefanout_chunk_text(state.prefanout)
     for chunk in gathered.chunks:
         raw_start, raw_len = getattr(chunk, "start", None), getattr(chunk, "len", None)
         if raw_start is None and raw_len is None:
             continue
+        original = stored.get(chunk.chunk_id)
+        if original is None:
+            chunk.start = chunk.len = None
+            log.info(
+                "agent.span_resolved",
+                customer_id=state.customer_id,
+                trace_id=state.trace_id,
+                outcome="unanchored",
+                chunk_id=chunk.chunk_id,
+                asked=[raw_start, raw_len],
+            )
+            continue
+        chunk.content = original
         span, outcome = resolve_span(chunk.content, raw_start, raw_len)
         if span is None:
             chunk.start = chunk.len = None

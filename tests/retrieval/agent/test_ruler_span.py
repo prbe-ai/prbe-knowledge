@@ -136,3 +136,83 @@ def test_the_resolved_span_indexes_the_stored_string() -> None:
     start, length = span
     assert text[start : start + length]
     assert len(text[start : start + length]) == length
+
+
+# -- the span must index the text the ruler labelled, not the model's retype ---
+
+
+def _loop_state(prefanout: dict) -> object:
+    from engine.retrieval.agent.loop import LoopState
+
+    state = LoopState(customer_id="t", trace_id="q-1", query="deployment verification")
+    state.prefanout = prefanout
+    return state
+
+
+def _gathered(chunk_id: str, content: str, start: int | None, length: int | None):
+    from engine.retrieval.agent.models import GatheredChunk, GathererOutput
+
+    return GathererOutput(
+        entities=[],
+        chunks=[
+            GatheredChunk(
+                doc_id="d1",
+                chunk_id=chunk_id,
+                content=content,
+                start=start,
+                len=length,
+            )
+        ],
+    )
+
+
+def _prefanout(chunk_id: str, content: str) -> dict:
+    return {"sub_queries": [{"vector": [{"chunk_id": chunk_id, "doc_id": "d1", "content": content}]}]}
+
+
+def test_a_pointed_chunk_is_restored_to_the_text_its_offsets_describe() -> None:
+    """THE bug this guards: the model's `content` is not what it read.
+
+    Verbatim only 12% of the time, an excerpt 59%, reworded 29% -- so a span
+    read off the ruler and applied to the model's own rendering lands nowhere
+    near the sentence it meant, and against a short paraphrase it clamps to a
+    one-character window.
+    """
+    from engine.retrieval.agent.loop import _resolve_spans
+
+    stored = _long(2000)
+    gathered = _gathered("c1", "a short paraphrase of the chunk", 1200, 300)
+    _resolve_spans(gathered, _loop_state(_prefanout("c1", stored)), query="deployment")
+    chunk = gathered.chunks[0]
+    assert chunk.content == stored, "restored to the string the ruler labelled"
+    assert (chunk.start, chunk.len) == (1200, 300)
+    assert len(chunk.content[chunk.start : chunk.start + chunk.len]) == 300
+
+
+def test_a_chunk_whose_stored_text_is_gone_keeps_its_own_and_loses_the_span() -> None:
+    """A pointer into a string it does not describe is worse than no pointer."""
+    from engine.retrieval.agent.loop import _resolve_spans
+
+    gathered = _gathered("c-unknown", "the model's own text", 1200, 300)
+    _resolve_spans(gathered, _loop_state(_prefanout("c1", _long())), query="deployment")
+    chunk = gathered.chunks[0]
+    assert chunk.content == "the model's own text"
+    assert chunk.start is None and chunk.len is None
+
+
+def test_an_unpointed_chunk_is_left_entirely_alone() -> None:
+    """Content fidelity is a separate change; this one only touches pointers."""
+    from engine.retrieval.agent.loop import _resolve_spans
+
+    gathered = _gathered("c1", "the model's own text", None, None)
+    _resolve_spans(gathered, _loop_state(_prefanout("c1", _long())), query="deployment")
+    assert gathered.chunks[0].content == "the model's own text"
+
+
+def test_no_chunk_is_ever_dropped() -> None:
+    """#370 removed chunks whose lookup missed and search went empty (#371)."""
+    from engine.retrieval.agent.loop import _resolve_spans
+
+    gathered = _gathered("c-unknown", "kept", 10, 200)
+    _resolve_spans(gathered, _loop_state({}), query="x")
+    assert len(gathered.chunks) == 1
