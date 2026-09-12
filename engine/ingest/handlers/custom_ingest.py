@@ -12,7 +12,6 @@ from engine.ingest.handlers.base import Connector
 from engine.ingest.handlers.registry import register_connector
 from engine.shared.constants import (
     DocClass,
-    DocType,
     EdgeType,
     IngestionEventType,
     NodeLabel,
@@ -20,7 +19,7 @@ from engine.shared.constants import (
     PrincipalType,
     SourceSystem,
 )
-from engine.shared.custom_ingest import CustomIngestEnvelope, custom_ingest_doc_id
+from engine.shared.custom_ingest import CustomIngestEnvelope, custom_doc_type, custom_ingest_doc_id
 from engine.shared.exceptions import InvalidWebhookPayload
 from engine.shared.models import (
     ACLPrincipal,
@@ -164,7 +163,9 @@ class CustomIngestConnector(Connector):
             source_id=source_id,
             source_url=source_url,
             doc_class=DocClass.RAW_SOURCE,
-            doc_type=DocType.CUSTOM_DOCUMENT,
+            # `custom.<type>`: the document's own kind becomes a filterable
+            # doc_type (pre-search `doc_types` scope); malformed -> family default.
+            doc_type=custom_doc_type(document.type),
             content_type="text/plain",
             content_hash=content_hash,
             title=title[:240],

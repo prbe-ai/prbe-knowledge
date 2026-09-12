@@ -230,6 +230,26 @@ def encode_source_key_for_doc_id(source_key: str) -> str:
     return source_key.replace(":", "%3A")
 
 
+#: A custom document's `type` (research-os: "experiment.run", "team.note",
+#: "session.digest", ...) becomes a dotted doc_type under the `custom.` family
+#: so `QueryRequest.doc_types` can filter kinds pre-search. Only this shape is
+#: admitted into a doc_type; anything else keeps the generic family value.
+CUSTOM_DOC_TYPE_KIND_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,78}$")
+CUSTOM_DOC_TYPE_FAMILY = "custom"
+
+
+def custom_doc_type(kind: str | None) -> str:
+    """Map a custom document's `type` to its `documents.doc_type`.
+
+    `"experiment.run"` -> `"custom.experiment.run"`; a missing or malformed
+    type -> `"custom.document"` (the pre-existing family default), never an
+    error: an ingest must not be refused over a label.
+    """
+    if kind and CUSTOM_DOC_TYPE_KIND_RE.match(kind):
+        return f"{CUSTOM_DOC_TYPE_FAMILY}.{kind}"
+    return f"{CUSTOM_DOC_TYPE_FAMILY}.document"
+
+
 def custom_ingest_doc_id(customer_id: str, source_key: str, document_id: str) -> str:
     """Compose the internal documents.doc_id for a custom-ingest document.
 
