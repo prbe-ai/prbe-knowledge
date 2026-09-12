@@ -1765,7 +1765,8 @@ def _build_prefanout_doc_meta(prefanout: dict[str, Any] | None) -> dict[str, dic
                     continue
                 meta = out.setdefault(doc_id, {})
                 for meta_field in ("source_system", "title", "source_url",
-                                   "created_at", "updated_at", "author_id"):
+                                   "created_at", "updated_at", "author_id",
+                                   "doc_version"):
                     if not meta.get(meta_field) and hit.get(meta_field):
                         meta[meta_field] = hit[meta_field]
     return out
@@ -2035,6 +2036,9 @@ def _backfill_recall_floor(
                 doc_id=doc_id,
                 chunk_id=hit.get("chunk_id") or doc_id,
                 content=hit.get("content") or "",
+                # From the channel hit, so a backfilled doc reports the version
+                # it was read from instead of the adapter's fallback of 1.
+                doc_version=hit.get("doc_version"),
                 # The trace records what was DELIVERED (the fallback paths rely
                 # on that), so a harness-appended chunk says so on itself rather
                 # than hiding behind an empty why_relevant.
@@ -2195,6 +2199,13 @@ def _coerce_lenient(raw: dict[str, Any], state: LoopState | None = None) -> dict
         for meta_field in ("created_at", "updated_at", "author_id"):
             if meta.get(meta_field) is not None:
                 ch_out[meta_field] = meta[meta_field]
+        # `doc_version` is HARNESS-owned: the channels know which version they
+        # read, the model does not, and a model-supplied number would be
+        # reported to the caller as the document's real version. Drop whatever
+        # was emitted and restore the channel's own value when there is one.
+        ch_out.pop("doc_version", None)
+        if meta.get("doc_version") is not None:
+            ch_out["doc_version"] = meta["doc_version"]
         # Filter `matched_via` to the schema's allowed channel set. The
         # model (Cerebras gpt-oss-120b in particular) sometimes invents
         # labels here ("telepathy" etc.) and occasionally emits non-
@@ -2819,6 +2830,8 @@ async def run_gatherer(
         per_source_top_k=request_per_source_top_k,
         project_id=request_project_id,
         temporal=request_temporal,
+        temporal_from_request="temporal" in req.model_fields_set,
+        min_confidence=req.min_confidence,
     )
     timing["prefanout_ms"] = (time.perf_counter() - t_prefanout) * 1000
 
@@ -3003,6 +3016,7 @@ async def run_gatherer(
             sources=request_sources,
             project_id=request_project_id,
             temporal=request_temporal,
+            temporal_from_request="temporal" in req.model_fields_set,
             min_confidence=req.min_confidence,
             status=status,
             id_pins=id_pins,
@@ -3063,6 +3077,7 @@ async def run_gatherer(
             sources=request_sources,
             project_id=request_project_id,
             temporal=request_temporal,
+            temporal_from_request="temporal" in req.model_fields_set,
             min_confidence=req.min_confidence,
             status=status,
             id_pins=id_pins,
@@ -3121,6 +3136,7 @@ async def run_gatherer(
             sources=request_sources,
             project_id=request_project_id,
             temporal=request_temporal,
+            temporal_from_request="temporal" in req.model_fields_set,
             min_confidence=req.min_confidence,
             status=status,
             id_pins=id_pins,
@@ -3369,6 +3385,7 @@ async def run_gatherer(
         sources=request_sources,
         project_id=request_project_id,
         temporal=request_temporal,
+        temporal_from_request="temporal" in req.model_fields_set,
         min_confidence=req.min_confidence,
         status=status,
         id_pins=id_pins,

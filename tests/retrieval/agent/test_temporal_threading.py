@@ -150,7 +150,8 @@ async def test_response_echoes_applied_temporal_and_min_confidence() -> None:
     as_of = datetime(2026, 1, 1, tzinfo=UTC)
     resp = await to_query_response(
         query="q", gathered=gathered, trace_id="t", timing_ms={}, status=None,
-        temporal=TemporalSpec(mode=TemporalMode.AS_OF, as_of=as_of), min_confidence="EXTRACTED",
+        temporal=TemporalSpec(mode=TemporalMode.AS_OF, as_of=as_of),
+        temporal_from_request=True, min_confidence="EXTRACTED",
     )
     assert resp.applied_temporal["mode"] == "as_of" and resp.applied_temporal["source"] == "request"
     assert resp.applied_min_confidence == "EXTRACTED"
@@ -351,3 +352,155 @@ async def test_unscoped_gate_drops_an_invented_chunk_id(live_db: None) -> None:
     gathered = GathererOutput(chunks=[_chunk("edited"), _chunk("made-up-doc")], gatherer_notes=GathererNotes())
     ok = await _enforce_scope_on_chunks(cid, gathered, source_keys=None, doc_types=None, trace_id="t")
     assert ok is True and [c.doc_id for c in gathered.chunks] == ["edited"]
+
+
+# ============================================================
+# 6. Review fixes: parameter binding, suppressed lanes, harness-owned version
+# ============================================================
+
+
+async def test_changed_between_window_binds_only_what_it_references(live_db: None) -> None:
+    """The regression: CHANGED_BETWEEN puts BOTH parameters in `doc_sql` and
+    NONE in `chunk_sql`, so a query that bound them and used only the chunk
+    half handed asyncpg two arguments nothing referenced -- every
+    CHANGED_BETWEEN window fetch died on the bind."""
+    cid = "test-cust-temporal-changed-between"
+    _, edited_at = await _seed_two_versions(cid)
+    spec = {
+        "mode": "changed_between",
+        "since": (edited_at - timedelta(days=1)).isoformat(),
+        "until": (edited_at + timedelta(days=1)).isoformat(),
+    }
+    win = await execute_fetch_chunk_window(cid, chunk_id="edited:v2", before=2, after=2, temporal=spec)
+    assert [c["content"] for c in win["chunks"]] == ["new text"]
+    # Outside the window the document did not change: no rows, still no bind error.
+    stale = {
+        "mode": "changed_between",
+        "since": "2000-01-01T00:00:00+00:00",
+        "until": "2000-01-02T00:00:00+00:00",
+    }
+    assert (await execute_fetch_chunk_window(
+        cid, chunk_id="edited:v2", before=2, after=2, temporal=stale
+    ))["chunks"] == []
+
+
+async def test_changed_between_fetch_doc_binds_cleanly(live_db: None) -> None:
+    cid = "test-cust-temporal-changed-between-doc"
+    _, edited_at = await _seed_two_versions(cid)
+    spec = {
+        "mode": "changed_between",
+        "since": (edited_at - timedelta(days=1)).isoformat(),
+        "until": (edited_at + timedelta(days=1)).isoformat(),
+    }
+    page = await execute_fetch_doc(cid, doc_id="edited", temporal=spec)
+    assert [c["content"] for c in page["chunks"]] == ["new text"]
+
+
+async def test_window_reports_the_version_it_read(live_db: None) -> None:
+    cid = "test-cust-temporal-window-version"
+    await _seed_two_versions(cid)
+    win = await execute_fetch_chunk_window(cid, chunk_id="edited:v2", before=1, after=1)
+    assert win["chunks"][0]["doc_version"] == 2
+
+
+async def test_historical_requests_suppress_the_inferred_edge_lane() -> None:
+    """inferred_edge_search reads CURRENT versions and CURRENT edges; pairing
+    today's inference with an as-of chunk set would date the rationale wrong,
+    so the lane is omitted and RECORDED as lost rather than silently thinned."""
+    from engine.retrieval.channel_health import begin_request, lost_channels
+
+    begin_request()
+    out = await execute_search(
+        "c1", queries=["q"], temporal={"mode": "as_of", "as_of": "2026-01-01T00:00:00+00:00"}
+    )
+    assert "inferred_edge" in lost_channels()
+    assert out["sub_queries"][0]["inferred_edge"] == []
+
+
+async def test_subgraph_drops_edge_enrichment_on_a_historical_spec(live_db: None) -> None:
+    cid = "test-cust-temporal-subgraph"
+    await _seed_two_versions(cid)
+    out = await execute_subgraph(
+        cid, anchor_canonical_id="edited", include_inferred=True,
+        temporal={"mode": "as_of", "as_of": "2026-01-01T00:00:00+00:00"},
+    )
+    # The node walk still runs; only the current-only inferred edges are gone.
+    assert out.get("inferred_edges", out.get("outbound_inferred_edges", [])) == []
+
+
+async def test_fetch_doc_drops_edge_enrichment_on_a_historical_spec(live_db: None) -> None:
+    cid = "test-cust-temporal-fetchdoc-edges"
+    await _seed_two_versions(cid)
+    page = await execute_fetch_doc(
+        cid, doc_id="edited", with_inferred_edges=True, with_evidence=True,
+        temporal={"mode": "as_of", "as_of": "2026-01-01T00:00:00+00:00"},
+    )
+    assert page.get("outbound_inferred_edges", []) == []
+    assert page.get("evidence_by_edge_id", {}) == {}
+
+
+def test_doc_version_is_harness_owned_never_the_models(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A model-emitted version would be reported to the caller as the
+    document's real version. The channels know it; the model does not."""
+    from engine.retrieval.agent.loop import LoopState, _coerce_lenient
+
+    state = LoopState(customer_id="c1", trace_id="t", query="q")
+    state.prefanout = {"sub_queries": [{
+        "query": "q", "grounded_entities": [],
+        "vector": [{"doc_id": "d1", "chunk_id": "d1:c0", "content": "c", "score": 0.5,
+                    "source_system": "github", "title": "t", "doc_version": 9}],
+        "bm25": [], "graph": [], "inferred_edge": [],
+    }]}
+    out = _coerce_lenient(
+        {"chunks": [{"doc_id": "d1", "chunk_id": "d1:c0", "content": "c",
+                     "why_relevant": "w", "matched_via": ["vector"], "doc_version": 999}]},
+        state=state,
+    )
+    assert out["chunks"][0]["doc_version"] == 9
+
+
+def test_backfilled_chunks_carry_the_version_they_were_read_from() -> None:
+    prefanout = {"sub_queries": [{
+        "query": "q", "grounded_entities": [],
+        "vector": [{"doc_id": "doc:1", "chunk_id": "doc:1:c0", "score": 0.5,
+                    "source_system": "github", "title": "t", "content": "c",
+                    "doc_version": 4, "updated_at": datetime.now(UTC).isoformat()}],
+        "bm25": [], "graph": [], "inferred_edge": [],
+    }]}
+    gathered = GathererOutput(chunks=[], gatherer_notes=GathererNotes())
+    assert _backfill_recall_floor(gathered, prefanout) == 1
+    assert gathered.chunks[0].doc_version == 4
+
+
+async def test_applied_temporal_source_reflects_what_the_caller_sent() -> None:
+    """QueryRequest.temporal has a default factory, so a non-null value proves
+    nothing: without model_fields_set every ordinary request claimed
+    `source: request` and the echo said nothing at all."""
+    gathered = GathererOutput(chunks=[], gatherer_notes=GathererNotes())
+    resp = await to_query_response(
+        query="q", gathered=gathered, trace_id="t", timing_ms={}, status=None,
+        temporal=TemporalSpec(), temporal_from_request=False,
+    )
+    assert resp.applied_temporal["source"] == "default"
+    assert "temporal" not in QueryRequest(query="q").model_fields_set
+    assert "temporal" in QueryRequest(query="q", temporal={"mode": "all"}).model_fields_set
+
+
+async def test_min_confidence_reaches_the_graph_channel(monkeypatch: pytest.MonkeyPatch) -> None:
+    """It is the graph channel's floor, not just an evidence filter: an
+    EXTRACTED request used to get inferred-only neighbours because the value
+    never left the adapter."""
+    from engine.retrieval.agent import tools as tools_mod
+
+    seen: dict = {}
+
+    async def _graph(**kwargs):  # type: ignore[no-untyped-def]
+        seen.update(kwargs)
+        return []
+
+    monkeypatch.setattr(tools_mod, "_graph", _graph)
+    await execute_search(
+        "c1", queries=["q"], entity_ids=[{"entity_type": "issue", "canonical_id": "x"}],
+        min_confidence="EXTRACTED",
+    )
+    assert seen.get("min_confidence") == "EXTRACTED"

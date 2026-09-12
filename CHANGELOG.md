@@ -40,6 +40,17 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   an edited document paged out old and new text interleaved at colliding
   chunk indexes. Chunks now join the document version the temporal spec
   selects, and results carry the real `doc_version` instead of `1`.
+- **`CHANGED_BETWEEN` no longer dies on the bind.** Its two parameters live in
+  the document half of the predicate and none in the chunk half, so the window
+  fetch and the evidence hydration -- which used the chunk half alone -- handed
+  the driver arguments nothing referenced. Both now join the document and apply
+  both halves, which is also what makes "this chunk belongs to that version"
+  true. A historical request suppresses the inferred-edge lane (the edge store
+  holds only current edges) and records it as a lost channel rather than dating
+  today's rationale wrong. `min_confidence` reaches the graph channel, not just
+  the evidence filter. `doc_version` is harness-owned: restored from the
+  channel hit, carried by the identifier pins and the recall floor, and
+  stripped from anything the model emits.
 - **The response gate runs on every response.** Emitted ids are re-verified
   against live rows whether or not a scope was set (an invented chunk_id is
   dropped); on a database error a scoped request still fails, an unscoped one

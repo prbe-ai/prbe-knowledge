@@ -83,7 +83,7 @@ from engine.shared.constants import (
 )
 from engine.shared.db import with_tenant
 from engine.shared.logging import get_logger
-from engine.shared.models import TemporalSpec
+from engine.shared.models import TemporalMode, TemporalSpec
 
 log = get_logger(__name__)
 
@@ -357,6 +357,7 @@ async def execute_search(
     project_id: str | None = None,
     per_source_top_k: int | None = None,
     temporal: TemporalSpec | dict[str, Any] | None = None,
+    min_confidence: str | None = None,
 ) -> dict[str, Any]:
     """Fan out 1+ queries through the 4 channels (vector + bm25 + graph +
     inferred_edge) in parallel — same shape the harness runs on turn 0.
@@ -503,6 +504,10 @@ async def execute_search(
                 hits = await _graph(
                     customer_id=customer_id, entities=graph_pairs,
                     top_k=top_k_g, temporal=temporal_spec,
+                    # The request's floor, not the retriever's default: an
+                    # EXTRACTED request used to receive inferred-only
+                    # neighbours because this never reached the channel.
+                    **({"min_confidence": min_confidence} if min_confidence else {}),
                     author_ids=author_ids,
                     sort_by=sort_by,
                     doc_types=doc_types,
@@ -530,6 +535,15 @@ async def execute_search(
                 return []
 
         async def _inferred_call() -> list[dict[str, Any]]:
+            if temporal_spec.mode != TemporalMode.LATEST:
+                # inferred_edge_search reads CURRENT versions and CURRENT edge
+                # rows; there is no historical edge store. Returning today's
+                # inferences beside an as-of chunk set would date the
+                # rationale wrong, so the lane is omitted for historical
+                # requests and recorded as lost (the caller sees the channel
+                # in `lost_channels`, not a silently thinner answer).
+                record_channel_loss("inferred_edge")
+                return []
             if not ents:
                 return []
             try:
@@ -734,6 +748,10 @@ async def execute_subgraph(
     strings surface inline. Optionally expands entity aliases
     (`include_aliases=True`) so Person/Repo clusters are visible.
 
+    `temporal`: a non-LATEST spec SUPPRESSES the inferred-edge enrichment --
+    the edge store holds only current edges, so pairing today's inference with
+    an as-of chunk set would date the rationale wrong.
+
     `source_keys` / `doc_types` / `project_id` (harness-injected request scope): applied
     to the inferred-edge CONTENT enrichment only. The node walk itself is
     deliberately unconstrained -- it returns graph structure (labels,
@@ -749,6 +767,12 @@ async def execute_subgraph(
     top_k_per_hop = _clamp_top_k(top_k_per_hop, SEARCH_AGENT_GRAPH_WALK_TOP_K)
     if include_inferred is None:
         include_inferred = True
+    if _coerce_temporal(temporal).mode != TemporalMode.LATEST:
+        # The edge store holds only CURRENT inferred edges -- there is no
+        # historical edge history -- so an as-of walk that included them would
+        # pair today's inference with a chunk set from another week. Omitted
+        # rather than dated wrong; the node walk itself still runs.
+        include_inferred = False
     if include_aliases is None:
         include_aliases = True
 
@@ -905,6 +929,10 @@ async def execute_fetch_doc(
         with_inferred_edges = False
     if with_evidence is None:
         with_evidence = False
+    if _coerce_temporal(temporal).mode != TemporalMode.LATEST:
+        # Only current edges exist; see execute_search's `_inferred_call`.
+        with_inferred_edges = False
+        with_evidence = False
 
     # Plan A Component 6: hide draft chunks from the agent fetch path.
     # The agent runs under an API key and never sees pre-approval content.
@@ -947,8 +975,11 @@ async def execute_fetch_doc(
                 source_keys_include_keyless=source_keys_include_keyless,
                 project_id=project_id,
             )
+            # Only `doc_sql` is used here (there is no chunk in this query),
+            # so bind ONLY what it references: under CHANGED_BETWEEN that is
+            # both parameters, under LATEST none.
             gate_pred = build_predicate(
-                spec, doc_alias="d", chunk_alias="c", next_param_index=len(scope_params) + 1
+                spec, doc_alias="d", chunk_alias="d", next_param_index=len(scope_params) + 1
             )
             scope_params.extend(gate_pred.params)
             visible = await conn.fetchval(
@@ -1050,32 +1081,36 @@ async def execute_fetch_doc(
                 ev_scope = ""
                 if source_keys or doc_types or project_id:
                     preds = _doc_scope_sql(
-                        ev_params, alias="d", source_keys=source_keys, doc_types=doc_types,
+                        ev_params, alias="ds", source_keys=source_keys, doc_types=doc_types,
                         source_keys_include_keyless=source_keys_include_keyless,
                         project_id=project_id,
                     )
-                    ev_doc_pred = build_predicate(
-                        ev_spec, doc_alias="d", chunk_alias="c",
-                        next_param_index=len(ev_params) + 1,
-                    )
-                    ev_params.extend(ev_doc_pred.params)
                     ev_scope = f"""
                       AND EXISTS (
-                          SELECT 1 FROM documents d
-                          WHERE d.customer_id = $1 AND d.doc_id = c.doc_id
-                            {ev_doc_pred.doc_sql} {preds}
+                          SELECT 1 FROM documents ds
+                          WHERE ds.customer_id = $1 AND ds.doc_id = c.doc_id
+                            AND ds.valid_to IS NULL {preds}
                       )"""
-                ev_chunk_pred = build_predicate(
+                # Both halves, against the joined document -- see the window
+                # query: under CHANGED_BETWEEN the chunk half is placeholder-
+                # free and the doc half holds both parameters.
+                ev_pred = build_predicate(
                     ev_spec, doc_alias="d", chunk_alias="c", next_param_index=len(ev_params) + 1
                 )
-                ev_params.extend(ev_chunk_pred.params)
+                ev_params.extend(ev_pred.params)
                 ev_rows = await conn.fetch(
                     f"""
                     SELECT c.chunk_id, c.doc_id, c.content, c.kind
                     FROM chunks c
+                    JOIN documents d
+                      ON d.customer_id = c.customer_id
+                     AND d.doc_id = c.doc_id
+                     {live_version_join("d", "c")}
                     WHERE c.customer_id = $1 AND c.chunk_id = ANY($2::text[])
                       AND c.visibility = 'approved'
-                      {ev_chunk_pred.chunk_sql}{ev_scope}
+                      AND d.visibility = 'approved'
+                      {ev_pred.chunk_sql}
+                      {ev_pred.doc_sql}{ev_scope}
                     """,
                     *ev_params,
                 )
@@ -1148,41 +1183,54 @@ async def execute_fetch_chunk_window(
     scope_sql = ""
     if source_keys or doc_types or project_id:
         preds = _doc_scope_sql(
-            params, alias="d", source_keys=source_keys, doc_types=doc_types,
+            params, alias="ds", source_keys=source_keys, doc_types=doc_types,
             source_keys_include_keyless=source_keys_include_keyless,
             project_id=project_id,
         )
-        gate_pred = build_predicate(
-            spec, doc_alias="d", chunk_alias="c0", next_param_index=len(params) + 1
-        )
-        params.extend(gate_pred.params)
         scope_sql = f"""
               AND EXISTS (
-                  SELECT 1 FROM documents d
-                  WHERE d.customer_id = $1 AND d.doc_id = c0.doc_id
-                    {gate_pred.doc_sql} {preds}
+                  SELECT 1 FROM documents ds
+                  WHERE ds.customer_id = $1 AND ds.doc_id = c0.doc_id
+                    AND ds.valid_to IS NULL {preds}
               )"""
-    # One parameter set, two aliases: the target CTE filters `c0`, the window
-    # rows filter `c`, both against the SAME temporal parameters.
+    # ONE parameter set, two aliases. Both halves of the predicate are applied
+    # at both ends, against a joined `documents` row: under CHANGED_BETWEEN the
+    # chunk half carries no placeholder at all and the doc half carries both,
+    # so a query that bound the params and used only `chunk_sql` handed asyncpg
+    # two arguments nothing referenced (Codex review). Joining the document is
+    # also what makes "this chunk belongs to THAT version" true.
     first_tp = len(params) + 1
-    target_pred = build_predicate(spec, doc_alias="d", chunk_alias="c0", next_param_index=first_tp)
+    target_pred = build_predicate(spec, doc_alias="d0", chunk_alias="c0", next_param_index=first_tp)
     window_pred = build_predicate(spec, doc_alias="d", chunk_alias="c", next_param_index=first_tp)
     params.extend(target_pred.params)
     window_sql = f"""
         WITH target AS (
             SELECT c0.doc_id, c0.chunk_index
             FROM chunks c0
+            JOIN documents d0
+              ON d0.customer_id = c0.customer_id
+             AND d0.doc_id = c0.doc_id
+             {live_version_join("d0", "c0")}
             WHERE c0.customer_id = $1 AND c0.chunk_id = $2
               AND c0.visibility = 'approved'
-              {target_pred.chunk_sql}{scope_sql}
+              AND d0.visibility = 'approved'
+              {target_pred.chunk_sql}
+              {target_pred.doc_sql}{scope_sql}
             LIMIT 1
         )
-        SELECT c.chunk_id, c.doc_id, c.content, c.kind, c.chunk_index
-        FROM chunks c, target t
-        WHERE c.customer_id = $1
-          AND c.doc_id = t.doc_id
-          AND c.visibility = 'approved'
+        SELECT c.chunk_id, c.doc_id, c.content, c.kind, c.chunk_index,
+               d.version AS doc_version
+        FROM target t
+        JOIN chunks c
+          ON c.customer_id = $1 AND c.doc_id = t.doc_id
+        JOIN documents d
+          ON d.customer_id = c.customer_id
+         AND d.doc_id = c.doc_id
+         {live_version_join("d", "c")}
+        WHERE c.visibility = 'approved'
+          AND d.visibility = 'approved'
           {window_pred.chunk_sql}
+          {window_pred.doc_sql}
           AND c.chunk_index BETWEEN t.chunk_index - $3 AND t.chunk_index + $4
         ORDER BY c.chunk_index ASC
     """
@@ -1196,6 +1244,7 @@ async def execute_fetch_chunk_window(
             "content": r["content"],
             "kind": r["kind"],
             "chunk_index": int(r["chunk_index"]),
+            "doc_version": int(r["doc_version"]),
         }
         for r in rows
     ]

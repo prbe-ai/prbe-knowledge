@@ -591,6 +591,10 @@ async def to_query_response(
     sources: list[str] | None = None,
     project_id: str | None = None,
     temporal: TemporalSpec | None = None,
+    #: True when the CALLER sent a temporal spec. `QueryRequest.temporal` has a
+    #: default factory, so a non-null value proves nothing -- without this every
+    #: ordinary request reported `source: "request"` and the echo said nothing.
+    temporal_from_request: bool = False,
     min_confidence: str | None = None,
     id_pins: list[Any] | None = None,
     top_k: int | None = None,
@@ -703,6 +707,9 @@ async def to_query_response(
                         doc_id=h.doc_id,
                         chunk_id=h.chunk_id,
                         content=h.content,
+                        # The version the lookup read, so a pinned doc reports
+                        # its real version like every other result.
+                        doc_version=h.doc_version,
                         matched_via=["id_lookup"],
                         # Inferred resolutions (prefix / number ref) say how
                         # they resolved; claiming "Exact" for an expansion
@@ -1009,7 +1016,8 @@ async def to_query_response(
         applied_sources=sources,
         applied_scope={"project_id": project_id} if project_id else None,
         applied_temporal=applied_temporal_meta(
-            temporal or TemporalSpec(), source="request" if temporal is not None else "default"
+            temporal or TemporalSpec(),
+            source="request" if temporal_from_request else "default",
         ),
         applied_min_confidence=min_confidence,
         timing_ms=timing_ms,
