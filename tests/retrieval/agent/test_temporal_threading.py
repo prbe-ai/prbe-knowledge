@@ -504,3 +504,49 @@ async def test_min_confidence_reaches_the_graph_channel(monkeypatch: pytest.Monk
         min_confidence="EXTRACTED",
     )
     assert seen.get("min_confidence") == "EXTRACTED"
+
+
+def test_every_kwarg_the_loop_sends_is_one_the_callee_accepts() -> None:
+    """The regression, and the blind spot that let it reach production.
+
+    `run_gatherer` calls `execute_search` and `to_query_response` with long
+    keyword lists. Every test in this suite patches `execute_search` with an
+    AsyncMock, which accepts ANY keyword -- so a kwarg the real function does
+    not take passes the whole suite and then 500s on the first live request.
+    That is exactly what happened: `temporal_from_request` belongs to the
+    response builder, an edit added it to the prefanout call too, and
+    `/retrieve` answered 500 for every query until it was caught by hand.
+
+    So this reads the SOURCE of the two call sites and checks each keyword
+    against the real signature. No mock can absorb it.
+    """
+    import ast
+    import inspect
+    import pathlib
+
+    from engine.retrieval.agent.adapter import to_query_response
+    from engine.retrieval.agent.tools import execute_search
+
+    targets = {
+        "execute_search": set(inspect.signature(execute_search).parameters),
+        "to_query_response": set(inspect.signature(to_query_response).parameters),
+    }
+    source = pathlib.Path(inspect.getsourcefile(execute_search)).parent / "loop.py"
+    tree = ast.parse(source.read_text())
+    checked = 0
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+        if name not in targets:
+            continue
+        accepted = targets[name]
+        for kw in node.keywords:
+            if kw.arg is None:  # **kwargs splat
+                continue
+            assert kw.arg in accepted, (
+                f"loop.py line {node.lineno}: {name}() is called with "
+                f"`{kw.arg}=`, which it does not accept"
+            )
+            checked += 1
+    assert checked > 20, f"expected to check many keywords, checked {checked}"

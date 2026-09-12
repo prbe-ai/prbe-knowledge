@@ -2830,7 +2830,6 @@ async def run_gatherer(
         per_source_top_k=request_per_source_top_k,
         project_id=request_project_id,
         temporal=request_temporal,
-        temporal_from_request="temporal" in req.model_fields_set,
         min_confidence=req.min_confidence,
     )
     timing["prefanout_ms"] = (time.perf_counter() - t_prefanout) * 1000
