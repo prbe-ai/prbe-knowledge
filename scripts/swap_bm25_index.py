@@ -50,7 +50,7 @@ import asyncio
 import sys
 import time
 
-from engine.shared.db import close_pool, get_pool, init_pool
+from engine.shared.db import close_pool, get_pool, init_pool, with_tenant
 from engine.shared.logging import configure_logging, get_logger
 from engine.shared.pg_search_guardian import (
     BM25_INDEX_V2,
@@ -74,22 +74,29 @@ _MIN_BACKFILLED_ROWS = 1
 
 
 async def _count_backfilled(conn) -> int:
-    """Chunks carrying a project_id, counted PER TENANT with the GUC bound.
+    """Chunks carrying a project_id, counted PER TENANT through `with_tenant`.
 
     A bare `SELECT count(*) FROM chunks` is the wrong question here and
     answers it wrong. `chunks` is under FORCE ROW LEVEL SECURITY and this
     script connects as `app`, which owns the table and is therefore subject to
-    the policy: with no `app.current_customer_id` set the policy reduces to
+    the policy: with no `app.current_customer_id` bound the policy reduces to
     `customer_id = NULL` and the count comes back 0 on EVERY database,
     backfilled or not.
 
-    That is how this check was first written, and the result was a guard that
-    refused unconditionally -- indistinguishable from a real "the backfill did
-    not run", and the kind of false alarm that teaches somebody to pass
-    --force. Which this script does not have, on purpose.
+    It goes through `with_tenant` rather than binding the GUC by hand, and
+    that is not style. The first fix here DID bind it by hand --
+    `set_config(..., true)` in a loop -- and still counted zero, because
+    `is_local = true` scopes the setting to the current TRANSACTION and these
+    statements were running in autocommit, so the GUC was discarded before the
+    very next count. Two different wrong answers, both of them plausible SQL,
+    both reported as "the backfill has not run".
 
-    Stops at the first tenant with any rows: the question is "did the backfill
-    run at all", not "how many rows".
+    `with_tenant` is the one place in this codebase that gets the transaction
+    and the GUC right together. Using it means this cannot drift from the way
+    every request-path read already works.
+
+    Stops at the first tenant with rows: the question is "did the backfill run
+    at all", not "how many rows".
     """
     customers = [
         r["customer_id"]
@@ -97,13 +104,12 @@ async def _count_backfilled(conn) -> int:
     ]
     total = 0
     for customer_id in customers:
-        await conn.execute("SELECT set_config('app.current_customer_id', $1, true)", customer_id)
-        total += await conn.fetchval(
-            "SELECT count(*) FROM chunks WHERE project_id IS NOT NULL"
-        )
+        async with with_tenant(customer_id) as tenant_conn:
+            total += await tenant_conn.fetchval(
+                "SELECT count(*) FROM chunks WHERE project_id IS NOT NULL"
+            )
         if total >= _MIN_BACKFILLED_ROWS:
             break
-    await conn.execute("SELECT set_config('app.current_customer_id', '', true)")
     return total
 
 

@@ -189,37 +189,76 @@ def test_the_index_contract_names_the_generation_schema_sql_declares() -> None:
 # --------------------------------------- the swap script's own safety check
 
 @pytest.mark.asyncio
-async def test_the_backfill_precondition_counts_per_tenant() -> None:
+async def test_the_backfill_precondition_counts_per_tenant(monkeypatch) -> None:
     """A guard that always refuses is as broken as one that never fires.
 
     `chunks` is under FORCE ROW LEVEL SECURITY and the swap script connects as
-    `app`, which OWNS the table and is therefore subject to the policy. A bare
-    `SELECT count(*) FROM chunks` with no tenant GUC returns 0 on every
-    database, backfilled or not -- so the first version of this check refused
-    unconditionally, indistinguishable from a real "the backfill did not run".
-    That is the false alarm that teaches somebody to reach for a --force flag,
-    which this script deliberately does not have.
-    """
-    from scripts.swap_bm25_index import _count_backfilled
+    `app`, which OWNS the table and is therefore subject to the policy. This
+    check got the wrong answer TWICE before it got the right one:
 
-    seen_guc: list[str] = []
+      1. `SELECT count(*) FROM chunks` with no tenant bound -> 0 everywhere.
+      2. A hand-rolled `set_config(..., true)` loop -> also 0, because
+         `is_local = true` scopes the GUC to the TRANSACTION and the
+         statements ran in autocommit, so it was discarded before each count.
+
+    Both are plausible SQL and both reported "the backfill has not run" on a
+    database where 15,431 chunks demonstrably carried a project_id. Going
+    through `with_tenant` is what makes it right, because that helper is the
+    one place that gets the transaction and the GUC together.
+    """
+    import contextlib
+
+    from scripts import swap_bm25_index
+
+    entered: list[str] = []
+
+    class _TenantConn:
+        def __init__(self, customer_id: str) -> None:
+            self.customer_id = customer_id
+
+        async def fetchval(self, sql, *args):
+            # alpha has nothing, beta has rows -- so a single peek at the
+            # first customer would wrongly report an empty backfill.
+            return 0 if self.customer_id == "alpha" else 7
+
+    @contextlib.asynccontextmanager
+    async def _fake_with_tenant(customer_id: str):
+        entered.append(customer_id)
+        yield _TenantConn(customer_id)
+
+    monkeypatch.setattr(swap_bm25_index, "with_tenant", _fake_with_tenant)
 
     class _Conn:
         async def fetch(self, sql, *args):
             assert "customers" in sql
             return [{"customer_id": "alpha"}, {"customer_id": "beta"}]
 
-        async def execute(self, sql, *args):
-            # The GUC bind is the whole point; record what it was set to.
-            if "set_config" in sql:
-                seen_guc.append(args[0] if args else "")
-
-        async def fetchval(self, sql, *args):
-            # alpha has nothing, beta has rows -- so a single-tenant peek at
-            # the first customer would wrongly report an empty backfill.
-            return 0 if seen_guc[-1] == "alpha" else 7
-
-    total = await _count_backfilled(_Conn())
+    total = await swap_bm25_index._count_backfilled(_Conn())
     assert total == 7, "the count must not stop at the first empty tenant"
-    assert "alpha" in seen_guc and "beta" in seen_guc
-    assert seen_guc[-1] == "", "the GUC must be cleared when the count finishes"
+    assert entered == ["alpha", "beta"]
+
+
+@pytest.mark.asyncio
+async def test_the_precondition_binds_the_tenant_through_with_tenant() -> None:
+    """Not a style check. Binding the GUC by hand is what produced failure (2)
+    above, and the only thing that makes it correct is the transaction
+    `with_tenant` opens around it."""
+    import ast
+    import inspect
+
+    from scripts import swap_bm25_index
+
+    src = inspect.getsource(swap_bm25_index._count_backfilled)
+    # The DOCSTRING names `set_config` on purpose -- it records the failure.
+    # Strip it, so this checks the code and not the explanation of the code.
+    tree = ast.parse(src.lstrip())
+    fn = tree.body[0]
+    assert isinstance(fn, ast.AsyncFunctionDef)
+    body = fn.body[1:] if ast.get_docstring(fn) else fn.body
+    code = "\n".join(ast.unparse(node) for node in body)
+
+    assert "with_tenant(" in code
+    assert "set_config" not in code, (
+        "binding app.current_customer_id by hand here needs a transaction, "
+        "and without one the GUC is discarded before the next statement"
+    )
