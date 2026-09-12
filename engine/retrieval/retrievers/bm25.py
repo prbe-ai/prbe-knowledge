@@ -79,7 +79,7 @@ from datetime import datetime
 from typing import Literal
 
 from engine.retrieval.helpers import project_scope_predicate, source_key_predicate
-from engine.retrieval.temporal import build_predicate
+from engine.retrieval.temporal import build_predicate, live_version_join
 from engine.shared.constants import TOP_K_BM25
 from engine.shared.db import with_tenant
 from engine.shared.models import TemporalSpec, normalize_author_id
@@ -462,7 +462,7 @@ async def bm25_search(
             JOIN documents d
               ON k.doc_id = d.doc_id
              AND d.customer_id = $1
-             AND d.version BETWEEN k.first_seen_version AND k.last_seen_version
+             {live_version_join("d", "k")}
             WHERE TRUE
               {pred.doc_sql}
               {source_filter}

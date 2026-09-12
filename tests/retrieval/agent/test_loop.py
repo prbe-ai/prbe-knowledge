@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, get_args
 from unittest.mock import AsyncMock, patch
@@ -63,7 +64,7 @@ from engine.shared.constants import (
 )
 from engine.shared.llm import LLMError
 from engine.shared.llm_tools import is_context_overflow, is_transient_provider_error
-from engine.shared.models import QueryRequest
+from engine.shared.models import QueryRequest, TemporalMode
 
 # ============================================================
 # Fixtures: fake LiteLLM response builder
@@ -189,6 +190,15 @@ def _stub_grounding_extraction_prefanout(monkeypatch: pytest.MonkeyPatch) -> Non
         "engine.retrieval.agent.loop.extract_entities_with_llm",
         AsyncMock(return_value=EntityExtraction()),
     )
+    # The response gate re-verifies emitted ids against LIVE documents rows on
+    # every response with a tenant; there is no database in this suite, so
+    # stand in for "every row is live and in scope". The gate's own postures
+    # (drop an invented id; scoped fails / unscoped degrades on a DB error)
+    # are pinned in test_temporal_threading.py and test_project_scope_threading.py.
+    async def _all_live(customer_id, doc_ids, **kwargs):  # type: ignore[no-untyped-def]
+        return {d: True for d in doc_ids}
+
+    monkeypatch.setattr("engine.retrieval.agent.adapter._scope_verdicts", _all_live)
     monkeypatch.setattr(
         "engine.retrieval.agent.loop.execute_search",
         AsyncMock(return_value={"sub_queries": [{
@@ -3243,3 +3253,53 @@ async def test_no_project_scope_threads_none_everywhere(
     assert search.await_args.kwargs["project_id"] is None
     assert pins.await_args.kwargs["project_id"] is None
     assert resp.applied_scope is None
+
+
+async def test_temporal_spec_reaches_prefanout_pins_and_response(
+    monkeypatch: pytest.MonkeyPatch, fake_request: SimpleNamespace
+) -> None:
+    """QueryRequest.temporal was validated and never read on this path."""
+    as_of = datetime(2026, 1, 1, tzinfo=UTC)
+    req = QueryRequest(query="PRB-17", top_k=5, temporal={"mode": "as_of", "as_of": as_of.isoformat()})
+    search = AsyncMock(return_value={"sub_queries": [{
+        "query": "PRB-17", "grounded_entities": [],
+        "vector": [{"doc_id": "stub:0", "score": 0.5, "source_system": "github",
+                    "title": "stub", "content": "stub"}],
+        "bm25": [], "graph": [], "inferred_edge": [],
+    }]})
+    pins = AsyncMock(return_value=([], set()))
+    monkeypatch.setattr("engine.retrieval.agent.loop.execute_search", search)
+    monkeypatch.setattr("engine.retrieval.agent.loop.lookup_identifiers", pins)
+    with patch(
+        "engine.retrieval.agent.loop.acompletion",
+        new=AsyncMock(return_value=_mk_resp(tool_calls=[_terminal_call(_final_emission_args(chunks=0))])),
+    ):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+    assert search.await_args.kwargs["temporal"].mode == TemporalMode.AS_OF
+    assert pins.await_args.kwargs["temporal"].as_of == as_of
+    assert resp.applied_temporal["mode"] == "as_of" and resp.applied_temporal["source"] == "request"
+
+
+async def test_trace_stash_marks_harness_appended_chunks(
+    monkeypatch: pytest.MonkeyPatch, fake_request: SimpleNamespace
+) -> None:
+    """The recall-floor backfill appends harness-chosen docs to `gathered`
+    in place; the trace blob used to record them as if the model emitted
+    them. Each appended chunk now says so on itself."""
+    req = QueryRequest(query="PRB-17", top_k=5)
+    search = AsyncMock(return_value={"sub_queries": [{
+        "query": "PRB-17", "grounded_entities": [],
+        "vector": [{"doc_id": f"doc:{i}", "chunk_id": f"doc:{i}:c0", "score": 0.5,
+                    "source_system": "github", "title": "t", "content": "c"} for i in range(3)],
+        "bm25": [], "graph": [], "inferred_edge": [],
+    }]})
+    monkeypatch.setattr("engine.retrieval.agent.loop.execute_search", search)
+    monkeypatch.setattr("engine.retrieval.agent.loop.lookup_identifiers", AsyncMock(return_value=([], set())))
+    with patch(
+        "engine.retrieval.agent.loop.acompletion",
+        new=AsyncMock(return_value=_mk_resp(tool_calls=[_terminal_call(_final_emission_args(chunks=0))])),
+    ):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+    assert len(resp.results) == 3  # the backfill filled the response
+    stashed = fake_request.state.search_agent_gathered.chunks
+    assert len(stashed) == 3 and all(c.harness_appended for c in stashed)

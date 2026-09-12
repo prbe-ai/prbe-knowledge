@@ -114,7 +114,7 @@ from engine.shared.llm_tools import (
     usage_tokens,
 )
 from engine.shared.logging import get_logger
-from engine.shared.models import QueryRequest, RetrieveResponse
+from engine.shared.models import QueryRequest, RetrieveResponse, TemporalMode, TemporalSpec
 from engine.shared.source_registry import half_life_days_for, score_multiplier_for
 from engine.shared.telemetry import new_trace_id
 
@@ -266,6 +266,14 @@ class LoopState:
     # QueryRequest.scope.project_id, injected into every scope-gated tool
     # call and threaded to the prefanout + response gate (pre-search scope).
     request_project_id: str | None = None
+    # QueryRequest.temporal, threaded to the prefanout, every in-loop content
+    # tool and the response gate, so AS_OF / CHANGED_BETWEEN govern retrieval,
+    # expansion and validation together (a ranked channel that correctly
+    # selects a retired chunk must not have fetch_doc substitute live text).
+    request_temporal: TemporalSpec = field(default_factory=TemporalSpec)
+    # QueryRequest.recency_half_life_days: overrides the per-source decay in
+    # `_source_weight` for this request only.
+    request_recency_half_life_days: float | None = None
     request_per_source_top_k: int | None = None
 
 
@@ -749,6 +757,7 @@ _HARNESS_OWNED_SCOPE_KEYS = (
     "source_keys_include_keyless",
     "project_id",
     "sources",
+    "temporal",
 )
 
 
@@ -1648,6 +1657,10 @@ async def _execute_tool_call(
             arguments["source_keys_include_keyless"] = True
         if state.request_project_id:
             arguments["project_id"] = state.request_project_id
+        # Only a non-default spec rides the call: LATEST is what every tool
+        # assumes, and an always-present dict would churn the trace shape.
+        if state.request_temporal.mode != TemporalMode.LATEST:
+            arguments["temporal"] = state.request_temporal.model_dump(mode="json")
     if name == "search" and state.request_discovery:
         arguments["discovery"] = True
     if name == "search":
@@ -1752,7 +1765,8 @@ def _build_prefanout_doc_meta(prefanout: dict[str, Any] | None) -> dict[str, dic
                     continue
                 meta = out.setdefault(doc_id, {})
                 for meta_field in ("source_system", "title", "source_url",
-                                   "created_at", "updated_at", "author_id"):
+                                   "created_at", "updated_at", "author_id",
+                                   "doc_version"):
                     if not meta.get(meta_field) and hit.get(meta_field):
                         meta[meta_field] = hit[meta_field]
     return out
@@ -1779,7 +1793,9 @@ _RRF_K = 60
 _LN2 = math.log(2)
 
 
-def _source_weight(hit: dict[str, Any], ref_now: datetime) -> float:
+def _source_weight(
+    hit: dict[str, Any], ref_now: datetime, half_life_days: float | None = None
+) -> float:
     """Per-source score multiplier + recency decay for one hit.
 
     Ported from the deleted fusion._apply_source_decay. These two signals
@@ -1816,14 +1832,22 @@ def _source_weight(hit: dict[str, Any], ref_now: datetime) -> float:
 
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
-    half_life = half_life_days_for(source_system, DEFAULT_RECENCY_HALF_LIFE_DAYS)
+    # A request-level override (QueryRequest.recency_half_life_days) beats
+    # the per-source profile; the field was accepted and ignored for months.
+    half_life = (
+        half_life_days
+        if half_life_days is not None
+        else half_life_days_for(source_system, DEFAULT_RECENCY_HALF_LIFE_DAYS)
+    )
     age_days = (ref_now - parsed).total_seconds() / 86400.0
     if age_days >= 0 and half_life > 0:
         weight *= math.exp(-_LN2 * age_days / half_life)
     return weight
 
 
-def _fuse_prefanout_docs(prefanout: dict[str, Any] | None) -> list[dict[str, Any]]:
+def _fuse_prefanout_docs(
+    prefanout: dict[str, Any] | None, *, half_life_days: float | None = None
+) -> list[dict[str, Any]]:
     """Reciprocal-rank-fuse every (sub_query, channel) ranked list in the
     pre-fan-out into a single doc-deduped ranking.
 
@@ -1865,7 +1889,7 @@ def _fuse_prefanout_docs(prefanout: dict[str, Any] | None) -> list[dict[str, Any
                     best_hit[doc_id] = hit
                     best_channel[doc_id] = channel
     for doc_id in scores:
-        scores[doc_id] *= _source_weight(best_hit[doc_id], ref_now)
+        scores[doc_id] *= _source_weight(best_hit[doc_id], ref_now, half_life_days)
     ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
     return [
         {"doc_id": d, "hit": best_hit[d], "channel": best_channel[d], "score": s}
@@ -1983,7 +2007,10 @@ def _resolve_spans(gathered: GathererOutput, state: LoopState, *, query: str) ->
 
 
 def _backfill_recall_floor(
-    gathered: GathererOutput, prefanout: dict[str, Any] | None
+    gathered: GathererOutput,
+    prefanout: dict[str, Any] | None,
+    *,
+    half_life_days: float | None = None,
 ) -> int:
     """Append top fused pre-fan-out docs the gatherer didn't emit until the
     response carries at least `_RECALL_FLOOR_DOCS` distinct docs.
@@ -1996,7 +2023,7 @@ def _backfill_recall_floor(
     if needed <= 0:
         return 0
     appended = 0
-    for entry in _fuse_prefanout_docs(prefanout):
+    for entry in _fuse_prefanout_docs(prefanout, half_life_days=half_life_days):
         if appended >= needed:
             break
         doc_id = entry["doc_id"]
@@ -2009,6 +2036,13 @@ def _backfill_recall_floor(
                 doc_id=doc_id,
                 chunk_id=hit.get("chunk_id") or doc_id,
                 content=hit.get("content") or "",
+                # From the channel hit, so a backfilled doc reports the version
+                # it was read from instead of the adapter's fallback of 1.
+                doc_version=hit.get("doc_version"),
+                # The trace records what was DELIVERED (the fallback paths rely
+                # on that), so a harness-appended chunk says so on itself rather
+                # than hiding behind an empty why_relevant.
+                harness_appended=True,
                 matched_via=[channel] if channel in _MATCHED_VIA_VALID else [],
                 why_relevant="",
                 source_system=(
@@ -2165,6 +2199,13 @@ def _coerce_lenient(raw: dict[str, Any], state: LoopState | None = None) -> dict
         for meta_field in ("created_at", "updated_at", "author_id"):
             if meta.get(meta_field) is not None:
                 ch_out[meta_field] = meta[meta_field]
+        # `doc_version` is HARNESS-owned: the channels know which version they
+        # read, the model does not, and a model-supplied number would be
+        # reported to the caller as the document's real version. Drop whatever
+        # was emitted and restore the channel's own value when there is one.
+        ch_out.pop("doc_version", None)
+        if meta.get("doc_version") is not None:
+            ch_out["doc_version"] = meta["doc_version"]
         # Filter `matched_via` to the schema's allowed channel set. The
         # model (Cerebras gpt-oss-120b in particular) sometimes invents
         # labels here ("telepathy" etc.) and occasionally emits non-
@@ -2492,6 +2533,8 @@ async def run_gatherer(
     # QueryRequest.scope, derived once: the id-lookup pins, the prefanout,
     # the loop state and the response gate all read this one value.
     request_project_id = req.scope.project_id if req.scope else None
+    request_temporal = req.temporal or TemporalSpec()
+    request_recency_half_life_days = req.recency_half_life_days
 
     async def _grounding_task() -> GroundingBundle:
         try:
@@ -2517,6 +2560,7 @@ async def run_gatherer(
                 source_keys=req.source_keys or None,
                 source_keys_include_keyless=bool(req.source_keys_include_keyless),
                 project_id=request_project_id,
+                temporal=request_temporal,
             )
         except Exception as exc:
             # A failed lookup degrades to "no pins", never to a failed
@@ -2785,6 +2829,9 @@ async def run_gatherer(
         source_keys_include_keyless=request_source_keys_include_keyless,
         per_source_top_k=request_per_source_top_k,
         project_id=request_project_id,
+        temporal=request_temporal,
+        temporal_from_request="temporal" in req.model_fields_set,
+        min_confidence=req.min_confidence,
     )
     timing["prefanout_ms"] = (time.perf_counter() - t_prefanout) * 1000
 
@@ -2847,6 +2894,8 @@ async def run_gatherer(
         pre_fanout_author_ids=list(author_ids),
         request_source_keys=request_source_keys,
         request_project_id=request_project_id,
+        request_temporal=request_temporal,
+        request_recency_half_life_days=request_recency_half_life_days,
         request_doc_types=request_doc_types,
         request_sources=request_sources,
         request_discovery=request_discovery,
@@ -2918,7 +2967,9 @@ async def run_gatherer(
             confidence="high",
             record_drop=False,
         )
-        backfilled = _backfill_recall_floor(gathered, state.prefanout)
+        backfilled = _backfill_recall_floor(
+            gathered, state.prefanout, half_life_days=state.request_recency_half_life_days
+        )
         if backfilled:
             log.info(
                 "agent.recall_floor_backfill",
@@ -2964,6 +3015,9 @@ async def run_gatherer(
             source_keys_include_keyless=request_source_keys_include_keyless,
             sources=request_sources,
             project_id=request_project_id,
+            temporal=request_temporal,
+            temporal_from_request="temporal" in req.model_fields_set,
+            min_confidence=req.min_confidence,
             status=status,
             id_pins=id_pins,
             top_k=req.top_k,
@@ -3022,6 +3076,9 @@ async def run_gatherer(
             source_keys_include_keyless=request_source_keys_include_keyless,
             sources=request_sources,
             project_id=request_project_id,
+            temporal=request_temporal,
+            temporal_from_request="temporal" in req.model_fields_set,
+            min_confidence=req.min_confidence,
             status=status,
             id_pins=id_pins,
             top_k=req.top_k,
@@ -3078,6 +3135,9 @@ async def run_gatherer(
             source_keys_include_keyless=request_source_keys_include_keyless,
             sources=request_sources,
             project_id=request_project_id,
+            temporal=request_temporal,
+            temporal_from_request="temporal" in req.model_fields_set,
+            min_confidence=req.min_confidence,
             status=status,
             id_pins=id_pins,
             top_k=req.top_k,
@@ -3232,7 +3292,9 @@ async def run_gatherer(
     # graded recall isn't capped by hand-curation. Latency-neutral — no
     # added LLM turn. Also recovers recall on degraded paths (loop_timeout
     # / schema_violation) where `gathered` is empty but the pool has hits.
-    backfilled = _backfill_recall_floor(gathered, state.prefanout)
+    backfilled = _backfill_recall_floor(
+        gathered, state.prefanout, half_life_days=state.request_recency_half_life_days
+    )
     if backfilled:
         log.info(
             "agent.recall_floor_backfill",
@@ -3322,6 +3384,9 @@ async def run_gatherer(
         source_keys_include_keyless=request_source_keys_include_keyless,
         sources=request_sources,
         project_id=request_project_id,
+        temporal=request_temporal,
+        temporal_from_request="temporal" in req.model_fields_set,
+        min_confidence=req.min_confidence,
         status=status,
         id_pins=id_pins,
         top_k=req.top_k,

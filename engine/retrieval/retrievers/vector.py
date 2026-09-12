@@ -11,7 +11,7 @@ from typing import Any, Literal
 import asyncpg
 
 from engine.retrieval.helpers import project_scope_predicate, source_key_predicate
-from engine.retrieval.temporal import build_predicate
+from engine.retrieval.temporal import build_predicate, live_version_join
 from engine.shared.constants import TOP_K_VECTOR, VECTOR_RECENCY_POOL_MULTIPLIER
 from engine.shared.db import with_tenant
 from engine.shared.embeddings import get_embedder_v2
@@ -357,7 +357,7 @@ def _build_inner_query(
             JOIN documents d
               ON c.doc_id = d.doc_id
              AND d.customer_id = c.customer_id
-             AND d.version BETWEEN c.first_seen_version AND c.last_seen_version
+             {live_version_join("d", "c")}
             WHERE c.customer_id = $1
               AND c.embedding_v2 IS NOT NULL
               {pred.chunk_sql}

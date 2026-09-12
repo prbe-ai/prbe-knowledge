@@ -91,6 +91,41 @@ def build_predicate(
 # ---------------------------------------------------------------------------
 
 
+def live_version_join(doc_alias: str, chunk_alias: str) -> str:
+    """The chunk<->document version join every content query needs.
+
+    A chunk row is shared across the document versions whose content it
+    appeared in (`first_seen_version..last_seen_version`); joining a chunk to
+    the version the temporal predicate selected is what makes "this chunk is
+    part of THAT version" true. It used to be inlined in vector and bm25; the
+    fetch tools then grew without it and served dead-version chunks.
+    """
+    return (
+        f"AND {doc_alias}.version BETWEEN {chunk_alias}.first_seen_version "
+        f"AND {chunk_alias}.last_seen_version"
+    )
+
+
+def applied_temporal_meta(spec: TemporalSpec, *, source: str) -> dict[str, object]:
+    """The caller-visible echo of the temporal spec a request ran under.
+
+    `source` says where it came from: "request" (the caller sent one) or
+    "default" (LATEST because nothing was sent). A caller that asked for
+    AS_OF reads this to tell "answered as of that date" from "the server
+    ignored the spec" -- the field existed for years while nothing set it.
+    """
+    meta: dict[str, object] = {"mode": spec.mode.value, "source": source}
+    if spec.as_of is not None:
+        meta["as_of"] = spec.as_of.isoformat()
+    if spec.since is not None:
+        meta["since"] = spec.since.isoformat()
+    if spec.until is not None:
+        meta["until"] = spec.until.isoformat()
+    if spec.mode != TemporalMode.LATEST:
+        meta["time_basis"] = spec.time_basis
+    return meta
+
+
 def resolve_temporal(
     symbolic: dict[str, Any] | None, now: datetime
 ) -> tuple[TemporalSpec | None, str | None]:

@@ -26,6 +26,38 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Fixed
 
+- **`/retrieve` honours its `temporal` filter.** `QueryRequest.temporal`
+  (AS_OF / CHANGED_BETWEEN) was validated and then ignored on the gatherer
+  path -- every channel ran LATEST and `applied_temporal` was never set. The
+  spec now reaches every channel, the identifier lookup, the agent's in-loop
+  content tools and the response gate, and `applied_temporal` echoes it
+  (`source: request` or `default`). `recency_half_life_days` and
+  `min_confidence` do what their descriptions say; `entity_match_threshold`
+  and `requesting_user_id`, which fed only the deleted list pipeline, are
+  removed (ignored if sent).
+- **`fetch_doc` / `fetch_chunk_window` serve one version.** They filtered
+  only `visibility`, so for the 30 days a dead version's chunks are retained
+  an edited document paged out old and new text interleaved at colliding
+  chunk indexes. Chunks now join the document version the temporal spec
+  selects, and results carry the real `doc_version` instead of `1`.
+- **`CHANGED_BETWEEN` no longer dies on the bind.** Its two parameters live in
+  the document half of the predicate and none in the chunk half, so the window
+  fetch and the evidence hydration -- which used the chunk half alone -- handed
+  the driver arguments nothing referenced. Both now join the document and apply
+  both halves, which is also what makes "this chunk belongs to that version"
+  true. A historical request suppresses the inferred-edge lane (the edge store
+  holds only current edges) and records it as a lost channel rather than dating
+  today's rationale wrong. `min_confidence` reaches the graph channel, not just
+  the evidence filter. `doc_version` is harness-owned: restored from the
+  channel hit, carried by the identifier pins and the recall floor, and
+  stripped from anything the model emits.
+- **The response gate runs on every response.** Emitted ids are re-verified
+  against live rows whether or not a scope was set (an invented chunk_id is
+  dropped); on a database error a scoped request still fails, an unscoped one
+  keeps its chunks and reports `degraded_reason: scope_check_unavailable`.
+  Chunks the recall-floor backfill appends are marked `harness_appended`
+  in the trace, so "retrieved but never examined" and "examined and
+  rejected" stop looking alike.
 - **`sort=recency` keeps its ANN candidate pool.** The recency branch of the
   vector channel took no ANN limit, so "latest X" returned the newest chunks
   in scope whatever X was. The pool is now the index's best

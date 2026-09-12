@@ -348,7 +348,6 @@ class QueryRequest(BaseModel):
             f"Cap {MAX_REQUEST_SOURCE_KEYS} keys."
         ),
     )
-    requesting_user_id: str | None = None
     trace_id: str | None = None
     temporal: TemporalSpec = Field(default_factory=TemporalSpec)
     recency_half_life_days: float | None = Field(
@@ -380,17 +379,6 @@ class QueryRequest(BaseModel):
             "for broad-recall callers (e.g. the MCP) where a router-extracted "
             "entity that has no matching graph_node would otherwise zero out "
             "the SQL result."
-        ),
-    )
-    entity_match_threshold: float = Field(
-        default=0.7,
-        ge=0.0,
-        le=1.0,
-        description=(
-            "Confidence threshold for entities to qualify as filter needles "
-            "when `entity_must_match` is true. Entities below this confidence "
-            "are ignored by the filter. Lower (e.g. 0.5) is more aggressive; "
-            "higher (e.g. 0.9) only filters on dead-certain entities."
         ),
     )
     min_confidence: str | None = Field(

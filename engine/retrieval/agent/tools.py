@@ -65,6 +65,7 @@ from engine.retrieval.retrievers.vector import vector_search as _vector
 from engine.retrieval.router import (
     _escape_query_for_xml,  # noqa: F401 — re-exported for any caller
 )
+from engine.retrieval.temporal import build_predicate, live_version_join
 from engine.shared.constants import (
     INFERRED_EDGE_HYDRATION_CHUNKS,
     ROUTER_ENTITY_TO_LABEL,
@@ -82,7 +83,7 @@ from engine.shared.constants import (
 )
 from engine.shared.db import with_tenant
 from engine.shared.logging import get_logger
-from engine.shared.models import TemporalSpec
+from engine.shared.models import TemporalMode, TemporalSpec
 
 log = get_logger(__name__)
 
@@ -203,6 +204,17 @@ _SCOPE_REFUSAL_NOTE = (
 )
 
 
+def _coerce_temporal(value: TemporalSpec | dict[str, Any] | None) -> TemporalSpec:
+    """The harness injects the request's temporal spec into tool calls as a
+    JSON dict (tool arguments are serialised into the trace); executors take
+    either shape. None -> LATEST, the historical behaviour."""
+    if value is None:
+        return TemporalSpec()
+    if isinstance(value, TemporalSpec):
+        return value
+    return TemporalSpec.model_validate(value)
+
+
 def _hit_to_chunk_dict(hit: Any, channel: str) -> dict[str, Any]:
     """Normalize a channel hit (VectorHit / BM25Hit / GraphHit) to a
     chunk-shaped dict the agent reads."""
@@ -210,6 +222,7 @@ def _hit_to_chunk_dict(hit: Any, channel: str) -> dict[str, Any]:
         "channel": channel,
         "chunk_id": getattr(hit, "chunk_id", None),
         "doc_id": hit.doc_id,
+        "doc_version": getattr(hit, "doc_version", None),
         "source_system": hit.source_system,
         "source_url": hit.source_url,
         "title": hit.title,
@@ -343,6 +356,8 @@ async def execute_search(
     source_keys_include_keyless: bool = False,
     project_id: str | None = None,
     per_source_top_k: int | None = None,
+    temporal: TemporalSpec | dict[str, Any] | None = None,
+    min_confidence: str | None = None,
 ) -> dict[str, Any]:
     """Fan out 1+ queries through the 4 channels (vector + bm25 + graph +
     inferred_edge) in parallel — same shape the harness runs on turn 0.
@@ -390,6 +405,7 @@ async def execute_search(
     Returns: {sub_queries: [{query, grounded_entities, vector[], bm25[],
                             graph[], inferred_edge[]}]}
     """
+    temporal_spec = _coerce_temporal(temporal)
     queries = [q for q in (queries or []) if isinstance(q, str) and q.strip()][:_SEARCH_MAX_SUBQUERIES]
     if not queries:
         return {"sub_queries": []}
@@ -439,7 +455,7 @@ async def execute_search(
             try:
                 hits = await _vector(
                     customer_id=customer_id, query_text=q,
-                    top_k=top_k_v, temporal=TemporalSpec(),
+                    top_k=top_k_v, temporal=temporal_spec,
                     author_ids=author_ids,
                     sort_by=sort_by,
                     doc_types=doc_types,
@@ -462,7 +478,7 @@ async def execute_search(
             try:
                 hits = await _bm25(
                     customer_id=customer_id, query_text=q,
-                    top_k=top_k_b, temporal=TemporalSpec(),
+                    top_k=top_k_b, temporal=temporal_spec,
                     author_ids=author_ids,
                     sort_by=sort_by,
                     doc_types=doc_types,
@@ -487,7 +503,11 @@ async def execute_search(
             try:
                 hits = await _graph(
                     customer_id=customer_id, entities=graph_pairs,
-                    top_k=top_k_g, temporal=TemporalSpec(),
+                    top_k=top_k_g, temporal=temporal_spec,
+                    # The request's floor, not the retriever's default: an
+                    # EXTRACTED request used to receive inferred-only
+                    # neighbours because this never reached the channel.
+                    **({"min_confidence": min_confidence} if min_confidence else {}),
                     author_ids=author_ids,
                     sort_by=sort_by,
                     doc_types=doc_types,
@@ -515,6 +535,15 @@ async def execute_search(
                 return []
 
         async def _inferred_call() -> list[dict[str, Any]]:
+            if temporal_spec.mode != TemporalMode.LATEST:
+                # inferred_edge_search reads CURRENT versions and CURRENT edge
+                # rows; there is no historical edge store. Returning today's
+                # inferences beside an as-of chunk set would date the
+                # rationale wrong, so the lane is omitted for historical
+                # requests and recorded as lost (the caller sees the channel
+                # in `lost_channels`, not a silently thinner answer).
+                record_channel_loss("inferred_edge")
+                return []
             if not ents:
                 return []
             try:
@@ -709,6 +738,7 @@ async def execute_subgraph(
     doc_types: list[str] | None = None,
     source_keys_include_keyless: bool = False,
     project_id: str | None = None,
+    temporal: TemporalSpec | dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Multi-hop BFS from an anchor node in ONE tool call.
 
@@ -717,6 +747,10 @@ async def execute_subgraph(
     INFERRED Doc-Doc edges (`include_inferred=True`) so the LLM `why`
     strings surface inline. Optionally expands entity aliases
     (`include_aliases=True`) so Person/Repo clusters are visible.
+
+    `temporal`: a non-LATEST spec SUPPRESSES the inferred-edge enrichment --
+    the edge store holds only current edges, so pairing today's inference with
+    an as-of chunk set would date the rationale wrong.
 
     `source_keys` / `doc_types` / `project_id` (harness-injected request scope): applied
     to the inferred-edge CONTENT enrichment only. The node walk itself is
@@ -733,6 +767,12 @@ async def execute_subgraph(
     top_k_per_hop = _clamp_top_k(top_k_per_hop, SEARCH_AGENT_GRAPH_WALK_TOP_K)
     if include_inferred is None:
         include_inferred = True
+    if _coerce_temporal(temporal).mode != TemporalMode.LATEST:
+        # The edge store holds only CURRENT inferred edges -- there is no
+        # historical edge history -- so an as-of walk that included them would
+        # pair today's inference with a chunk set from another week. Omitted
+        # rather than dated wrong; the node walk itself still runs.
+        include_inferred = False
     if include_aliases is None:
         include_aliases = True
 
@@ -861,6 +901,7 @@ async def execute_fetch_doc(
     doc_types: list[str] | None = None,
     source_keys_include_keyless: bool = False,
     project_id: str | None = None,
+    temporal: TemporalSpec | dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Paginate a doc's chunks plus optional inferred-edge context in ONE call.
 
@@ -888,15 +929,35 @@ async def execute_fetch_doc(
         with_inferred_edges = False
     if with_evidence is None:
         with_evidence = False
+    if _coerce_temporal(temporal).mode != TemporalMode.LATEST:
+        # Only current edges exist; see execute_search's `_inferred_call`.
+        with_inferred_edges = False
+        with_evidence = False
 
     # Plan A Component 6: hide draft chunks from the agent fetch path.
     # The agent runs under an API key and never sees pre-approval content.
-    chunks_sql = """
-        SELECT chunk_id, doc_id, content, kind, chunk_index
-        FROM chunks
-        WHERE customer_id = $1 AND doc_id = $2
-          AND visibility = 'approved'
-        ORDER BY chunk_index ASC
+    # The chunk page honours the request's temporal spec and joins each chunk
+    # to the document VERSION it belongs to. Before this the query filtered
+    # only `visibility`, so for the 30 days a dead version's chunks are
+    # retained an edited document paged out old and new text interleaved at
+    # colliding chunk_index values, with no marker for the model.
+    spec = _coerce_temporal(temporal)
+    chunk_params: list[Any] = [customer_id, doc_id, n, off]
+    tpred = build_predicate(spec, doc_alias="d", chunk_alias="c", next_param_index=5)
+    chunk_params.extend(tpred.params)
+    chunks_sql = f"""
+        SELECT c.chunk_id, c.doc_id, c.content, c.kind, c.chunk_index, d.version AS doc_version
+        FROM chunks c
+        JOIN documents d
+          ON d.customer_id = c.customer_id
+         AND d.doc_id = c.doc_id
+         {live_version_join("d", "c")}
+        WHERE c.customer_id = $1 AND c.doc_id = $2
+          AND c.visibility = 'approved'
+          AND d.visibility = 'approved'
+          {tpred.chunk_sql}
+          {tpred.doc_sql}
+        ORDER BY c.chunk_index ASC
         LIMIT $3 OFFSET $4
     """
 
@@ -914,10 +975,18 @@ async def execute_fetch_doc(
                 source_keys_include_keyless=source_keys_include_keyless,
                 project_id=project_id,
             )
+            # Only `doc_sql` is used here (there is no chunk in this query),
+            # so bind ONLY what it references: under CHANGED_BETWEEN that is
+            # both parameters, under LATEST none.
+            gate_pred = build_predicate(
+                spec, doc_alias="d", chunk_alias="d", next_param_index=len(scope_params) + 1
+            )
+            scope_params.extend(gate_pred.params)
             visible = await conn.fetchval(
                 f"""
                 SELECT 1 FROM documents d
-                WHERE d.customer_id = $1 AND d.doc_id = $2 AND d.valid_to IS NULL
+                WHERE d.customer_id = $1 AND d.doc_id = $2
+                  {gate_pred.doc_sql}
                   {scope_preds}
                 """,
                 *scope_params,
@@ -939,7 +1008,7 @@ async def execute_fetch_doc(
                     "note": _SCOPE_REFUSAL_NOTE,
                 }
 
-        rows = await conn.fetch(chunks_sql, customer_id, doc_id, n, off)
+        rows = await conn.fetch(chunks_sql, *chunk_params)
         chunks = [
             {
                 "chunk_id": r["chunk_id"],
@@ -1008,25 +1077,40 @@ async def execute_fetch_doc(
                 # hydrate from OTHER documents (the edge's far endpoint),
                 # so the request scope applies to their parent docs too.
                 ev_params: list[Any] = [customer_id, list(all_chunk_ids)]
+                ev_spec = _coerce_temporal(temporal)
                 ev_scope = ""
                 if source_keys or doc_types or project_id:
                     preds = _doc_scope_sql(
-                        ev_params, alias="d", source_keys=source_keys, doc_types=doc_types,
+                        ev_params, alias="ds", source_keys=source_keys, doc_types=doc_types,
                         source_keys_include_keyless=source_keys_include_keyless,
                         project_id=project_id,
                     )
                     ev_scope = f"""
                       AND EXISTS (
-                          SELECT 1 FROM documents d
-                          WHERE d.customer_id = $1 AND d.doc_id = c.doc_id
-                            AND d.valid_to IS NULL {preds}
+                          SELECT 1 FROM documents ds
+                          WHERE ds.customer_id = $1 AND ds.doc_id = c.doc_id
+                            AND ds.valid_to IS NULL {preds}
                       )"""
+                # Both halves, against the joined document -- see the window
+                # query: under CHANGED_BETWEEN the chunk half is placeholder-
+                # free and the doc half holds both parameters.
+                ev_pred = build_predicate(
+                    ev_spec, doc_alias="d", chunk_alias="c", next_param_index=len(ev_params) + 1
+                )
+                ev_params.extend(ev_pred.params)
                 ev_rows = await conn.fetch(
                     f"""
                     SELECT c.chunk_id, c.doc_id, c.content, c.kind
                     FROM chunks c
+                    JOIN documents d
+                      ON d.customer_id = c.customer_id
+                     AND d.doc_id = c.doc_id
+                     {live_version_join("d", "c")}
                     WHERE c.customer_id = $1 AND c.chunk_id = ANY($2::text[])
-                      AND c.visibility = 'approved'{ev_scope}
+                      AND c.visibility = 'approved'
+                      AND d.visibility = 'approved'
+                      {ev_pred.chunk_sql}
+                      {ev_pred.doc_sql}{ev_scope}
                     """,
                     *ev_params,
                 )
@@ -1066,6 +1150,7 @@ async def execute_fetch_chunk_window(
     doc_types: list[str] | None = None,
     source_keys_include_keyless: bool = False,
     project_id: str | None = None,
+    temporal: TemporalSpec | dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return a matched chunk plus its immediate neighbours in the same doc.
 
@@ -1094,32 +1179,58 @@ async def execute_fetch_chunk_window(
     # request scope (when injected) gates the target CTE via its parent
     # document — every window row shares the target's doc_id.
     params: list[Any] = [customer_id, chunk_id, b, a]
+    spec = _coerce_temporal(temporal)
     scope_sql = ""
     if source_keys or doc_types or project_id:
         preds = _doc_scope_sql(
-            params, alias="d", source_keys=source_keys, doc_types=doc_types,
+            params, alias="ds", source_keys=source_keys, doc_types=doc_types,
             source_keys_include_keyless=source_keys_include_keyless,
             project_id=project_id,
         )
         scope_sql = f"""
               AND EXISTS (
-                  SELECT 1 FROM documents d
-                  WHERE d.customer_id = $1 AND d.doc_id = c0.doc_id
-                    AND d.valid_to IS NULL {preds}
+                  SELECT 1 FROM documents ds
+                  WHERE ds.customer_id = $1 AND ds.doc_id = c0.doc_id
+                    AND ds.valid_to IS NULL {preds}
               )"""
+    # ONE parameter set, two aliases. Both halves of the predicate are applied
+    # at both ends, against a joined `documents` row: under CHANGED_BETWEEN the
+    # chunk half carries no placeholder at all and the doc half carries both,
+    # so a query that bound the params and used only `chunk_sql` handed asyncpg
+    # two arguments nothing referenced (Codex review). Joining the document is
+    # also what makes "this chunk belongs to THAT version" true.
+    first_tp = len(params) + 1
+    target_pred = build_predicate(spec, doc_alias="d0", chunk_alias="c0", next_param_index=first_tp)
+    window_pred = build_predicate(spec, doc_alias="d", chunk_alias="c", next_param_index=first_tp)
+    params.extend(target_pred.params)
     window_sql = f"""
         WITH target AS (
             SELECT c0.doc_id, c0.chunk_index
             FROM chunks c0
+            JOIN documents d0
+              ON d0.customer_id = c0.customer_id
+             AND d0.doc_id = c0.doc_id
+             {live_version_join("d0", "c0")}
             WHERE c0.customer_id = $1 AND c0.chunk_id = $2
-              AND c0.visibility = 'approved'{scope_sql}
+              AND c0.visibility = 'approved'
+              AND d0.visibility = 'approved'
+              {target_pred.chunk_sql}
+              {target_pred.doc_sql}{scope_sql}
             LIMIT 1
         )
-        SELECT c.chunk_id, c.doc_id, c.content, c.kind, c.chunk_index
-        FROM chunks c, target t
-        WHERE c.customer_id = $1
-          AND c.doc_id = t.doc_id
-          AND c.visibility = 'approved'
+        SELECT c.chunk_id, c.doc_id, c.content, c.kind, c.chunk_index,
+               d.version AS doc_version
+        FROM target t
+        JOIN chunks c
+          ON c.customer_id = $1 AND c.doc_id = t.doc_id
+        JOIN documents d
+          ON d.customer_id = c.customer_id
+         AND d.doc_id = c.doc_id
+         {live_version_join("d", "c")}
+        WHERE c.visibility = 'approved'
+          AND d.visibility = 'approved'
+          {window_pred.chunk_sql}
+          {window_pred.doc_sql}
           AND c.chunk_index BETWEEN t.chunk_index - $3 AND t.chunk_index + $4
         ORDER BY c.chunk_index ASC
     """
@@ -1133,6 +1244,7 @@ async def execute_fetch_chunk_window(
             "content": r["content"],
             "kind": r["kind"],
             "chunk_index": int(r["chunk_index"]),
+            "doc_version": int(r["doc_version"]),
         }
         for r in rows
     ]

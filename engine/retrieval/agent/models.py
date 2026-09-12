@@ -59,6 +59,13 @@ GathererStatus = Literal[
     # is one query away instead of an archaeology project.
     "loop_budget_starved",
     "schema_violation",
+    # The response gate could not re-verify the emitted chunks against the
+    # live documents rows (DB error) on an UNSCOPED request. The chunks are
+    # kept -- there was no scope to enforce, only invented ids to catch --
+    # and the response says so. A SCOPED request in the same situation
+    # fails instead: the check IS the scope. Degraded (not in the
+    # non-degraded set) so `degraded_reason` names it.
+    "scope_check_unavailable",
     "tool_budget_exceeded",
     # No LLM credentials configured (test env / bootstrap / self-host without
     # SEARCH_AGENT_INFERENCE_MODEL provider key). Loop short-circuits to an
@@ -251,6 +258,14 @@ class GatheredChunk(BaseModel):
 
     doc_id: str
     chunk_id: str
+    # The document version the chunk was read from (VectorHit.doc_version),
+    # carried so the response reports the REAL version instead of a constant.
+    doc_version: int | None = Field(default=None, ge=1)
+    # True when the recall-floor backfill appended this chunk from the
+    # pre-fan-out pool: no model read it, so it carries no span and no
+    # rationale. Persisted in the trace blob so "retrieved but never examined"
+    # and "examined and rejected" stop looking alike.
+    harness_appended: bool = Field(default=False)
     content: str
     matched_via: list[MatchedViaChannel] = Field(
         default_factory=list,
