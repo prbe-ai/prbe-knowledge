@@ -50,6 +50,27 @@ assumed v3 the moment this migration ran, every BM25 query would fail in the
 window between deploy and rebuild -- which can be days, because the rebuild
 waits for a window.
 
+WHY THIS BACKFILL SEES ANY ROWS AT ALL
+--------------------------------------
+`chunks` and `documents` are both under FORCE ROW LEVEL SECURITY, and the
+policy is `customer_id = current_setting('app.current_customer_id', true)`.
+A query with no tenant GUC set matches NOTHING -- it does not error, it
+returns zero rows and an UPDATE reports success having changed nothing. That
+is the standard trap in this codebase and the reason most data backfills here
+loop per tenant with the GUC bound.
+
+This one does not, and the reason is specific rather than an oversight:
+migrations run as `postgres`, which is `rolsuper` and `rolbypassrls`, so FORCE
+RLS does not apply to them. Verified on the research primary 2026-09-12 -- the
+only roles are app (no bypass), cnpg_metrics_exporter, streaming_replica and
+postgres -- and confirmed empirically by migration 0100, whose identically
+shaped `UPDATE chunks` populated 869,512 of probe's 905,221 chunk titles.
+
+If the migration role ever stops being a superuser, this statement starts
+silently updating zero rows, and the symptom would be a scoped BM25 search
+returning nothing rather than an error. Check `rolbypassrls` before assuming
+this still holds.
+
 THE DEDUPE IS LOAD-BEARING
 --------------------------
 `chunks JOIN documents ON version BETWEEN first_seen_version AND
