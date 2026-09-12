@@ -221,5 +221,7 @@ jobs:
           tests/retrieval/test_vector_per_source_ann.py
           tests/retrieval/test_vector_per_source_ann_binding.py
           tests/retrieval/test_vector_recency_pool.py
+          tests/retrieval/test_dedupe_gathered.py
+          tests/retrieval/test_graph_discovery_ordering.py
           tests/test_custom_ingest.py
           tests/test_backfill_custom_doc_types.py

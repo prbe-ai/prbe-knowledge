@@ -195,9 +195,11 @@ def test_backfill_marks_every_chunk_it_appends() -> None:
         "bm25": [], "graph": [], "inferred_edge": [],
     }]}
     gathered = GathererOutput(chunks=[], gatherer_notes=GathererNotes())
-    appended = _backfill_recall_floor(gathered, prefanout)
-    assert appended == 3 and len(gathered.chunks) == 3
+    outcome = _backfill_recall_floor(gathered, prefanout)
+    assert outcome.appended == 3 and len(gathered.chunks) == 3
     assert all(c.harness_appended for c in gathered.chunks)
+    # And each one says HOW it got here, not which channel it was pulled from.
+    assert all(c.matched_via == ["recall_floor"] for c in gathered.chunks)
 
 
 # ============================================================
