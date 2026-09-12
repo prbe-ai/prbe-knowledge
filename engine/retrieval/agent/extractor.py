@@ -149,8 +149,6 @@ shape genuinely calls for it.
                                           → ["sentry.issue", "sentry.event"]
     * "meetings" / "granola"             → ["granola.meeting"]
     * "claude code sessions"             → ["claude_code.session"]
-      (a bare "sessions" resolves to all three agents' families; naming an
-       agent, or passing `sources`, is what narrows it)
 
   HARD RULE — when you set `doc_types`, the query is asking about the
   CLASS, so DO NOT also emit a specific instance of that class in

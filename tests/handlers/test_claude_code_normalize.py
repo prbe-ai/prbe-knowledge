@@ -49,10 +49,21 @@ async def test_normalize_incomplete_emits_bare_session_doc_only() -> None:
     assert doc.doc_class == DocClass.RAW_SOURCE
     assert doc.source_id == "s-1"
     assert doc.author_id == "emp-1"
-    # ACL: one principal = the employee
+    # ACL: one principal = the WORKSPACE, not the author.
+    #
+    # This used to assert PrincipalType.USER / "emp-1", and nothing anywhere
+    # enforced it: the transcript route scopes by customer_id alone and
+    # retrieval has no ACL filter, so every teammate could already read every
+    # session. The row described a protection that did not exist — which is
+    # worse than describing none, because it is the shape of assurance someone
+    # relies on. Found while tracing a leaked AWS key that was readable by the
+    # author's whole team despite an ACL naming only them (2026-08-30).
+    #
+    # Team-wide visibility is the product. Authorship is asserted below, on the
+    # AUTHORED edge, which is where provenance belongs.
     assert len(doc.acl.principals) == 1
-    assert doc.acl.principals[0].principal_type == PrincipalType.USER
-    assert doc.acl.principals[0].principal_id == "emp-1"
+    assert doc.acl.principals[0].principal_type == PrincipalType.WORKSPACE
+    assert doc.acl.principals[0].principal_id == "cust-1"
     # Graph: at least one AUTHORED edge
     assert any(
         getattr(e, "edge_type", None) == EdgeType.AUTHORED for e in result.graph_edges

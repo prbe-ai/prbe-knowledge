@@ -37,6 +37,7 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, 
 from fastapi.responses import JSONResponse
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
+from engine.ingest import secret_redaction
 from engine.ingest.connectedness import is_source_connected
 from engine.ingest.custom_ingest_routes import router as custom_ingest_router
 from engine.ingest.entity_clusters_routes import (
@@ -129,9 +130,17 @@ app.include_router(session_receipts_router)
 @app.get("/health")
 async def health() -> JSONResponse:
     db_ok = await health_check()
+    # The credential redactor fails OPEN by design: a missing scanner must not
+    # stop ingestion, because the tap is the primary control and this is the
+    # backstop. That makes its absence invisible in every other signal — the
+    # pod is healthy, batches flow, and nothing is being scanned. Surfacing it
+    # here is what turns "quietly unprotected" into something a dashboard can
+    # show. Deliberately NOT part of the ok/degraded verdict: refusing traffic
+    # over a missing backstop would trade a silent gap for an outage.
     body = {
         "status": "ok" if db_ok else "degraded",
         "db": db_ok,
+        "secret_scanner": secret_redaction.available(),
         "connectors": [s.value for s in list_registered()],
         "time": datetime.now(UTC).isoformat(),
     }

@@ -1,0 +1,57 @@
+# Gitleaks rule extension for Probe's ingest redaction.
+#
+# ONE rule on top of the stock corpus. Stock gitleaks does not catch
+#   AWS Secret Access Key [None]: <40 chars>
+# which is the literal shape that leaked from a customer session on 2026-08-30:
+# an AWS secret access key has no format of its own (it is 40 base64
+# characters, indistinguishable from a checkpoint path), and gitleaks'
+# generic-api-key rule wants an `=`-style assignment, not a `:`-separated echo
+# from `aws configure`.
+#
+# This rule anchors on the KEY NAME instead, then requires entropy on the value.
+# The anchor list is deliberately tight: `hash`, `id`, `sha`, `digest` and
+# `signature` are NOT anchors, because `content_hash = e3b0c442...` is ordinary
+# pipeline output and firing on it is precisely how the previous gate died
+# (615 false positives out of 645 drops).
+#
+# TWO GUARDS, both found by scanning 4,000 real production chunks rather than a
+# fixture:
+#
+#   [^\n.!?] between the anchor and its separator. A gap that may cross a
+#   sentence turns "...secret configuration. BEFORE:  --some-flag" into a
+#   finding -- prose ABOUT credentials followed by a CLI flag. This was 19 of
+#   the 30 findings on that sample, every one of them wrong.
+#
+#   NO `/` in the value charset. A file path needs one, an opaque token does
+#   not -- and a 40-character path is precisely what produced 539 of the 615
+#   false positives in 2026-08. This does give up AWS secrets that happen to
+#   contain `/` (about half of them): gitleaks' own generic-api-key still
+#   catches those when they are `=`-assigned, and the tap catches them at
+#   capture with a mechanism that can afford lookarounds. Losing half of one
+#   backstop's recall is the right trade against reintroducing the exact
+#   false-positive class that made the last gate unusable.
+#
+#   The value may not START with `-`. A CLI flag always does
+#   (`--some-thing-SOME-VALUE-`) and a credential never does; that one
+#   character removes three of the four remaining false positives on the
+#   4,000-chunk sample at no recall cost.
+#
+#   RE2 has no lookaheads, so "contains a digit AND an uppercase" cannot be
+#   expressed here. An earlier attempt wrote it as an alternation with
+#   `{20,512}` attached -- which repeats the GROUP 20 times, not the character
+#   class, and silently matched nothing at all. The suite caught it; a
+#   measurement alone read as a clean 0 findings.
+#
+# Measured: 0 findings on the outage corpus, and the real leaked session fully
+# redacted (both halves).
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "probe-anchored-secret"
+description = "A credential-shaped key name introducing an opaque value"
+regex = '''(?i)(?:secret|password|passwd|api[_ -]?key|apikey|access[_ -]?key|secret[_ -]?key|private[_ -]?key|auth[_ -]?token|access[_ -]?token|client[_ -]?secret|credential)(?:[^\n.!?]{0,24}?)[:=][ \t"']{0,4}([A-Za-z0-9+=_][A-Za-z0-9+=_\-]{19,511})'''
+entropy = 3.5
+secretGroup = 1
+keywords = ["secret", "password", "passwd", "apikey", "api key", "api_key", "access key", "access_key", "credential", "token"]

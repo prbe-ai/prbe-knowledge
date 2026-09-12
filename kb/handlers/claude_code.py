@@ -90,23 +90,6 @@ class ClaudeCodeConnector(Connector):
     source_system: ClassVar[SourceSystem] = SourceSystem.CLAUDE_CODE
     display_name: ClassVar[str] = "Claude Code"
     doc_type_prefix: ClassVar[str] = "claude_code."
-
-    @classmethod
-    def _doc_type(cls, kind: str) -> DocType:
-        """This connector's DocType for one unit kind.
-
-        Composed from `doc_type_prefix` rather than named literally, so a
-        subclass that changes the prefix cannot keep emitting the parent's
-        family by forgetting a call site. That is exactly how Codex and pi
-        sessions came to be typed `claude_code.*` for 10,191 documents: the
-        prefix was inherited, every `DocType.CLAUDE_CODE_*` literal below was
-        inherited with it, and nothing connected the two.
-
-        Raises ValueError if the family is incomplete for this prefix, which is
-        the loud failure we want: a missing member is caught on the first
-        ingest rather than by a reader noticing a wrong label months later.
-        """
-        return DocType(f"{cls.doc_type_prefix}{kind}")
     # Queue priority 75: bursty, deprioritized vs interactive webhooks (100).
     # Sessions are search-indexable, not user-blocking; one chatty CC user
     # shouldn't block other connectors at the queue claim layer.
@@ -492,7 +475,7 @@ class ClaudeCodeConnector(Connector):
             GraphNodeSpec(
                 label=NodeLabel.DOCUMENT,
                 canonical_id=session_doc.doc_id,
-                properties={"doc_type": self._doc_type("session").value},
+                properties={"doc_type": DocType.CLAUDE_CODE_SESSION.value},
             ),
             make_named_entity(
                 NodeLabel.AGENT_SESSION,
@@ -525,7 +508,7 @@ class ClaudeCodeConnector(Connector):
         ]
         if unverified_author:
             graph_edges = [edge for edge in graph_edges if edge.edge_type != EdgeType.AUTHORED]
-        acl = self._acl(employee_id)
+        acl = self._acl(event.customer_id)
         acl_rows: list[ACLSnapshotRow] = [
             ACLSnapshotRow(
                 source_system=self.source_system,
@@ -580,7 +563,7 @@ class ClaudeCodeConnector(Connector):
                     employee_name=employee_name,
                     employee_email=employee_email,
                     employee_hostname=employee_hostname,
-                    doc_type=self._doc_type("qa"),
+                    doc_type=DocType.CLAUDE_CODE_QA,
                     unit_kind="qa",
                     idx=idx,
                     unit=qa,
@@ -603,7 +586,7 @@ class ClaudeCodeConnector(Connector):
                     employee_name=employee_name,
                     employee_email=employee_email,
                     employee_hostname=employee_hostname,
-                    doc_type=self._doc_type("code_change"),
+                    doc_type=DocType.CLAUDE_CODE_CODE_CHANGE,
                     unit_kind="code_change",
                     idx=idx,
                     unit=cc,
@@ -628,7 +611,7 @@ class ClaudeCodeConnector(Connector):
                     employee_name=employee_name,
                     employee_email=employee_email,
                     employee_hostname=employee_hostname,
-                    doc_type=self._doc_type("decision"),
+                    doc_type=DocType.CLAUDE_CODE_DECISION,
                     unit_kind="decision",
                     idx=idx,
                     unit=dec,
@@ -662,7 +645,7 @@ class ClaudeCodeConnector(Connector):
                     employee_name=employee_name,
                     employee_email=employee_email,
                     employee_hostname=employee_hostname,
-                    doc_type=self._doc_type("file_ref"),
+                    doc_type=DocType.CLAUDE_CODE_FILE_REF,
                     unit_kind="file_ref",
                     idx=idx,
                     unit=fr,
@@ -685,7 +668,7 @@ class ClaudeCodeConnector(Connector):
                     employee_name=employee_name,
                     employee_email=employee_email,
                     employee_hostname=employee_hostname,
-                    doc_type=self._doc_type("directive"),
+                    doc_type=DocType.CLAUDE_CODE_DIRECTIVE,
                     unit_kind="directive",
                     idx=idx,
                     unit=directive,
@@ -840,12 +823,33 @@ class ClaudeCodeConnector(Connector):
                 return candidate
         return None
 
-    def _acl(self, employee_id: str) -> ACLSnapshot:
+    def _acl(self, customer_id: str) -> ACLSnapshot:
+        """Captured sessions are readable by the whole tenant. Say so.
+
+        This used to name a single USER principal — the session's author — and
+        nothing anywhere enforced it. `GET /v1/sessions/{id}/transcript` scopes
+        by customer_id alone, and retrieval has no ACL filter at all, so every
+        teammate could already read every session. The row therefore described
+        a protection that did not exist, which is worse than describing none:
+        it is exactly the shape of assurance someone relies on. (Found while
+        tracing a leaked AWS key that was readable by the author's whole team
+        despite an ACL naming only them — Anthrogen, 2026-08-30.)
+
+        Team-wide visibility is the product, not the bug: a shared research
+        memory nobody else can read is not a shared memory. So the principal is
+        now the WORKSPACE, matching what the code actually does — the same
+        principal Linear's handler writes for workspace-visible documents.
+
+        Authorship is NOT lost by this: it lives on the AUTHORED graph edge,
+        which is where provenance belonged all along. Access control and
+        attribution are different questions and this row only ever answered
+        one of them.
+        """
         return ACLSnapshot(
             principals=[
                 ACLPrincipal(
-                    principal_type=PrincipalType.USER,
-                    principal_id=employee_id,
+                    principal_type=PrincipalType.WORKSPACE,
+                    principal_id=customer_id,
                     permission=Permission.READ,
                 )
             ],
@@ -914,7 +918,7 @@ class ClaudeCodeConnector(Connector):
             source_id=session_id,
             source_url=f"https://prbe.ai/dashboard/agent-sessions/{session_id}",
             doc_class=DocClass.RAW_SOURCE,
-            doc_type=self._doc_type("session"),
+            doc_type=DocType.CLAUDE_CODE_SESSION,
             content_type="application/json",
             content_hash=content_hash,
             title=title,
@@ -936,7 +940,7 @@ class ClaudeCodeConnector(Connector):
             # versions for the same conversation. See migration 0036 for the
             # one-time cleanup that prunes the prior accumulation.
             coalesce_into_live=not complete,
-            acl=self._acl(employee_id),
+            acl=self._acl(event.customer_id),
         )
 
     @staticmethod
@@ -1243,18 +1247,10 @@ class CodexConnector(ClaudeCodeConnector):
 
     source_system: ClassVar[SourceSystem] = SourceSystem.CODEX
     display_name: ClassVar[str] = "Codex"
-    # Its OWN doc-type family. The parsing, coalescing and staleness curve are
-    # genuinely identical to Claude Code's -- which is why this prefix was
-    # inherited, on purpose, for a long time -- but `doc_type` is the field a
-    # reader sees on a hit, and 10,191 documents said "claude_code" when they
-    # were Codex or pi. `source_system` carried the truth and nothing made
-    # anyone look there. Every other source in the enum takes its prefix from
-    # its own name; these now do too.
-    #
-    # The REST of the source profile (priority 75, 0.5 multiplier, 7d
-    # half-life) is still inherited, and still on purpose: those describe how
-    # the documents behave, which has not changed.
-    doc_type_prefix: ClassVar[str] = "codex."
+    # Source profile (doc_type_prefix "claude_code.", priority 75, 0.5
+    # multiplier, 7d half-life) is inherited from ClaudeCodeConnector on
+    # purpose: same doc shape, same coalescing semantics, same staleness
+    # curve — only the provenance label differs.
     _doc_id_prefix: ClassVar[str] = "codex"
     _agent_label: ClassVar[str] = "codex"
     _session_title_prefix: ClassVar[str] = "Codex session"
@@ -1277,9 +1273,10 @@ class PiConnector(ClaudeCodeConnector):
 
     source_system: ClassVar[SourceSystem] = SourceSystem.PI
     display_name: ClassVar[str] = "pi"
-    # Its own doc-type family, for the reason on CodexConnector above. The rest
-    # of the source profile is still inherited.
-    doc_type_prefix: ClassVar[str] = "pi."
+    # Source profile (doc_type_prefix "claude_code.", priority 75, 0.5
+    # multiplier, 7d half-life) is inherited from ClaudeCodeConnector on
+    # purpose: same doc shape, same coalescing semantics, same staleness
+    # curve — only the provenance label differs.
     _doc_id_prefix: ClassVar[str] = "pi"
     _agent_label: ClassVar[str] = "pi"
     _session_title_prefix: ClassVar[str] = "pi session"

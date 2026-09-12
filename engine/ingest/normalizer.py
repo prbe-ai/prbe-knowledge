@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -39,6 +39,7 @@ from engine.ingest.chunker import (
 from engine.ingest.graph_writer import upsert_edges, upsert_nodes
 from engine.ingest.handlers.base import Connector, ConnectorContext
 from engine.ingest.handlers.registry import build_connector
+from engine.ingest.secret_redaction import redact_documents_async
 from engine.shared.chunk_reconstruction import (
     reconstruct_chunk_text,
     strip_chunk_overlap_tokens,
@@ -1049,6 +1050,67 @@ class Normalizer:
             new_pieces = [_postgres_safe_chunk_piece(piece) for piece in new_pieces]
             if metadata_piece is not None:
                 metadata_piece = _postgres_safe_chunk_piece(metadata_piece)
+
+        # CREDENTIAL REDACTION (the server-side backstop). Runs at this shared
+        # boundary for the same reason NUL normalization does: every connector
+        # reaches persistence through here, so one call covers claude_code,
+        # codex, pi, custom_ingest and manual_uploads, and a new connector
+        # inherits it rather than having to remember.
+        #
+        # BEFORE the content hash, deliberately. The hash is the reuse key: if
+        # it were computed on the pre-redaction text, an unredacted chunk
+        # already stored under that hash would be reused and the redaction
+        # would be a no-op on exactly the documents that needed it.
+        #
+        # Never rejects. A finding replaces a substring and is recorded; it can
+        # never drop a chunk, a document or a batch. The gate removed in
+        # 0.104.9.0 quarantined whole sessions on a finding and lost 33
+        # transcripts to 615 false positives.
+        #
+        # The METADATA chunk goes through with the content chunks. It carries
+        # `summary: <body_preview>`, and body_preview is the first 200 bytes of
+        # the session — so a session whose opening line is an `aws configure`
+        # echo stored the credential in the metadata chunk, embedded it, and
+        # served it from retrieval, while every content chunk was clean. Same
+        # shape as the NUL-escaping block above, which also has to cover it.
+        #
+        # `title` and `body_preview` ride along in the SAME scan. They are
+        # columns on `documents`, not chunks, and grounding runs FTS over
+        # `title || ' ' || body_preview` — so redacting only the chunks left the
+        # value stored and lexically searchable, and a sweep would report the
+        # document clean. body_preview is the first 200 bytes of the session,
+        # which for an `aws configure` echo is exactly the credential.
+        # This runs before `_upsert_document`, so writing back here persists.
+        if new_pieces or metadata_piece is not None:
+            targets = list(new_pieces) + ([metadata_piece] if metadata_piece else [])
+            doc_fields = [doc.title or "", doc.body_preview or ""]
+            redacted_texts, redactions = await redact_documents_async(
+                [p.content for p in targets] + doc_fields
+            )
+            if redactions:
+                piece_texts = redacted_texts[: len(targets)]
+                new_title, new_preview = redacted_texts[len(targets):]
+                rewritten = [
+                    replace(piece, content=text)
+                    for piece, text in zip(targets, piece_texts, strict=True)
+                ]
+                if metadata_piece is not None:
+                    new_pieces, metadata_piece = rewritten[:-1], rewritten[-1]
+                else:
+                    new_pieces = rewritten
+                if doc.title:
+                    doc.title = new_title
+                if doc.body_preview:
+                    doc.body_preview = new_preview
+                log.warning(
+                    "normalizer.credentials_redacted",
+                    customer=customer_id,
+                    doc_id=doc.doc_id,
+                    count=len(redactions),
+                    # Rule ids only. The values are never logged, and
+                    # Redaction has no field that could carry one.
+                    rules=sorted({r.rule for r in redactions}),
+                )
 
         new_hashes: list[str] = [_chunk_hash(p.content) for p in new_pieces]
         new_by_hash: dict[str, ChunkPiece] = {
