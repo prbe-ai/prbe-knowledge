@@ -381,22 +381,36 @@ async def bm25_search(
             params, source_keys, alias="d",
             include_keyless=source_keys_include_keyless,
         )
-        # Project scope goes INDEX-side when the v3 index carries project_id as
-        # a fast field, and stays on the documents join otherwise. Exactly one
-        # of the two applies, never both: applying it twice is harmless for
-        # correctness but pays the heap filter this change exists to remove.
+        # Project scope is applied in BOTH places when the v3 index is live,
+        # and that is not redundancy -- it is the same belt-and-braces the
+        # tenant and visibility filters already use, in the same order.
+        #
+        # The index leg is a PRE-FILTER. It keeps Tantivy's TopK from ranking
+        # the whole tenant and handing the join a pool that is mostly out of
+        # scope. The SQL predicate on the documents join is the CORRECTNESS
+        # filter, and it always runs.
+        #
+        # `match(..., conjunction_mode => true)`, NOT `term()`. `project_id` is
+        # indexed under the default tokenizer, which splits on hyphens -- and a
+        # project_id is a uuid, which is nothing but hyphens. Verified against
+        # a real pg_search index: `term('project_id', '240f2b75-a2ee-...')`
+        # matches ZERO rows, because the whole-string token does not exist.
+        # Shipping that would have made every project-scoped BM25 query return
+        # nothing, silently, under `state: "ok"`.
+        #
+        # This is the identical trap the customer_id clause below documents,
+        # one field over. conjunction_mode requires EVERY token of the id,
+        # which is why it is a sound pre-filter; the SQL predicate is what
+        # makes the answer exact, so a tokenized near-match cannot leak.
         project_index_side = bool(project_id) and await bm25_project_scope_is_index_side(conn)
         project_must = ""
-        project_filter = ""
         if project_index_side:
             params.append(project_id)
-            # `term()`, not `match()`: a project_id is an opaque uuid and must
-            # match whole. `match()` would tokenize it and let a scope leak to
-            # any project sharing a hyphen-delimited segment -- which for uuids
-            # is a real collision, not a theoretical one.
-            project_must = f"paradedb.term('project_id', ${len(params)}),"
-        else:
-            project_filter = project_scope_predicate(params, project_id, alias="d")
+            project_must = (
+                f"paradedb.match('project_id', ${len(params)}, "
+                f"conjunction_mode => true),"
+            )
+        project_filter = project_scope_predicate(params, project_id, alias="d")
 
         pred = build_predicate(
             spec, doc_alias="d", chunk_alias="c", next_param_index=len(params) + 1
@@ -426,9 +440,12 @@ async def bm25_search(
         # document's chunks in the ranking; picking chunk 0 was expressing a
         # ranking idea as a join predicate. The cap below keeps the guarantee
         # the old predicate was really providing.
-        # `project_id` counts as document-level scope ONLY while it is a heap
-        # filter. Once it rides the index, TopK already returns in-scope rows
-        # and widening the pool 4x for it would just do four times the work.
+        # `project_id` counts as document-level scope ONLY while it is a pure
+        # heap filter. Once the index leg pre-filters, TopK already returns a
+        # pool that is almost entirely in scope and the SQL predicate trims a
+        # small residual, so widening 4x for it would be four times the work
+        # for nothing. The other scopes still land only on the join and still
+        # need it.
         scoped = bool(
             sources
             or doc_types

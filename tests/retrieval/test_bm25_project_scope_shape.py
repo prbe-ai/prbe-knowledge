@@ -69,10 +69,46 @@ def test_the_scoped_pool_factor_still_exists_for_the_other_scopes() -> None:
     assert "source_keys" in src
 
 
-def test_the_scope_uses_term_not_match_so_a_uuid_matches_whole() -> None:
-    """`match()` tokenizes. A project_id is an opaque uuid, and tokenizing it
-    would let a scope leak to any project sharing a hyphen-delimited segment --
-    which for uuids is a real collision, not a theoretical one."""
+def test_the_scope_uses_match_not_term_because_a_uuid_is_all_hyphens() -> None:
+    """THE INVERSE of what this test first asserted, and the reason matters.
+
+    `term()` looks up a TOKEN. `project_id` is indexed under the default
+    tokenizer, which splits on hyphens, and a project_id is a uuid -- which is
+    nothing but hyphens. Verified against a real pg_search index:
+    `term('project_id', '240f2b75-a2ee-4189-ad05-9883bd5514a5')` matches ZERO
+    rows, because the whole-string token does not exist.
+
+    Shipping that would have made every project-scoped BM25 query return
+    nothing, silently, under `state: "ok"` -- and it is the identical trap the
+    customer_id clause in this same query already documents, one field over.
+    """
     src = inspect.getsource(bm25.bm25_search)
-    assert "paradedb.term('project_id'" in src
-    assert "paradedb.match('project_id'" not in src
+    assert "paradedb.match('project_id'" in src
+    assert "conjunction_mode => true" in src
+    assert "paradedb.term('project_id'" not in src
+
+
+def test_the_sql_predicate_is_kept_as_the_correctness_filter() -> None:
+    """The index leg is a PRE-FILTER, not the filter.
+
+    conjunction_mode requires every token of the id, which makes it a sound
+    pre-filter but not an equality test. The SQL predicate on the documents
+    join is what makes the answer exact, so it runs whether or not the index
+    leg applied -- the same belt-and-braces, in the same order, that the
+    tenant and visibility filters already use.
+    """
+    src = inspect.getsource(bm25.bm25_search)
+    filter_line = [
+        ln for ln in src.splitlines()
+        if "project_filter = project_scope_predicate" in ln
+    ]
+    assert len(filter_line) == 1, "the SQL predicate must be built exactly once"
+    assert not filter_line[0].strip().startswith("#")
+    # It must NOT sit inside the `if project_index_side:` branch -- that is the
+    # shape that made the two mutually exclusive.
+    indent = len(filter_line[0]) - len(filter_line[0].lstrip())
+    branch = next(ln for ln in src.splitlines() if "if project_index_side" in ln)
+    assert indent <= len(branch) - len(branch.lstrip()), (
+        "the SQL predicate is nested under the index-side branch, so an "
+        "index-side query has no correctness filter"
+    )
