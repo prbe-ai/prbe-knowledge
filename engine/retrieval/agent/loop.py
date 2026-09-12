@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from functools import lru_cache
 from hashlib import sha256
-from typing import TYPE_CHECKING, Any, get_args
+from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from fastapi import HTTPException
 
@@ -64,6 +64,7 @@ from engine.retrieval.agent.tools import (
     tool_definitions,
 )
 from engine.retrieval.channel_health import begin_request, lost_channels
+from engine.retrieval.dedup import dedupe_gathered
 from engine.retrieval.grounding import GroundingBundle
 from engine.retrieval.helpers import expand_to_author_id_set
 from engine.retrieval.retrievers.bm25 import residualize_for_bm25
@@ -94,6 +95,7 @@ from engine.shared.constants import (
     SEARCH_AGENT_MAX_CONTEXT_TOKENS,
     SEARCH_AGENT_MAX_EXTENSIONS,
     SEARCH_AGENT_MAX_OUTPUT_TOKENS,
+    SEARCH_AGENT_MIN_OUTPUT,
     SEARCH_AGENT_PREFANOUT_MAX_SUBQUERIES,
     SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET,
     SEARCH_AGENT_RULER_MIN_CHARS,
@@ -271,6 +273,16 @@ class LoopState:
     # expansion and validation together (a ranked channel that correctly
     # selects a retired chunk must not have fetch_doc substitute live text).
     request_temporal: TemporalSpec = field(default_factory=TemporalSpec)
+    # QueryRequest.recall_floor_mode. `always` is the shipped behaviour;
+    # `conditional` skips the harness top-up when the gatherer's own answer is
+    # confident and substantial. Request-level so the A/B runs per query on one
+    # deployment instead of needing two.
+    request_recall_floor_mode: RecallFloorMode = "always"
+    # Every doc_id the pre-fan-out render actually put in front of the
+    # gatherer. Filled by `_build_user_message`; read by the recall-floor
+    # accounting to separate a candidate the model REJECTED from one it never
+    # saw. Empty when nothing was rendered (id-lookup short circuit).
+    rendered_doc_ids: set[str] = field(default_factory=set)
     # QueryRequest.recency_half_life_days: overrides the per-source decay in
     # `_source_weight` for this request only.
     request_recency_half_life_days: float | None = None
@@ -465,8 +477,31 @@ def _without_trimmable(prefanout: dict[str, Any]) -> dict[str, Any]:
     return stripped
 
 
-def _render_prefanout_budgeted(prefanout: dict[str, Any]) -> str:
+def _all_prefanout_doc_ids(prefanout: dict[str, Any] | None) -> set[str]:
+    """Every doc_id present in a pre-fan-out payload, across all four channels."""
+    out: set[str] = set()
+    for sq in (prefanout or {}).get("sub_queries") or []:
+        if not isinstance(sq, dict):
+            continue
+        for channel in ("vector", "bm25", "graph", "inferred_edge"):
+            for hit in sq.get(channel) or []:
+                if isinstance(hit, dict) and hit.get("doc_id"):
+                    out.add(hit["doc_id"])
+    return out
+
+
+def _render_prefanout_budgeted(
+    prefanout: dict[str, Any], *, rendered_doc_ids: set[str] | None = None
+) -> str:
     """Render the pre-fan-out for the LLM, capped at a token budget.
+
+    `rendered_doc_ids`, when given, is FILLED with every doc_id this render
+    actually put in front of the model. It is an out-parameter rather than a
+    second function because the selection below is the only place that knows
+    what survived the budget, and a recomputation elsewhere would silently
+    drift from it the first time this ranking changes. The recall-floor
+    accounting needs it to tell a candidate the gatherer REJECTED from one it
+    was never shown.
 
     Previously an UNCAPPED `json.dumps` of every hit with full content. That
     dump rides in the message history on every turn and was the primary
@@ -563,6 +598,8 @@ def _render_prefanout_budgeted(prefanout: dict[str, Any]) -> str:
     if len(kept_docs) >= total_trim_docs:
         # Every content doc fits — original behaviour, no filtering overhead.
         # Same serializer the budget costed with, so the two cannot drift.
+        if rendered_doc_ids is not None:
+            rendered_doc_ids.update(_all_prefanout_doc_ids(prefanout))
         return _dump_prefanout(prefanout)
 
     # Trim vector + bm25 to kept docs. Keep every metadata-only hit (no content
@@ -585,6 +622,11 @@ def _render_prefanout_budgeted(prefanout: dict[str, Any]) -> str:
         filtered_sqs.append(new_sq)
     filtered = dict(prefanout)
     filtered["sub_queries"] = filtered_sqs
+    if rendered_doc_ids is not None:
+        # What the model SEES: the content docs that fit, plus everything in
+        # the always-kept baseline. Read off `filtered`, not off `kept_docs`,
+        # so the two can never disagree about the baseline.
+        rendered_doc_ids.update(_all_prefanout_doc_ids(filtered))
     dropped = total_trim_docs - len(kept_docs)
     note = (
         f"\n(pre-fan-out trimmed to fit context: showing the top "
@@ -772,6 +814,7 @@ def _build_user_message(
     doc_types: list[str] | None = None,
     id_pins: list[IdLookupHit] | None = None,
     project_id: str | None = None,
+    rendered_doc_ids: set[str] | None = None,
 ) -> str:
     """Render the per-query user message.
 
@@ -898,7 +941,7 @@ def _build_user_message(
             f"detail on any doc_id, call `fetch_doc(doc_id)`. For exploration, "
             f"call `search` with REFORMULATED queries or `subgraph(anchor)`. "
             f"When you've curated the answer, call `emit_gatherer_output`.\n"
-            f"{_render_prefanout_budgeted(prefanout)}\n"
+            f"{_render_prefanout_budgeted(prefanout, rendered_doc_ids=rendered_doc_ids)}\n"
             f"</channel_results>"
         )
         chains_block = _format_inferred_chains(prefanout)
@@ -1785,6 +1828,36 @@ def _build_prefanout_doc_meta(prefanout: dict[str, Any] | None) -> dict[str, dic
 # is strictly safe.
 _RECALL_FLOOR_DOCS = 10
 
+
+#: `always` = top the response up to `_RECALL_FLOOR_DOCS` on every query (the
+#: shipped behaviour). `conditional` = only when the gatherer's own answer is
+#: thin. Defined here rather than in models.py because the loop is what acts
+#: on it; `QueryRequest.recall_floor_mode` re-exports the same Literal.
+RecallFloorMode = Literal["always", "conditional"]
+
+
+@dataclass(slots=True)
+class RecallFloorOutcome:
+    """What the recall floor did, and the two numbers the A/B is graded on.
+
+    `appended` alone cannot distinguish a gatherer that curated well from one
+    that was never shown the candidates -- both produce a large backfill. So:
+
+      rejected   — pool docs the gatherer WAS shown and chose not to emit.
+                   High and rising means curation is doing real work.
+      unexamined — pool docs that never fit the render budget. High means the
+                   budget, not the prompt, is the ceiling; no amount of prompt
+                   work recovers these.
+
+    `reason` records why the floor fired or did not, so a skipped backfill is
+    as visible in the logs as a performed one.
+    """
+
+    appended: int
+    reason: str
+    rejected: int
+    unexamined: int
+
 # Reciprocal-rank-fusion constant. Standard value; rank is 0-based so the
 # top hit of any list contributes 1/(_RRF_K + 1).
 _RRF_K = 60
@@ -2006,31 +2079,142 @@ def _resolve_spans(gathered: GathererOutput, state: LoopState, *, query: str) ->
         )
 
 
+def _log_recall_floor(
+    outcome: RecallFloorOutcome,
+    *,
+    customer_id: str,
+    trace_id: str,
+    status: str,
+    mode: RecallFloorMode,
+    total_chunks: int,
+) -> None:
+    """One log line per query, whether or not the floor fired.
+
+    Logged unconditionally -- the old call site logged only when it appended,
+    which made "the floor was skipped because the gatherer was good" and "the
+    floor never ran" the same observation. The A/B needs to tell those apart.
+    """
+    log.info(
+        "agent.recall_floor",
+        customer_id=customer_id,
+        trace_id=trace_id,
+        status=status,
+        mode=mode,
+        reason=outcome.reason,
+        appended=outcome.appended,
+        # Pool docs the gatherer saw and declined vs. never saw. See
+        # RecallFloorOutcome.
+        rejected=outcome.rejected,
+        unexamined=outcome.unexamined,
+        total_chunks=total_chunks,
+    )
+
+
+def _recall_floor_should_backfill(
+    gathered: GathererOutput, *, mode: RecallFloorMode
+) -> tuple[bool, str]:
+    """Should the harness top this response up from the raw pool?
+
+    Returns `(backfill, reason)`; `reason` is logged so a skipped backfill is
+    as visible as a performed one.
+
+        mode=always       -> always, the shipped behaviour
+        mode=conditional  -> only when the curated answer looks THIN:
+                               confidence is not "high",  OR
+                               the gatherer emitted < SEARCH_AGENT_MIN_OUTPUT
+                               chunks,                    OR
+                               confidence is ABSENT
+
+    WHY CONDITIONAL AT ALL. The floor was unconditional, and it supplies 88% of
+    returned chunks: the gatherer's curation -- the `why_relevant` line, the
+    confidence grade, the decision NOT to emit something -- is a rounding error
+    in what a consumer actually receives. Skipping the top-up when the gatherer
+    already did a confident, substantial job is what makes curation mean
+    anything. It is a request-level A/B rather than a flip because the graded
+    metric is set-recall, and trading recall for precision is exactly the kind
+    of change that must be measured on a paired run, not asserted.
+
+    WHY ABSENT CONFIDENCE BACKFILLS (fail OPEN). A missing `confidence` is not
+    a low grade, it is a PARSE recovery: `_coerce_lenient` rebuilt an
+    off-schema emit (~2% of calls) and the field never survived. Treating that
+    as "not high" and backfilling keeps a provider quirk from silently cutting
+    recall; treating it as high would let the thinnest answers skip the floor.
+    """
+    if mode == "always":
+        return True, "mode_always"
+    confidence = getattr(gathered.gatherer_notes, "confidence", None)
+    if confidence not in _CONFIDENCE_VALID:
+        # Absent or unparseable -> a schema recovery, not a verdict. Fail open.
+        return True, "confidence_absent"
+    if confidence != "high":
+        return True, f"confidence_{confidence}"
+    emitted = len([c for c in gathered.chunks if c.doc_id])
+    if emitted < SEARCH_AGENT_MIN_OUTPUT:
+        return True, "output_below_min"
+    return False, "gatherer_sufficient"
+
+
 def _backfill_recall_floor(
     gathered: GathererOutput,
     prefanout: dict[str, Any] | None,
     *,
     half_life_days: float | None = None,
-) -> int:
+    mode: RecallFloorMode = "always",
+    examined_doc_ids: set[str] | None = None,
+) -> RecallFloorOutcome:
     """Append top fused pre-fan-out docs the gatherer didn't emit until the
     response carries at least `_RECALL_FLOOR_DOCS` distinct docs.
 
-    No-op when the pool is empty or the gatherer already cleared the floor.
-    Mutates `gathered.chunks` in place; returns the number of docs appended.
+    No-op when the pool is empty, when the gatherer already cleared the floor,
+    or when `mode="conditional"` and the curated answer is already good enough
+    (see `_recall_floor_should_backfill`). Mutates `gathered.chunks` in place.
+
+    THE DECISION, in order:
+
+        pool empty ----------------------------> nothing to append
+        mode=conditional and answer is strong -> skipped, reason recorded
+        floor already cleared -----------------> nothing needed
+        otherwise -----------------------------> append pool docs, newest
+                                                 fused rank first, each
+                                                 tagged `recall_floor`
+
+    Returns a `RecallFloorOutcome` carrying the count, the decision reason, and
+    the two numbers the A/B is graded on: how many pool docs the gatherer SAW
+    and did not emit (`rejected`) versus how many never reached it at all
+    (`unexamined`). Backfill share on its own cannot tell a gatherer that
+    curates well from one that never got the candidates.
     """
+    fused = _fuse_prefanout_docs(prefanout, half_life_days=half_life_days)
     emitted_docs = {c.doc_id for c in gathered.chunks if c.doc_id}
+    examined = {d for d in (examined_doc_ids or set()) if d}
+    pool_docs = {entry["doc_id"] for entry in fused}
+    # A pool doc the gatherer saw and chose not to emit is a REJECTION -- the
+    # curation working. A pool doc it never saw is a RENDER-BUDGET miss, which
+    # no prompt change can fix. They look identical in a backfill count.
+    rejected = len((pool_docs & examined) - emitted_docs) if examined else 0
+    unexamined = len(pool_docs - examined - emitted_docs) if examined else len(
+        pool_docs - emitted_docs
+    )
+
+    should, reason = _recall_floor_should_backfill(gathered, mode=mode)
+    if not should:
+        return RecallFloorOutcome(
+            appended=0, reason=reason, rejected=rejected, unexamined=unexamined
+        )
+
     needed = _RECALL_FLOOR_DOCS - len(emitted_docs)
     if needed <= 0:
-        return 0
+        return RecallFloorOutcome(
+            appended=0, reason="floor_already_met", rejected=rejected, unexamined=unexamined
+        )
     appended = 0
-    for entry in _fuse_prefanout_docs(prefanout, half_life_days=half_life_days):
+    for entry in fused:
         if appended >= needed:
             break
         doc_id = entry["doc_id"]
         if doc_id in emitted_docs:
             continue
         hit = entry["hit"]
-        channel = entry["channel"]
         gathered.chunks.append(
             GatheredChunk(
                 doc_id=doc_id,
@@ -2043,7 +2227,12 @@ def _backfill_recall_floor(
                 # on that), so a harness-appended chunk says so on itself rather
                 # than hiding behind an empty why_relevant.
                 harness_appended=True,
-                matched_via=[channel] if channel in _MATCHED_VIA_VALID else [],
+                # `recall_floor`, NOT the channel the hit came from. The channel
+                # would claim a model surfaced this passage on purpose; it did
+                # not. Carrying the real provenance is what lets a consumer
+                # weigh curated evidence against raw pool recall at all -- see
+                # MatchProvenance.channel.
+                matched_via=["recall_floor"],
                 why_relevant="",
                 source_system=(
                     hit.get("source_system")
@@ -2059,7 +2248,9 @@ def _backfill_recall_floor(
         )
         emitted_docs.add(doc_id)
         appended += 1
-    return appended
+    return RecallFloorOutcome(
+        appended=appended, reason=reason, rejected=rejected, unexamined=unexamined
+    )
 
 
 def _coerce_lenient(raw: dict[str, Any], state: LoopState | None = None) -> dict[str, Any]:
@@ -2771,6 +2962,19 @@ async def run_gatherer(
     request_doc_types = req.doc_types or None
     request_sources = [s.value for s in req.sources] if req.sources else None
     request_discovery = bool(req.discovery)
+    # The A/B lever. `conditional` is honoured only when the deployment opts in,
+    # exactly like any other unreleased retrieval posture: a request must not be
+    # able to change how much recall a tenant gets until we have measured it.
+    # Off -> every request runs `always`, the shipped behaviour, whatever it asks
+    # for. The rejection is silent by design (the request is still valid and
+    # still served); `agent.recall_floor` logs the mode actually applied.
+    from engine.shared.config import get_settings as _get_settings
+
+    request_recall_floor_mode: RecallFloorMode = (
+        req.recall_floor_mode
+        if _get_settings().recall_floor_conditional_enabled
+        else "always"
+    )
     request_source_keys_include_keyless = bool(req.source_keys_include_keyless)
     request_per_source_top_k = req.per_source_top_k
     effective_doc_types = request_doc_types or search_options.doc_types or None
@@ -2869,6 +3073,9 @@ async def run_gatherer(
     )
 
     # Step 3 — Build the user message and short-circuit if no LLM.
+    # Filled by the render below with exactly the doc_ids the gatherer is
+    # shown, then carried on LoopState for the recall-floor accounting.
+    rendered_doc_ids: set[str] = set()
     user_msg = _build_user_message(
         req.query,
         bundle,
@@ -2879,6 +3086,7 @@ async def run_gatherer(
         doc_types=request_doc_types,
         id_pins=id_pins,
         project_id=request_project_id,
+        rendered_doc_ids=rendered_doc_ids,
     )
     system_prompt = build_system_prompt(datetime.now(UTC))
 
@@ -2893,6 +3101,8 @@ async def run_gatherer(
         pre_fanout_author_ids=list(author_ids),
         request_source_keys=request_source_keys,
         request_project_id=request_project_id,
+        request_recall_floor_mode=request_recall_floor_mode,
+        rendered_doc_ids=rendered_doc_ids,
         request_temporal=request_temporal,
         request_recency_half_life_days=request_recency_half_life_days,
         request_doc_types=request_doc_types,
@@ -2966,18 +3176,21 @@ async def run_gatherer(
             confidence="high",
             record_drop=False,
         )
-        backfilled = _backfill_recall_floor(
-            gathered, state.prefanout, half_life_days=state.request_recency_half_life_days
+        floor = _backfill_recall_floor(
+            gathered,
+            state.prefanout,
+            half_life_days=state.request_recency_half_life_days,
+            mode=state.request_recall_floor_mode,
+            examined_doc_ids=state.rendered_doc_ids,
         )
-        if backfilled:
-            log.info(
-                "agent.recall_floor_backfill",
-                customer_id=customer_id,
-                trace_id=trace_id,
-                status=status,
-                appended=backfilled,
-                total_chunks=len(gathered.chunks),
-            )
+        _log_recall_floor(
+            floor,
+            customer_id=customer_id,
+            trace_id=trace_id,
+            status=status,
+            mode=state.request_recall_floor_mode,
+            total_chunks=len(gathered.chunks),
+        )
         timing["agent_ms"] = (time.perf_counter() - t_agent) * 1000
         if request is not None:
             status = merge_channel_loss(status, lost_channels())
@@ -3291,17 +3504,40 @@ async def run_gatherer(
     # graded recall isn't capped by hand-curation. Latency-neutral — no
     # added LLM turn. Also recovers recall on degraded paths (loop_timeout
     # / schema_violation) where `gathered` is empty but the pool has hits.
-    backfilled = _backfill_recall_floor(
-        gathered, state.prefanout, half_life_days=state.request_recency_half_life_days
+    floor = _backfill_recall_floor(
+        gathered,
+        state.prefanout,
+        half_life_days=state.request_recency_half_life_days,
+        mode=state.request_recall_floor_mode,
+        examined_doc_ids=state.rendered_doc_ids,
     )
-    if backfilled:
+    _log_recall_floor(
+        floor,
+        customer_id=customer_id,
+        trace_id=trace_id,
+        status=status,
+        mode=state.request_recall_floor_mode,
+        total_chunks=len(gathered.chunks),
+    )
+
+    # Dedupe AFTER the backfill, never inside it. The pool can hold the same
+    # passage the gatherer already emitted (a Slack cross-post, a Notion
+    # mirror), and order here is delivery order -- gatherer picks first -- so
+    # the curated copy with its `why_relevant` line is the one that survives.
+    # `dedupe()` has existed with zero callers since the agentic cutover; this
+    # is it re-attached, with the cheap exact-content stage in front.
+    t_dedupe = time.perf_counter()
+    deduped, dropped = dedupe_gathered(gathered.chunks)
+    timing["agent_dedupe_ms"] = (time.perf_counter() - t_dedupe) * 1000
+    if dropped:
+        gathered.chunks = deduped
         log.info(
-            "agent.recall_floor_backfill",
+            "agent.dedupe",
             customer_id=customer_id,
             trace_id=trace_id,
-            status=status,
-            appended=backfilled,
-            total_chunks=len(gathered.chunks),
+            dropped=dropped,
+            kept=len(deduped),
+            dedupe_ms=round(timing["agent_dedupe_ms"], 2),
         )
 
     _resolve_spans(gathered, state, query=state.query)

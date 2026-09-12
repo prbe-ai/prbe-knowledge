@@ -34,6 +34,10 @@ MatchedViaChannel = Literal[
     "id_lookup",
     "entity_cluster",
     "reissue",
+    # Harness-appended to clear the recall floor. See MatchProvenance.channel
+    # in shared/models.py for why this is its own name and not the channel the
+    # chunk was pulled from.
+    "recall_floor",
 ]
 
 ConfidenceLabel = Literal["high", "medium", "low"]

@@ -356,7 +356,48 @@ async def record_timeline(conn: asyncpg.Connection, timeline_id: int) -> None:
 # the guardian should MISS when it is gone. Today that is exactly the BM25
 # index -- the one whose absence makes lexical search silently return nothing
 # while every tick reads `broken_count: 0`.
-REQUIRED_PG_SEARCH_INDEXES: dict[str, str] = {"idx_chunks_bm25_v2": "chunks"}
+REQUIRED_PG_SEARCH_INDEXES: dict[str, str] = {"idx_chunks_bm25_v3": "chunks"}
+
+#: The BM25 index the product wants, by generation. v3 (migration 0131) adds
+#: `project_id` as a fast field so a project scope filters index-side.
+#:
+#: WHICH ONE IS REQUIRED IS NOT A CONSTANT, and it cannot be: pg_search allows
+#: exactly ONE `USING bm25` index per relation, so v2 and v3 are mutually
+#: exclusive and the answer depends on the database in front of you. The
+#: discriminator is the COLUMN, not the index -- `chunks.project_id` exists
+#: from 0131 onward, and creating v3 without it fails. So:
+#:
+#:     column absent  -> v2 is required (pre-0131 database)
+#:     column present -> v3 is required (0131 onward)
+#:
+#: This matters most in the guardian's own repair path. It DROPS a broken index
+#: and leaves the table with none; the next rebuild then recreates whichever
+#: generation this function names. Hard-coding v2 would mean a database that
+#: had already been swapped to v3 silently regressed to v2 the first time the
+#: index broke, taking index-side project scope with it and giving no signal at
+#: all -- lexical search would work, just slower and with a wider pool.
+BM25_INDEX_V2 = "idx_chunks_bm25_v2"
+BM25_INDEX_V3 = "idx_chunks_bm25_v3"
+
+#: v3 is what `REQUIRED_PG_SEARCH_INDEXES` and `db/schema.sql` name, because
+#: that is what a database SHOULD have. v2 is still buildable -- a database
+#: where 0131 has not run yet has no `chunks.project_id` and v3's DDL would
+#: fail there -- so its DDL lives in `LEGACY_INDEX_DDL` instead, deliberately
+#: outside the "must match schema.sql" contract that the current generation is
+#: held to. Drop it once 0131 is everywhere.
+
+
+async def required_bm25_index(conn: asyncpg.Connection) -> str:
+    """Which BM25 index generation this database should have. See above."""
+    has_project_id = await conn.fetchval(
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM information_schema.columns
+             WHERE table_name = 'chunks' AND column_name = 'project_id'
+        )
+        """
+    )
+    return BM25_INDEX_V3 if has_project_id else BM25_INDEX_V2
 
 
 async def find_absent_required_indexes(conn: asyncpg.Connection) -> list[str]:
@@ -374,12 +415,29 @@ async def find_absent_required_indexes(conn: asyncpg.Connection) -> list[str]:
     fresh or partially-migrated database the missing piece is the table, and
     that is the migration chain's problem, not a search outage.
     """
+    # The BM25 entry is resolved per-database (see `required_bm25_index`);
+    # everything else in the registry is a fixed name.
+    required = dict(REQUIRED_PG_SEARCH_INDEXES)
+    bm25_table = required.pop(BM25_INDEX_V3, None)
+    if bm25_table is not None:
+        required[await required_bm25_index(conn)] = bm25_table
+
     absent: list[str] = []
-    for index_name, table_name in REQUIRED_PG_SEARCH_INDEXES.items():
+    for index_name, table_name in required.items():
         if await conn.fetchval("SELECT to_regclass($1)", index_name) is not None:
             continue
         if await conn.fetchval("SELECT to_regclass($1)", table_name) is None:
             continue
+        # An index of the OTHER generation standing in this one's place is not
+        # an absence: both serve lexical search, and only a deliberate swap
+        # moves between them. Reporting it would have the guardian try to
+        # CREATE a second bm25 index on `chunks`, which pg_search refuses
+        # outright ("a relation may only have one `USING bm25` index") -- an
+        # unattended job failing every tick on a healthy database.
+        if index_name in (BM25_INDEX_V2, BM25_INDEX_V3):
+            other = BM25_INDEX_V2 if index_name == BM25_INDEX_V3 else BM25_INDEX_V3
+            if await conn.fetchval("SELECT to_regclass($1)", other) is not None:
+                continue
         absent.append(index_name)
     return absent
 
@@ -440,6 +498,30 @@ async def record_known_absent(conn: asyncpg.Connection, absent: frozenset[str]) 
 # `IF NOT EXISTS` is deliberate. The rebuild only runs when the index is already
 # known absent, but two ticks racing is not worth a crash.
 REQUIRED_INDEX_DDL: dict[str, str] = {
+    "idx_chunks_bm25_v3": """
+        CREATE INDEX IF NOT EXISTS idx_chunks_bm25_v3
+        ON chunks USING bm25 (
+            chunk_id, content, title, customer_id, doc_id, kind,
+            chunk_index, first_seen_version, last_seen_version, visibility,
+            project_id
+        )
+        WITH (
+            key_field=chunk_id,
+            text_fields='{"title": {"tokenizer": {"type": "source_code"}}}'
+        )
+    """,
+}
+
+#: DDL for index generations that are no longer the target but are still
+#: buildable, and must stay buildable: a database where migration 0131 has not
+#: run has no `chunks.project_id`, so v3's DDL fails there and v2 is the only
+#: index it can have. Held OUTSIDE `REQUIRED_INDEX_DDL` on purpose -- that dict
+#: is pinned against `db/schema.sql`, and schema.sql declares the CURRENT
+#: generation only. A legacy entry cannot satisfy that contract and should not
+#: pretend to.
+#:
+#: Delete an entry here once no database can still be on it.
+LEGACY_INDEX_DDL: dict[str, str] = {
     "idx_chunks_bm25_v2": """
         CREATE INDEX IF NOT EXISTS idx_chunks_bm25_v2
         ON chunks USING bm25 (
@@ -452,6 +534,11 @@ REQUIRED_INDEX_DDL: dict[str, str] = {
         )
     """,
 }
+
+
+def index_ddl(index_name: str) -> str | None:
+    """DDL for an index, current generation or legacy. None if undeclared."""
+    return REQUIRED_INDEX_DDL.get(index_name) or LEGACY_INDEX_DDL.get(index_name)
 
 # Advisory lock key. Two rebuilds of the same index at once would each hold a
 # SHARE lock and build a 500MB+ index; the second is pure waste at best. The
@@ -518,10 +605,27 @@ async def rebuild_absent_index(
     comes from REQUIRED_INDEX_DDL. Neither carries a value derived from user
     input or from the database.
     """
-    if index_name not in REQUIRED_INDEX_DDL:
+    ddl = index_ddl(index_name)
+    if ddl is None:
         raise ValueError(f"no rebuild DDL declared for index: {index_name!r}")
 
-    ddl = REQUIRED_INDEX_DDL[index_name]
+    # pg_search allows ONE bm25 index per relation. Building the second
+    # generation while the first still stands fails on that rule, and the
+    # failure looks like a broken rebuild job rather than what it is. Refuse
+    # early with a message that says which one is in the way -- moving between
+    # generations is a deliberate swap (`scripts/swap_bm25_index.py`), never
+    # something an unattended tick does.
+    if index_name in (BM25_INDEX_V2, BM25_INDEX_V3):
+        other = BM25_INDEX_V2 if index_name == BM25_INDEX_V3 else BM25_INDEX_V3
+        if await conn.fetchval("SELECT to_regclass($1)", other) is not None:
+            log.warning(
+                "rebuild.skipped_other_bm25_generation",
+                wanted=index_name,
+                present=other,
+                reason="one bm25 index per relation; swap deliberately, not here",
+            )
+            return False
+
     if dry_run:
         log.info("rebuild.would_build", index=index_name)
         return False

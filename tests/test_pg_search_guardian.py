@@ -373,11 +373,39 @@ async def test_absent_required_index_is_reported() -> None:
     required index must be its own signal."""
     conn = _FakeConn()
 
-    async def _regclass(_sql: str, name: str) -> Any:
-        return None if name == "idx_chunks_bm25_v2" else "present"
+    async def _regclass(sql: str, *args: Any) -> Any:
+        # Which BM25 generation is required is resolved per-database off the
+        # presence of `chunks.project_id` (migration 0131). This database has
+        # not run it, so v2 is what it should have -- and what it is missing.
+        if "information_schema.columns" in sql:
+            return False
+        # NEITHER bm25 generation exists -- the guardian dropped the broken one
+        # and the table now has none. An index of the other generation standing
+        # here would NOT be an absence, which is its own test below.
+        if args[0].startswith("idx_chunks_bm25"):
+            return None
+        return "present"
 
     conn.fetchval = _regclass  # type: ignore[method-assign]
     assert await guardian.find_absent_required_indexes(conn) == ["idx_chunks_bm25_v2"]  # type: ignore[arg-type]
+
+
+async def test_a_post_0131_database_reports_v3_absent_not_v2() -> None:
+    """The same absence on a migrated database names the OTHER generation.
+
+    Hard-coding v2 here would mean a database already swapped to v3 silently
+    regressed the first time its index broke and the guardian repaired it --
+    lexical search would still work, just without index-side project scope,
+    and nothing anywhere would say so."""
+    conn = _FakeConn()
+
+    async def _regclass(sql: str, *args: Any) -> Any:
+        if "information_schema.columns" in sql:
+            return True
+        return None if args[0].startswith("idx_chunks_bm25") else "present"
+
+    conn.fetchval = _regclass  # type: ignore[method-assign]
+    assert await guardian.find_absent_required_indexes(conn) == ["idx_chunks_bm25_v3"]  # type: ignore[arg-type]
 
 
 async def test_absent_table_is_the_migrations_problem_not_ours() -> None:
@@ -386,7 +414,9 @@ async def test_absent_table_is_the_migrations_problem_not_ours() -> None:
     for every `docker compose up`."""
     conn = _FakeConn()
 
-    async def _regclass(_sql: str, _name: str) -> Any:
+    async def _regclass(sql: str, *_args: Any) -> Any:
+        if "information_schema.columns" in sql:
+            return False
         return None  # neither index nor table exists
 
     conn.fetchval = _regclass  # type: ignore[method-assign]
