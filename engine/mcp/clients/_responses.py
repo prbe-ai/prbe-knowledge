@@ -26,6 +26,9 @@ _TOP_LEVEL_DROP = frozenset(
         "applied_mode",
         "applied_doc_types",
         "applied_sources",
+        # The MCP tool surface exposes no scope argument, so the echo can
+        # only ever be null here; dropped with its siblings.
+        "applied_scope",
         "aggregation",
         "router_hit_cache",
     }

@@ -162,8 +162,8 @@ def _doc_scope_sql(
     """Append scope params and return AND-predicates against a documents alias.
 
     Same predicates the retrieval channels apply (request-level
-    QueryRequest.source_keys / .doc_types hard scope). Mutates `params`
-    in place; returns '' when no scope is set.
+    QueryRequest.source_keys / .doc_types / .scope.project_id hard scope).
+    Mutates `params` in place; returns '' when no scope is set.
 
     `source_keys_include_keyless` mirrors `helpers.source_key_predicate`: it
     admits keyless docs (connector-ingested — github, claude_code) alongside
@@ -718,7 +718,7 @@ async def execute_subgraph(
     strings surface inline. Optionally expands entity aliases
     (`include_aliases=True`) so Person/Repo clusters are visible.
 
-    `source_keys` / `doc_types` (harness-injected request scope): applied
+    `source_keys` / `doc_types` / `project_id` (harness-injected request scope): applied
     to the inferred-edge CONTENT enrichment only. The node walk itself is
     deliberately unconstrained -- it returns graph structure (labels,
     canonical ids, trimmed properties), not document content, and entity
@@ -870,7 +870,7 @@ async def execute_fetch_doc(
     also lets the agent reach a chunk past the first page — the prior
     `LIMIT`-only query could never return a matched chunk at index >= 10.
 
-    `source_keys` / `doc_types` (harness-injected request scope, never on
+    `source_keys` / `doc_types` / `project_id` (harness-injected request scope, never on
     the agent tool schema): when set, a doc outside the scope returns an
     empty page with a refusal note instead of content, and any evidence
     chunks hydrated from OTHER docs are scope-filtered too. Closes the
@@ -1075,7 +1075,7 @@ async def execute_fetch_chunk_window(
     fixed-window fragmentation of the 512-token chunker, WITHOUT hauling the
     whole doc. Total chunks returned <= before + 1 + after.
 
-    `source_keys` / `doc_types` (harness-injected request scope): the
+    `source_keys` / `doc_types` / `project_id` (harness-injected request scope): the
     target chunk's parent document must pass the scope or the window
     comes back empty — the whole window shares that doc, so gating the
     target CTE gates everything.

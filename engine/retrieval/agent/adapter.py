@@ -362,6 +362,112 @@ def _chunk_to_query_chunk(
     )
 
 
+async def _scope_verdicts(
+    customer_id: str,
+    doc_ids: list[str],
+    *,
+    source_keys: list[str] | None,
+    doc_types: list[str] | None,
+    source_keys_include_keyless: bool = False,
+    sources: list[str] | None = None,
+    project_id: str | None = None,
+) -> dict[str, bool]:
+    """Re-verify document ids against the LIVE documents row and the request
+    scope. Returns {doc_id: in_scope} for every id that HAS a live row; ids
+    with no live row are absent (unverifiable -- callers treat absent as
+    out of scope for content, and as "not a document" for graph neighbours,
+    which may be entity nodes). One query, one predicate, shared by the
+    chunk gate and the graph-evidence filter so the two cannot disagree.
+    """
+    verdicts: dict[str, bool] = {}
+    if not doc_ids:
+        return verdicts
+    async with with_tenant(customer_id) as conn:
+        rows = await conn.fetch(
+            """
+            SELECT doc_id, doc_type, source_system,
+                   metadata->>'source_key' AS source_key,
+                   metadata->>'project_id' AS project_id
+            FROM documents
+            WHERE customer_id = $1 AND doc_id = ANY($2::text[])
+              AND valid_to IS NULL
+            """,
+            customer_id,
+            doc_ids,
+        )
+    for r in rows:
+        ok = True
+        if source_keys and not (
+            r["source_key"] in source_keys
+            # Keyless tolerance must match what the channels admitted
+            # (helpers.source_key_predicate). Without this the gate
+            # dropped every connector doc the request had explicitly
+            # opted into, emptying the response.
+            or (source_keys_include_keyless and r["source_key"] is None)
+        ):
+            ok = False
+        if doc_types and r["doc_type"] not in doc_types:
+            ok = False
+        if sources and r["source_system"] not in sources:
+            ok = False
+        if project_id and r["project_id"] != project_id:
+            ok = False
+        verdicts[r["doc_id"]] = ok
+    return verdicts
+
+
+async def _scope_graph_evidence(
+    customer_id: str,
+    doc_evidence: dict[str, list[GraphEvidence]],
+    *,
+    source_keys: list[str] | None,
+    doc_types: list[str] | None,
+    source_keys_include_keyless: bool = False,
+    sources: list[str] | None = None,
+    project_id: str | None = None,
+    trace_id: str = "",
+) -> None:
+    """Drop graph-evidence entries whose `via_entity` is a live DOCUMENT
+    outside the request scope. Mutates `doc_evidence` in place.
+
+    The chunk gate keeps out-of-scope CONTENT out of the response, but the
+    inferred-edge enrichment runs on the curated result set and projects the
+    OTHER endpoint of every edge -- title, url, source -- with no scope check
+    (review finding: a project-scoped response disclosed a neighbouring
+    project's documents through `graph_evidence`). `via_entity` may also be
+    an entity node (a person, a ticket) with no documents row; those have
+    nothing to leak and are kept.
+    """
+    if not doc_evidence:
+        return
+    via_ids = sorted({ev.via_entity for evs in doc_evidence.values() for ev in evs if ev.via_entity})
+    verdicts = await _scope_verdicts(
+        customer_id,
+        via_ids,
+        source_keys=source_keys,
+        doc_types=doc_types,
+        source_keys_include_keyless=source_keys_include_keyless,
+        sources=sources,
+        project_id=project_id,
+    )
+    dropped = 0
+    for doc_id, evs in list(doc_evidence.items()):
+        kept = [ev for ev in evs if verdicts.get(ev.via_entity, True)]
+        dropped += len(evs) - len(kept)
+        if kept:
+            doc_evidence[doc_id] = kept
+        else:
+            del doc_evidence[doc_id]
+    if dropped:
+        log.info(
+            "adapter.scope_gate_dropped_graph_evidence",
+            customer_id=customer_id,
+            trace_id=trace_id,
+            dropped=dropped,
+            project_id=project_id,
+        )
+
+
 async def _enforce_scope_on_chunks(
     customer_id: str,
     gathered: GathererOutput,
@@ -375,8 +481,9 @@ async def _enforce_scope_on_chunks(
 ) -> None:
     """Hard scope gate at the response choke point. Mutates gathered.chunks.
 
-    The request-level source_keys / doc_types scope is enforced in every
-    retrieval channel's SQL and injected into the agent's content tools,
+    The request-level source_keys / doc_types / sources / project_id scope is
+    enforced in every retrieval channel's SQL and injected into the agent's
+    content tools,
     but the gatherer is an LLM loop: navigation surfaces (subgraph node
     metadata, grounding, its own prior context) can still hand it an
     out-of-scope doc_id to emit. This recheck is the guarantee the
@@ -388,38 +495,16 @@ async def _enforce_scope_on_chunks(
     if not gathered.chunks:
         return
     doc_ids = sorted({c.doc_id for c in gathered.chunks if c.doc_id})
-    allowed: set[str] = set()
-    if doc_ids:
-        async with with_tenant(customer_id) as conn:
-            rows = await conn.fetch(
-                """
-                SELECT doc_id, doc_type, source_system,
-                       metadata->>'source_key' AS source_key,
-                       metadata->>'project_id' AS project_id
-                FROM documents
-                WHERE customer_id = $1 AND doc_id = ANY($2::text[])
-                  AND valid_to IS NULL
-                """,
-                customer_id,
-                doc_ids,
-            )
-        for r in rows:
-            if source_keys and not (
-                r["source_key"] in source_keys
-                # Keyless tolerance must match what the channels admitted
-                # (helpers.source_key_predicate). Without this the gate
-                # dropped every connector doc the request had explicitly
-                # opted into, emptying the response.
-                or (source_keys_include_keyless and r["source_key"] is None)
-            ):
-                continue
-            if doc_types and r["doc_type"] not in doc_types:
-                continue
-            if sources and r["source_system"] not in sources:
-                continue
-            if project_id and r["project_id"] != project_id:
-                continue
-            allowed.add(r["doc_id"])
+    verdicts = await _scope_verdicts(
+        customer_id,
+        doc_ids,
+        source_keys=source_keys,
+        doc_types=doc_types,
+        source_keys_include_keyless=source_keys_include_keyless,
+        sources=sources,
+        project_id=project_id,
+    )
+    allowed = {d for d, ok in verdicts.items() if ok}
     kept = [c for c in gathered.chunks if c.doc_id and c.doc_id in allowed]
     dropped = len(gathered.chunks) - len(kept)
     if dropped:
@@ -495,11 +580,13 @@ async def to_query_response(
     Zero disables it; positive values cap it without removing gathered entity
     rows or `extracted_entities` from the core response.
 
-    `source_keys` / `doc_types` (optional): the caller's request-level hard
-    scope. When either is set (and customer_id is available), every gathered
-    chunk is re-verified against the live documents row and out-of-scope /
-    unverifiable chunks are dropped BEFORE the response is assembled -- see
-    _enforce_scope_on_chunks. This is the final gate behind the per-channel
+    `source_keys` / `doc_types` / `sources` / `project_id` (optional): the
+    caller's request-level hard scope. When any is set (and customer_id is
+    available), every gathered chunk is re-verified against the live
+    documents row and out-of-scope / unverifiable chunks are dropped BEFORE
+    the response is assembled -- see _enforce_scope_on_chunks -- and graph
+    evidence pointing at an out-of-scope document is dropped the same way
+    (_scope_graph_evidence). This is the final gate behind the per-channel
     SQL filters and the tool-dispatch injection.
 
     `status` (REQUIRED, may be None): the harness's terminal GathererStatus.
@@ -622,6 +709,21 @@ async def to_query_response(
                     continue
                 seen.add(key)
                 existing.append(ev)
+
+    # The evidence neighbours are subject to the same scope as the chunks:
+    # an in-scope result's edge to an out-of-scope document must not carry
+    # that document's title / url into a scoped response.
+    if (source_keys or doc_types or sources or project_id) and customer_id:
+        await _scope_graph_evidence(
+            customer_id,
+            doc_evidence,
+            source_keys=source_keys,
+            doc_types=doc_types,
+            source_keys_include_keyless=source_keys_include_keyless,
+            sources=sources,
+            project_id=project_id,
+            trace_id=trace_id,
+        )
 
     # Group chunks by doc_id.
     doc_groups: dict[str, list[Any]] = {}

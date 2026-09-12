@@ -5,7 +5,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from engine.shared.constants import (
     MAX_REQUEST_SOURCE_KEYS,
@@ -282,11 +282,14 @@ class ScopeSpec(BaseModel):
     the final live-row gate, so a scoped request never spends its `top_k` on
     out-of-scope documents and then reports "nothing here".
 
-    `project_id` matches `documents.metadata->>'project_id'`, which the
-    research-os custom-ingest projections stamp on every entity, artifact and
-    digest document that belongs to a project. Documents carrying no
-    project_id (team notes, workspace files) are excluded by a project scope
-    -- a scope is a hard filter, not a boost.
+    `project_id` is an exact match on `documents.metadata->>'project_id'`,
+    a key the ingesting client stamps per document (research-os: run,
+    experiment and project projections carry it today; artifacts and digests
+    only once that client stamps them). Documents carrying no project_id are
+    excluded by a project scope -- a scope is a hard filter, not a boost.
+    On the bm25 channel the predicate lands after the Tantivy top-K pool
+    (widened for scoped queries, `_BM25_SCOPED_POOL_FACTOR`); every other
+    channel applies it inside the candidate query.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -295,11 +298,18 @@ class ScopeSpec(BaseModel):
         default=None,
         min_length=1,
         max_length=200,
-        description="Only documents whose metadata.project_id equals this value.",
+        description="Only documents whose metadata.project_id equals this value (exact match).",
     )
 
-    def is_empty(self) -> bool:
-        return self.project_id is None
+    @field_validator("project_id")
+    @classmethod
+    def _strip_project_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("scope.project_id must not be blank")
+        return value
 
 
 class QueryRequest(BaseModel):
@@ -315,7 +325,10 @@ class QueryRequest(BaseModel):
         default=None,
         description=(
             "Optional caller-provided doc_type filter. Values are dotted "
-            "DocType strings (e.g. 'github.commit'). When set, overrides "
+            "DocType strings (e.g. 'github.commit', or 'custom.<type>' for a "
+            "custom-ingest document's own `type`; 'custom.document' is the "
+            "legacy value rows carry until scripts/backfill_custom_doc_types "
+            "runs). When set, overrides "
             "any doc_type the extractor would have inferred from the query "
             "and hard-filters `documents.doc_type = ANY(...)` in every "
             "retrieval channel (pre-fan-out AND the agent's in-loop "
