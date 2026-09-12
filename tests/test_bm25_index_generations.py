@@ -144,3 +144,43 @@ def test_the_v3_ddl_matches_what_schema_sql_declares() -> None:
 
     schema_block = text[text.index("CREATE INDEX IF NOT EXISTS idx_chunks_bm25_v3"):]
     assert _fields(REQUIRED_INDEX_DDL[BM25_INDEX_V3]) == _fields(schema_block)
+
+
+# ------------------------------------------- the legacy copy stays droppable
+
+def test_the_old_generation_is_still_droppable_by_the_guardian() -> None:
+    """The contracts name the CURRENT generation, because that is what
+    schema.sql declares and what the query is pinned against. But a database
+    that has not been swapped still HAS v2, and if that copy goes 0-byte after
+    a promotion the guardian must be able to drop it.
+
+    Deriving the allowlist from the contracts alone would skip it as unlisted
+    and leave lexical search dead on exactly the databases nobody is watching
+    -- the un-migrated ones.
+    """
+    from engine.shared.pg_search_guardian import (
+        ALLOWED_INDEX_NAMES,
+        LEGACY_DROPPABLE_INDEXES,
+    )
+
+    assert BM25_INDEX_V3 in ALLOWED_INDEX_NAMES
+    assert BM25_INDEX_V2 in ALLOWED_INDEX_NAMES
+    assert BM25_INDEX_V2 in LEGACY_DROPPABLE_INDEXES
+
+
+def test_the_index_contract_names_the_generation_schema_sql_declares() -> None:
+    """The contract checker asserts the contracted index exists in
+    db/schema.sql. Naming a generation schema.sql no longer declares fails
+    that check -- which is how this was caught."""
+    import pathlib as _pathlib
+
+    from engine.retrieval.index_contracts import INDEX_CONTRACTS
+
+    bm25 = [c for c in INDEX_CONTRACTS if c.index.startswith("idx_chunks_bm25")]
+    assert len(bm25) == 1, "exactly one bm25 generation is contracted at a time"
+    assert bm25[0].index == BM25_INDEX_V3
+
+    schema = (
+        _pathlib.Path(__file__).resolve().parents[1] / "db" / "schema.sql"
+    ).read_text()
+    assert bm25[0].index in schema

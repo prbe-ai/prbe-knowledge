@@ -86,7 +86,24 @@ PG_SEARCH_ACCESS_METHODS: tuple[str, ...] = ("bm25", "paradedb")
 # Only indexes this repository declares a contract for are droppable. Derived
 # rather than hardcoded so a new pg_search index is covered by declaring it in
 # the one place the codebase already declares indexes.
-ALLOWED_INDEX_NAMES: frozenset[str] = frozenset(c.index for c in INDEX_CONTRACTS)
+#: Index generations that are no longer contracted but must stay DROPPABLE.
+#:
+#: The contracts name the CURRENT generation, because that is what schema.sql
+#: declares and what the query is pinned against. But a database that has not
+#: been swapped yet still HAS the old index, and if that copy goes 0-byte after
+#: a promotion the guardian has to be able to drop it. Without this the
+#: allowlist would skip it as unlisted and lexical search would stay dead on
+#: exactly the databases that have not been migrated -- the ones least likely
+#: to be watched.
+#:
+#: Drop an entry here once no database can still be on that generation.
+LEGACY_DROPPABLE_INDEXES: frozenset[str] = frozenset({"idx_chunks_bm25_v2"})
+
+# Only indexes this repository declares a contract for -- plus the legacy
+# generations above -- are droppable.
+ALLOWED_INDEX_NAMES: frozenset[str] = (
+    frozenset(c.index for c in INDEX_CONTRACTS) | LEGACY_DROPPABLE_INDEXES
+)
 
 # How long a half-built index may sit `indisvalid = false` before it is treated
 # as abandoned debris worth alerting on. A live CREATE INDEX CONCURRENTLY on

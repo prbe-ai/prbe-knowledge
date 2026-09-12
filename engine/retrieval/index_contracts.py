@@ -108,7 +108,12 @@ INDEX_CONTRACTS: Final[tuple[IndexContract, ...]] = (
         ),
     ),
     IndexContract(
-        index="idx_chunks_bm25_v2",
+        # v3 since migration 0131 added `project_id` as a fast field. The
+        # contract names the CURRENT generation because that is what
+        # `db/schema.sql` declares and what a fresh database gets; v2 is still
+        # droppable by the guardian (see `LEGACY_DROPPABLE_INDEXES`) but is no
+        # longer the shape the query is pinned against.
+        index="idx_chunks_bm25_v3",
         table="chunks",
         # The COLUMN-LIST neighbourhood, not a bare "title". A bare token
         # passes even when title is removed from the indexed columns, because
