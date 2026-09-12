@@ -28,8 +28,8 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0130_retire_session_user_acls"
-down_revision = "0129_retrieve_pages"
+revision = "0133_retire_session_user_acls"
+down_revision = "0132_backfill_chunks_project_id"
 branch_labels = None
 depends_on = None
 
