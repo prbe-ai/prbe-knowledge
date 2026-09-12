@@ -30,7 +30,12 @@ from engine.retrieval.agent.adapter import (
     to_query_response,
 )
 from engine.retrieval.agent.loop import LoopState, _build_user_message, _execute_tool_call
-from engine.retrieval.agent.models import GatheredChunk, GathererNotes, GathererOutput
+from engine.retrieval.agent.models import (
+    GatheredChunk,
+    GatheredEntity,
+    GathererNotes,
+    GathererOutput,
+)
 from engine.retrieval.agent.tools import (
     _SCOPE_REFUSAL_NOTE,
     _doc_scope_sql,
@@ -506,3 +511,28 @@ async def test_loop_sends_no_scope_keys_when_the_request_has_none(
     await _execute_tool_call(state, _tool_call("fetch_doc", {"doc_id": "d", "project_id": "proj-b"}))
     sent = dispatch.await_args.kwargs["arguments"]
     assert "project_id" not in sent and "source_keys" not in sent
+
+
+async def test_live_row_gate_drops_document_backed_entities_outside_the_project(
+    live_db: None,
+) -> None:
+    """Grounding / subgraph can hand the gatherer an out-of-scope Document
+    node; emitted as an ENTITY (canonical_id == doc_id) it used to bypass the
+    chunk gate and reach `results` under the requested applied_scope (Codex
+    re-review). Entities with no documents row (a person) are kept."""
+    cid = "test-cust-project-scope-entities"
+    await _seed_project_docs(cid)
+    gathered = GathererOutput(
+        entities=[
+            GatheredEntity(canonical_id="doc-a", label="Document"),
+            GatheredEntity(canonical_id="doc-b", label="Document"),
+            GatheredEntity(canonical_id="person:alice", label="Person"),
+        ],
+        chunks=[_chunk("doc-a")],
+        gatherer_notes=GathererNotes(),
+    )
+    await _enforce_scope_on_chunks(
+        cid, gathered, source_keys=None, doc_types=None, trace_id="t", project_id="proj-a"
+    )
+    assert [e.canonical_id for e in gathered.entities] == ["doc-a", "person:alice"]
+    assert [c.doc_id for c in gathered.chunks] == ["doc-a"]

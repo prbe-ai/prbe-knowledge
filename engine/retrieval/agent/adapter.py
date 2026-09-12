@@ -479,7 +479,8 @@ async def _enforce_scope_on_chunks(
     sources: list[str] | None = None,
     project_id: str | None = None,
 ) -> None:
-    """Hard scope gate at the response choke point. Mutates gathered.chunks.
+    """Hard scope gate at the response choke point. Mutates gathered.chunks
+    and gathered.entities (document-backed entities are gated the same way).
 
     The request-level source_keys / doc_types / sources / project_id scope is
     enforced in every retrieval channel's SQL and injected into the agent's
@@ -492,12 +493,19 @@ async def _enforce_scope_on_chunks(
     anything out of scope (or unverifiable: no doc_id, or no live row)
     is dropped. Fail closed.
     """
-    if not gathered.chunks:
+    if not gathered.chunks and not gathered.entities:
         return
     doc_ids = sorted({c.doc_id for c in gathered.chunks if c.doc_id})
+    # Document-backed ENTITIES are gated too: grounding and `subgraph` can hand
+    # the gatherer an out-of-scope Document node, and emitting it as an entity
+    # (canonical_id == doc_id) rather than a chunk used to skip this gate --
+    # the adapter then copied its properties into `results` and
+    # `related_entities` under the requested applied_scope (Codex re-review).
+    # An entity with no live documents row (a person, a ticket) is kept.
+    entity_ids = sorted({e.canonical_id for e in gathered.entities if e.canonical_id})
     verdicts = await _scope_verdicts(
         customer_id,
-        doc_ids,
+        sorted(set(doc_ids) | set(entity_ids)),
         source_keys=source_keys,
         doc_types=doc_types,
         source_keys_include_keyless=source_keys_include_keyless,
@@ -505,6 +513,17 @@ async def _enforce_scope_on_chunks(
         project_id=project_id,
     )
     allowed = {d for d, ok in verdicts.items() if ok}
+    kept_entities = [e for e in gathered.entities if verdicts.get(e.canonical_id, True)]
+    dropped_entities = len(gathered.entities) - len(kept_entities)
+    if dropped_entities:
+        log.warning(
+            "adapter.scope_gate_dropped_entities",
+            customer_id=customer_id,
+            trace_id=trace_id,
+            dropped=dropped_entities,
+            project_id=project_id,
+        )
+    gathered.entities = kept_entities
     kept = [c for c in gathered.chunks if c.doc_id and c.doc_id in allowed]
     dropped = len(gathered.chunks) - len(kept)
     if dropped:
