@@ -85,7 +85,16 @@ async def test_normalize_emits_codex_provenance() -> None:
     assert doc.title.startswith("Codex session ")
     assert doc.metadata["agent"] == "codex"
     # Doc shape stays CC (we share extraction + UI).
-    assert doc.doc_type == DocType.CLAUDE_CODE_SESSION
+    # ITS OWN family, not the parent's. Codex inherited
+    # `claude_code.*` from ClaudeCodeConnector for a long time, deliberately --
+    # the parsing and the staleness curve are identical and only the provenance
+    # differs -- and it still meant `doc_type`, the field a reader sees on a hit,
+    # named an agent that did not produce the document. `source_system` was
+    # right the whole time and nothing made anyone look there.
+    assert doc.doc_type == DocType.CODEX_SESSION
+    assert str(doc.doc_type).startswith(str(doc.source_system) + "."), (
+        "a document's doc-type family must name its own source"
+    )
     # ACL row tagged Codex too.
     assert all(row.source_system == SourceSystem.CODEX for row in result.acl_snapshots)
 

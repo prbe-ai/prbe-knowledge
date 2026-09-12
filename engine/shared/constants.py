@@ -90,6 +90,34 @@ class DocType(StrEnum):
     #: comment in engine/shared/claude_code_extraction.py for what was measured
     #: out of it and why.
     CLAUDE_CODE_DIRECTIVE = "claude_code.directive"
+
+    #: CODING-AGENT SESSIONS ARE ONE DOC SHAPE PER AGENT, NOT ONE SHARED FAMILY.
+    #:
+    #: Codex and pi sessions used to be typed `claude_code.*`, inherited from
+    #: ClaudeCodeConnector because the parsing, the coalescing and the staleness
+    #: curve really are identical and only the provenance label differs. It was
+    #: deliberate, and it was wrong in one specific way: 10,191 documents said
+    #: they were Claude Code when they were not, and `doc_type` is the field a
+    #: reader sees on a hit. `source_system` carried the truth, but nothing made
+    #: a reader look there, and every OTHER source in this enum takes its prefix
+    #: from its own name (github., notion., sentry., granola., manual_upload.).
+    #:
+    #: The families are deliberately parallel: same six kinds, same meanings. A
+    #: caller who wants coding-agent sessions regardless of agent filters by
+    #: `sources`, or resolves the bare token "session", which maps to all three
+    #: (see doc_type_resolver). A caller who wants one agent names its family.
+    CODEX_SESSION = "codex.session"
+    CODEX_QA = "codex.qa"
+    CODEX_CODE_CHANGE = "codex.code_change"
+    CODEX_DECISION = "codex.decision"
+    CODEX_FILE_REF = "codex.file_ref"
+    CODEX_DIRECTIVE = "codex.directive"
+    PI_SESSION = "pi.session"
+    PI_QA = "pi.qa"
+    PI_CODE_CHANGE = "pi.code_change"
+    PI_DECISION = "pi.decision"
+    PI_FILE_REF = "pi.file_ref"
+    PI_DIRECTIVE = "pi.directive"
     MANUAL_UPLOAD_TEXT = "manual_upload.text"
     MANUAL_UPLOAD_MARKDOWN = "manual_upload.markdown"
     MANUAL_UPLOAD_DOCX = "manual_upload.docx"

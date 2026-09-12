@@ -86,7 +86,16 @@ async def test_normalize_emits_pi_provenance() -> None:
     assert doc.title.startswith("pi session ")
     assert doc.metadata["agent"] == "pi"
     # Doc shape stays CC (we share extraction + UI).
-    assert doc.doc_type == DocType.CLAUDE_CODE_SESSION
+    # ITS OWN family, not the parent's. pi inherited
+    # `claude_code.*` from ClaudeCodeConnector for a long time, deliberately --
+    # the parsing and the staleness curve are identical and only the provenance
+    # differs -- and it still meant `doc_type`, the field a reader sees on a hit,
+    # named an agent that did not produce the document. `source_system` was
+    # right the whole time and nothing made anyone look there.
+    assert doc.doc_type == DocType.PI_SESSION
+    assert str(doc.doc_type).startswith(str(doc.source_system) + "."), (
+        "a document's doc-type family must name its own source"
+    )
     # ACL row tagged pi too.
     assert all(row.source_system == SourceSystem.PI for row in result.acl_snapshots)
 
