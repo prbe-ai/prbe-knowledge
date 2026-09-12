@@ -8,6 +8,33 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Added
 
+- **`/retrieve` takes a pre-search scope.** `scope: {project_id}` hard-filters
+  `metadata->>'project_id'` inside every retrieval channel, the agent's
+  in-loop content tools, the identifier lookup and the final live-row gate,
+  and the response echoes it as `applied_scope`. A scoped request never
+  spends its `top_k` on out-of-scope documents and then reports "nothing
+  here" -- the post-filter shape this replaces did exactly that. Graph
+  evidence pointing at an out-of-scope document is dropped the same way.
+  Unknown scope keys are a 422. Documents with no project_id are OUT of a
+  project scope.
+- **Custom documents carry their own kind as `doc_type`.** A custom-ingest
+  document's `type` is stored as `custom.<type>` (was always
+  `custom.document`), so `doc_types` can exclude kinds pre-search.
+  `scripts/backfill_custom_doc_types.py --all-tenants` maps existing rows
+  (batched, per tenant, idempotent, `--revert` available); until it runs
+  they keep `custom.document`.
+
+### Fixed
+
+- **`sort=recency` keeps its ANN candidate pool.** The recency branch of the
+  vector channel took no ANN limit, so "latest X" returned the newest chunks
+  in scope whatever X was. The pool is now the index's best
+  `top_k * VECTOR_RECENCY_POOL_MULTIPLIER` by distance, sorted by time; with
+  `per_source_top_k` the per-source top-ups apply on the recency path too.
+- **A model-emitted scope argument can no longer widen a keyed scope.**
+  Harness-owned scope keys are stripped from every in-loop tool call before
+  the request scope is re-applied.
+
 - **A stalled provider no longer costs the whole 12-second deadline.** 3.6% of
   searches hit a Cerebras turn that never answers; the loop waited out
   `SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS` and only THEN started the fallback
