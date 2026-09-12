@@ -168,9 +168,14 @@ async def test_iterative_scan_enabled_on_the_ann_path(
 async def test_recency_path_keeps_its_combined_ordering(
     recorded: _RecordingConn,
 ) -> None:
-    """recency cannot use the ANN index by construction, so it is untouched."""
+    """recency keeps the ANN pool: the inner query still orders by the bare
+    distance expression (index-servable, no second sort key) with a LIMIT,
+    and the OUTER query sorts that bounded pool by time. See
+    test_vector_recency_pool.py for the pool sizing."""
     await vector_mod.vector_search(
         customer_id="c1", query_text="q", top_k=10, sort_by="recency"
     )
     sql = recorded.sql or ""
     assert "updated_at DESC" in sql
+    clause = _ann_order_clause(sql)
+    assert "," not in clause, clause

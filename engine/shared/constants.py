@@ -1044,6 +1044,11 @@ SEARCH_AGENT_MIN_OUTPUT = 5
 # pool lifts recall without re-ranking. Graph / inferred_edge stay at 10:
 # they're entity-anchored and rarely the recall bottleneck.
 SEARCH_AGENT_VECTOR_TOP_K = 30
+#: `sort_by="recency"` on the vector channel keeps an ANN pool of
+#: `top_k * this` best-by-distance chunks and sorts that pool by updated_at.
+#: 6 -> 180 rows for the default 30. A larger pool admits older on-topic
+#: chunks at the cost of a longer HNSW walk on recency-sorted queries only.
+VECTOR_RECENCY_POOL_MULTIPLIER = 6
 SEARCH_AGENT_BM25_TOP_K = 30
 SEARCH_AGENT_GRAPH_TOP_K = 10
 
