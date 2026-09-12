@@ -319,3 +319,28 @@ def source_key_predicate(
     if include_keyless:
         return f"AND ({keyed} OR {alias}.metadata->>'source_key' IS NULL)"
     return f"AND {keyed}"
+
+
+def project_scope_predicate(
+    params: list,
+    project_id: str | None,
+    *,
+    alias: str,
+) -> str:
+    """Build the `AND ...project_id...` predicate shared by every retriever.
+
+    The pre-search half of `QueryRequest.scope`: a HARD filter on
+    `metadata->>'project_id'`, the key research-os stamps on every document
+    that belongs to a project. Appends `project_id` to `params` (in place)
+    and returns the SQL fragment; '' when no project scope is set.
+
+    Same shape as `source_key_predicate` on purpose -- the agent's in-loop
+    gate (`tools._doc_scope_sql`) and the response gate
+    (`adapter._enforce_scope_on_chunks`) restate exactly this predicate, and
+    `tests/retrieval/agent/test_project_scope_threading.py` pins the three
+    together. Documents with no project_id are OUT of a project scope.
+    """
+    if not project_id:
+        return ""
+    params.append(project_id)
+    return f"AND {alias}.metadata->>'project_id' = ${len(params)}"

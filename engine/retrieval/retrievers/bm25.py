@@ -78,7 +78,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
-from engine.retrieval.helpers import source_key_predicate
+from engine.retrieval.helpers import project_scope_predicate, source_key_predicate
 from engine.retrieval.temporal import build_predicate
 from engine.shared.constants import TOP_K_BM25
 from engine.shared.db import with_tenant
@@ -165,6 +165,16 @@ BM25_TITLE_ONLY_PER_DOC = 1
 # reports short result sets on a corpus dominated by one document, this is the
 # knob.
 _BM25_POOL_MULTIPLIER = 10
+#: When the request carries any DOCUMENT-level scope (sources / doc_types /
+#: author / source_keys / project_id), that predicate lands on the documents
+#: join AFTER the Tantivy TopK pool -- it cannot ride the bm25 index the way
+#: the tenant and visibility filters do (project_id lives on documents, not
+#: on chunks). A scoped query therefore post-filters a tenant-wide pool, and
+#: a project holding a small share of the tenant's chunks would empty it.
+#: Widen the pool for scoped queries so the filter has something to keep;
+#: TopK over the index is cheap, the documents join is per-row. Phase 2 puts
+#: project_id inside the index and retires this factor.
+_BM25_SCOPED_POOL_FACTOR = 4
 
 # Weight on a title match relative to a content match.
 #
@@ -265,6 +275,7 @@ async def bm25_search(
     sort_by: Literal["relevance", "recency"] = "relevance",
     source_keys: list[str] | None = None,
     source_keys_include_keyless: bool = False,
+    project_id: str | None = None,
     per_source_top_k: int | None = None,
 ) -> list[BM25Hit]:
     """`include_drafts` defaults to False — retrieval hides ``visibility='draft'``
@@ -314,6 +325,7 @@ async def bm25_search(
             params, source_keys, alias="d",
             include_keyless=source_keys_include_keyless,
         )
+        project_filter = project_scope_predicate(params, project_id, alias="d")
 
         pred = build_predicate(
             spec, doc_alias="d", chunk_alias="c", next_param_index=len(params) + 1
@@ -343,7 +355,9 @@ async def bm25_search(
         # document's chunks in the ranking; picking chunk 0 was expressing a
         # ranking idea as a join predicate. The cap below keeps the guarantee
         # the old predicate was really providing.
-        params.append(top_k * _BM25_POOL_MULTIPLIER)
+        scoped = bool(sources or doc_types or author_ids or source_keys or project_id)
+        pool_size = top_k * _BM25_POOL_MULTIPLIER * (_BM25_SCOPED_POOL_FACTOR if scoped else 1)
+        params.append(pool_size)
         pool_idx = len(params)
         # The tenant and visibility filters appear TWICE below, and both
         # copies are load-bearing.
@@ -456,6 +470,7 @@ async def bm25_search(
               {"" if include_drafts else "AND d.visibility = 'approved'"}
               {author_filter}
               {source_key_filter}
+              {project_filter}
         """
         if per_source_top_k is not None:
             # Per-source top-K slotting (PR#78 recall guarantee, server-side).

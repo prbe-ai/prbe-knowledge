@@ -263,6 +263,9 @@ class LoopState:
     # reformulates queries, it does not choose the retrieval posture).
     request_discovery: bool = False
     request_source_keys_include_keyless: bool = False
+    # QueryRequest.scope.project_id, injected into every scope-gated tool
+    # call and threaded to the prefanout + response gate (pre-search scope).
+    request_project_id: str | None = None
     request_per_source_top_k: int | None = None
 
 
@@ -737,6 +740,18 @@ async def _resolve_person_author_ids(
         return person_ids  # Fall back to unexpanded — never NULL the intent.
 
 
+#: Tool arguments the harness owns. Stripped from every model-issued
+#: scope-gated tool call before the request scope is re-applied, so a
+#: hallucinated or provider-drifted value can neither widen nor narrow it.
+_HARNESS_OWNED_SCOPE_KEYS = (
+    "source_keys",
+    "doc_types",
+    "source_keys_include_keyless",
+    "project_id",
+    "sources",
+)
+
+
 def _build_user_message(
     query: str,
     bundle: GroundingBundle,
@@ -747,6 +762,7 @@ def _build_user_message(
     source_keys: list[str] | None = None,
     doc_types: list[str] | None = None,
     id_pins: list[IdLookupHit] | None = None,
+    project_id: str | None = None,
 ) -> str:
     """Render the per-query user message.
 
@@ -816,7 +832,7 @@ def _build_user_message(
     options_block = ""
     sort_nondefault = options is not None and options.sort != "relevance"
     has_author_filter = bool(author_ids)
-    has_scope_filter = bool(source_keys) or bool(doc_types)
+    has_scope_filter = bool(source_keys) or bool(doc_types) or bool(project_id)
     if sort_nondefault or has_author_filter or has_scope_filter:
         # Render each option INDEPENDENTLY — only emit `sort=...` when the
         # sort directive deviates from the default; only emit `author_ids=...`
@@ -841,11 +857,14 @@ def _build_user_message(
                 parts.append(f"source_keys={list(source_keys)}")
             if doc_types:
                 parts.append(f"doc_types={list(doc_types)}")
+            if project_id:
+                parts.append(f"project_id={project_id}")
             scope_note = (
-                " The `source_keys` / `doc_types` scope is caller-enforced: "
-                "every `search` you issue is automatically constrained to "
-                "it, so do not retry searches hoping to reach other "
-                "sources — curate from what the scope returns."
+                " The `source_keys` / `doc_types` / `project_id` scope is "
+                "caller-enforced: every `search` you issue is automatically "
+                "constrained to it and `fetch_doc` refuses documents outside "
+                "it, so do not retry searches hoping to reach other sources "
+                "or projects — curate from what the scope returns."
             )
         options_block = (
             f"\n\n<search_options>\n"
@@ -1601,15 +1620,21 @@ async def _execute_tool_call(
         }
 
     # Enforce the caller's request-level scope on every in-loop content
-    # tool. `source_keys` / `doc_types` are not on the agent-facing tool
-    # schema, so this never overwrites a model-provided value -- it
-    # re-applies the QueryRequest scope the prefanout already ran under.
+    # tool. `source_keys` / `doc_types` / `project_id` and the keyless flag
+    # are HARNESS-OWNED: they are not on the agent-facing tool schema, but a
+    # non-strict provider can still emit them, so any model-supplied value is
+    # discarded first and the QueryRequest scope the prefanout ran under is
+    # re-applied unconditionally. Before this, a model-emitted
+    # `source_keys_include_keyless: true` survived into dispatch and widened a
+    # keyed scope to every keyless connector doc in the tenant.
     # Covers the navigation bypass: without this, `subgraph` can surface
     # an out-of-scope Document node and `fetch_doc` / `fetch_chunk_window`
     # would happily haul its content into the agent's context. (The
     # adapter's scope gate re-verifies the final output regardless --
     # this keeps out-of-scope content from ever entering the loop.)
     if name in ("search", "fetch_doc", "fetch_chunk_window", "subgraph"):
+        for harness_key in _HARNESS_OWNED_SCOPE_KEYS:
+            arguments.pop(harness_key, None)
         if state.request_source_keys:
             arguments["source_keys"] = state.request_source_keys
         if state.request_doc_types:
@@ -1621,6 +1646,8 @@ async def _execute_tool_call(
         # for), so the loop could see them but never read or emit them.
         if state.request_source_keys_include_keyless:
             arguments["source_keys_include_keyless"] = True
+        if state.request_project_id:
+            arguments["project_id"] = state.request_project_id
     if name == "search" and state.request_discovery:
         arguments["discovery"] = True
     if name == "search":
@@ -2462,6 +2489,10 @@ async def run_gatherer(
     detected_ids = detect_identifiers(req.query)
     t_grounding = time.perf_counter()
 
+    # QueryRequest.scope, derived once: the id-lookup pins, the prefanout,
+    # the loop state and the response gate all read this one value.
+    request_project_id = req.scope.project_id if req.scope else None
+
     async def _grounding_task() -> GroundingBundle:
         try:
             return await _build_bundle_with_token_fallback(customer_id, req.query)
@@ -2485,6 +2516,7 @@ async def run_gatherer(
                 doc_types=req.doc_types or None,
                 source_keys=req.source_keys or None,
                 source_keys_include_keyless=bool(req.source_keys_include_keyless),
+                project_id=request_project_id,
             )
         except Exception as exc:
             # A failed lookup degrades to "no pins", never to a failed
@@ -2752,6 +2784,7 @@ async def run_gatherer(
         discovery=request_discovery,
         source_keys_include_keyless=request_source_keys_include_keyless,
         per_source_top_k=request_per_source_top_k,
+        project_id=request_project_id,
     )
     timing["prefanout_ms"] = (time.perf_counter() - t_prefanout) * 1000
 
@@ -2799,6 +2832,7 @@ async def run_gatherer(
         source_keys=request_source_keys,
         doc_types=request_doc_types,
         id_pins=id_pins,
+        project_id=request_project_id,
     )
     system_prompt = build_system_prompt(datetime.now(UTC))
 
@@ -2812,6 +2846,7 @@ async def run_gatherer(
         search_options=search_options,
         pre_fanout_author_ids=list(author_ids),
         request_source_keys=request_source_keys,
+        request_project_id=request_project_id,
         request_doc_types=request_doc_types,
         request_sources=request_sources,
         request_discovery=request_discovery,
@@ -2928,6 +2963,7 @@ async def run_gatherer(
             doc_types=request_doc_types,
             source_keys_include_keyless=request_source_keys_include_keyless,
             sources=request_sources,
+            project_id=request_project_id,
             status=status,
             id_pins=id_pins,
             top_k=req.top_k,
@@ -2985,6 +3021,7 @@ async def run_gatherer(
             doc_types=request_doc_types,
             source_keys_include_keyless=request_source_keys_include_keyless,
             sources=request_sources,
+            project_id=request_project_id,
             status=status,
             id_pins=id_pins,
             top_k=req.top_k,
@@ -3040,6 +3077,7 @@ async def run_gatherer(
             doc_types=request_doc_types,
             source_keys_include_keyless=request_source_keys_include_keyless,
             sources=request_sources,
+            project_id=request_project_id,
             status=status,
             id_pins=id_pins,
             top_k=req.top_k,
@@ -3283,6 +3321,7 @@ async def run_gatherer(
         doc_types=request_doc_types,
         source_keys_include_keyless=request_source_keys_include_keyless,
         sources=request_sources,
+        project_id=request_project_id,
         status=status,
         id_pins=id_pins,
         top_k=req.top_k,

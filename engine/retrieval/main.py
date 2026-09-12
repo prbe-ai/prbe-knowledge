@@ -411,6 +411,8 @@ async def query_stream(
                     "applied_entity_filter": rresp.applied_entity_filter,
                     "applied_mode": rresp.applied_mode,
                     "applied_doc_types": rresp.applied_doc_types,
+                    "applied_sources": rresp.applied_sources,
+                    "applied_scope": rresp.applied_scope,
                     "aggregation": rresp.aggregation,
                     "related_entities": (
                         [e.model_dump(mode="json") for e in rresp.related_entities]

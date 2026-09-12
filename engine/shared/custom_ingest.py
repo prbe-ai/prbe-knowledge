@@ -10,7 +10,8 @@ from typing import Any
 import orjson
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from engine.shared.constants import EdgeType, NodeLabel
+from engine.shared.constants import DocType, EdgeType, NodeLabel
+from engine.shared.source_registry import DEFAULT_DOC_TYPE_PREFIX
 
 # Colon allowed (after the first char) so consumers can namespace dynamic
 # source keys, e.g. research-os pushes workspace files under
@@ -228,6 +229,31 @@ def encode_source_key_for_doc_id(source_key: str) -> str:
     identical under this encoding -- zero impact on existing doc ids.
     """
     return source_key.replace(":", "%3A")
+
+
+#: A custom document's `type` (research-os: "experiment.run", "team.note",
+#: "session.digest", ...) becomes a dotted doc_type under the `custom.` family
+#: (source_registry.DEFAULT_DOC_TYPE_PREFIX) so `QueryRequest.doc_types` can
+#: filter kinds pre-search. Only this shape is admitted into a doc_type;
+#: anything else keeps DocType.CUSTOM_DOCUMENT. The SAME pattern is applied
+#: as a POSIX regex by scripts/backfill_custom_doc_types.py, so it must stay
+#: free of Python-only syntax, and the Python side uses fullmatch() because
+#: `$` would admit a trailing newline that Postgres `~` refuses.
+CUSTOM_DOC_TYPE_KIND_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,78}")
+
+
+def custom_doc_type(kind: str | None) -> str:
+    """Map a custom document's `type` to its `documents.doc_type`.
+
+    `"experiment.run"` -> `"custom.experiment.run"`; a missing or malformed
+    type (uppercase, spaces, > 79 chars) -> `"custom.document"`, the family
+    default every custom document carried before, never an error: an ingest
+    must not be refused over a label. `"document"` maps to the default too,
+    which keeps the value set closed under re-mapping.
+    """
+    if kind and CUSTOM_DOC_TYPE_KIND_RE.fullmatch(kind):
+        return f"{DEFAULT_DOC_TYPE_PREFIX}{kind}"
+    return DocType.CUSTOM_DOCUMENT.value
 
 
 def custom_ingest_doc_id(customer_id: str, source_key: str, document_id: str) -> str:

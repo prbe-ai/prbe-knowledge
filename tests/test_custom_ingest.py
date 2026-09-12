@@ -10,7 +10,7 @@ from engine.ingest.handlers.base import ConnectorContext, make_default_context
 from engine.ingest.handlers.custom_ingest import CustomIngestConnector
 from engine.ingest.normalizer import Normalizer
 from engine.shared.config import Settings, get_settings
-from engine.shared.constants import DocType, Permission, PrincipalType, SourceSystem
+from engine.shared.constants import Permission, PrincipalType, SourceSystem
 from engine.shared.custom_ingest import CustomIngestEnvelope, document_content_hash, source_event_id
 from engine.shared.db import raw_conn
 from engine.shared.embeddings import reset_embedder
@@ -218,7 +218,9 @@ async def test_custom_ingest_connector_normalization() -> None:
     assert doc.doc_id == f"custom_ingest:{CUSTOMER}:acme_internal_incidents:incident-123"
     assert doc.source_system == SourceSystem.CUSTOM_INGEST
     assert doc.source_id == "acme_internal_incidents:incident-123"
-    assert doc.doc_type == DocType.CUSTOM_DOCUMENT
+    # The document's own `type` is a filterable doc_type under the `custom.`
+    # family (pre-search `doc_types` scope), not the generic family value.
+    assert doc.doc_type == "custom.incident"
     assert doc.metadata["source_key"] == "acme_internal_incidents"
     assert doc.metadata["custom_document_type"] == "incident"
     assert "acl" not in doc.metadata
@@ -368,3 +370,37 @@ async def _process_queue_id(queue_id: int) -> None:
         )
     finally:
         await ctx.http.aclose()
+
+
+# ============================================================
+# doc_type mapping: a document's own kind becomes a filterable doc_type
+# ============================================================
+
+
+def test_custom_doc_type_maps_a_kind_under_the_custom_family() -> None:
+    from engine.shared.custom_ingest import custom_doc_type
+
+    assert custom_doc_type("experiment.run") == "custom.experiment.run"
+    assert custom_doc_type("team.note") == "custom.team.note"
+    assert custom_doc_type("workspace-file_v2") == "custom.workspace-file_v2"
+
+
+def test_custom_doc_type_keeps_the_family_default_for_missing_or_malformed_kinds() -> None:
+    """An ingest is never refused over a label: no kind, or a kind that is
+    not a dotted lowercase token, lands on the pre-existing family value."""
+    from engine.shared.custom_ingest import custom_doc_type
+
+    assert custom_doc_type(None) == "custom.document"
+    assert custom_doc_type("") == "custom.document"
+    assert custom_doc_type("Bad Type!") == "custom.document"
+    assert custom_doc_type(".leading-dot") == "custom.document"
+    assert custom_doc_type("x" * 120) == "custom.document"
+    # Boundary: 79 chars is the longest kind admitted; 80 falls back.
+    assert custom_doc_type("a" * 79) == "custom." + "a" * 79
+    assert custom_doc_type("a" * 80) == "custom.document"
+    # fullmatch, not match: a trailing newline is NOT a valid kind (Python
+    # `$` would have admitted it while the backfill's Postgres `~` refuses it).
+    assert custom_doc_type("run\n") == "custom.document"
+    # A kind literally named "document" maps to the family default, which keeps
+    # the value set closed under re-mapping (the backfill relies on it).
+    assert custom_doc_type("document") == "custom.document"

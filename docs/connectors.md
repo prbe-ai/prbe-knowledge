@@ -153,6 +153,18 @@ Each document requires `id` and `body`; `title`, `type`, `url`, `metadata`, and
 `acl` are optional. The envelope requires a `source_key` naming the logical
 source and a non-empty `documents` array (up to 100 per request).
 
+`type` is the document's own kind and becomes its filterable `doc_type`:
+`"experiment.run"` is stored as `custom.experiment.run` and can be selected
+with `doc_types: ["custom.experiment.run"]` on `/retrieve`. A type must match
+`[a-z0-9][a-z0-9_.-]{0,78}` (lowercase, dotted); anything else, or no type at
+all, keeps the family default `custom.document`. The raw value is always
+preserved in `metadata.custom_document_type`. Rows ingested before this
+mapping keep `custom.document` until
+`python -m scripts.backfill_custom_doc_types --all-tenants` runs.
+
+`metadata.project_id`, when a client stamps it, is what `/retrieve`'s
+`scope.project_id` filters on (exact match, pre-search, in every channel).
+
 To delete a document, send an entry with `"deleted": true` (the `body` is
 optional for deletes). This tombstones the document — its live version and
 chunks are closed and it drops out of retrieval — with the same semantics as a

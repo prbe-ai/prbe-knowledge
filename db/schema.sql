@@ -257,6 +257,9 @@ CREATE INDEX idx_documents_metadata ON documents USING GIN (metadata jsonb_path_
 -- Parallel Seq Scan (measured 37-52s vs ~300ms warm, research plane
 -- 2026-08-26). Equality service is a bonus.
 CREATE INDEX idx_documents_source_key_expr ON documents ((metadata->>'source_key'));
+-- Same mechanism for `scope.project_id` (0130): the expression statistics
+-- are what keep a scoped ANN query on the HNSW index.
+CREATE INDEX idx_documents_project_id_expr ON documents ((metadata->>'project_id'));
 
 CREATE INDEX idx_documents_source_id_trgm ON documents USING GIN (source_id gin_trgm_ops);
 CREATE INDEX idx_documents_doc_id_trgm ON documents USING GIN (doc_id gin_trgm_ops);

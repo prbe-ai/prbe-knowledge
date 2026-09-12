@@ -178,6 +178,15 @@ jobs:
       # embedder and both model calls are stubs, because conftest blanks the
       # provider keys. The classifier's real-accuracy block skips itself without
       # a key rather than failing.
+      #
+      # The vector-channel SQL-shape files (test_ann_order_by_shape,
+      # test_vector_per_source_ann*, test_vector_recency_pool) pin the ORDER BY
+      # / LIMIT the HNSW index can serve; they were not on the list when the
+      # recency path silently dropped its LIMIT. test_custom_ingest and
+      # test_backfill_custom_doc_types cover the custom.<type> doc_type mapping
+      # and its backfill. NEVER put a `#` comment INSIDE the folded `run: >-`
+      # scalar below: YAML folds it into one line and the first `#` comments
+      # out every path after it -- CI stays green and runs none of them.
       - name: Tests (storage + workflow-memory suites)
         run: >-
           .venv/bin/pytest -q
@@ -208,3 +217,9 @@ jobs:
           tests/test_litellm_key.py
           tests/retrieval/test_tenant_key_binding.py
           tests/retrieval/agent/
+          tests/retrieval/test_ann_order_by_shape.py
+          tests/retrieval/test_vector_per_source_ann.py
+          tests/retrieval/test_vector_per_source_ann_binding.py
+          tests/retrieval/test_vector_recency_pool.py
+          tests/test_custom_ingest.py
+          tests/test_backfill_custom_doc_types.py

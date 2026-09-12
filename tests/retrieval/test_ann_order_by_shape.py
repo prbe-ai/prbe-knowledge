@@ -37,48 +37,13 @@ tiebreak turns `test_determinism_is_preserved_outside_the_ann_pool` red.
 from __future__ import annotations
 
 import re
-from contextlib import asynccontextmanager
-from typing import Any
-
-import pytest
 
 from engine.retrieval.retrievers import vector as vector_mod
+from tests.retrieval.conftest import RecordingConn
 
-
-class _RecordingConn:
-    """Captures the SQL `vector_search` builds without touching a database."""
-
-    def __init__(self) -> None:
-        self.sql: str | None = None
-        self.params: tuple[Any, ...] = ()
-        self.statements: list[str] = []
-
-    async def execute(self, sql: str, *args: Any) -> None:
-        # SAVEPOINT / SET LOCAL hnsw.iterative_scan / RELEASE
-        self.statements.append(sql)
-
-    async def fetch(self, sql: str, *params: Any) -> list[Any]:
-        self.sql = sql
-        self.params = params
-        return []
-
-
-@pytest.fixture
-def recorded(monkeypatch: pytest.MonkeyPatch) -> _RecordingConn:
-    conn = _RecordingConn()
-
-    @asynccontextmanager
-    async def _fake_with_tenant(customer_id: str):  # type: ignore[no-untyped-def]
-        yield conn
-
-    monkeypatch.setattr(vector_mod, "with_tenant", _fake_with_tenant)
-
-    class _FakeEmbedder:
-        async def embed_query(self, text: str) -> list[float]:
-            return [0.1, 0.2, 0.3]
-
-    monkeypatch.setattr(vector_mod, "get_embedder_v2", lambda: _FakeEmbedder())
-    return conn
+# `_RecordingConn` / `recorded` live in tests/retrieval/conftest.py now, shared
+# with test_vector_recency_pool.py so the two SQL-shape harnesses cannot drift.
+_RecordingConn = RecordingConn
 
 
 def _ann_order_clause(sql: str) -> str:
@@ -168,9 +133,14 @@ async def test_iterative_scan_enabled_on_the_ann_path(
 async def test_recency_path_keeps_its_combined_ordering(
     recorded: _RecordingConn,
 ) -> None:
-    """recency cannot use the ANN index by construction, so it is untouched."""
+    """recency keeps the ANN pool: the inner query still orders by the bare
+    distance expression (index-servable, no second sort key) with a LIMIT,
+    and the OUTER query sorts that bounded pool by time. See
+    test_vector_recency_pool.py for the pool sizing."""
     await vector_mod.vector_search(
         customer_id="c1", query_text="q", top_k=10, sort_by="recency"
     )
     sql = recorded.sql or ""
     assert "updated_at DESC" in sql
+    clause = _ann_order_clause(sql)
+    assert "," not in clause, clause

@@ -3185,3 +3185,61 @@ async def test_unresolved_id_keeps_the_full_loop(
     extractor.assert_awaited()  # the full loop ran
     assert fake_request.state.gatherer_status != "id_lookup_short_circuit"
     assert resp is not None
+
+
+# ============================================================
+# QueryRequest.scope.project_id reaches every hop (E7 phase 1)
+# ============================================================
+
+
+async def test_project_scope_reaches_prefanout_pins_and_response(
+    monkeypatch: pytest.MonkeyPatch, fake_request: SimpleNamespace
+) -> None:
+    """The wire from the request to the prefanout, the identifier pins and
+    the response echo. Signature tests cannot see a dropped kwarg; this
+    does: delete any `project_id=request_project_id` and it goes red."""
+    req = QueryRequest(query="PRB-17", top_k=5, scope={"project_id": "proj-a"})
+    search = AsyncMock(return_value={"sub_queries": [{
+        "query": "PRB-17", "grounded_entities": [],
+        "vector": [{"doc_id": "stub:0", "score": 0.5, "source_system": "github",
+                    "title": "stub", "content": "stub"}],
+        "bm25": [], "graph": [], "inferred_edge": [],
+    }]})
+    pins = AsyncMock(return_value=([], set()))
+    monkeypatch.setattr("engine.retrieval.agent.loop.execute_search", search)
+    monkeypatch.setattr("engine.retrieval.agent.loop.lookup_identifiers", pins)
+    # The response gate is DB-backed (live-row re-verification); this test
+    # pins the wire, the gate has its own live tests.
+    gate = AsyncMock(return_value={})
+    monkeypatch.setattr("engine.retrieval.agent.adapter._scope_verdicts", gate)
+    with patch(
+        "engine.retrieval.agent.loop.acompletion",
+        new=AsyncMock(return_value=_mk_resp(tool_calls=[_terminal_call(_final_emission_args(chunks=0))])),
+    ):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+    assert search.await_args.kwargs["project_id"] == "proj-a"
+    assert pins.await_args.kwargs["project_id"] == "proj-a"
+    assert resp.applied_scope == {"project_id": "proj-a"}
+
+
+async def test_no_project_scope_threads_none_everywhere(
+    monkeypatch: pytest.MonkeyPatch, fake_request: SimpleNamespace
+) -> None:
+    req = QueryRequest(query="PRB-17", top_k=5)
+    search = AsyncMock(return_value={"sub_queries": [{
+        "query": "PRB-17", "grounded_entities": [],
+        "vector": [{"doc_id": "stub:0", "score": 0.5, "source_system": "github",
+                    "title": "stub", "content": "stub"}],
+        "bm25": [], "graph": [], "inferred_edge": [],
+    }]})
+    pins = AsyncMock(return_value=([], set()))
+    monkeypatch.setattr("engine.retrieval.agent.loop.execute_search", search)
+    monkeypatch.setattr("engine.retrieval.agent.loop.lookup_identifiers", pins)
+    with patch(
+        "engine.retrieval.agent.loop.acompletion",
+        new=AsyncMock(return_value=_mk_resp(tool_calls=[_terminal_call(_final_emission_args(chunks=0))])),
+    ):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+    assert search.await_args.kwargs["project_id"] is None
+    assert pins.await_args.kwargs["project_id"] is None
+    assert resp.applied_scope is None

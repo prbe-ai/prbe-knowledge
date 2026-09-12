@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
-from engine.retrieval.helpers import source_key_predicate
+from engine.retrieval.helpers import project_scope_predicate, source_key_predicate
 from engine.shared.constants import INFERRED_EDGE_DAMPENING, INFERRED_EDGE_TOP_K, NodeLabel
 from engine.shared.db import with_tenant
 from engine.shared.models import normalize_author_id
@@ -86,6 +86,7 @@ async def inferred_edge_search(
     doc_types: list[str] | None = None,
     source_keys: list[str] | None = None,
     source_keys_include_keyless: bool = False,
+    project_id: str | None = None,
     sources: list[str] | None = None,
 ) -> list[InferredEdgeHit]:
     """Walk INFERRED Doc-Doc edges from `top_doc_ids` and return up to
@@ -144,6 +145,7 @@ async def inferred_edge_search(
         params, source_keys, alias="d",
         include_keyless=source_keys_include_keyless,
     )
+    project_filter_sql = project_scope_predicate(params, project_id, alias="d")
 
     # Default order: edge-type priority then recency within tier.
     # sort_by="recency": pure recency first (still tie-broken by edge-type
@@ -262,6 +264,7 @@ async def inferred_edge_search(
           {doc_type_filter_sql}
           {source_filter_sql}
           {source_key_filter_sql}
+              {project_filter_sql}
         ORDER BY {order_by_sql}
         LIMIT $3
     """
