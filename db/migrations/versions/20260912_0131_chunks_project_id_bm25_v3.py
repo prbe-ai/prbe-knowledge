@@ -50,6 +50,30 @@ assumed v3 the moment this migration ran, every BM25 query would fail in the
 window between deploy and rebuild -- which can be days, because the rebuild
 waits for a window.
 
+THIS MIGRATION'S BACKFILL DID NOT WORK, AND 0132 IS THE FIX
+-----------------------------------------------------------
+Left here as written, because it ran in production and alembic will not run
+it again -- and because the failure is worth reading.
+
+`chunks` and `documents` are under FORCE ROW LEVEL SECURITY. The policy is
+`customer_id = current_setting('app.current_customer_id', true)`, and with no
+tenant GUC set that reduces to `customer_id = NULL`, which matches nothing.
+The UPDATE below therefore touched ZERO rows and reported success. Measured
+after it ran on the research plane: 31 of 15,431 target chunks carried a
+project_id, and those 31 came from the INSERT trigger firing on new rows
+afterwards, not from this statement.
+
+FORCE is what makes RLS apply to the table's own owner, and migrations connect
+as `app`, which owns both tables and has `rolbypassrls = false`. The
+superuser-bypass reasoning that was briefly written here was wrong twice over:
+it checked that `postgres` can bypass RLS without checking that migrations run
+as `postgres`. They do not.
+
+Migration 0132 redoes the backfill with `ALTER TABLE ... NO FORCE ROW LEVEL
+SECURITY` around it -- the pattern migration 0028 already established in this
+repo for exactly this -- which lets the owner through for the duration of the
+migration's transaction and restores the posture before commit.
+
 THE DEDUPE IS LOAD-BEARING
 --------------------------
 `chunks JOIN documents ON version BETWEEN first_seen_version AND
