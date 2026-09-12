@@ -184,3 +184,42 @@ def test_the_index_contract_names_the_generation_schema_sql_declares() -> None:
         _pathlib.Path(__file__).resolve().parents[1] / "db" / "schema.sql"
     ).read_text()
     assert bm25[0].index in schema
+
+
+# --------------------------------------- the swap script's own safety check
+
+@pytest.mark.asyncio
+async def test_the_backfill_precondition_counts_per_tenant() -> None:
+    """A guard that always refuses is as broken as one that never fires.
+
+    `chunks` is under FORCE ROW LEVEL SECURITY and the swap script connects as
+    `app`, which OWNS the table and is therefore subject to the policy. A bare
+    `SELECT count(*) FROM chunks` with no tenant GUC returns 0 on every
+    database, backfilled or not -- so the first version of this check refused
+    unconditionally, indistinguishable from a real "the backfill did not run".
+    That is the false alarm that teaches somebody to reach for a --force flag,
+    which this script deliberately does not have.
+    """
+    from scripts.swap_bm25_index import _count_backfilled
+
+    seen_guc: list[str] = []
+
+    class _Conn:
+        async def fetch(self, sql, *args):
+            assert "customers" in sql
+            return [{"customer_id": "alpha"}, {"customer_id": "beta"}]
+
+        async def execute(self, sql, *args):
+            # The GUC bind is the whole point; record what it was set to.
+            if "set_config" in sql:
+                seen_guc.append(args[0] if args else "")
+
+        async def fetchval(self, sql, *args):
+            # alpha has nothing, beta has rows -- so a single-tenant peek at
+            # the first customer would wrongly report an empty backfill.
+            return 0 if seen_guc[-1] == "alpha" else 7
+
+    total = await _count_backfilled(_Conn())
+    assert total == 7, "the count must not stop at the first empty tenant"
+    assert "alpha" in seen_guc and "beta" in seen_guc
+    assert seen_guc[-1] == "", "the GUC must be cleared when the count finishes"
