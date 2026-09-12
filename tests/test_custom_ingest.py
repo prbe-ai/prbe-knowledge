@@ -395,3 +395,12 @@ def test_custom_doc_type_keeps_the_family_default_for_missing_or_malformed_kinds
     assert custom_doc_type("Bad Type!") == "custom.document"
     assert custom_doc_type(".leading-dot") == "custom.document"
     assert custom_doc_type("x" * 120) == "custom.document"
+    # Boundary: 79 chars is the longest kind admitted; 80 falls back.
+    assert custom_doc_type("a" * 79) == "custom." + "a" * 79
+    assert custom_doc_type("a" * 80) == "custom.document"
+    # fullmatch, not match: a trailing newline is NOT a valid kind (Python
+    # `$` would have admitted it while the backfill's Postgres `~` refuses it).
+    assert custom_doc_type("run\n") == "custom.document"
+    # A kind literally named "document" maps to the family default, which keeps
+    # the value set closed under re-mapping (the backfill relies on it).
+    assert custom_doc_type("document") == "custom.document"

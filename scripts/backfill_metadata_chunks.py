@@ -38,7 +38,6 @@ from engine.shared.models import (
     ACLPrincipal,
     ACLSnapshot,
     DocClass,
-    DocType,
     Document,
     Permission,
     PrincipalType,
@@ -105,7 +104,9 @@ async def _docs_needing_backfill(customer_id: str, batch_size: int) -> AsyncIter
                     source_id=row["source_id"],
                     source_url=row["source_url"],
                     doc_class=DocClass(row["doc_class"]),
-                    doc_type=DocType(row["doc_type"]),
+                    # Free-form string on the model (custom.<kind> values are
+                    # not DocType members); never coerce through the enum.
+                    doc_type=row["doc_type"],
                     content_type=row["content_type"],
                     content_hash=row["content_hash"],
                     title=row["title"],
