@@ -73,6 +73,40 @@ log = get_logger(__name__)
 _MIN_BACKFILLED_ROWS = 1
 
 
+async def _count_backfilled(conn) -> int:
+    """Chunks carrying a project_id, counted PER TENANT with the GUC bound.
+
+    A bare `SELECT count(*) FROM chunks` is the wrong question here and
+    answers it wrong. `chunks` is under FORCE ROW LEVEL SECURITY and this
+    script connects as `app`, which owns the table and is therefore subject to
+    the policy: with no `app.current_customer_id` set the policy reduces to
+    `customer_id = NULL` and the count comes back 0 on EVERY database,
+    backfilled or not.
+
+    That is how this check was first written, and the result was a guard that
+    refused unconditionally -- indistinguishable from a real "the backfill did
+    not run", and the kind of false alarm that teaches somebody to pass
+    --force. Which this script does not have, on purpose.
+
+    Stops at the first tenant with any rows: the question is "did the backfill
+    run at all", not "how many rows".
+    """
+    customers = [
+        r["customer_id"]
+        for r in await conn.fetch("SELECT customer_id FROM customers ORDER BY customer_id")
+    ]
+    total = 0
+    for customer_id in customers:
+        await conn.execute("SELECT set_config('app.current_customer_id', $1, true)", customer_id)
+        total += await conn.fetchval(
+            "SELECT count(*) FROM chunks WHERE project_id IS NOT NULL"
+        )
+        if total >= _MIN_BACKFILLED_ROWS:
+            break
+    await conn.execute("SELECT set_config('app.current_customer_id', '', true)")
+    return total
+
+
 async def _preconditions(conn) -> str | None:
     """None when it is safe to swap, else the reason to refuse."""
     has_column = await conn.fetchval(
@@ -103,15 +137,15 @@ async def _preconditions(conn) -> str | None:
             "flight or one failed. Resolve by hand; this will not race it."
         )
 
-    backfilled = await conn.fetchval(
-        "SELECT count(*) FROM chunks WHERE project_id IS NOT NULL"
-    )
+    backfilled = await _count_backfilled(conn)
     if backfilled < _MIN_BACKFILLED_ROWS:
         return (
-            "chunks.project_id is NULL on every row -- 0131's backfill has not "
-            "run. Building v3 now would index an empty column and every scoped "
-            "query would return nothing."
+            "chunks.project_id is NULL on every row in every tenant -- the "
+            "backfill (migration 0132) has not run. Building v3 now would "
+            "index an empty column and every scoped query would return "
+            "nothing."
         )
+    log.info("swap.precondition_ok", chunks_with_project_id=backfilled)
     return None
 
 
