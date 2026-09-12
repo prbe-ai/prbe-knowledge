@@ -97,6 +97,40 @@ _ENTITY_TO_LABEL = {k: v.value for k, v in ROUTER_ENTITY_TO_LABEL.items()}
 CODE_GRAPH_LABELS = frozenset({"CodeSymbol"})
 
 
+def order_graph_hits(hits: list[GraphHit], *, discovery: bool) -> None:
+    """Order graph hits IN PLACE. Two orderings, chosen by retrieval posture.
+
+    `discovery=True` -- surprise score descending. The highest-surprise edge
+    lands at rank 1 and takes the biggest graph-side RRF contribution (1/61).
+    This is what you want for "how should we approach X" / "anything else I
+    should know about Y".
+
+    `discovery=False` (the default, and what every query used to NOT get) --
+    confidence tier descending: EXTRACTED, then INFERRED, then AMBIGUOUS, with
+    surprise as the tie-break inside a tier. Surprise is the wrong ranking for
+    a direct lookup: it deliberately REWARDS the speculative edge (AMBIGUOUS
+    carries a 1.5x weight against EXTRACTED's 1.0) and PENALIZES hub-to-hub
+    links, so for "what is the status of PRB-17" it ranks the
+    deterministically-matched edge into the hub LAST -- and that edge is the
+    answer.
+
+    `.score` stays surprise-derived under both, so cross-channel fusion math is
+    unchanged; only the list order the gatherer reads differs. Both orderings
+    tie-break on chunk_id: MCP surfaces `retriever_scores`, and jitter on
+    identical queries reads as a ranking change that never happened.
+    """
+    if discovery:
+        hits.sort(key=lambda h: (-h.score, h.chunk_id))
+        return
+    hits.sort(
+        key=lambda h: (
+            -_CONFIDENCE_RANK.get((h.confidence or "").upper(), -1),
+            -h.score,
+            h.chunk_id,
+        )
+    )
+
+
 async def graph_search(
     customer_id: str,
     entities: list[tuple[str, str]],  # (entity_type, canonical_id)
@@ -111,6 +145,7 @@ async def graph_search(
     source_keys_include_keyless: bool = False,
     project_id: str | None = None,
     sources: list[str] | None = None,
+    discovery: bool = False,
 ) -> list[GraphHit]:
     """Return chunks from documents within 1 hop of any matching entity node.
 
@@ -420,10 +455,5 @@ async def graph_search(
         ))
         return hits
 
-    # Sort by surprise score so the highest-surprise edge lands at rank 1
-    # and gets the biggest graph-side RRF contribution (1/61) in fusion.
-    # Without this sort, hits would arrive in arbitrary heap-scan order.
-    # Tie-break by chunk_id so the order is deterministic across runs and
-    # MCP retriever_scores telemetry doesn't jitter on identical queries.
-    hits.sort(key=lambda h: (-h.score, h.chunk_id))
+    order_graph_hits(hits, discovery=discovery)
     return hits

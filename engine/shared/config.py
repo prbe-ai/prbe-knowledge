@@ -153,6 +153,22 @@ class Settings(BaseSettings):
     #: turning it back on re-mines them instead of leaving a silent hole.
     claude_code_extraction_enabled: bool = Field(default=True)
 
+    #: Honour `QueryRequest.recall_floor_mode="conditional"`. OFF by default.
+    #:
+    #: The recall floor tops every response up to 10 distinct docs from the raw
+    #: pre-fan-out pool, and it supplies ~88% of the chunks consumers receive --
+    #: so the gatherer's curation is currently a rounding error in what anyone
+    #: actually reads. `conditional` skips the top-up when the gatherer's own
+    #: answer is confident and substantial, which is the change that makes
+    #: curation mean something.
+    #:
+    #: It is gated because the graded metric is set-recall and this trades
+    #: recall for precision. The gate exists to run a PAIRED A/B on one
+    #: deployment -- same day, same corpus, mode chosen per request -- rather
+    #: than to ship the behaviour quietly. With it off, a request asking for
+    #: `conditional` is served `always`; nothing errors.
+    recall_floor_conditional_enabled: bool = Field(default=False)
+
     # --- LLM gateway (managed-shared / self-host: route LLM + embedding
     #     calls through a central LiteLLM proxy instead of direct provider
     #     SDKs — plan D1, `shared/llm.py`) ------------------------------------

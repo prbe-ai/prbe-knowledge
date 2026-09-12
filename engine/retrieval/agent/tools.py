@@ -52,6 +52,7 @@ import asyncio
 import json
 import time
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from engine.retrieval.agent.models import GathererOutput
@@ -215,6 +216,49 @@ def _coerce_temporal(value: TemporalSpec | dict[str, Any] | None) -> TemporalSpe
     return TemporalSpec.model_validate(value)
 
 
+def _age_days(updated_at: Any) -> int | None:
+    """Whole days between a hit's document clock and now, or None.
+
+    Rendered beside every hit so the gatherer can weigh validity without doing
+    date arithmetic on an ISO string mid-generation -- which it does badly, and
+    silently. None when the document carries no clock: "unknown age" must never
+    render as "0 days old".
+
+    Reads the document's `updated_at`, which since the research-os content-clock
+    change is when the document's KNOWLEDGE was written, not when we last
+    reindexed it. Before that it was reindex time, and every age read as days.
+    """
+    if updated_at is None:
+        return None
+    if isinstance(updated_at, str):
+        try:
+            updated_at = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(updated_at, datetime):
+        return None
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=UTC)
+    delta = datetime.now(UTC) - updated_at
+    return max(0, delta.days)
+
+
+def _hit_origin(hit: Any) -> str | None:
+    """Where this text came from: `generated` when a machine wrote it,
+    `human` when a person did, None when the document does not say.
+
+    Read off the indexed document's metadata (research-os R2 stamps it).
+    None renders as absent rather than as `human` -- claiming a person wrote
+    something we cannot attribute is the failure this field exists to prevent.
+    """
+    meta = getattr(hit, "metadata", None)
+    if isinstance(meta, dict):
+        origin = meta.get("origin")
+        if isinstance(origin, str) and origin in ("human", "generated"):
+            return origin
+    return None
+
+
 def _hit_to_chunk_dict(hit: Any, channel: str) -> dict[str, Any]:
     """Normalize a channel hit (VectorHit / BM25Hit / GraphHit) to a
     chunk-shaped dict the agent reads."""
@@ -230,6 +274,10 @@ def _hit_to_chunk_dict(hit: Any, channel: str) -> dict[str, Any]:
         "score": float(hit.score),
         "created_at": hit.created_at.isoformat() if hit.created_at else None,
         "updated_at": hit.updated_at.isoformat() if hit.updated_at else None,
+        # Validity signals the CURATION rule in the prompt reads. Omitted
+        # entirely when unknown, never defaulted -- see `_age_days`.
+        **({"age_days": a} if (a := _age_days(hit.updated_at)) is not None else {}),
+        **({"origin": o} if (o := _hit_origin(hit)) is not None else {}),
         "author_id": hit.author_id,
     }
 
@@ -251,6 +299,8 @@ def _inferred_hit_to_dict(hit: Any) -> dict[str, Any]:
         "score": float(hit.score),
         "created_at": hit.created_at.isoformat() if hit.created_at else None,
         "updated_at": hit.updated_at.isoformat() if hit.updated_at else None,
+        **({"age_days": a} if (a := _age_days(hit.updated_at)) is not None else {}),
+        **({"origin": o} if (o := _hit_origin(hit)) is not None else {}),
         "author_id": hit.author_id,
     }
 
@@ -362,11 +412,14 @@ async def execute_search(
     """Fan out 1+ queries through the 4 channels (vector + bm25 + graph +
     inferred_edge) in parallel — same shape the harness runs on turn 0.
 
-    `discovery` widens the GRAPH channel's budget only (see
-    SEARCH_AGENT_GRAPH_TOP_K_DISCOVERY). Graph hits arrive sorted by their
-    per-edge surprise score, so a wider budget admits more of the
-    structurally-surprising tail while low-surprise hub-to-hub edges stay at
-    the back and fall outside it. Vector and BM25 budgets are unchanged.
+    `discovery` changes the GRAPH channel twice: it widens that channel's
+    budget (see SEARCH_AGENT_GRAPH_TOP_K_DISCOVERY) AND it turns on
+    surprise-score ORDERING. Off (the default), graph hits arrive ordered by
+    confidence tier -- EXTRACTED, then INFERRED, then AMBIGUOUS -- because a
+    direct lookup wants the deterministically-matched edge, and surprise
+    deliberately ranks that last. On, hits arrive by surprise score, so the
+    wider budget admits more of the structurally-surprising tail. Vector and
+    BM25 budgets and ordering are unchanged either way.
 
     If `entity_ids` is omitted and the agent provides multiple queries,
     each query gets its own grounding run; entity-anchored channels
@@ -515,6 +568,10 @@ async def execute_search(
                     sources=sources,
                     source_keys_include_keyless=source_keys_include_keyless,
                     project_id=project_id,
+                    # Surprise ordering is an EXPLORATION posture, not a default.
+                    # Passing it through means a direct lookup reads canonical
+                    # edges first instead of the speculative tail.
+                    discovery=discovery,
                 )
                 return [
                     {

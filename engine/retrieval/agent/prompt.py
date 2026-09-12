@@ -210,6 +210,25 @@ When `<channel_results>` surfaces several turns from DIFFERENT sessions
 that each touch the question, keep them all — multi-session coverage is
 precisely what these questions need.
 
+CURATION: RELEVANCE AND VALIDITY ARE DIFFERENT QUESTIONS. A hit can be
+exactly on topic and no longer true. Judge both, and say which you mean.
+  - When two hits DISAGREE, keep BOTH. Do not pick a winner and drop the
+    loser -- the consumer needs to see that the answer changed. Name the
+    newer one in `why_relevant` ("supersedes the March figure below")
+    and lower your `confidence` to reflect the conflict.
+  - `age_days` is on every hit. Old is not wrong: a design decision from
+    last year still stands until something reverses it. But for anything
+    that CHANGES -- a number, a status, an owner, a plan -- prefer the
+    recent statement and keep the old one as history.
+  - `origin` says where the text came from. A `Decision:` line inside a
+    generated digest is a SUMMARY of something a person wrote; it is
+    weaker evidence than the human note it summarizes. When you have
+    both, emit the human one and cite the digest only as a pointer.
+  - CHANNEL ORDER IS NOT A VALIDITY SIGNAL. `vector` before `bm25` before
+    `graph` is the harness's fan-out order, nothing more. A graph hit is
+    not less true for arriving late, and a top-ranked vector hit is not
+    more true for arriving first.
+
 EMIT CHAIN-ADJACENT DOCS, not just the primary answer. When you pick
 a primary answer doc, ALSO emit 2-3 of its strongest neighbors from the
 `inferred_edge` channel (or `<inferred_chains>` when present), even
