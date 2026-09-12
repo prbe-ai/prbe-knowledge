@@ -78,7 +78,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
 
-from engine.retrieval.helpers import project_scope_predicate, source_key_predicate
+from engine.retrieval.helpers import origin_of, project_scope_predicate, source_key_predicate
 from engine.retrieval.temporal import build_predicate, live_version_join
 from engine.shared.constants import TOP_K_BM25
 from engine.shared.db import with_tenant
@@ -105,6 +105,9 @@ class BM25Hit:
     score: float
     author_id: str | None = None
     kind: str = "content"
+    # Who wrote the TEXT: "human", "generated", or None when unknown. See
+    # `helpers.origin_of` -- None is never "human".
+    origin: str | None = None
 
 
 def _build_or_tsquery_string(query_text: str) -> str:
@@ -535,6 +538,7 @@ async def bm25_search(
                    k.kind,
                    d.created_at,
                    d.updated_at,
+                   d.metadata->>'origin' AS origin,
                    k.score
             FROM ({capped_sql}) k
             JOIN documents d
@@ -596,6 +600,7 @@ async def bm25_search(
             score=float(r["score"]),
             author_id=normalize_author_id(r["author_id"]),
             kind=r["kind"],
+            origin=origin_of(r),
         )
         for r in rows
     ]

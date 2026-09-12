@@ -15,7 +15,16 @@ from engine.retrieval.agent.tools import _age_days, _hit_origin, _hit_to_chunk_d
 
 
 class _Hit:
-    def __init__(self, updated_at=None, metadata=None) -> None:
+    """A stand-in for a retriever hit.
+
+    NOTE the `origin` attribute and the test below that pins it against the
+    REAL dataclasses. The first version of this file gave the fake a
+    `metadata` dict, which no retriever hit has ever had -- so `_hit_origin`
+    returned None for every hit in production while these tests stayed green.
+    A fake is only evidence about production if production has the same shape.
+    """
+
+    def __init__(self, updated_at=None, origin=None) -> None:
         self.chunk_id = "c1"
         self.doc_id = "slack:d1"
         self.doc_version = 3
@@ -27,7 +36,7 @@ class _Hit:
         self.created_at = datetime(2026, 1, 1, tzinfo=UTC)
         self.updated_at = updated_at
         self.author_id = None
-        self.metadata = metadata
+        self.origin = origin
 
 
 # ------------------------------------------------------------------ the rule
@@ -67,10 +76,49 @@ def test_age_days_rides_on_every_rendered_hit() -> None:
 # ------------------------------------------------------------------ origin
 
 def test_origin_is_carried_when_the_document_says_and_omitted_when_it_does_not() -> None:
-    assert _hit_origin(_Hit(metadata={"origin": "generated"})) == "generated"
-    assert _hit_origin(_Hit(metadata={"origin": "human"})) == "human"
+    assert _hit_origin(_Hit(origin="generated")) == "generated"
+    assert _hit_origin(_Hit(origin="human")) == "human"
     # Never invent an attribution.
-    assert _hit_origin(_Hit(metadata={})) is None
-    assert _hit_origin(_Hit(metadata=None)) is None
-    assert _hit_origin(_Hit(metadata={"origin": "something-else"})) is None
+    assert _hit_origin(_Hit(origin=None)) is None
+    assert _hit_origin(_Hit(origin="something-else")) is None
     assert "origin" not in _hit_to_chunk_dict(_Hit(), "vector")
+
+
+def test_every_retriever_hit_actually_has_the_field_this_reads() -> None:
+    """The guard for the bug this file shipped with.
+
+    `_hit_origin` read `hit.metadata`, and NO retriever hit has ever had that
+    attribute -- so it returned None for every hit in production while the
+    test above passed, because the fake had the attribute the real objects
+    lack. Asserting against the real dataclasses is the only version of this
+    test that can fail when the field moves.
+    """
+    import dataclasses
+
+    from engine.retrieval.retrievers.bm25 import BM25Hit
+    from engine.retrieval.retrievers.graph import GraphHit
+    from engine.retrieval.retrievers.vector import VectorHit
+
+    for hit_type in (VectorHit, BM25Hit, GraphHit):
+        names = {f.name for f in dataclasses.fields(hit_type)}
+        assert "origin" in names, (
+            f"{hit_type.__name__} has no `origin` field, so _hit_origin "
+            f"returns None for every hit it produces"
+        )
+
+
+def test_every_channel_selects_origin_from_the_document() -> None:
+    """A field on the dataclass that no query populates is the same bug one
+    layer down: the attribute exists, it is always None, and nothing fails."""
+    import inspect
+
+    from engine.retrieval.retrievers import bm25, graph, vector
+
+    for module in (vector, bm25, graph):
+        source = inspect.getsource(module)
+        assert "metadata->>'origin'" in source, (
+            f"{module.__name__} never selects origin, so its hits carry None"
+        )
+        assert "origin_of(r)" in source, (
+            f"{module.__name__} selects origin but never puts it on the hit"
+        )

@@ -247,16 +247,20 @@ def _hit_origin(hit: Any) -> str | None:
     """Where this text came from: `generated` when a machine wrote it,
     `human` when a person did, None when the document does not say.
 
-    Read off the indexed document's metadata (research-os R2 stamps it).
-    None renders as absent rather than as `human` -- claiming a person wrote
+    Reads the retriever hit's own `origin` field, which every channel selects
+    from `documents.metadata->>'origin'` (research-os stamps it).
+
+    This USED to read `hit.metadata`, and no retriever hit has ever had such
+    an attribute -- so it returned None for every hit ever rendered, and the
+    unit test passed because its fake hit had the attribute the real ones
+    lack. Hence `_ORIGIN_BEARING_HITS` below, which asserts against the real
+    dataclasses instead of a stand-in.
+
+    None renders as ABSENT rather than as `human`: claiming a person wrote
     something we cannot attribute is the failure this field exists to prevent.
     """
-    meta = getattr(hit, "metadata", None)
-    if isinstance(meta, dict):
-        origin = meta.get("origin")
-        if isinstance(origin, str) and origin in ("human", "generated"):
-            return origin
-    return None
+    origin = getattr(hit, "origin", None)
+    return origin if origin in ("human", "generated") else None
 
 
 def _hit_to_chunk_dict(hit: Any, channel: str) -> dict[str, Any]:

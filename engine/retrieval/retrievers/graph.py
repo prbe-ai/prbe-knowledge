@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
-from engine.retrieval.helpers import project_scope_predicate, source_key_predicate
+from engine.retrieval.helpers import origin_of, project_scope_predicate, source_key_predicate
 from engine.retrieval.surprise import surprise_score
 from engine.retrieval.temporal import build_predicate
 from engine.shared.constants import ROUTER_ENTITY_TO_LABEL, TOP_K_GRAPH
@@ -57,6 +57,9 @@ class GraphHit:
     edge_type: str | None = None
     confidence: str | None = None
     via_label: str | None = None
+    # Who wrote the TEXT: "human", "generated", or None when unknown. See
+    # `helpers.origin_of` -- None is never "human".
+    origin: str | None = None
     # Surprise-score telemetry. Always set (even when flag=false) so we can
     # compare would-be scores via logs without flipping the flag in prod.
     retriever_scores: dict[str, float] | None = None
@@ -347,7 +350,7 @@ async def graph_search(
             -- title / opening summary across every source_system shape).
             SELECT chunk_id, doc_id, doc_version,
                    source_system, source_url, title, author_id,
-                   content, created_at, updated_at,
+                   content, created_at, updated_at, origin,
                    via_entity, via_label, edge_type, confidence,
                    via_degree, via_community, via_source_system,
                    degree, community_id
@@ -355,6 +358,7 @@ async def graph_search(
               SELECT c.chunk_id, c.doc_id, d.version AS doc_version,
                    d.source_system, d.source_url, d.title, d.author_id,
                    c.content, d.created_at, d.updated_at,
+                   d.metadata->>'origin'    AS origin,
                    MIN(n.via)               AS via_entity,
                    MIN(n.via_label)         AS via_label,
                    MIN(n.edge_type)         AS edge_type,
@@ -389,7 +393,8 @@ async def graph_search(
               {project_filter}
             GROUP BY c.chunk_id, c.doc_id, c.chunk_index, d.version,
                      d.source_system, d.source_url, d.title, d.author_id,
-                     c.content, d.created_at, d.updated_at
+                     c.content, d.created_at, d.updated_at,
+                     d.metadata->>'origin'
             ) AS chunks_with_rn
             WHERE rn_in_doc = 1
             LIMIT $4
@@ -438,6 +443,7 @@ async def graph_search(
                 edge_type=r["edge_type"],
                 confidence=confidence,
                 via_label=r["via_label"],
+                origin=origin_of(r),
                 retriever_scores={"surprise": surprise},
             )
         )
