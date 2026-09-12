@@ -127,6 +127,20 @@ jobs:
           createdb -h localhost -p 5432 -U prbe session_receipts_test
           createdb -h localhost -p 5432 -U prbe backfill_schema_test
 
+      # The credential-redaction suite scans with the real gitleaks binary.
+      # Without it that suite SKIPS, which reads as a pass — so the suite
+      # raises in CI when the binary is absent rather than quietly skipping,
+      # and this step is what keeps it present.
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          VERSION=8.30.1
+          curl -fsSL -o /tmp/gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz"
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo install -m 0755 /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
       - name: Tests (session protocol and bootstrap)
         env:
           PRBE_RECEIPT_TEST_DATABASE_URL: postgresql://prbe:prbe@localhost:5432/session_receipts_test
@@ -142,7 +156,7 @@ jobs:
           tests/handlers/test_claude_code_extract_external_id.py
           tests/handlers/test_codex_registration.py
           tests/handlers/test_pi_registration.py
-          tests/test_session_doc_type_families.py
+          tests/test_secret_redaction.py
 
       # Scoped to the STORAGE suite (Postgres + MinIO), not `tests/` wholesale.
       # The full suite has ~42 pre-existing failures unrelated to storage: tests that

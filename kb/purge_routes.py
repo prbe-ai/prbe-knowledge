@@ -25,8 +25,9 @@ from typing import Any
 
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
+from engine.ingest.credential_sweep import sweep_credentials
 from engine.ingest.purge import (
     cascade_for,
     create_purge_run,
@@ -145,6 +146,59 @@ async def _run_and_record(
         await finish_purge_run(
             customer_id, purge_id, None, error=f"{type(exc).__name__}: {exc}"
         )
+
+
+class CredentialSweepRequest(BaseModel):
+    """Targeted credential remediation, not a source purge.
+
+    `kb/purge_routes.py`'s other endpoint purges a whole integration source and
+    cannot express "this document" or "this value" — and transcript sources are
+    not in `_PURGEABLE` at all, so a leaked key in a captured session had no
+    removal path whatsoever before this.
+    """
+
+    #: Empty means every document this tenant has.
+    doc_ids: list[str] = Field(default_factory=list, max_length=1000)
+    #: Report without writing. THE DEFAULT, on purpose: deciding whether a hit
+    #: is a live key or AWS's published example is a human judgement, and a
+    #: sweep that writes first and asks later is one nobody will point at a
+    #: customer's data.
+    dry_run: bool = True
+
+
+@router.post("/credentials", dependencies=[Depends(verify_internal_knowledge_key)])
+async def sweep_stored_credentials(
+    body: CredentialSweepRequest,
+    customer_id: str = Depends(_require_customer),
+) -> dict[str, Any]:
+    """Find credentials already stored in this tenant's chunks; optionally
+    replace them in place.
+
+    Synchronous, unlike the source purge: this is an operator action taken
+    against a known finding, and an operator who has just been told a live key
+    is in a customer's index wants the answer, not a poll token. The sweep is
+    bounded by the tenant's live chunk count and does no network work beyond
+    the scanner subprocess.
+
+    Rewrites, never deletes. The transcript stays; the credential does not.
+    """
+    result = await sweep_credentials(
+        customer_id, doc_ids=body.doc_ids or None, dry_run=body.dry_run
+    )
+    if result.skipped_no_binary:
+        # A sweep that could not scan must not answer with a clean-looking
+        # zero. 503: the capability is missing, the question is unanswered.
+        raise HTTPException(
+            status_code=503,
+            detail="credential scanner unavailable on this deployment; no conclusion drawn",
+        )
+    log.info(
+        "purge.credential_sweep",
+        customer=customer_id,
+        dry_run=body.dry_run,
+        **result.as_dict(),
+    )
+    return {"customer_id": customer_id, "dry_run": body.dry_run, **result.as_dict()}
 
 
 @router.post("", status_code=202, dependencies=[Depends(verify_internal_knowledge_key)])

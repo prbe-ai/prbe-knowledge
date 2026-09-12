@@ -30,31 +30,21 @@ _TOKEN_TO_DOC_TYPES: dict[str, tuple[DocType, ...]] = {
     # "comment" maps both kinds — Linear ticket comments and GitHub
     # commit comments. Users say "comment" without qualifying which.
     "comment": (DocType.LINEAR_COMMENT, DocType.GITHUB_COMMIT_COMMENT),
-    # ALL THREE coding agents. "session" is what a person says when they mean
-    # a coding-agent conversation, and they almost never mean one vendor's --
-    # so an unqualified token must not silently pick Claude Code and drop the
-    # Codex and pi sessions beside it. Narrowing to one agent is what `sources`
-    # is for, and the prefix narrowing below does it automatically.
-    "session": (
-        DocType.CLAUDE_CODE_SESSION,
-        DocType.CODEX_SESSION,
-        DocType.PI_SESSION,
-    ),
+    "session": (DocType.CLAUDE_CODE_SESSION,),
     "meeting": (DocType.GRANOLA_MEETING,),
 }
 
 
 # Source → dotted-prefix narrowing reads shared.source_registry (each
 # connector registers its doc_type_prefix where the source is defined).
-# CODEX and PI now register `codex.` and `pi.` rather than inheriting
-# `claude_code.`, so `sources=[codex]` + the token "session" narrows to
-# `codex.session` -- the right document family, named after the agent that
-# produced it. The token maps to all three families precisely so that this
-# narrowing is what picks one, instead of the token silently having picked
-# Claude Code before anyone asked. Sources without a registered profile
-# resolve to the `custom.` default prefix, which no resolver token maps to --
-# they narrow to nothing, exactly like the pre-registry behavior of sources
-# missing from the old hardcoded map.
+# CODEX registers the `claude_code.` doc_type prefix because the connector
+# emits CLAUDE_CODE_SESSION docs for both — provenance differs at
+# `source_system`, doc shape is identical — so a `sources=[codex]` filter
+# resolves a token like "session" to `claude_code.session` without dropping
+# zero results. Sources without a registered profile resolve to the
+# `custom.` default prefix, which no resolver token maps to — they narrow
+# to nothing, exactly like the pre-registry behavior of sources missing
+# from the old hardcoded map.
 
 
 def resolve_doc_type_token(
