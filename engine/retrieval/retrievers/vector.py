@@ -189,11 +189,13 @@ async def vector_search(
         sort_by=sort_by,
     )
 
-    # The per-source guarantee on the relevance path gets its own strategy:
-    # a bounded ANN pool plus per-source ANN top-ups, all through the index.
-    # recency keeps the windowed full-scan below -- it cannot use the ANN
-    # index by construction, and its filters prune the pool first.
-    if per_source_top_k is not None and sort_by != "recency":
+    # The per-source guarantee gets its own strategy on BOTH sorts: a
+    # bounded ANN pool plus per-source ANN top-ups, all through the index.
+    # For recency the pool and top-ups are still distance-ordered (the only
+    # order the HNSW index serves); only the per-source ranking that hands
+    # out the K slots switches to updated_at. A global recency pool alone
+    # would let one loud source's 180 nearest chunks starve a quiet one.
+    if per_source_top_k is not None:
         rows = await _per_source_ann_search(
             customer_id=customer_id,
             inner_sql=inner_sql,
@@ -202,10 +204,11 @@ async def vector_search(
             top_k=top_k,
             per_source_top_k=per_source_top_k,
             sources=sources,
+            rank_by=sort_by,
         )
         return _to_hits(rows)
 
-    async with with_tenant(customer_id) as conn:
+    async with _ANN_STATEMENT_SEMAPHORE, with_tenant(customer_id) as conn:
         # Selective post-filter mitigation (see docstring). This used to be
         # gated on `source_keys`, which under-scoped it: pgvector applies
         # EVERY filter after the ANN scan, and the visibility filter below is
@@ -234,47 +237,15 @@ async def vector_search(
             f"\n            LIMIT ${len(params)}"
         )
 
-        if per_source_top_k is not None:
-            # recency + per-source: the original windowed shape, unchanged.
-            # Give each source_system its own top-K slot instead of one global
-            # budget, so a loud source can't bury a quiet one in a mixed-source
-            # request (the PR#78 recall guarantee, moved server-side). LIMIT $3
-            # stays an overall safety cap. The window orders by the SELECTED
-            # columns (score / updated_at), not the raw distance expression,
-            # which isn't in scope at the wrapping layer.
-            partition_order = "updated_at DESC, chunk_id"
-            params.append(per_source_top_k)
-            ps_idx = len(params)
-            sql = f"""
-            SELECT chunk_id, doc_id, doc_version, source_system, source_url,
-                   title, author_id, content, kind, created_at, updated_at, score
-            FROM (
-                SELECT sub.*,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY sub.source_system ORDER BY {partition_order}
-                       ) AS _ps_rn
-                FROM ({candidate_sql}) sub
-            ) ranked
-            WHERE _ps_rn <= ${ps_idx}
-            -- Interleave sources: each source's rank-1 before any source's
-            -- rank-2. Ordering by score here instead would re-impose exactly
-            -- the cross-source competition the PARTITION just prevented --
-            -- cosine scores are NOT comparable across sources (terse
-            -- structured projections always lose to chatty transcripts), so
-            -- rank, not score, is the only fair cross-source currency.
-            ORDER BY _ps_rn, {partition_order}
-            LIMIT $3
-            """
-        else:
-            # Deterministic tiebreak lives HERE, outside the ANN pool, so it
-            # sorts at most `pool_size` rows instead of defeating the index.
-            sql = f"""
-            SELECT chunk_id, doc_id, doc_version, source_system, source_url,
-                   title, author_id, content, kind, created_at, updated_at, score
-            FROM ({candidate_sql}) pool
-            ORDER BY {outer_order_sql}
-            LIMIT $3
-            """
+        # Deterministic tiebreak lives HERE, outside the ANN pool, so it
+        # sorts at most `pool_size` rows instead of defeating the index.
+        sql = f"""
+        SELECT chunk_id, doc_id, doc_version, source_system, source_url,
+               title, author_id, content, kind, created_at, updated_at, score
+        FROM ({candidate_sql}) pool
+        ORDER BY {outer_order_sql}
+        LIMIT $3
+        """
 
         rows = await conn.fetch(sql, *params)
 
@@ -426,8 +397,15 @@ async def _per_source_ann_search(
     top_k: int,
     per_source_top_k: int,
     sources: list[str] | None,
+    rank_by: str = "relevance",
 ) -> list[Any]:
     """The per-source recall guarantee, kept ON the ANN index.
+
+    `rank_by="recency"`: the pool and the top-ups are unchanged (distance-
+    ordered, index-served); only the per-source ranking below hands out the
+    K slots by `updated_at DESC, chunk_id` instead of score. That keeps the
+    quiet-source guarantee on the recency path, which a single global
+    recency pool cannot give.
 
     HISTORY, because the previous shape looked reasonable and cost 37-52
     seconds. The guarantee (PR#78): every source_system gets its own top-K
@@ -552,23 +530,56 @@ async def _per_source_ann_search(
     # rank rows within each source by (score DESC, chunk_id), keep at most K
     # per source, then interleave by rank (every source's rank-1 before any
     # source's rank-2 -- see the interleave rationale above), cap at top_k.
+    return _rank_per_source(
+        [*pool_rows, *topup_rows],
+        per_source_top_k=per_source_top_k,
+        top_k=top_k,
+        rank_by=rank_by,
+    )
+
+
+def _rank_per_source(
+    rows: list[Any],
+    *,
+    per_source_top_k: int,
+    top_k: int,
+    rank_by: str = "relevance",
+) -> list[Any]:
+    """Merge pool + top-up rows in Python, mirroring the SQL window this
+    replaced: dedupe by chunk_id (a short source's pool rows reappear in its
+    top-up -- first occurrence wins, rows identical), rank rows WITHIN each
+    source, keep at most K per source, then interleave by rank (every
+    source's rank-1 before any source's rank-2 -- see the interleave
+    rationale in the per-source docstring), cap at top_k.
+
+    `rank_by="recency"` ranks within a source by `updated_at DESC, chunk_id`
+    instead of `score DESC, chunk_id`; the pool that fed it stays distance-
+    ordered either way, which is what keeps the quiet-source guarantee on
+    the recency path.
+    """
+    if rank_by == "recency":
+        def _key(r: Any) -> tuple[Any, ...]:
+            # Newest first; `updated_at` is never NULL on documents.
+            return (-r["updated_at"].timestamp(), r["chunk_id"])
+    else:
+        def _key(r: Any) -> tuple[Any, ...]:
+            return (-r["score"], r["chunk_id"])
+
     seen: set[str] = set()
     by_source: dict[str, list[Any]] = defaultdict(list)
-    for r in [*pool_rows, *topup_rows]:
-        # A short source's pool rows reappear in its top-up (the top-up is a
-        # superset by construction); first occurrence wins, rows identical.
+    for r in rows:
         if r["chunk_id"] in seen:
             continue
         seen.add(r["chunk_id"])
         by_source[r["source_system"]].append(r)
 
-    ranked: list[tuple[int, float, str, Any]] = []
+    ranked: list[tuple[int, tuple[Any, ...], Any]] = []
     for rows_for_source in by_source.values():
-        rows_for_source.sort(key=lambda r: (-r["score"], r["chunk_id"]))
+        rows_for_source.sort(key=_key)
         for rank, r in enumerate(rows_for_source[:per_source_top_k], start=1):
-            ranked.append((rank, -r["score"], r["chunk_id"], r))
-    ranked.sort(key=lambda t: t[:3])
-    return [r for _, _, _, r in ranked[:top_k]]
+            ranked.append((rank, _key(r), r))
+    ranked.sort(key=lambda t: t[:2])
+    return [r for _, _, r in ranked[:top_k]]
 
 
 def _to_hits(rows: list[Any]) -> list[VectorHit]:

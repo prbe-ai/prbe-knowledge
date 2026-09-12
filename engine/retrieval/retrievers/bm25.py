@@ -165,6 +165,16 @@ BM25_TITLE_ONLY_PER_DOC = 1
 # reports short result sets on a corpus dominated by one document, this is the
 # knob.
 _BM25_POOL_MULTIPLIER = 10
+#: When the request carries any DOCUMENT-level scope (sources / doc_types /
+#: author / source_keys / project_id), that predicate lands on the documents
+#: join AFTER the Tantivy TopK pool -- it cannot ride the bm25 index the way
+#: the tenant and visibility filters do (project_id lives on documents, not
+#: on chunks). A scoped query therefore post-filters a tenant-wide pool, and
+#: a project holding a small share of the tenant's chunks would empty it.
+#: Widen the pool for scoped queries so the filter has something to keep;
+#: TopK over the index is cheap, the documents join is per-row. Phase 2 puts
+#: project_id inside the index and retires this factor.
+_BM25_SCOPED_POOL_FACTOR = 4
 
 # Weight on a title match relative to a content match.
 #
@@ -345,7 +355,9 @@ async def bm25_search(
         # document's chunks in the ranking; picking chunk 0 was expressing a
         # ranking idea as a join predicate. The cap below keeps the guarantee
         # the old predicate was really providing.
-        params.append(top_k * _BM25_POOL_MULTIPLIER)
+        scoped = bool(sources or doc_types or author_ids or source_keys or project_id)
+        pool_size = top_k * _BM25_POOL_MULTIPLIER * (_BM25_SCOPED_POOL_FACTOR if scoped else 1)
+        params.append(pool_size)
         pool_idx = len(params)
         # The tenant and visibility filters appear TWICE below, and both
         # copies are load-bearing.

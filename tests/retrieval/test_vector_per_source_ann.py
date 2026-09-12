@@ -129,13 +129,21 @@ async def test_every_candidate_query_is_ann_limited(db: _Dispatcher) -> None:
         )
 
 
-async def test_recency_per_source_keeps_the_windowed_shape(db: _Dispatcher) -> None:
-    """recency cannot use the ANN index by construction, so its per-source
-    branch legitimately keeps the window. Pinned so the fast-path fix cannot
-    quietly widen into a path it does not serve."""
-    db.pool_rows = [_row("c1", "github", 0.9)]
+async def test_recency_per_source_takes_the_same_pool_and_topups(db: _Dispatcher) -> None:
+    """recency + per-source no longer windows a full scan (nor one global
+    recency pool, which let a loud source starve a quiet one): it takes the
+    same distance-ordered pool + per-source top-ups as relevance, and only the
+    in-Python ranking switches to updated_at. Every candidate query stays
+    ANN-ordered and LIMITed. See test_vector_recency_pool.py."""
+    db.pool_rows = [_row("c1", "github", 0.9), _row("c2", "github", 0.8)]
+    db.source_rows = ["github", "custom_ingest"]
+    db.topup_rows["custom_ingest"] = [_row("c9", "custom_ingest", 0.4)]
     await _search(db, sort_by="recency")
-    assert any("ROW_NUMBER()" in s for s, _ in db.fetched)
+    candidate_sqls = [s for s, _ in db.fetched if "FROM chunks c" in s]
+    assert len(candidate_sqls) == 2  # pool + one top-up for the short source
+    for sql in candidate_sqls:
+        assert "ROW_NUMBER()" not in sql
+        assert re.search(r"ORDER BY\s+c\.embedding_v2\s+<=>\s+\$2::halfvec\s+LIMIT \$\d+", sql)
 
 
 async def test_iterative_scan_is_enabled_on_every_ann_connection(db: _Dispatcher) -> None:

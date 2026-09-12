@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import pytest
 import pytest_asyncio
 
 import engine.shared.db as db_module
@@ -200,3 +201,60 @@ async def pg_search_db(live_db):
             "cannot be exercised. See pg_search_db in tests/retrieval/conftest.py."
         )
     yield None
+
+
+# ---------------------------------------------------------------------------
+# Shared SQL-shape harness for the vector retriever. Several files pin the
+# exact SQL `vector_search` builds (ANN ORDER BY shape, recency pool, per-
+# source windows) without a database; they all use this one recording
+# connection so the harness cannot drift between them.
+# ---------------------------------------------------------------------------
+from contextlib import asynccontextmanager  # noqa: E402
+from typing import Any  # noqa: E402
+
+
+class RecordingConn:
+    """Captures every SQL statement `vector_search` builds; returns no rows.
+
+    `sql` / `params` are the LAST fetch (the historical single-query shape);
+    `fetched` keeps them all, in order, for the per-source strategy that
+    issues a pool query and a source listing concurrently.
+    """
+
+    def __init__(self, rows: list[Any] | None = None) -> None:
+        self.sql: str | None = None
+        self.params: tuple[Any, ...] = ()
+        self.statements: list[str] = []
+        self.fetched: list[tuple[str, tuple[Any, ...]]] = []
+        self._rows = rows or []
+
+    async def execute(self, sql: str, *args: Any) -> None:
+        # SAVEPOINT / SET LOCAL hnsw.iterative_scan / RELEASE
+        self.statements.append(sql)
+
+    async def fetch(self, sql: str, *params: Any) -> list[Any]:
+        self.sql = sql
+        self.params = params
+        self.fetched.append((sql, params))
+        return list(self._rows)
+
+
+class FakeEmbedder:
+    async def embed_query(self, text: str) -> list[float]:
+        return [0.1, 0.2, 0.3]
+
+
+@pytest.fixture
+def recorded(monkeypatch: pytest.MonkeyPatch) -> RecordingConn:
+    """`vector_search` against a recording connection and a fake embedder."""
+    from engine.retrieval.retrievers import vector as vector_mod
+
+    conn = RecordingConn()
+
+    @asynccontextmanager
+    async def _fake_with_tenant(customer_id: str):  # type: ignore[no-untyped-def]
+        yield conn
+
+    monkeypatch.setattr(vector_mod, "with_tenant", _fake_with_tenant)
+    monkeypatch.setattr(vector_mod, "get_embedder_v2", lambda: FakeEmbedder())
+    return conn
