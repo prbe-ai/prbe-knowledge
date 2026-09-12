@@ -55,6 +55,10 @@ _DEGRADED = {
     "fatal_provider_error",
     "provider_error_prefanout_fallback",
     "context_overflow",
+    # Degraded, deliberately: the response gate could not re-verify emitted
+    # chunk ids against live rows on an UNSCOPED request; the chunks stand
+    # but an invented id could be among them. (A scoped request fails.)
+    "scope_check_unavailable",
     # Degraded, deliberately: the emit was cut off at
     # SEARCH_AGENT_MAX_OUTPUT_TOKENS, so the caller holds a structurally
     # partial answer even when JSON repair salvages a parseable object.

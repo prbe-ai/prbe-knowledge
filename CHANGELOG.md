@@ -26,6 +26,27 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Fixed
 
+- **`/retrieve` honours its `temporal` filter.** `QueryRequest.temporal`
+  (AS_OF / CHANGED_BETWEEN) was validated and then ignored on the gatherer
+  path -- every channel ran LATEST and `applied_temporal` was never set. The
+  spec now reaches every channel, the identifier lookup, the agent's in-loop
+  content tools and the response gate, and `applied_temporal` echoes it
+  (`source: request` or `default`). `recency_half_life_days` and
+  `min_confidence` do what their descriptions say; `entity_match_threshold`
+  and `requesting_user_id`, which fed only the deleted list pipeline, are
+  removed (ignored if sent).
+- **`fetch_doc` / `fetch_chunk_window` serve one version.** They filtered
+  only `visibility`, so for the 30 days a dead version's chunks are retained
+  an edited document paged out old and new text interleaved at colliding
+  chunk indexes. Chunks now join the document version the temporal spec
+  selects, and results carry the real `doc_version` instead of `1`.
+- **The response gate runs on every response.** Emitted ids are re-verified
+  against live rows whether or not a scope was set (an invented chunk_id is
+  dropped); on a database error a scoped request still fails, an unscoped one
+  keeps its chunks and reports `degraded_reason: scope_check_unavailable`.
+  Chunks the recall-floor backfill appends are marked `harness_appended`
+  in the trace, so "retrieved but never examined" and "examined and
+  rejected" stop looking alike.
 - **`sort=recency` keeps its ANN candidate pool.** The recency branch of the
   vector channel took no ANN limit, so "latest X" returned the newest chunks
   in scope whatever X was. The pool is now the index's best
