@@ -20,7 +20,7 @@ import pytest_asyncio
 from fastapi import HTTPException
 
 from engine.ingest.handlers.base import make_default_context
-from engine.shared.constants import SourceSystem
+from engine.shared.constants import PrincipalType, SourceSystem
 from engine.shared.models import WebhookEvent
 from kb import session_receipts as sr
 from kb.handlers.claude_code import ClaudeCodeConnector
@@ -524,4 +524,12 @@ async def test_copied_history_projects_native_provenance_and_uploader_without_au
         assert doc.metadata["uploader_name"] == "Copy Uploader"
         assert doc.metadata["uploader_device_id"] == "paired-upload-device"
         assert not any(key.startswith("employee_") for key in doc.metadata)
-        assert doc.acl.principals[0].principal_id == "copy-uploader"
+        # The ACL names the WORKSPACE, not the uploader. Nothing enforces a
+        # per-user ACL on session documents -- the transcript route scopes by
+        # customer_id and retrieval has no ACL filter -- so naming one asserted
+        # a protection that did not exist. What this test actually guards is
+        # untouched and still asserted above: no AUTHORED edge, `author_id` is
+        # None, the uploader is recorded in metadata but not credited as the
+        # author. The uploader still reads the document, by being in the tenant.
+        assert doc.acl.principals[0].principal_type == PrincipalType.WORKSPACE
+        assert doc.acl.principals[0].principal_id == "tenant-a"
