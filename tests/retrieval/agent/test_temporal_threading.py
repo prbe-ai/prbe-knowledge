@@ -470,7 +470,7 @@ def test_backfilled_chunks_carry_the_version_they_were_read_from() -> None:
         "bm25": [], "graph": [], "inferred_edge": [],
     }]}
     gathered = GathererOutput(chunks=[], gatherer_notes=GathererNotes())
-    assert _backfill_recall_floor(gathered, prefanout) == 1
+    assert _backfill_recall_floor(gathered, prefanout).appended == 1
     assert gathered.chunks[0].doc_version == 4
 
 

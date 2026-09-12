@@ -361,6 +361,18 @@ CREATE TABLE chunks (
     -- Kept in sync by two triggers below, not by application code.
     title                TEXT NOT NULL DEFAULT '',
 
+    -- Denormalized copy of the owning document's `metadata->>'project_id'`
+    -- (migration 0131). Same argument as `title` above: a project scope on
+    -- the documents join lands AFTER Tantivy has chosen its TopK pool, so a
+    -- scoped query ranks the whole tenant and discards most of it. On the
+    -- chunk it becomes a `must` clause inside the boolean and filters
+    -- index-side.
+    --
+    -- NULL means "this chunk's document belongs to no project", which is a
+    -- real and common state -- deliberately not '' , which would compare
+    -- equal to a scope asking for the empty string.
+    project_id           TEXT,
+
     -- migration 0082 (post-approval draft gating for generated artifacts).
     -- Tracks the visibility of the chunk's owning document version so retrieval
     -- can default-filter draft chunks without joining documents.
@@ -427,15 +439,25 @@ CREATE UNIQUE INDEX chunks_chunk_id_unique ON chunks (chunk_id);
 -- pg_search permits exactly ONE `USING bm25` index per relation, so this is
 -- the only one -- adding a second raises
 -- "a relation may only have one `USING bm25` index".
+--
+-- v3 (migration 0131) adds `project_id`, so a project scope filters INDEX-side
+-- as a Tantivy `must` clause instead of as a per-candidate heap filter after
+-- TopK. A FRESH database gets v3 here and needs nothing further. An EXISTING
+-- one still has v2 until `scripts/cron_pg_search_rebuild.py` swaps it on a
+-- planned window -- one index per relation means the swap is DROP + CREATE,
+-- which is an operational event, not a migration step. `bm25.py` probes
+-- pg_class and picks its query shape from what is actually installed, so both
+-- states are supported for as long as they need to be.
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'pg_search') THEN
         CREATE EXTENSION IF NOT EXISTS pg_search;
         EXECUTE $ix$
-            CREATE INDEX IF NOT EXISTS idx_chunks_bm25_v2
+            CREATE INDEX IF NOT EXISTS idx_chunks_bm25_v3
             ON chunks USING bm25 (
                 chunk_id, content, title, customer_id, doc_id, kind,
-                chunk_index, first_seen_version, last_seen_version, visibility
+                chunk_index, first_seen_version, last_seen_version, visibility,
+                project_id
             )
             WITH (
                 key_field=chunk_id,
@@ -450,6 +472,53 @@ BEGIN
     END IF;
 END
 $$;
+
+-- Project-id sync (migration 0131). Same obligation as the title sync below,
+-- and the same reason it lives in the database: a chunk whose document moved
+-- between projects must not keep claiming the old one, or a scoped search
+-- returns documents that are not in the project -- a scope LEAK, which is the
+-- failure the whole pre-search-scope line of work exists to prevent.
+CREATE OR REPLACE FUNCTION chunks_fill_project_id_on_insert()
+RETURNS trigger AS $fn$
+BEGIN
+    IF NEW.project_id IS NULL THEN
+        SELECT d.metadata->>'project_id' INTO NEW.project_id
+        FROM documents d
+        WHERE d.doc_id = NEW.doc_id
+          AND d.customer_id = NEW.customer_id
+          AND d.version BETWEEN NEW.first_seen_version AND NEW.last_seen_version
+        ORDER BY d.version DESC
+        LIMIT 1;
+    END IF;
+    RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION chunks_sync_project_id_from_document()
+RETURNS trigger AS $fn$
+BEGIN
+    UPDATE chunks c
+       SET project_id = NEW.metadata->>'project_id'
+     WHERE c.doc_id = NEW.doc_id
+       AND c.customer_id = NEW.customer_id
+       AND NEW.version BETWEEN c.first_seen_version AND c.last_seen_version
+       AND c.project_id IS DISTINCT FROM NEW.metadata->>'project_id';
+    RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_chunks_fill_project_id ON chunks;
+CREATE TRIGGER trg_chunks_fill_project_id
+    BEFORE INSERT ON chunks
+    FOR EACH ROW
+    EXECUTE FUNCTION chunks_fill_project_id_on_insert();
+
+DROP TRIGGER IF EXISTS trg_chunks_sync_project_id ON documents;
+CREATE TRIGGER trg_chunks_sync_project_id
+    AFTER UPDATE OF metadata ON documents
+    FOR EACH ROW
+    WHEN (OLD.metadata->>'project_id' IS DISTINCT FROM NEW.metadata->>'project_id')
+    EXECUTE FUNCTION chunks_sync_project_id_from_document();
 
 -- Title sync (migration 0100). The obligation a denormalized column takes on.
 -- Enforced in the database because the application is not the only writer:

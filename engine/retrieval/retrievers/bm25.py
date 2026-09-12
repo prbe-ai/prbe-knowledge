@@ -76,7 +76,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from engine.retrieval.helpers import project_scope_predicate, source_key_predicate
 from engine.retrieval.temporal import build_predicate, live_version_join
@@ -175,6 +175,59 @@ _BM25_POOL_MULTIPLIER = 10
 #: TopK over the index is cheap, the documents join is per-row. Phase 2 puts
 #: project_id inside the index and retires this factor.
 _BM25_SCOPED_POOL_FACTOR = 4
+
+#: Name of the BM25 index that carries `project_id` as a fast field, so a
+#: project scope can be a Tantivy `must` clause instead of a heap filter.
+#: Migration 0131 adds the column; the index itself is swapped by
+#: `scripts/cron_pg_search_rebuild.py` on a planned window, because pg_search
+#: allows exactly ONE bm25 index per relation and the swap is a DROP + CREATE.
+_BM25_V3_INDEX = "idx_chunks_bm25_v3"
+
+#: Cached answer to "is the v3 index live on this database?".
+#:
+#: Code ALWAYS deploys before the index is rebuilt -- the rebuild waits for a
+#: window, which can be days. A retriever that assumed v3 the moment 0131 ran
+#: would fail every BM25 query for the whole of that window. So the shape of
+#: the query is chosen from what is actually installed, and both shapes are
+#: supported paths rather than one being a fallback nobody exercises.
+#:
+#: None = not yet probed. Probed once per process against pg_class; the answer
+#: only changes when someone rebuilds the index, which restarts nothing, so a
+#: process started before a rebuild keeps using the documents-join predicate
+#: until it recycles. That is correct, just not optimal, and it is the safe
+#: direction: the join predicate returns the same rows, more slowly.
+_bm25_v3_available: bool | None = None
+
+
+async def bm25_project_scope_is_index_side(conn: Any) -> bool:
+    """Can a project scope ride the BM25 index on this database?
+
+    True only when the v3 index exists AND is valid -- a half-built index from
+    a killed `CREATE INDEX` keeps its name with `indisvalid = false`, and
+    querying through one returns wrong results rather than an error. That
+    exact debris is what the pg_search guardian exists to find, so this refuses
+    to trust a name alone.
+    """
+    global _bm25_v3_available
+    if _bm25_v3_available is not None:
+        return _bm25_v3_available
+    try:
+        _bm25_v3_available = bool(
+            await conn.fetchval(
+                """
+                SELECT i.indisvalid
+                  FROM pg_class c
+                  JOIN pg_index i ON i.indexrelid = c.oid
+                 WHERE c.relname = $1
+                """,
+                _BM25_V3_INDEX,
+            )
+        )
+    except Exception:
+        # A probe failure must not take the query down. Assume the old shape,
+        # which works on every database this code has ever run against.
+        _bm25_v3_available = False
+    return _bm25_v3_available
 
 # Weight on a title match relative to a content match.
 #
@@ -325,7 +378,22 @@ async def bm25_search(
             params, source_keys, alias="d",
             include_keyless=source_keys_include_keyless,
         )
-        project_filter = project_scope_predicate(params, project_id, alias="d")
+        # Project scope goes INDEX-side when the v3 index carries project_id as
+        # a fast field, and stays on the documents join otherwise. Exactly one
+        # of the two applies, never both: applying it twice is harmless for
+        # correctness but pays the heap filter this change exists to remove.
+        project_index_side = bool(project_id) and await bm25_project_scope_is_index_side(conn)
+        project_must = ""
+        project_filter = ""
+        if project_index_side:
+            params.append(project_id)
+            # `term()`, not `match()`: a project_id is an opaque uuid and must
+            # match whole. `match()` would tokenize it and let a scope leak to
+            # any project sharing a hyphen-delimited segment -- which for uuids
+            # is a real collision, not a theoretical one.
+            project_must = f"paradedb.term('project_id', ${len(params)}),"
+        else:
+            project_filter = project_scope_predicate(params, project_id, alias="d")
 
         pred = build_predicate(
             spec, doc_alias="d", chunk_alias="c", next_param_index=len(params) + 1
@@ -355,7 +423,16 @@ async def bm25_search(
         # document's chunks in the ranking; picking chunk 0 was expressing a
         # ranking idea as a join predicate. The cap below keeps the guarantee
         # the old predicate was really providing.
-        scoped = bool(sources or doc_types or author_ids or source_keys or project_id)
+        # `project_id` counts as document-level scope ONLY while it is a heap
+        # filter. Once it rides the index, TopK already returns in-scope rows
+        # and widening the pool 4x for it would just do four times the work.
+        scoped = bool(
+            sources
+            or doc_types
+            or author_ids
+            or source_keys
+            or (project_id and not project_index_side)
+        )
         pool_size = top_k * _BM25_POOL_MULTIPLIER * (_BM25_SCOPED_POOL_FACTOR if scoped else 1)
         params.append(pool_size)
         pool_idx = len(params)
@@ -410,6 +487,7 @@ async def bm25_search(
               AND c.chunk_id @@@ paradedb.boolean(must => ARRAY[
                     {tenant_must},
                     {visibility_must}
+                    {project_must}
                     paradedb.boolean(should => ARRAY[
                       paradedb.boost({_BM25_TITLE_BOOST}, paradedb.match('title', $2)),
                       paradedb.match('content', $2)
