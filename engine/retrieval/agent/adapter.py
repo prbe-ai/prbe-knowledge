@@ -24,6 +24,7 @@ from engine.retrieval.agent.models import (
     merge_channel_loss,
 )
 from engine.retrieval.channel_health import lost_channels
+from engine.retrieval.temporal import applied_temporal_meta, build_predicate
 from engine.shared.constants import SourceSystem
 from engine.shared.db import with_tenant
 from engine.shared.logging import get_logger
@@ -36,6 +37,7 @@ from engine.shared.models import (
     QueryResult,
     RelatedEntity,
     RetrieveResponse,
+    TemporalSpec,
 )
 
 log = get_logger(__name__)
@@ -362,6 +364,10 @@ def _chunk_to_query_chunk(
     )
 
 
+#: Graph-edge confidence tiers, highest first, for `min_confidence`.
+_CONFIDENCE_RANK: dict[str, int] = {"EXTRACTED": 3, "INFERRED": 2, "AMBIGUOUS": 1}
+
+
 async def _scope_verdicts(
     customer_id: str,
     doc_ids: list[str],
@@ -371,6 +377,7 @@ async def _scope_verdicts(
     source_keys_include_keyless: bool = False,
     sources: list[str] | None = None,
     project_id: str | None = None,
+    temporal: TemporalSpec | None = None,
 ) -> dict[str, bool]:
     """Re-verify document ids against the LIVE documents row and the request
     scope. Returns {doc_id: in_scope} for every id that HAS a live row; ids
@@ -382,18 +389,22 @@ async def _scope_verdicts(
     verdicts: dict[str, bool] = {}
     if not doc_ids:
         return verdicts
+    # "Live" means live UNDER THE REQUEST'S TEMPORAL SPEC: an AS_OF request
+    # correctly selects a since-retired version, and the gate must not drop
+    # it for not being current today.
+    pred = build_predicate(temporal or TemporalSpec(), doc_alias="d", chunk_alias="c", next_param_index=3)
+    params: list[Any] = [customer_id, doc_ids, *pred.params]
     async with with_tenant(customer_id) as conn:
         rows = await conn.fetch(
-            """
-            SELECT doc_id, doc_type, source_system,
-                   metadata->>'source_key' AS source_key,
-                   metadata->>'project_id' AS project_id
-            FROM documents
-            WHERE customer_id = $1 AND doc_id = ANY($2::text[])
-              AND valid_to IS NULL
+            f"""
+            SELECT d.doc_id, d.doc_type, d.source_system,
+                   d.metadata->>'source_key' AS source_key,
+                   d.metadata->>'project_id' AS project_id
+            FROM documents d
+            WHERE d.customer_id = $1 AND d.doc_id = ANY($2::text[])
+              {pred.doc_sql}
             """,
-            customer_id,
-            doc_ids,
+            *params,
         )
     for r in rows:
         ok = True
@@ -426,6 +437,7 @@ async def _scope_graph_evidence(
     sources: list[str] | None = None,
     project_id: str | None = None,
     trace_id: str = "",
+    temporal: TemporalSpec | None = None,
 ) -> None:
     """Drop graph-evidence entries whose `via_entity` is a live DOCUMENT
     outside the request scope. Mutates `doc_evidence` in place.
@@ -449,6 +461,7 @@ async def _scope_graph_evidence(
         source_keys_include_keyless=source_keys_include_keyless,
         sources=sources,
         project_id=project_id,
+        temporal=temporal,
     )
     dropped = 0
     for doc_id, evs in list(doc_evidence.items()):
@@ -478,7 +491,8 @@ async def _enforce_scope_on_chunks(
     source_keys_include_keyless: bool = False,
     sources: list[str] | None = None,
     project_id: str | None = None,
-) -> None:
+    temporal: TemporalSpec | None = None,
+) -> bool:
     """Hard scope gate at the response choke point. Mutates gathered.chunks
     and gathered.entities (document-backed entities are gated the same way).
 
@@ -494,7 +508,8 @@ async def _enforce_scope_on_chunks(
     is dropped. Fail closed.
     """
     if not gathered.chunks and not gathered.entities:
-        return
+        return True
+    scoped = bool(source_keys or doc_types or sources or project_id)
     doc_ids = sorted({c.doc_id for c in gathered.chunks if c.doc_id})
     # Document-backed ENTITIES are gated too: grounding and `subgraph` can hand
     # the gatherer an out-of-scope Document node, and emitting it as an entity
@@ -503,15 +518,31 @@ async def _enforce_scope_on_chunks(
     # `related_entities` under the requested applied_scope (Codex re-review).
     # An entity with no live documents row (a person, a ticket) is kept.
     entity_ids = sorted({e.canonical_id for e in gathered.entities if e.canonical_id})
-    verdicts = await _scope_verdicts(
-        customer_id,
-        sorted(set(doc_ids) | set(entity_ids)),
-        source_keys=source_keys,
-        doc_types=doc_types,
-        source_keys_include_keyless=source_keys_include_keyless,
-        sources=sources,
-        project_id=project_id,
-    )
+    try:
+        verdicts = await _scope_verdicts(
+            customer_id,
+            sorted(set(doc_ids) | set(entity_ids)),
+            source_keys=source_keys,
+            doc_types=doc_types,
+            source_keys_include_keyless=source_keys_include_keyless,
+            sources=sources,
+            project_id=project_id,
+            temporal=temporal,
+        )
+    except Exception as exc:
+        if scoped:
+            # The check IS the scope. A scoped request that cannot be
+            # verified must fail, not answer with unverified rows.
+            raise
+        # Unscoped: nothing to enforce, only invented ids to catch. Keep the
+        # chunks and let the caller see `scope_check_unavailable`.
+        log.warning(
+            "adapter.scope_check_failed",
+            customer_id=customer_id,
+            trace_id=trace_id,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return False
     allowed = {d for d, ok in verdicts.items() if ok}
     kept_entities = [e for e in gathered.entities if verdicts.get(e.canonical_id, True)]
     dropped_entities = len(gathered.entities) - len(kept_entities)
@@ -540,6 +571,7 @@ async def _enforce_scope_on_chunks(
             project_id=project_id,
         )
     gathered.chunks = kept
+    return True
 
 
 async def to_query_response(
@@ -558,6 +590,8 @@ async def to_query_response(
     source_keys_include_keyless: bool = False,
     sources: list[str] | None = None,
     project_id: str | None = None,
+    temporal: TemporalSpec | None = None,
+    min_confidence: str | None = None,
     id_pins: list[Any] | None = None,
     top_k: int | None = None,
 ) -> RetrieveResponse:
@@ -689,8 +723,13 @@ async def to_query_response(
         merged.extend(rest)
         gathered = gathered.model_copy(update={"chunks": merged})
 
-    if (source_keys or doc_types or sources or project_id) and customer_id:
-        await _enforce_scope_on_chunks(
+    # The live-row gate runs on EVERY response with a tenant: with a scope it
+    # is the hard filter; without one it still drops a chunk_id the model
+    # invented (nothing in _coerce_lenient checks emitted ids against the pool
+    # or the DB). Failure posture differs -- see _enforce_scope_on_chunks.
+    gate_ok = True
+    if customer_id:
+        gate_ok = await _enforce_scope_on_chunks(
             customer_id,
             gathered,
             source_keys=source_keys,
@@ -699,6 +738,7 @@ async def to_query_response(
             source_keys_include_keyless=source_keys_include_keyless,
             sources=sources,
             project_id=project_id,
+            temporal=temporal,
         )
 
     doc_evidence = _build_doc_to_graph_evidence(prefanout)
@@ -742,7 +782,19 @@ async def to_query_response(
             sources=sources,
             project_id=project_id,
             trace_id=trace_id,
+            temporal=temporal,
         )
+
+    # QueryRequest.min_confidence: floor on the graph-edge tier that joins
+    # the response. Accepted and ignored on this path until now.
+    if min_confidence and min_confidence in _CONFIDENCE_RANK:
+        floor = _CONFIDENCE_RANK[min_confidence]
+        for doc_id, evs in list(doc_evidence.items()):
+            kept_evs = [e for e in evs if _CONFIDENCE_RANK.get(e.confidence, 0) >= floor]
+            if kept_evs:
+                doc_evidence[doc_id] = kept_evs
+            else:
+                del doc_evidence[doc_id]
 
     # Group chunks by doc_id.
     doc_groups: dict[str, list[Any]] = {}
@@ -819,7 +871,12 @@ async def to_query_response(
                 rank=rank_counter,
                 matched_via=provenance,
                 doc_id=doc_id,
-                doc_version=1,
+                # The version the chunk was read from (carried on the hit
+                # dict by `_hit_to_chunk_dict`); 1 only when no chunk knows.
+                doc_version=next(
+                    (int(v) for v in (getattr(c, "doc_version", None) for c in chunks) if v),
+                    1,
+                ),
                 source_system=_safe_source_system(  # type: ignore[arg-type]
                     getattr(first, "source_system", None),
                     doc_id=doc_id,
@@ -930,6 +987,10 @@ async def to_query_response(
     # `degraded` and `degraded_reason` cannot disagree about the same request.
     lost = lost_channels()
     effective_status = merge_channel_loss(status, lost)
+    if not gate_ok and not is_degraded(effective_status):
+        # Same one-directional precedence as merge_channel_loss: an
+        # already-degraded status tells the caller more than this does.
+        effective_status = "scope_check_unavailable"
 
     return RetrieveResponse(
         query=query,
@@ -947,6 +1008,10 @@ async def to_query_response(
         # filter was in force — the same lie the echo exists to prevent.
         applied_sources=sources,
         applied_scope={"project_id": project_id} if project_id else None,
+        applied_temporal=applied_temporal_meta(
+            temporal or TemporalSpec(), source="request" if temporal is not None else "default"
+        ),
+        applied_min_confidence=min_confidence,
         timing_ms=timing_ms,
         trace_id=trace_id,
         confidence_breakdown=confidence_breakdown,
