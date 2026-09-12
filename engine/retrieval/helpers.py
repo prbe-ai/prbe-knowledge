@@ -344,3 +344,29 @@ def project_scope_predicate(
         return ""
     params.append(project_id)
     return f"AND {alias}.metadata->>'project_id' = ${len(params)}"
+
+
+#: The values `documents.metadata->>'origin'` may carry. Anything else -- a
+#: typo, a value from a newer writer, a hand-edited row -- is treated as
+#: UNKNOWN and dropped. A value a reader cannot interpret is worse than an
+#: absent one: it looks like an attribution and is not.
+VALID_ORIGINS = frozenset({"human", "generated"})
+
+
+def origin_of(row: object) -> str | None:
+    """Read `origin` off a retriever row: "human", "generated", or None.
+
+    Shared by every retriever so the three cannot disagree about what counts
+    as an attribution. Tolerant of a row that has no `origin` column at all --
+    an inner query that predates it still returns rows, and a missing key must
+    read as "unknown" rather than raising mid-search.
+
+    None NEVER means "human". Claiming a person wrote something we cannot
+    attribute is the failure this field exists to prevent, and it is the
+    reason the value is dropped rather than defaulted.
+    """
+    try:
+        value = row["origin"]  # type: ignore[index]
+    except (KeyError, IndexError, TypeError):
+        return None
+    return value if value in VALID_ORIGINS else None

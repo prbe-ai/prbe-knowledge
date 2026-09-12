@@ -10,7 +10,7 @@ from typing import Any, Literal
 
 import asyncpg
 
-from engine.retrieval.helpers import project_scope_predicate, source_key_predicate
+from engine.retrieval.helpers import origin_of, project_scope_predicate, source_key_predicate
 from engine.retrieval.temporal import build_predicate, live_version_join
 from engine.shared.constants import TOP_K_VECTOR, VECTOR_RECENCY_POOL_MULTIPLIER
 from engine.shared.db import with_tenant
@@ -86,6 +86,13 @@ class VectorHit:
     # best content chunk's ranking) and to drop synthetic key:value text from
     # the response.
     kind: str = "content"
+    # Who wrote the TEXT: "human", "generated", or None when the document does
+    # not say. Selected here rather than derived downstream because only the
+    # retriever has the document row -- a consumer holding a hit has no way to
+    # look it up, and guessing is the failure this field exists to prevent.
+    # None renders as ABSENT, never as "human": claiming a person wrote
+    # something we cannot attribute is worse than admitting we do not know.
+    origin: str | None = None
 
 
 async def vector_search(
@@ -241,7 +248,8 @@ async def vector_search(
         # sorts at most `pool_size` rows instead of defeating the index.
         sql = f"""
         SELECT chunk_id, doc_id, doc_version, source_system, source_url,
-               title, author_id, content, kind, created_at, updated_at, score
+               title, author_id, content, kind, created_at, updated_at, score,
+               origin
         FROM ({candidate_sql}) pool
         ORDER BY {outer_order_sql}
         LIMIT $3
@@ -352,6 +360,7 @@ def _build_inner_query(
                    c.kind,
                    d.created_at,
                    d.updated_at,
+                   d.metadata->>'origin' AS origin,
                    1 - (c.embedding_v2 <=> $2::halfvec) AS score
             FROM chunks c
             JOIN documents d
@@ -597,6 +606,11 @@ def _to_hits(rows: list[Any]) -> list[VectorHit]:
             score=float(r["score"]),
             author_id=normalize_author_id(r["author_id"]),
             kind=r["kind"],
+            # `.get`-shaped: an inner query that predates this column still
+            # returns rows, and a missing key must read as "unknown origin"
+            # rather than raising mid-search.
+            origin=origin_of(r),
         )
         for r in rows
     ]
+
