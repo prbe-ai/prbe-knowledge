@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
-from engine.retrieval.helpers import source_key_predicate
+from engine.retrieval.helpers import project_scope_predicate, source_key_predicate
 from engine.retrieval.surprise import surprise_score
 from engine.retrieval.temporal import build_predicate
 from engine.shared.constants import ROUTER_ENTITY_TO_LABEL, TOP_K_GRAPH
@@ -109,6 +109,7 @@ async def graph_search(
     sort_by: Literal["relevance", "recency"] = "relevance",
     source_keys: list[str] | None = None,
     source_keys_include_keyless: bool = False,
+    project_id: str | None = None,
     sources: list[str] | None = None,
 ) -> list[GraphHit]:
     """Return chunks from documents within 1 hop of any matching entity node.
@@ -203,6 +204,7 @@ async def graph_search(
             params, source_keys, alias="d",
             include_keyless=source_keys_include_keyless,
         )
+        project_filter = project_scope_predicate(params, project_id, alias="d")
 
         pred = build_predicate(
             spec, doc_alias="d", chunk_alias="c", next_param_index=len(params) + 1
@@ -349,6 +351,7 @@ async def graph_search(
               {author_filter}
               {source_filter}
               {source_key_filter}
+              {project_filter}
             GROUP BY c.chunk_id, c.doc_id, c.chunk_index, d.version,
                      d.source_system, d.source_url, d.title, d.author_id,
                      c.content, d.created_at, d.updated_at

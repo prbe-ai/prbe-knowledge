@@ -57,7 +57,7 @@ from typing import Any, Literal
 from engine.retrieval.agent.models import GathererOutput
 from engine.retrieval.channel_health import record_channel_loss
 from engine.retrieval.grounding import GroundingBundle, build_bundle
-from engine.retrieval.helpers import expand_to_cluster_members
+from engine.retrieval.helpers import expand_to_cluster_members, project_scope_predicate
 from engine.retrieval.retrievers.bm25 import bm25_search as _bm25
 from engine.retrieval.retrievers.graph import graph_search as _graph
 from engine.retrieval.retrievers.inferred_edges import inferred_edge_search as _inferred
@@ -157,6 +157,7 @@ def _doc_scope_sql(
     source_keys: list[str] | None,
     doc_types: list[str] | None,
     source_keys_include_keyless: bool = False,
+    project_id: str | None = None,
 ) -> str:
     """Append scope params and return AND-predicates against a documents alias.
 
@@ -184,6 +185,12 @@ def _doc_scope_sql(
     if doc_types:
         params.append(doc_types)
         parts.append(f"AND {alias}.doc_type = ANY(${len(params)}::text[])")
+    # Pre-search project scope (QueryRequest.scope.project_id). Same
+    # predicate as helpers.project_scope_predicate so the in-loop gate can
+    # never admit what the channels excluded, or the reverse.
+    project = project_scope_predicate(params, project_id, alias=alias)
+    if project:
+        parts.append(project)
     return " ".join(parts)
 
 
@@ -191,7 +198,7 @@ def _doc_scope_sql(
 # document sits outside the caller's request-level scope. Rendered to the
 # model so it stops re-fetching instead of retrying variants.
 _SCOPE_REFUSAL_NOTE = (
-    "document is outside the caller-enforced source_keys/doc_types scope; "
+    "document is outside the caller-enforced source_keys/doc_types/project scope; "
     "do not retry -- curate from in-scope results only"
 )
 
@@ -334,6 +341,7 @@ async def execute_search(
     sources: list[str] | None = None,
     discovery: bool = False,
     source_keys_include_keyless: bool = False,
+    project_id: str | None = None,
     per_source_top_k: int | None = None,
 ) -> dict[str, Any]:
     """Fan out 1+ queries through the 4 channels (vector + bm25 + graph +
@@ -438,6 +446,7 @@ async def execute_search(
                     source_keys=source_keys,
                     sources=sources,
                     source_keys_include_keyless=source_keys_include_keyless,
+                    project_id=project_id,
                     per_source_top_k=per_source_top_k,
                 )
                 return [_hit_to_chunk_dict(h, "vector") for h in hits]
@@ -460,6 +469,7 @@ async def execute_search(
                     source_keys=source_keys,
                     sources=sources,
                     source_keys_include_keyless=source_keys_include_keyless,
+                    project_id=project_id,
                     per_source_top_k=per_source_top_k,
                 )
                 return [_hit_to_chunk_dict(h, "bm25") for h in hits]
@@ -484,6 +494,7 @@ async def execute_search(
                     source_keys=source_keys,
                     sources=sources,
                     source_keys_include_keyless=source_keys_include_keyless,
+                    project_id=project_id,
                 )
                 return [
                     {
@@ -521,6 +532,7 @@ async def execute_search(
                     source_keys=source_keys,
                     sources=sources,
                     source_keys_include_keyless=source_keys_include_keyless,
+                    project_id=project_id,
                 )
                 return [_inferred_hit_to_dict(h) for h in hits]
             except Exception as exc:
@@ -696,6 +708,7 @@ async def execute_subgraph(
     source_keys: list[str] | None = None,
     doc_types: list[str] | None = None,
     source_keys_include_keyless: bool = False,
+    project_id: str | None = None,
 ) -> dict[str, Any]:
     """Multi-hop BFS from an anchor node in ONE tool call.
 
@@ -790,6 +803,7 @@ async def execute_subgraph(
                     source_keys=source_keys,
                     doc_types=doc_types,
                     source_keys_include_keyless=source_keys_include_keyless,
+                    project_id=project_id,
                 )
                 inferred_edges = [_inferred_hit_to_dict(h) for h in hits]
             except Exception as exc:
@@ -846,6 +860,7 @@ async def execute_fetch_doc(
     source_keys: list[str] | None = None,
     doc_types: list[str] | None = None,
     source_keys_include_keyless: bool = False,
+    project_id: str | None = None,
 ) -> dict[str, Any]:
     """Paginate a doc's chunks plus optional inferred-edge context in ONE call.
 
@@ -892,11 +907,12 @@ async def execute_fetch_doc(
         # Request-scope gate: refuse the whole fetch when the target doc's
         # live version is outside the caller's scope (fail closed on a
         # missing live row too -- an unverifiable doc is treated the same).
-        if source_keys or doc_types:
+        if source_keys or doc_types or project_id:
             scope_params: list[Any] = [customer_id, doc_id]
             scope_preds = _doc_scope_sql(
                 scope_params, alias="d", source_keys=source_keys, doc_types=doc_types,
                 source_keys_include_keyless=source_keys_include_keyless,
+                project_id=project_id,
             )
             visible = await conn.fetchval(
                 f"""
@@ -949,6 +965,7 @@ async def execute_fetch_doc(
                     source_keys=source_keys,
                     doc_types=doc_types,
                     source_keys_include_keyless=source_keys_include_keyless,
+                    project_id=project_id,
                 )
                 inferred_edges = [_inferred_hit_to_dict(h) for h in hits]
             except Exception as exc:
@@ -992,10 +1009,11 @@ async def execute_fetch_doc(
                 # so the request scope applies to their parent docs too.
                 ev_params: list[Any] = [customer_id, list(all_chunk_ids)]
                 ev_scope = ""
-                if source_keys or doc_types:
+                if source_keys or doc_types or project_id:
                     preds = _doc_scope_sql(
                         ev_params, alias="d", source_keys=source_keys, doc_types=doc_types,
                         source_keys_include_keyless=source_keys_include_keyless,
+                        project_id=project_id,
                     )
                     ev_scope = f"""
                       AND EXISTS (
@@ -1047,6 +1065,7 @@ async def execute_fetch_chunk_window(
     source_keys: list[str] | None = None,
     doc_types: list[str] | None = None,
     source_keys_include_keyless: bool = False,
+    project_id: str | None = None,
 ) -> dict[str, Any]:
     """Return a matched chunk plus its immediate neighbours in the same doc.
 
@@ -1076,10 +1095,11 @@ async def execute_fetch_chunk_window(
     # document — every window row shares the target's doc_id.
     params: list[Any] = [customer_id, chunk_id, b, a]
     scope_sql = ""
-    if source_keys or doc_types:
+    if source_keys or doc_types or project_id:
         preds = _doc_scope_sql(
             params, alias="d", source_keys=source_keys, doc_types=doc_types,
             source_keys_include_keyless=source_keys_include_keyless,
+            project_id=project_id,
         )
         scope_sql = f"""
               AND EXISTS (

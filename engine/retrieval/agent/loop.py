@@ -263,6 +263,9 @@ class LoopState:
     # reformulates queries, it does not choose the retrieval posture).
     request_discovery: bool = False
     request_source_keys_include_keyless: bool = False
+    # QueryRequest.scope.project_id, injected into every scope-gated tool
+    # call and threaded to the prefanout + response gate (pre-search scope).
+    request_project_id: str | None = None
     request_per_source_top_k: int | None = None
 
 
@@ -1621,6 +1624,8 @@ async def _execute_tool_call(
         # for), so the loop could see them but never read or emit them.
         if state.request_source_keys_include_keyless:
             arguments["source_keys_include_keyless"] = True
+        if state.request_project_id:
+            arguments["project_id"] = state.request_project_id
     if name == "search" and state.request_discovery:
         arguments["discovery"] = True
     if name == "search":
@@ -2485,6 +2490,7 @@ async def run_gatherer(
                 doc_types=req.doc_types or None,
                 source_keys=req.source_keys or None,
                 source_keys_include_keyless=bool(req.source_keys_include_keyless),
+                project_id=req.scope.project_id if req.scope else None,
             )
         except Exception as exc:
             # A failed lookup degrades to "no pins", never to a failed
@@ -2696,6 +2702,7 @@ async def run_gatherer(
     request_sources = [s.value for s in req.sources] if req.sources else None
     request_discovery = bool(req.discovery)
     request_source_keys_include_keyless = bool(req.source_keys_include_keyless)
+    request_project_id = req.scope.project_id if req.scope else None
     request_per_source_top_k = req.per_source_top_k
     effective_doc_types = request_doc_types or search_options.doc_types or None
 
@@ -2752,6 +2759,7 @@ async def run_gatherer(
         discovery=request_discovery,
         source_keys_include_keyless=request_source_keys_include_keyless,
         per_source_top_k=request_per_source_top_k,
+        project_id=request_project_id,
     )
     timing["prefanout_ms"] = (time.perf_counter() - t_prefanout) * 1000
 
@@ -2812,6 +2820,7 @@ async def run_gatherer(
         search_options=search_options,
         pre_fanout_author_ids=list(author_ids),
         request_source_keys=request_source_keys,
+        request_project_id=request_project_id,
         request_doc_types=request_doc_types,
         request_sources=request_sources,
         request_discovery=request_discovery,
@@ -2928,6 +2937,7 @@ async def run_gatherer(
             doc_types=request_doc_types,
             source_keys_include_keyless=request_source_keys_include_keyless,
             sources=request_sources,
+            project_id=request_project_id,
             status=status,
             id_pins=id_pins,
             top_k=req.top_k,
@@ -2985,6 +2995,7 @@ async def run_gatherer(
             doc_types=request_doc_types,
             source_keys_include_keyless=request_source_keys_include_keyless,
             sources=request_sources,
+            project_id=request_project_id,
             status=status,
             id_pins=id_pins,
             top_k=req.top_k,
@@ -3040,6 +3051,7 @@ async def run_gatherer(
             doc_types=request_doc_types,
             source_keys_include_keyless=request_source_keys_include_keyless,
             sources=request_sources,
+            project_id=request_project_id,
             status=status,
             id_pins=id_pins,
             top_k=req.top_k,
@@ -3283,6 +3295,7 @@ async def run_gatherer(
         doc_types=request_doc_types,
         source_keys_include_keyless=request_source_keys_include_keyless,
         sources=request_sources,
+        project_id=request_project_id,
         status=status,
         id_pins=id_pins,
         top_k=req.top_k,

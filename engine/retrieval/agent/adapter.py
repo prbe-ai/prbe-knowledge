@@ -371,6 +371,7 @@ async def _enforce_scope_on_chunks(
     trace_id: str,
     source_keys_include_keyless: bool = False,
     sources: list[str] | None = None,
+    project_id: str | None = None,
 ) -> None:
     """Hard scope gate at the response choke point. Mutates gathered.chunks.
 
@@ -393,7 +394,8 @@ async def _enforce_scope_on_chunks(
             rows = await conn.fetch(
                 """
                 SELECT doc_id, doc_type, source_system,
-                       metadata->>'source_key' AS source_key
+                       metadata->>'source_key' AS source_key,
+                       metadata->>'project_id' AS project_id
                 FROM documents
                 WHERE customer_id = $1 AND doc_id = ANY($2::text[])
                   AND valid_to IS NULL
@@ -415,6 +417,8 @@ async def _enforce_scope_on_chunks(
                 continue
             if sources and r["source_system"] not in sources:
                 continue
+            if project_id and r["project_id"] != project_id:
+                continue
             allowed.add(r["doc_id"])
     kept = [c for c in gathered.chunks if c.doc_id and c.doc_id in allowed]
     dropped = len(gathered.chunks) - len(kept)
@@ -429,6 +433,7 @@ async def _enforce_scope_on_chunks(
             source_keys_include_keyless=source_keys_include_keyless,
             sources=sources,
             doc_types=doc_types,
+            project_id=project_id,
         )
     gathered.chunks = kept
 
@@ -448,6 +453,7 @@ async def to_query_response(
     doc_types: list[str] | None = None,
     source_keys_include_keyless: bool = False,
     sources: list[str] | None = None,
+    project_id: str | None = None,
     id_pins: list[Any] | None = None,
     top_k: int | None = None,
 ) -> RetrieveResponse:
@@ -577,7 +583,7 @@ async def to_query_response(
         merged.extend(rest)
         gathered = gathered.model_copy(update={"chunks": merged})
 
-    if (source_keys or doc_types or sources) and customer_id:
+    if (source_keys or doc_types or sources or project_id) and customer_id:
         await _enforce_scope_on_chunks(
             customer_id,
             gathered,
@@ -586,6 +592,7 @@ async def to_query_response(
             trace_id=trace_id,
             source_keys_include_keyless=source_keys_include_keyless,
             sources=sources,
+            project_id=project_id,
         )
 
     doc_evidence = _build_doc_to_graph_evidence(prefanout)
@@ -818,6 +825,7 @@ async def to_query_response(
         # inference), so echoing this value would report None while a
         # filter was in force — the same lie the echo exists to prevent.
         applied_sources=sources,
+        applied_scope={"project_id": project_id} if project_id else None,
         timing_ms=timing_ms,
         trace_id=trace_id,
         confidence_breakdown=confidence_breakdown,

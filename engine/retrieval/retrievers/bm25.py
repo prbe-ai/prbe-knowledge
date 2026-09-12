@@ -78,7 +78,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
-from engine.retrieval.helpers import source_key_predicate
+from engine.retrieval.helpers import project_scope_predicate, source_key_predicate
 from engine.retrieval.temporal import build_predicate
 from engine.shared.constants import TOP_K_BM25
 from engine.shared.db import with_tenant
@@ -265,6 +265,7 @@ async def bm25_search(
     sort_by: Literal["relevance", "recency"] = "relevance",
     source_keys: list[str] | None = None,
     source_keys_include_keyless: bool = False,
+    project_id: str | None = None,
     per_source_top_k: int | None = None,
 ) -> list[BM25Hit]:
     """`include_drafts` defaults to False — retrieval hides ``visibility='draft'``
@@ -314,6 +315,7 @@ async def bm25_search(
             params, source_keys, alias="d",
             include_keyless=source_keys_include_keyless,
         )
+        project_filter = project_scope_predicate(params, project_id, alias="d")
 
         pred = build_predicate(
             spec, doc_alias="d", chunk_alias="c", next_param_index=len(params) + 1
@@ -456,6 +458,7 @@ async def bm25_search(
               {"" if include_drafts else "AND d.visibility = 'approved'"}
               {author_filter}
               {source_key_filter}
+              {project_filter}
         """
         if per_source_top_k is not None:
             # Per-source top-K slotting (PR#78 recall guarantee, server-side).

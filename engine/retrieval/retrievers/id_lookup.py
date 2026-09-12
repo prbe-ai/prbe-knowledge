@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from engine.retrieval.helpers import source_key_predicate
+from engine.retrieval.helpers import project_scope_predicate, source_key_predicate
 from engine.retrieval.temporal import build_predicate
 from engine.shared.constants import SourceSystem
 from engine.shared.db import with_tenant
@@ -110,6 +110,7 @@ def _append_scope_filters(
     author_ids: list[str] | None,
     source_keys: list[str] | None,
     source_keys_include_keyless: bool,
+    project_id: str | None = None,
     doc_only: bool = False,
 ) -> str:
     """The one scope gate every lookup in this module shares.
@@ -140,6 +141,7 @@ def _append_scope_filters(
             include_keyless=source_keys_include_keyless,
         )
     )
+    out.append(project_scope_predicate(params, project_id, alias="d"))
     pred = build_predicate(
         spec, doc_alias="d", chunk_alias="c", next_param_index=len(params) + 1
     )
@@ -165,6 +167,7 @@ async def id_lookup_search(
     author_ids: list[str] | None = None,
     source_keys: list[str] | None = None,
     source_keys_include_keyless: bool = False,
+    project_id: str | None = None,
 ) -> list[IdLookupHit]:
     """Return one content chunk per doc whose source_id/doc_id/source_url
     matches any of `canonical_ids`, carrying WHICH id matched.
@@ -222,6 +225,7 @@ async def id_lookup_search(
             author_ids=author_ids,
             source_keys=source_keys,
             source_keys_include_keyless=source_keys_include_keyless,
+            project_id=project_id,
         )
 
         rows = await conn.fetch(
@@ -320,6 +324,7 @@ async def _fetch_first_chunks(
     author_ids: list[str] | None,
     source_keys: list[str] | None,
     source_keys_include_keyless: bool,
+    project_id: str | None = None,
 ) -> dict[str, Any]:
     """First content chunk per doc, full scope enforced — phase 2 of the
     inferred lookups. Docs whose chunks are all filtered out simply drop
@@ -337,6 +342,7 @@ async def _fetch_first_chunks(
             author_ids=author_ids,
             source_keys=source_keys,
             source_keys_include_keyless=source_keys_include_keyless,
+            project_id=project_id,
         )
         rows = await conn.fetch(
             f"""
@@ -366,6 +372,7 @@ async def _prefix_lookup(
     author_ids: list[str] | None = None,
     source_keys: list[str] | None = None,
     source_keys_include_keyless: bool = False,
+    project_id: str | None = None,
 ) -> tuple[list[IdLookupHit], set[str]]:
     """Resolve bare hex prefixes (short sha / uuid first-segment) to full
     stored identifiers. Returns (hits, ambiguous_prefixes).
@@ -406,6 +413,7 @@ async def _prefix_lookup(
             author_ids=author_ids,
             source_keys=source_keys,
             source_keys_include_keyless=source_keys_include_keyless,
+            project_id=project_id,
             doc_only=True,
         )
         # LATERAL so the row cap applies PER IDENTIFIER: a pathological
@@ -484,6 +492,7 @@ async def _prefix_lookup(
         author_ids=author_ids,
         source_keys=source_keys,
         source_keys_include_keyless=source_keys_include_keyless,
+        project_id=project_id,
     )
     hits = [
         _row_to_hit(
@@ -508,6 +517,7 @@ async def _number_ref_lookup(
     author_ids: list[str] | None = None,
     source_keys: list[str] | None = None,
     source_keys_include_keyless: bool = False,
+    project_id: str | None = None,
 ) -> tuple[list[IdLookupHit], set[str]]:
     """Resolve PR/issue number refs ('#383', 'research-os#539') to a repo's
     PR, issue, or squash-merge commit doc. Returns (hits, ambiguous_refs).
@@ -550,6 +560,7 @@ async def _number_ref_lookup(
             author_ids=author_ids,
             source_keys=source_keys,
             source_keys_include_keyless=source_keys_include_keyless,
+            project_id=project_id,
             doc_only=True,
         )
         # Same LATERAL shape as _prefix_lookup: per-number cap, early
@@ -646,6 +657,7 @@ async def _number_ref_lookup(
         author_ids=author_ids,
         source_keys=source_keys,
         source_keys_include_keyless=source_keys_include_keyless,
+        project_id=project_id,
     )
     hits = [
         _row_to_hit(chunk_rows[doc_id], canonical, note=note)
@@ -674,6 +686,7 @@ async def lookup_identifiers(
     author_ids: list[str] | None = None,
     source_keys: list[str] | None = None,
     source_keys_include_keyless: bool = False,
+    project_id: str | None = None,
 ) -> tuple[list[IdLookupHit], set[str]]:
     """Route detected identifiers to the lookup their kind requires.
 
@@ -724,6 +737,7 @@ async def lookup_identifiers(
             author_ids=author_ids,
             source_keys=source_keys,
             source_keys_include_keyless=source_keys_include_keyless,
+            project_id=project_id,
         )
         return found, set()
 
@@ -740,6 +754,7 @@ async def lookup_identifiers(
             author_ids=author_ids,
             source_keys=source_keys,
             source_keys_include_keyless=source_keys_include_keyless,
+            project_id=project_id,
         )
 
     async def _numbers() -> tuple[list[IdLookupHit], set[str]]:
@@ -755,6 +770,7 @@ async def lookup_identifiers(
             author_ids=author_ids,
             source_keys=source_keys,
             source_keys_include_keyless=source_keys_include_keyless,
+            project_id=project_id,
         )
 
     results = await asyncio.gather(_exact(), _prefixes(), _numbers())

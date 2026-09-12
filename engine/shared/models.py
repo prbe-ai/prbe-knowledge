@@ -273,6 +273,35 @@ class TemporalSpec(BaseModel):
         return self
 
 
+class ScopeSpec(BaseModel):
+    """Caller-asserted retrieval scope, applied PRE-search.
+
+    Unlike a consumer-side post-filter over an already capped pool, a scope
+    here narrows the candidate pool inside every channel (vector / bm25 /
+    graph / inferred-edge / id-lookup), the agent's in-loop content tools and
+    the final live-row gate, so a scoped request never spends its `top_k` on
+    out-of-scope documents and then reports "nothing here".
+
+    `project_id` matches `documents.metadata->>'project_id'`, which the
+    research-os custom-ingest projections stamp on every entity, artifact and
+    digest document that belongs to a project. Documents carrying no
+    project_id (team notes, workspace files) are excluded by a project scope
+    -- a scope is a hard filter, not a boost.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        description="Only documents whose metadata.project_id equals this value.",
+    )
+
+    def is_empty(self) -> bool:
+        return self.project_id is None
+
+
 class QueryRequest(BaseModel):
     query: str
     #: Ask for the REST of an earlier retrieval instead of running a new one.
@@ -402,6 +431,15 @@ class QueryRequest(BaseModel):
             "instead of a client fanning out one request per corpus. No effect "
             "when `source_keys` is unset. Pair with `per_source_top_k` to keep "
             "one loud source from burying another in the shared budget."
+        ),
+    )
+    scope: ScopeSpec | None = Field(
+        default=None,
+        description=(
+            "Optional pre-search scope. `scope.project_id` hard-filters "
+            "`documents.metadata->>'project_id'` in every retrieval channel, "
+            "the agent's in-loop content tools and the final live-row gate. "
+            "Echoed back as `applied_scope`."
         ),
     )
     per_source_top_k: int | None = Field(
@@ -758,6 +796,11 @@ class RetrieveResponse(BaseModel):
     # could not distinguish "filtered, nothing matched" from "never
     # filtered at all". If you add a request-level filter, echo it here.
     applied_sources: list[str] | None = None
+    # Echo of the request's `scope` (today: {"project_id": ...}), mirroring
+    # applied_sources. None when the request carried no scope. A caller that
+    # pre-fills a project scope reads this to tell "scoped and empty" from
+    # "the server ignored the scope".
+    applied_scope: dict[str, str] | None = None
     applied_min_confidence: str | None = None
     extracted_entities: list[dict[str, object]] = Field(default_factory=list)
     aggregation: dict[str, object] | None = None
