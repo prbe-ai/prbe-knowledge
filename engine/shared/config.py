@@ -167,7 +167,22 @@ class Settings(BaseSettings):
     #: deployment -- same day, same corpus, mode chosen per request -- rather
     #: than to ship the behaviour quietly. With it off, a request asking for
     #: `conditional` is served `always`; nothing errors.
-    recall_floor_conditional_enabled: bool = Field(default=False)
+    #: ON. The DEFAULT is still `always` -- every response is topped up to
+    #: `_RECALL_FLOOR_DOCS` from the raw pool, exactly as before -- so turning
+    #: this on changes nothing for a caller who does not ask.
+    #:
+    #: What it enables is the CHOICE. A caller that passes
+    #: `recall_floor_mode="conditional"` now gets what the gatherer actually
+    #: selected, with the top-up skipped when its answer was already confident
+    #: and substantial. Off, that request was silently served `always`.
+    #:
+    #: It is a per-request lever rather than a flip because the trade is real
+    #: and unmeasured: the floor supplies ~88% of delivered chunks, so skipping
+    #: it means FEWER results, and fewer-but-curated only wins if the curation
+    #: is good. `agent.recall_floor` logs `rejected` (pool docs the gatherer saw
+    #: and declined) against `unexamined` (docs it never got shown) on every
+    #: query, which is the paired comparison that settles it.
+    recall_floor_conditional_enabled: bool = Field(default=True)
 
     # --- LLM gateway (managed-shared / self-host: route LLM + embedding
     #     calls through a central LiteLLM proxy instead of direct provider
