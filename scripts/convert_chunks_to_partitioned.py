@@ -43,6 +43,28 @@ happens or it does not.
 ROLLBACK is `chunks_old` -- kept, not dropped. Dropping it is a separate,
 deliberate, later command once the new table has served real traffic.
 
+EVERY READ BINDS THE TENANT GUC
+-------------------------------
+`chunks` is `FORCE ROW LEVEL SECURITY`, and FORCE applies to the table OWNER --
+which on both planes is `app`, the very role that runs this. A connection with
+no `app.current_customer_id` bound therefore sees ZERO rows, silently:
+
+    SELECT DISTINCT customer_id FROM chunks   ->  []
+    SELECT count(*) FROM chunks               ->  0
+
+(verified against the live research database, role `app`, owner `app`.)
+
+An earlier draft of this script counted without binding it. The result would not
+have been an error: it would have found no tenants, copied nothing, compared
+`0 == 0` in `_verify`, passed, and swapped an EMPTY table into place as `chunks`.
+Search returns nothing for every tenant until a human reverses the rename.
+
+So: the tenant list comes from `customers` (no RLS), every count and copy runs
+inside `_tenant_txn`, and `_verify` refuses outright when the source reads zero.
+`scripts/swap_bm25_index.py` documents the same trap, including the second half
+-- `set_config(..., true)` is TRANSACTION-local, so in autocommit it is
+discarded before the next statement even runs.
+
 THE WRITE FENCE
 ---------------
 Rows written to the OLD table after this script copied a tenant would be lost at
@@ -59,6 +81,7 @@ import asyncio
 import os
 import sys
 import time
+from contextlib import asynccontextmanager
 
 import asyncpg
 
@@ -85,11 +108,40 @@ def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+@asynccontextmanager
+async def _tenant_txn(conn: asyncpg.Connection, customer_id: str):
+    """Transaction with the tenant GUC bound, so RLS lets the rows through.
+
+    `set_config(..., true)` is transaction-local by design: outside an explicit
+    transaction it is discarded before the next statement, which is the quiet
+    version of this failure.
+    """
+    async with conn.transaction():
+        await conn.execute(
+            "SELECT set_config('app.current_customer_id', $1, true)", customer_id
+        )
+        yield conn
+
+
 async def _tenants(conn: asyncpg.Connection) -> list[str]:
-    rows = await conn.fetch(
-        f"SELECT DISTINCT customer_id FROM {OLD_TABLE} ORDER BY 1"
-    )
+    """From `customers`, NOT from `chunks`.
+
+    `SELECT DISTINCT customer_id FROM chunks` returns `[]` under FORCE RLS on an
+    unbound connection -- see the module docstring. `customers` carries no RLS,
+    so it is the only list that is true regardless of what is bound.
+    """
+    rows = await conn.fetch("SELECT customer_id FROM customers ORDER BY 1")
     return [r["customer_id"] for r in rows]
+
+
+async def _count(conn: asyncpg.Connection, table: str, customer_id: str) -> int:
+    async with _tenant_txn(conn, customer_id):
+        return (
+            await conn.fetchval(
+                f"SELECT count(*) FROM {table} WHERE customer_id = $1", customer_id
+            )
+            or 0
+        )
 
 
 async def _table_kind(conn: asyncpg.Connection, name: str) -> str | None:
@@ -126,22 +178,15 @@ async def status(conn: asyncpg.Connection) -> None:
     if old_kind == "p":
         log("ALREADY CONVERTED. Nothing to do.")
         return
-    total = await conn.fetchval(f"SELECT count(*) FROM {OLD_TABLE}")
-    log(f"{OLD_TABLE} rows: {total:,}")
+    total = 0
     for t in await _tenants(conn):
-        n = await conn.fetchval(
-            f"SELECT count(*) FROM {OLD_TABLE} WHERE customer_id = $1", t
-        )
-        copied = 0
-        if new_kind == "p":
-            copied = (
-                await conn.fetchval(
-                    f"SELECT count(*) FROM {NEW_TABLE} WHERE customer_id = $1", t
-                )
-                or 0
-            )
+        n = await _count(conn, OLD_TABLE, t)
+        total += n
+        copied = await _count(conn, NEW_TABLE, t) if new_kind == "p" else 0
         flag = "" if copied == n else "  <-- incomplete"
-        log(f"  {t:28} old={n:>9,}  new={copied:>9,}{flag}")
+        if n or copied:
+            log(f"  {t:28} old={n:>9,}  new={copied:>9,}{flag}")
+    log(f"{OLD_TABLE} rows (sum over tenants): {total:,}")
 
 
 async def _create_parent(conn: asyncpg.Connection) -> None:
@@ -205,6 +250,15 @@ async def _create_partitions(conn: asyncpg.Connection, tenants: list[str]) -> No
         await conn.execute(
             f"CREATE TABLE {default_name} PARTITION OF {NEW_TABLE} DEFAULT"
         )
+        # RLS on the parent governs parent-routed queries only. Without this the
+        # DEFAULT partition is the one partition any role with SELECT could read
+        # across tenants by naming it directly.
+        await conn.execute(f"ALTER TABLE {default_name} ENABLE ROW LEVEL SECURITY")
+        await conn.execute(f"ALTER TABLE {default_name} FORCE ROW LEVEL SECURITY")
+        await conn.execute(
+            f"CREATE POLICY tenant_isolation ON {default_name} "
+            "USING (customer_id = current_setting('app.current_customer_id', true))"
+        )
         log(f"step 2: DEFAULT partition {default_name} created")
     for t in tenants:
         part = await _partition_name(t)
@@ -234,37 +288,39 @@ async def _copy_tenant(conn: asyncpg.Connection, customer_id: str) -> int:
     Keyed on `chunk_id` rather than an offset: an offset resumes wrongly if the
     source shifts, and `(customer_id, chunk_id)` is the primary key so it is
     both unique and indexed on each side.
+
+    EVERY statement runs inside `_tenant_txn`. Without the GUC, FORCE RLS makes
+    the source read empty and this copies nothing while reporting success.
     """
     cols = await _column_list(conn, OLD_TABLE)
     collist = ", ".join(f'"{c}"' for c in cols)
-    total = await conn.fetchval(
-        f"SELECT count(*) FROM {OLD_TABLE} WHERE customer_id = $1", customer_id
-    )
+    total = await _count(conn, OLD_TABLE, customer_id)
     copied = 0
     while True:
-        cursor = await conn.fetchval(
-            f"SELECT max(chunk_id) FROM {NEW_TABLE} WHERE customer_id = $1",
-            customer_id,
-        )
-        moved = await conn.fetchval(
-            f"""
-            WITH batch AS (
-                SELECT {collist} FROM {OLD_TABLE}
-                WHERE customer_id = $1
-                  AND ($2::text IS NULL OR chunk_id > $2)
-                ORDER BY chunk_id
-                LIMIT {BATCH_ROWS}
-            ), ins AS (
-                INSERT INTO {NEW_TABLE} ({collist})
-                SELECT {collist} FROM batch
-                ON CONFLICT (customer_id, chunk_id) DO NOTHING
-                RETURNING 1
+        async with _tenant_txn(conn, customer_id):
+            cursor = await conn.fetchval(
+                f"SELECT max(chunk_id) FROM {NEW_TABLE} WHERE customer_id = $1",
+                customer_id,
             )
-            SELECT count(*) FROM ins
-            """,
-            customer_id,
-            cursor,
-        )
+            moved = await conn.fetchval(
+                f"""
+                WITH batch AS (
+                    SELECT {collist} FROM {OLD_TABLE}
+                    WHERE customer_id = $1
+                      AND ($2::text IS NULL OR chunk_id > $2)
+                    ORDER BY chunk_id
+                    LIMIT {BATCH_ROWS}
+                ), ins AS (
+                    INSERT INTO {NEW_TABLE} ({collist})
+                    SELECT {collist} FROM batch
+                    ON CONFLICT (customer_id, chunk_id) DO NOTHING
+                    RETURNING 1
+                )
+                SELECT count(*) FROM ins
+                """,
+                customer_id,
+                cursor,
+            )
         if not moved:
             break
         copied += moved
@@ -315,11 +371,33 @@ async def _build_partition_indexes(conn: asyncpg.Connection) -> None:
 
 
 async def _verify(conn: asyncpg.Connection) -> bool:
-    old_total = await conn.fetchval(f"SELECT count(*) FROM {OLD_TABLE}")
-    new_total = await conn.fetchval(f"SELECT count(*) FROM {NEW_TABLE}")
+    """Compare per-tenant counts, and REFUSE a swap when the source reads empty.
+
+    The zero-check is not paranoia. Under FORCE RLS an unbound connection reads
+    `chunks` as empty; an earlier draft compared `0 == 0`, called that a match,
+    and would have swapped an empty table into production. A real `chunks` is
+    never empty on a plane worth converting, so "source is empty" can only mean
+    the read was wrong.
+    """
+    old_total = 0
+    new_total = 0
+    mismatched: list[str] = []
+    for t in await _tenants(conn):
+        o = await _count(conn, OLD_TABLE, t)
+        n = await _count(conn, NEW_TABLE, t)
+        old_total += o
+        new_total += n
+        if o != n:
+            mismatched.append(f"{t}: old={o:,} new={n:,}")
     log(f"step 6: {OLD_TABLE}={old_total:,}  {NEW_TABLE}={new_total:,}")
-    if old_total != new_total:
-        log("step 6: COUNT MISMATCH -- refusing to swap.")
+    if old_total == 0:
+        log("step 6: SOURCE READ AS EMPTY. Either the tenant GUC is not being "
+            "bound (FORCE RLS) or this database has no chunks. Refusing to swap.")
+        return False
+    if mismatched:
+        for m in mismatched:
+            log(f"step 6:   MISMATCH {m}")
+        log("step 6: refusing to swap.")
         return False
     in_default = await conn.fetchval(
         f"SELECT count(*) FROM ONLY {NEW_TABLE}_default"
@@ -393,6 +471,19 @@ async def _swap(conn: asyncpg.Connection) -> None:
                 )
                 await conn.execute(f"ALTER TABLE {NEW_TABLE} RENAME TO {OLD_TABLE}")
                 await _rename_indexes(conn, OLD_TABLE, NEW_TABLE, OLD_TABLE)
+                # `db/schema.sql` names the DEFAULT partition `chunks_p_default`
+                # on a freshly-born database. Renaming it here means a converted
+                # plane and a fresh one agree -- the same divergence class the
+                # unique-constraint naming avoids a few lines up in schema.sql,
+                # and what `scripts/check_schema_drift.py` compares.
+                if await conn.fetchval(
+                    "SELECT to_regclass($1)", f"{NEW_TABLE}_default"
+                ) is not None and await conn.fetchval(
+                    "SELECT to_regclass($1)", "chunks_p_default"
+                ) is None:
+                    await conn.execute(
+                        f"ALTER TABLE {NEW_TABLE}_default RENAME TO chunks_p_default"
+                    )
             log(f"step 5: SWAPPED on attempt {attempt}. Old table kept as "
                 f"{RETIRED_TABLE} -- drop it deliberately, later.")
             return

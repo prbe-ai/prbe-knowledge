@@ -36,23 +36,28 @@ async def ensure_default_customer() -> None:
     api_key_hash = hashlib.sha256(token.encode()).hexdigest() if token else ""
     r2_bucket = settings.bucket_for(customer_id)
 
-    async with raw_conn() as conn:
+    async with raw_conn() as conn, conn.transaction():
         await conn.execute(
             """
-            INSERT INTO customers (customer_id, display_name, api_key_hash, r2_bucket)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (customer_id) DO UPDATE
-              SET api_key_hash = EXCLUDED.api_key_hash
-              WHERE customers.api_key_hash IS DISTINCT FROM EXCLUDED.api_key_hash
-            """,
+                INSERT INTO customers (customer_id, display_name, api_key_hash, r2_bucket)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (customer_id) DO UPDATE
+                  SET api_key_hash = EXCLUDED.api_key_hash
+                  WHERE customers.api_key_hash IS DISTINCT FROM EXCLUDED.api_key_hash
+                """,
             customer_id,
             "Community Self-Host",
             api_key_hash,
             r2_bucket,
         )
-        # Same reason as provisioning.create_customer: a tenant without its own
-        # partition writes into DEFAULT and shares an index. Idempotent, so it
-        # is correct to call on every boot alongside the customer upsert.
+        # Same reason as provisioning.create_customer: a tenant without its
+        # own partition writes into DEFAULT and shares an index. Idempotent,
+        # so it is correct to call on every boot alongside the upsert.
+        #
+        # This one runs at BOOT on a self-host, so a raise here would wedge
+        # startup. It is still not swallowed: the transaction rolls the
+        # upsert back too, so the next boot retries from a clean state
+        # rather than proceeding with a half-made tenant.
         await ensure_tenant_partition(conn, customer_id)
     log.info("community.default_customer_ensured", customer_id=customer_id)
 

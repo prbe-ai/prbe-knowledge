@@ -431,7 +431,21 @@ async def _enable_iterative_scan(conn: asyncpg.Connection) -> None:
         )
         return
 
-    if _ITERSCAN_VERIFIED is not None:
+    if _ITERSCAN_VERIFIED is False:
+        # Keep saying so. The verification itself runs once per process (two
+        # round trips), but a single startup log line is the wrong signal for a
+        # fault whose entire character is that it is invisible: a pod that came
+        # up mis-set would log once and then under-return on every filtered ANN
+        # search for days. Re-logging costs nothing -- no query, no round trip --
+        # and puts the line next to the searches it is degrading.
+        log.error(
+            "vector.iterative_scan_not_applied",
+            guc=_ITERSCAN_GUC,
+            expected=_ITERSCAN_WANT,
+            reason="filtered ANN scans are silently under-returning",
+        )
+        return
+    if _ITERSCAN_VERIFIED is True:
         return
 
     # A namespaced GUC only resolves to its real definition once the owning

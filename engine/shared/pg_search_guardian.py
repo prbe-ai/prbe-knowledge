@@ -247,7 +247,9 @@ async def find_invalid_index_debris(conn: asyncpg.Connection) -> list[str]:
     return [n for n in names if n in ALLOWED_INDEX_NAMES]
 
 
-async def drop_broken_index(conn: asyncpg.Connection, index_name: str) -> bool:
+async def drop_broken_index(
+    conn: asyncpg.Connection, index_name: str, *, allowlist_as: str | None = None
+) -> bool:
     """Drop one broken index. True if dropped, False if the lock was unavailable.
 
     Bounded by `lock_timeout` so the guardian yields to live traffic rather
@@ -260,8 +262,17 @@ async def drop_broken_index(conn: asyncpg.Connection, index_name: str) -> bool:
     string literals in `index_contracts.py` -- it never carries a value derived
     from user input or from the database.
     """
-    if index_name not in ALLOWED_INDEX_NAMES:
-        raise ValueError(f"refusing to drop index outside the allowlist: {index_name!r}")
+    # `allowlist_as` exists because of partitioning: the thing to DROP is the
+    # child (`chunks_p_<tenant>_<hash>_..._idx`, auto-named, in no allowlist),
+    # while the name a contract declares is its partitioned PARENT. Validating
+    # the child would raise ValueError on every partitioned repair -- uncaught
+    # in the cron, killing the tick before `record_timeline`, which by this
+    # module's own note re-fires the promotion alert every minute forever.
+    # Callers pass the root for validation and the child for the DDL; when the
+    # index is unpartitioned the two are the same name.
+    checked = allowlist_as or index_name
+    if checked not in ALLOWED_INDEX_NAMES:
+        raise ValueError(f"refusing to drop index outside the allowlist: {checked!r}")
     try:
         async with conn.transaction():
             await conn.execute(f"SET LOCAL lock_timeout = '{DROP_LOCK_TIMEOUT}'")
@@ -562,6 +573,14 @@ async def find_partitions_missing_required_index(
 
     missing: list[dict[str, str]] = []
     for index_name, table_name in required.items():
+        # An ABSENT index is `find_absent_required_indexes`' job, not this one.
+        # Without this guard `to_regclass($2)` is NULL, `inhparent = NULL` is
+        # never true, and NOT EXISTS holds for EVERY partition -- so any
+        # database without pg_search, and every minute of an attended multi-hour
+        # BM25 rebuild, would report every partition missing, with no transition
+        # dedupe to quiet it.
+        if await conn.fetchval("SELECT to_regclass($1)", index_name) is None:
+            continue
         rows = await conn.fetch(
             """
             SELECT part.relname AS partition_name
@@ -628,8 +647,12 @@ async def analyze_partitioned_parents(
             )
             if not stale:
                 continue
-            await conn.execute("SET statement_timeout = 0")
-            await conn.execute(f'ANALYZE "{table}"')
+            # SET LOCAL inside a transaction: a bare SET would leave
+            # statement_timeout disabled on this pooled connection for the rest
+            # of its life, and the next borrower would inherit the hole.
+            async with conn.transaction():
+                await conn.execute("SET LOCAL statement_timeout = 0")
+                await conn.execute(f'ANALYZE "{table}"')
             analyzed.append(table)
             log.info("guardian.analyzed_partitioned_parent", table=table)
         except Exception as exc:

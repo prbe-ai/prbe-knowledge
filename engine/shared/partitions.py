@@ -112,10 +112,29 @@ async def is_partitioned(conn: asyncpg.Connection, table: str = CHUNKS_PARENT) -
     ) or False
 
 
-async def partition_exists(conn: asyncpg.Connection, customer_id: str) -> bool:
+async def partition_exists(
+    conn: asyncpg.Connection, customer_id: str, *, parent: str = CHUNKS_PARENT
+) -> bool:
+    """True only when the partition exists AND is attached to the parent.
+
+    Name existence alone is the wrong test. `CREATE TABLE` and `ATTACH` are two
+    statements; if ATTACH fails the standalone table survives, and a
+    name-existence check would then report "already done" forever -- leaving
+    that tenant writing into DEFAULT with nothing ever retrying. Asking
+    `pg_inherits` makes a half-built partition look unbuilt, which is what lets
+    the next call finish the job.
+    """
     return (
         await conn.fetchval(
-            "SELECT to_regclass($1) IS NOT NULL", partition_name_for(customer_id)
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM pg_inherits h
+                WHERE h.inhrelid = to_regclass($1)
+                  AND h.inhparent = to_regclass($2)
+            )
+            """,
+            partition_name_for(customer_id),
+            parent,
         )
         or False
     )
@@ -139,7 +158,7 @@ async def ensure_tenant_partition(
     """
     if not await is_partitioned(conn, parent):
         return False
-    if await partition_exists(conn, customer_id):
+    if await partition_exists(conn, customer_id, parent=parent):
         return False
 
     part = partition_name_for(customer_id)
@@ -149,25 +168,39 @@ async def ensure_tenant_partition(
     # gate above is what makes it sound.
     literal = customer_id.replace("'", "''")
 
-    await conn.execute(f"SET LOCAL lock_timeout = '{lock_timeout}'")
-    # Standalone first: this touches the parent not at all, so a slow build
-    # cannot block a reader. INCLUDING ALL brings the column defaults, checks,
-    # storage parameters and index definitions across; ATTACH then matches them
-    # to the parent's partitioned indexes and builds any that LIKE could not
-    # express (the BM25 child among them).
-    await conn.execute(f'CREATE TABLE "{part}" (LIKE "{parent}" INCLUDING ALL)')
-    await conn.execute(
-        f'ALTER TABLE "{parent}" ATTACH PARTITION "{part}" FOR VALUES IN (\'{literal}\')'
-    )
-    # Parent policies govern parent-routed queries, which is every application
-    # path. This covers the other door: a query naming the partition directly
-    # would otherwise see every row in it with no tenant check at all.
-    await conn.execute(f'ALTER TABLE "{part}" ENABLE ROW LEVEL SECURITY')
-    await conn.execute(f'ALTER TABLE "{part}" FORCE ROW LEVEL SECURITY')
-    await conn.execute(
-        f'CREATE POLICY tenant_isolation ON "{part}" '
-        f"USING ({PARTITION_KEY} = current_setting('app.current_customer_id', true))"
-    )
+    # ONE TRANSACTION, for two reasons that are easy to miss.
+    #
+    # 1. `SET LOCAL` outside a transaction block is a NO-OP -- Postgres emits
+    #    `WARNING: SET LOCAL can only be used in transaction blocks` and moves
+    #    on. Both production callers use `raw_conn()`, which is autocommit, so
+    #    the documented lock cap simply would not exist and ATTACH could queue
+    #    behind autovacuum indefinitely. (Verified on the live database: after a
+    #    bare `SET LOCAL lock_timeout='3s'`, `SHOW lock_timeout` still reads 0.)
+    # 2. `CREATE TABLE` then `ATTACH` as separate autocommit statements leaves
+    #    an orphaned standalone table if ATTACH fails. Wrapped, a failure leaves
+    #    nothing behind and the next call starts clean.
+    async with conn.transaction():
+        await conn.execute(f"SET LOCAL lock_timeout = '{lock_timeout}'")
+        # Standalone first: this touches the parent not at all, so a slow build
+        # cannot block a reader. INCLUDING ALL brings the column defaults,
+        # checks, storage parameters and index definitions across; ATTACH then
+        # matches them to the parent's partitioned indexes and builds any that
+        # LIKE could not express (the BM25 child among them).
+        await conn.execute(f'CREATE TABLE "{part}" (LIKE "{parent}" INCLUDING ALL)')
+        await conn.execute(
+            f'ALTER TABLE "{parent}" ATTACH PARTITION "{part}" '
+            f"FOR VALUES IN ('{literal}')"
+        )
+        # Parent policies govern parent-routed queries, which is every
+        # application path. This covers the other door: a query naming the
+        # partition directly would otherwise see every row in it with no tenant
+        # check at all.
+        await conn.execute(f'ALTER TABLE "{part}" ENABLE ROW LEVEL SECURITY')
+        await conn.execute(f'ALTER TABLE "{part}" FORCE ROW LEVEL SECURITY')
+        await conn.execute(
+            f'CREATE POLICY tenant_isolation ON "{part}" '
+            f"USING ({PARTITION_KEY} = current_setting('app.current_customer_id', true))"
+        )
     log.info(
         "partitions.created", customer=customer_id, partition=part, parent=parent
     )
@@ -243,6 +276,15 @@ async def split_default(
 
     async with conn.transaction():
         await conn.execute(f"SET LOCAL lock_timeout = '{lock_timeout}'")
+        # The re-INSERT goes through the parent, and `chunks`' tenant_isolation
+        # policy carries a WITH CHECK clause (verified on the live database), so
+        # without the GUC every row is rejected with "new row violates row-level
+        # security policy". The transaction would roll back cleanly -- no data
+        # loss -- but the documented remedy for the guardian's
+        # `kb_chunks_default_partition_nonempty` alarm would never once succeed.
+        await conn.execute(
+            "SELECT set_config('app.current_customer_id', $1, true)", customer_id
+        )
         moved = await conn.fetch(
             f'DELETE FROM ONLY "{default_name}" WHERE {PARTITION_KEY} = $1 '
             f"RETURNING {collist}",

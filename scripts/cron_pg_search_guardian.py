@@ -225,13 +225,17 @@ async def run_once(*, dry_run: bool = False) -> int:
         skipped: list[str] = []
         for item in broken:
             index_name = str(item["index"])
+            # The CHILD is dropped; the ROOT is what an index contract declares
+            # and therefore what the allowlist can validate. Equal when the
+            # index is not partitioned.
+            root_name = str(item.get("root_index", index_name))
             if dry_run:
                 log.info("guardian.would_drop", **item)
                 continue
-            if await drop_broken_index(conn, index_name):
-                dropped.append(index_name)
+            if await drop_broken_index(conn, index_name, allowlist_as=root_name):
+                dropped.append(root_name)
             else:
-                skipped.append(index_name)
+                skipped.append(root_name)
 
         announced = True
         if dropped:
