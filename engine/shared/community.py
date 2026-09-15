@@ -16,6 +16,7 @@ import hashlib
 from engine.shared.config import get_settings
 from engine.shared.db import raw_conn
 from engine.shared.logging import get_logger
+from engine.shared.partitions import ensure_tenant_partition
 
 log = get_logger(__name__)
 
@@ -49,6 +50,10 @@ async def ensure_default_customer() -> None:
             api_key_hash,
             r2_bucket,
         )
+        # Same reason as provisioning.create_customer: a tenant without its own
+        # partition writes into DEFAULT and shares an index. Idempotent, so it
+        # is correct to call on every boot alongside the customer upsert.
+        await ensure_tenant_partition(conn, customer_id)
     log.info("community.default_customer_ensured", customer_id=customer_id)
 
 

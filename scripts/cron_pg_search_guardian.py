@@ -43,12 +43,16 @@ from engine.shared.db import close_pool, get_pool, init_pool
 from engine.shared.logging import configure_logging, get_logger
 from engine.shared.ops_alert import capture
 from engine.shared.pg_search_guardian import (
+    analyze_partitioned_parents,
     analyze_tables,
     current_timeline_id,
     drop_broken_index,
     find_absent_required_indexes,
     find_broken_pg_search_indexes,
     find_invalid_index_debris,
+    find_nonempty_default_partitions,
+    find_partitions_missing_required_index,
+    find_unpartitioned_tables,
     prewarm_indexes,
     read_known_absent,
     read_last_timeline,
@@ -98,6 +102,20 @@ async def run_once(*, dry_run: bool = False) -> int:
         # while lexical search was dead.
         absent = frozenset(await find_absent_required_indexes(conn))
         known_absent = await read_known_absent(conn)
+        # PARTITION-ERA CHECKS. Both are no-ops on an unpartitioned database,
+        # so this same code ships before and after the conversion.
+        #
+        # A partition without its child index is `absent` scoped to one tenant:
+        # lexical search dies for them alone while every global check stays
+        # green -- the same blind spot the absent-detector was added for, one
+        # level down.
+        partitions_missing_index = await find_partitions_missing_required_index(conn)
+        # Non-empty DEFAULT means a tenant is back on a shared index, which is
+        # the fault partitioning removed, restored silently for that tenant.
+        default_rows = await find_nonempty_default_partitions(conn)
+        # The conversion is attended and out of band, so a plane can sit at
+        # alembic head with a flat `chunks`. Expected, briefly; invisible, never.
+        unpartitioned = await find_unpartitioned_tables(conn)
 
         log.info(
             "guardian.tick",
@@ -107,6 +125,9 @@ async def run_once(*, dry_run: bool = False) -> int:
             broken_count=len(broken),
             debris_count=len(debris),
             absent_count=len(absent),
+            partitions_missing_index=len(partitions_missing_index),
+            default_partition_bytes=sum(int(d["heap_bytes"]) for d in default_rows),
+            unpartitioned=unpartitioned,
             dry_run=dry_run,
         )
 
@@ -133,6 +154,47 @@ async def run_once(*, dry_run: bool = False) -> int:
             )
         if absent != known_absent and not dry_run:
             await record_known_absent(conn, absent)
+
+        if unpartitioned:
+            capture(
+                "kb_chunks_not_partitioned",
+                {
+                    "tables": unpartitioned,
+                    "timeline_id": timeline,
+                    "state": "db/schema.sql declares these partitioned but this "
+                    "database has them flat; every tenant is still sharing one "
+                    "ANN index. Run scripts/convert_chunks_to_partitioned.py",
+                },
+            )
+
+        if partitions_missing_index:
+            capture(
+                "kb_pg_search_partition_index_missing",
+                {
+                    "partitions": partitions_missing_index,
+                    "timeline_id": timeline,
+                    "state": "lexical search returns nothing for these tenants; "
+                    "the rebuild cron must build the missing child index",
+                },
+            )
+
+        if default_rows:
+            capture(
+                "kb_chunks_default_partition_nonempty",
+                {
+                    "partitions": default_rows,
+                    "timeline_id": timeline,
+                    "state": "a tenant has no partition of its own and is back on a "
+                    "shared ANN index; run split_default() for the named tenants",
+                },
+            )
+
+        # Statistics on a PARTITIONED PARENT are nobody else's job: PG16
+        # autovacuum analyzes leaves only. Retrieval plans against the parent,
+        # so stale parent stats reproduce the mis-costing this partitioning was
+        # done to fix. Runs on its own age check, not on promotion.
+        if not dry_run:
+            await analyze_partitioned_parents(conn)
 
         if promoted:
             capture(

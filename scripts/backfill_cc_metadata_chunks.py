@@ -270,7 +270,7 @@ async def _process_doc(
                     $10,
                     $11::halfvec, $12, $13
                 )
-                ON CONFLICT (doc_id, content_hash) DO UPDATE
+                ON CONFLICT (customer_id, doc_id, content_hash) DO UPDATE
                     SET last_seen_version = EXCLUDED.last_seen_version,
                         valid_to = NULL,
                         embedding_v2 = EXCLUDED.embedding_v2,

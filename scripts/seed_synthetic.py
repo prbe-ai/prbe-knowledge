@@ -22,6 +22,7 @@ from engine.shared.config import get_settings
 from engine.shared.constants import QueueStatus, SourceSystem
 from engine.shared.db import close_pool, init_pool, raw_conn
 from engine.shared.logging import configure_logging, get_logger
+from engine.shared.partitions import ensure_tenant_partition
 from engine.shared.storage import get_store
 
 log = get_logger(__name__)
@@ -87,6 +88,7 @@ async def seed(customer_id: str, count: int) -> None:
             """,
             customer_id,
         )
+        await ensure_tenant_partition(conn, customer_id)
 
     ctx = make_default_context()
     normalizer = Normalizer(ctx)

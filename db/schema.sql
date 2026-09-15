@@ -381,7 +381,21 @@ CREATE TABLE chunks (
     -- PK includes customer_id so tenants ingesting overlapping source content
     -- can't collide on chunk_id (which is derived from doc_id + content_hash).
     PRIMARY KEY (customer_id, chunk_id),
-    UNIQUE (doc_id, content_hash),
+    -- The partition key leads every UNIQUE here because `chunks` is
+    -- PARTITIONED BY LIST (customer_id) below and PostgreSQL requires a unique
+    -- constraint on a partitioned table to contain the partition key. This is
+    -- not a weakening: `doc_id` already encodes the tenant, so adding
+    -- customer_id cannot admit a row the old (doc_id, content_hash) key
+    -- rejected. Migration 0134 adds the same index to pre-partition databases
+    -- so old and new ingestion code are both valid during the rollout.
+    -- NAMED explicitly. Left to Postgres this becomes
+    -- `chunks_customer_id_doc_id_content_hash_key`, while migration 0134 and
+    -- the conversion script both create `chunks_customer_doc_hash_key` -- so a
+    -- freshly-born database and a converted one would carry different names for
+    -- the same constraint. That is the divergence class migration 0101 exists
+    -- to document, and it is free to avoid here.
+    CONSTRAINT chunks_customer_doc_hash_key
+        UNIQUE (customer_id, doc_id, content_hash),
     CONSTRAINT chunks_visibility_chk CHECK (visibility IN ('draft','approved'))
     -- No FK to documents(doc_id, version). A chunk can span multiple versions
     -- (first_seen_version..last_seen_version), so pinning the FK to a specific
@@ -389,7 +403,23 @@ CREATE TABLE chunks (
     -- gets hand-deleted by a retention job. The customer_id CASCADE above
     -- handles the tenant-delete path, which is the only real delete in
     -- normal operation.
-);
+)
+-- PARTITIONED BY TENANT. One shared HNSW index over every tenant is priced by
+-- pgvector at the WHOLE-INDEX cost -- measured 3,808,868 cost units, identical
+-- for every tenant -- while the competing brute-force plan is priced on that
+-- tenant's own rows. Small tenants therefore lost the planner's comparison and
+-- were pushed onto a 1,003 ms / 646,471-buffer scan where the index takes
+-- 80 ms, and one tenant's growth could push another off the index. Per-tenant
+-- partitions give each tenant an index priced at its own size, so the choice
+-- the planner makes is honest either way.
+--
+-- Partitions are created by `engine.shared.partitions.ensure_tenant_partition`
+-- at tenant-creation time (CREATE + ATTACH; ~7 ms and no lock on the parent).
+-- The DEFAULT partition below is the backstop for any path that skips it; the
+-- pg_search guardian alarms when it stops being empty.
+PARTITION BY LIST (customer_id);
+
+CREATE TABLE IF NOT EXISTS chunks_p_default PARTITION OF chunks DEFAULT;
 
 -- halfvec_cosine_ops: pgvector HNSW indexes halfvec up to 4000 dims.
 -- Production retrieval index over gemini-embedding-2 vectors. The legacy
@@ -425,10 +455,14 @@ CREATE INDEX idx_chunks_metadata_kind  ON chunks (customer_id, doc_id) WHERE kin
 CREATE INDEX IF NOT EXISTS idx_chunks_stats_live
     ON chunks (customer_id, doc_id) WHERE valid_to IS NULL;
 
--- Single-column uniqueness on chunk_id (migration 0101). chunk_id is already
--- unique in practice (`{doc_id}:{prefix}{content_hash[:16]}`); this enforces
--- it. Was also a pg_search key_field requirement before 0.23.4 relaxed it.
-CREATE UNIQUE INDEX chunks_chunk_id_unique ON chunks (chunk_id);
+-- chunks_chunk_id_unique (migration 0101) is GONE. A UNIQUE index on a
+-- partitioned table must contain the partition key, and this one could not.
+-- Removing it costs nothing that was load-bearing: 0101's own text records that
+-- it was "obsolete as a pg_search requirement (0.23.4 no longer needs it)" and
+-- was kept only as belt-and-braces, while `PRIMARY KEY (customer_id, chunk_id)`
+-- is the identity every query actually relies on under RLS. It also removes a
+-- latent collision -- connector doc_ids carry no tenant, so the global unique
+-- forbade two tenants holding the same GitHub document.
 
 -- pg_search BM25 index (migration 0100). Guarded because the extension ships
 -- in `prbe-postgres` but NOT in the `pgvector/pgvector` image used for local

@@ -1692,6 +1692,35 @@ async def _upsert_document(conn: asyncpg.Connection, doc: Document) -> bool:
     )
 
 
+#: The ON CONFLICT arm shared by `_insert_chunk` and `_insert_chunks_batch`.
+#:
+#: ONE definition because the two statements must agree: `title` was once set on
+#: only one of them, which left a retitle+reingest carrying a stale title on
+#: whichever path happened to run. A shared constant makes that class of drift
+#: impossible rather than merely unlikely.
+#:
+#: The conflict target is `(customer_id, doc_id, content_hash)`, NOT the older
+#: `(doc_id, content_hash)`. `chunks` is partitioned by `customer_id`, and
+#: Postgres requires a unique constraint on a partitioned table to contain the
+#: partition key -- an ON CONFLICT naming the old target raises
+#: "there is no unique or exclusion constraint matching the ON CONFLICT
+#: specification" the moment the old index is gone. The uniqueness guarantee is
+#: unchanged in practice: `doc_id` already encodes the tenant, so adding
+#: `customer_id` cannot admit a row the old key rejected.
+#: Migration 0134 creates the index; the write switch rides the same release
+#: because kb-migrate is a `pre-upgrade` hook and completes first.
+_CHUNK_UPSERT_ON_CONFLICT = """
+        ON CONFLICT (customer_id, doc_id, content_hash) DO UPDATE
+            SET last_seen_version = EXCLUDED.last_seen_version,
+                valid_to = NULL,
+                embedding_v2 = EXCLUDED.embedding_v2,
+                embedding_v2_model = EXCLUDED.embedding_v2_model,
+                embedding_v2_dim = EXCLUDED.embedding_v2_dim,
+                visibility = EXCLUDED.visibility,
+                title = EXCLUDED.title
+"""
+
+
 async def _insert_chunk(
     conn: asyncpg.Connection,
     doc: Document,
@@ -1713,6 +1742,12 @@ async def _insert_chunk(
     # the wrong row.
     prefix = "m_" if kind == "metadata" else "c_"
     chunk_id = f"{doc.doc_id}:{prefix}{content_hash[:16]}"
+    # `title` is carried on the upsert branch too, and that is not redundant
+    # with the documents-title trigger from 0100. On a retitle+reingest the
+    # trigger fires while this chunk's range still ends at the PREVIOUS
+    # version, so it matches nothing; the row then has its last_seen_version
+    # extended here and would keep the stale title forever. Setting it on both
+    # branches closes that window. See _CHUNK_UPSERT_ON_CONFLICT.
     await conn.execute(
         """
         INSERT INTO chunks (
@@ -1731,21 +1766,8 @@ async def _insert_chunk(
             $11::halfvec, $12, $13,
             $14, $15
         )
-        -- `title` is carried on the upsert branch too, and that is not
-        -- redundant with the documents-title trigger from 0100. On a
-        -- retitle+reingest the trigger fires while this chunk's range still
-        -- ends at the PREVIOUS version, so it matches nothing; the row then
-        -- has its last_seen_version extended here and would keep the stale
-        -- title forever. Setting it on both branches closes that window.
-        ON CONFLICT (doc_id, content_hash) DO UPDATE
-            SET last_seen_version = EXCLUDED.last_seen_version,
-                valid_to = NULL,
-                embedding_v2 = EXCLUDED.embedding_v2,
-                embedding_v2_model = EXCLUDED.embedding_v2_model,
-                embedding_v2_dim = EXCLUDED.embedding_v2_dim,
-                visibility = EXCLUDED.visibility,
-                title = EXCLUDED.title
-        """,
+        """
+        + _CHUNK_UPSERT_ON_CONFLICT,
         chunk_id,
         doc.doc_id,
         doc.customer_id,
@@ -1772,8 +1794,10 @@ async def _insert_chunks_batch(
     """Batched counterpart to `_insert_chunk` — one INSERT for all pieces.
 
     Dedupes by content_hash before insert: the unique constraint is
-    (doc_id, content_hash), and ON CONFLICT DO UPDATE can't touch the same
-    target row twice in one statement. The prior loop handled duplicate
+    (customer_id, doc_id, content_hash) and every row in one batch shares a
+    customer_id, so content_hash alone still identifies a duplicate within the
+    batch. ON CONFLICT DO UPDATE can't touch the same target row twice in one
+    statement. The prior loop handled duplicate
     hashes by letting the second iteration UPDATE the row inserted by the
     first; the batched form collapses duplicates upfront with last-wins
     semantics on the per-piece fields (chunk_index, content) — they're
@@ -1835,17 +1859,8 @@ async def _insert_chunks_batch(
             $8::text[], $11::text[]
         ) AS t(chunk_id, chunk_index, content, content_hash, token_count,
                embedding_v2, kind)
-        -- See the single-chunk path: `title` on the upsert branch closes the
-        -- retitle+reingest window the documents trigger cannot see.
-        ON CONFLICT (doc_id, content_hash) DO UPDATE
-            SET last_seen_version = EXCLUDED.last_seen_version,
-                valid_to = NULL,
-                embedding_v2 = EXCLUDED.embedding_v2,
-                embedding_v2_model = EXCLUDED.embedding_v2_model,
-                embedding_v2_dim = EXCLUDED.embedding_v2_dim,
-                visibility = EXCLUDED.visibility,
-                title = EXCLUDED.title
-        """,
+        """
+        + _CHUNK_UPSERT_ON_CONFLICT,
         chunk_ids,
         doc.doc_id,
         doc.customer_id,
