@@ -211,31 +211,35 @@ _bm25_v3_available: bool | None = None
 async def bm25_scan_target(conn: Any, customer_id: str) -> str:
     """The relation this tenant's BM25 pool scans: its partition, or `chunks`.
 
-    THE PRODUCTION SHAPE IS UNSUPPORTED ON A PARTITIONED PARENT. pg_search
-    rejects it outright -- `Unsupported query shape. Please report at
-    https://github.com/paradedb/paradedb/issues/new/choose` -- and the exact
-    channel then returns nothing while the search still reports `state: ok`.
-    Measured on the research plane the day `chunks` was partitioned: the share
-    of searches reporting `channel_degraded` went from 10% to 98% in one
-    statement, average exact hits 1.03 -> 0.42, and the first person to notice
-    was a customer whose search came back semantic-only.
+    A SPEED OPTIMISATION, NOT A CORRECTNESS REQUIREMENT -- and it matters
+    which, because the first version of this was the other thing. It was
+    written as the fix for pg_search rejecting the pool query on a partitioned
+    parent, which made its own fallback a lie: `chunks` was returned for a
+    tenant without a partition and then rejected by exactly the shape this
+    was meant to route around. The actual defect was a SQL predicate on the
+    partition key (see the pool query's comment), and with that gone the pool
+    query is valid against the parent and against a partition alike.
 
-    It is the COMBINATION that is rejected, not scoring and not partitioning.
-    Bisected against the live database, same rows, same index:
+    So the fallback is real now, and what this buys is time. Both paths prune
+    to one partition -- RLS's `current_setting()` qual prunes at execution
+    time -- but under an Append pg_search cannot push its top-K into the scan,
+    so the outer sort does the work. Measured on the research plane, the real
+    pool shape, LIMIT 400:
 
-        score + ORDER BY score                              parent OK
-        ... + a `content_tsv @@ to_tsquery` projection      parent OK
-        ... + `c.customer_id = $1` + `valid_to IS NULL`     parent FAIL
-        the same query against one partition                      OK
+        tenant      parent (pruned to 1)    partition by name
+        monarcha            100 ms                  73 ms
+        probe             1,412 ms                 406 ms
 
-    So the pool scans the partition directly. Every BM25 query is already
-    tenant-scoped -- `paradedb.match('customer_id', ...)` is a `must` -- so one
-    partition is the whole search space anyway, and naming it also skips an
-    Append the planner would only prune.
+    Every BM25 query is tenant-scoped -- the `customer_id` match is a `must`
+    -- so one partition IS the whole search space, and naming it costs nothing
+    in recall.
 
     Falls back to `chunks` when this database is not partitioned (the other
     plane, a fresh install, a test fixture) or when the tenant has no partition
-    of its own, because DEFAULT holds those rows and only the parent reaches it.
+    of its own, because DEFAULT holds those rows and only the parent reaches
+    them. Two catalog lookups per call; both are sub-millisecond and
+    `is_partitioned` never changes at runtime, so cache it if this ever shows
+    up in a profile.
     """
     if not await is_partitioned(conn):
         return CHUNKS_PARENT
@@ -375,6 +379,7 @@ async def bm25_search(
     source_keys_include_keyless: bool = False,
     project_id: str | None = None,
     per_source_top_k: int | None = None,
+    _scan_target_override: str | None = None,
 ) -> list[BM25Hit]:
     """`include_drafts` defaults to False — retrieval hides ``visibility='draft'``
     rows (see migration 0082 + Plan A Component 6). Reviewer surfaces pass
@@ -525,16 +530,41 @@ async def bm25_search(
         # hyphenated tenant (verified live). conjunction_mode requires every
         # token of the id, which is correct and cheap.
         #
-        # The SQL predicates STAY, because the index-side clause is a
-        # pre-filter, not the correctness filter: tokenized ids overlap
-        # ('probe' matches probe-demo's first token), and under FORCE RLS the
-        # policy qual re-applies the tenant check regardless. Belt and braces,
-        # in that order.
+        # THERE IS DELIBERATELY NO `c.customer_id = $1` IN THE SQL. It used to
+        # be here as belt-and-braces over the index-side clause, on the
+        # reasoning that tokenized ids overlap ('probe' matches probe-demo's
+        # first token). The reasoning was right; the predicate was the bug.
+        #
+        # `customer_id` is the PARTITION KEY. A SQL equality on it engages
+        # partition pruning, and pg_search's custom scan cannot sit under that
+        # on a partitioned parent: the whole pool query is rejected with
+        # `Unsupported query shape`, the channel returns nothing, and the
+        # search still reports `state: ok`. Bisected live, same rows, same
+        # index -- every other clause and the projection pass in every
+        # combination; this one predicate fails in every combination. It took
+        # the exact channel from 10% degraded to 98% the moment `chunks` was
+        # partitioned, and a customer noticed before we did.
+        #
+        # What makes the answer exact without it is FORCE ROW LEVEL SECURITY:
+        # the policy qual `customer_id = current_setting(...)` is applied to
+        # every row, owner included, and because it is a stable function
+        # rather than a bound parameter it prunes at execution time WITHOUT
+        # taking the rejected path (measured: 1 partition scanned, 15
+        # subplans removed). The index-side clause below stays as the cheap
+        # pre-filter it always was. `test_bm25_pool_cannot_leak_across_
+        # token_sharing_tenants` pins the isolation that this comment used to
+        # merely assert.
         tenant_must = "paradedb.match('customer_id', $1, conjunction_mode => true)"
         visibility_must = (
             "" if include_drafts else "paradedb.term('visibility', 'approved'),"
         )
-        scan_target = await bm25_scan_target(conn, customer_id)
+        # `_scan_target_override` is the pg_search guardian's seam and nothing
+        # else's: the canary runs this exact function once as production does
+        # and once forced onto the parent, because the first fix for the
+        # partitioned-parent rejection had a fallback to the parent that was
+        # itself rejected -- dead code that read as a safety net. Forcing the
+        # path is the only way to know the fallback is alive.
+        scan_target = _scan_target_override or await bm25_scan_target(conn, customer_id)
         pool_sql = f"""
             SELECT c.chunk_id,
                    c.doc_id,
@@ -546,8 +576,7 @@ async def bm25_search(
                    paradedb.score(c.chunk_id) AS score,
                    (c.content_tsv @@ to_tsquery('english', $4)) AS content_hit
             FROM {scan_target} c
-            WHERE c.customer_id = $1
-              AND c.chunk_id @@@ paradedb.boolean(must => ARRAY[
+            WHERE c.chunk_id @@@ paradedb.boolean(must => ARRAY[
                     {tenant_must},
                     {visibility_must}
                     {project_must}

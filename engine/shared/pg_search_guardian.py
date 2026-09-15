@@ -71,6 +71,8 @@ alerting path is the thing that is broken.
 
 from __future__ import annotations
 
+import re
+
 import asyncpg
 
 from engine.retrieval.index_contracts import INDEX_CONTRACTS
@@ -456,6 +458,57 @@ async def required_bm25_index(conn: asyncpg.Connection) -> str:
         """
     )
     return BM25_INDEX_V3 if has_project_id else BM25_INDEX_V2
+
+
+#: Five letters or more: long enough to miss stopwords and short ids, short
+#: enough that almost any chunk carries one.
+_CANARY_TOKEN = re.compile(r"[A-Za-z]{5,}")
+
+
+async def bm25_canary_probe(conn: asyncpg.Connection) -> tuple[str, str] | None:
+    """A (tenant, term) pair for which the exact channel MUST return a row.
+
+    A healthy index is not a working query. On 2026-09-15 every BM25 index was
+    valid -- 16 children, 1,041 MB, `broken_count: 0` on every tick -- while
+    pg_search rejected the production query outright and the exact channel
+    returned nothing for 13 hours. Nothing here checks queries; this is what
+    lets the cron check one.
+
+    The term is sampled FROM THE TENANT'S OWN CHUNKS, which matters more than
+    it looks: pg_search rejects the bad shape at execution, not at planning,
+    so a query for a nonsense term "succeeds" with zero rows and a canary
+    built on one would pass forever. A token lifted from a live chunk is
+    guaranteed to match at least that chunk.
+
+    Reads under the tenant GUC, because `chunks` is FORCE RLS and this runs as
+    the owner. Returns None rather than guessing when no tenant yields a
+    token -- a skipped canary is logged; a false alarm trains people to ignore
+    the real one.
+    """
+    tenants = await conn.fetch(
+        "SELECT customer_id FROM customers WHERE status = 'active' ORDER BY customer_id"
+    )
+    for r in tenants:
+        tenant = r["customer_id"]
+        async with conn.transaction():
+            await conn.execute(
+                "SELECT set_config('app.current_customer_id', $1, true)", tenant
+            )
+            rows = await conn.fetch(
+                """
+                SELECT title, content FROM chunks
+                WHERE customer_id = $1 AND valid_to IS NULL
+                  AND visibility = 'approved'
+                LIMIT 20
+                """,
+                tenant,
+            )
+        for row in rows:
+            for text in (row["title"], row["content"]):
+                m = _CANARY_TOKEN.search(text or "")
+                if m:
+                    return tenant, m.group(0).lower()
+    return None
 
 
 async def find_absent_required_indexes(conn: asyncpg.Connection) -> list[str]:

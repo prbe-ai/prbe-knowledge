@@ -39,16 +39,19 @@ import argparse
 import asyncio
 import sys
 
+from engine.retrieval.retrievers.bm25 import bm25_search
 from engine.shared.db import close_pool, get_pool, init_pool
 from engine.shared.logging import configure_logging, get_logger
 from engine.shared.ops_alert import capture
 from engine.shared.partitions import (
+    CHUNKS_PARENT,
     drop_tenant_partition,
     find_orphan_partitions,
 )
 from engine.shared.pg_search_guardian import (
     analyze_partitioned_parents,
     analyze_tables,
+    bm25_canary_probe,
     current_timeline_id,
     drop_broken_index,
     find_absent_required_indexes,
@@ -234,6 +237,55 @@ async def run_once(*, dry_run: bool = False) -> int:
                         "dropped; its rows were already gone by cascade",
                     },
                 )
+
+        # ---- the query canary: a healthy index is not a working query ----
+        # Runs the REAL `bm25_search`, not a copy of its SQL -- a copy is how
+        # the original verification passed while production failed. Twice:
+        # once as production routes it (the tenant's partition) and once
+        # forced onto the parent, because the first fix for this had a
+        # fallback to the parent that was itself rejected. The exception path
+        # is the alarm; zero hits for a term lifted from the tenant's own rows
+        # is logged loudly but not alarmed, since a tokenizer edge could
+        # produce it and a false alarm costs more than a late one.
+        try:
+            probe = await bm25_canary_probe(conn)
+            if probe is None:
+                log.info("guardian.bm25_canary_skipped",
+                         reason="no active tenant yielded a sampleable token")
+            else:
+                tenant, term = probe
+                for path, override in (("partition", None), ("parent", CHUNKS_PARENT)):
+                    try:
+                        hits = await bm25_search(
+                            tenant, term, top_k=1, _scan_target_override=override
+                        )
+                    except Exception as exc:
+                        err = f"{type(exc).__name__}: {exc}"
+                        log.warning("guardian.bm25_canary_rejected", path=path,
+                                    tenant=tenant, term=term, error=err)
+                        capture(
+                            "kb_pg_search_query_rejected",
+                            {
+                                "path": path,
+                                "tenant": tenant,
+                                "term": term,
+                                "error": err[:300],
+                                "timeline_id": timeline,
+                                "state": "pg_search rejects the production BM25 "
+                                "query; the exact channel is returning nothing "
+                                "while searches report ok",
+                            },
+                        )
+                        continue
+                    if not hits:
+                        log.warning("guardian.bm25_canary_zero_hits", path=path,
+                                    tenant=tenant, term=term)
+                    else:
+                        log.info("guardian.bm25_canary_ok", path=path,
+                                 tenant=tenant, hits=len(hits))
+        except Exception as exc:
+            log.warning("guardian.bm25_canary_failed",
+                        error=f"{type(exc).__name__}: {exc}")
 
         # Statistics on a PARTITIONED PARENT are nobody else's job: PG16
         # autovacuum analyzes leaves only. Retrieval plans against the parent,

@@ -460,3 +460,48 @@ async def test_bm25_falls_back_to_the_parent_without_a_partition(
         if not await is_partitioned(conn):
             pytest.skip("chunks is not partitioned on this database")
         assert await bm25_scan_target(conn, "tenant-with-no-partition") == CHUNKS_PARENT
+
+
+async def test_bm25_pool_cannot_leak_across_token_sharing_tenants(
+    live_db: None,
+) -> None:
+    """The pool has NO SQL `customer_id = $1` any more. This is what replaces it.
+
+    That predicate was removed because `customer_id` is the partition key and
+    pg_search rejects a SQL predicate on it under a partitioned parent -- the
+    whole exact channel died for 13 hours. What now makes the answer exact is
+    FORCE RLS, and the index-side `paradedb.match('customer_id', ...)` is only
+    a pre-filter. The comment that used to justify the predicate said as much;
+    a comment is not a test.
+
+    The pair is chosen to be the WORST case for the pre-filter: every token of
+    the shorter id appears in the longer one, so `conjunction_mode` on
+    `leak-probe` matches `leak-probe-demo` too. If RLS were not binding, this
+    is the pair that would leak.
+
+    Both scan paths are exercised -- the partition by name, and the parent
+    forced -- because on the parent RLS is the ONLY thing between two tenants.
+    `assert hits` first, so a query that matches nothing cannot pass this
+    vacuously.
+    """
+    from engine.retrieval.retrievers.bm25 import bm25_search
+    from engine.shared.partitions import CHUNKS_PARENT
+
+    a, b = "leak-probe", "leak-probe-demo"
+    async with db_module.raw_conn() as conn:
+        if not await is_partitioned(conn):
+            pytest.skip("chunks is not partitioned on this database")
+        await _seed(conn, a, 60)
+        await _seed(conn, b, 60)
+
+    for path, override in (("partition", None), ("parent", CHUNKS_PARENT)):
+        for me, other in ((a, b), (b, a)):
+            hits = await bm25_search(
+                me, "content", top_k=200, _scan_target_override=override
+            )
+            assert hits, f"[{path}] {me}: the canary term matched nothing -- vacuous"
+            leaked = [h.chunk_id for h in hits if h.chunk_id.startswith(f"{other}:")]
+            assert not leaked, f"[{path}] {me} received {other}'s rows: {leaked[:3]}"
+            assert all(h.chunk_id.startswith(f"{me}:") for h in hits), (
+                f"[{path}] {me}: a hit belongs to neither tenant"
+            )
