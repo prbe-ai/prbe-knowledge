@@ -12,6 +12,11 @@ Runs every minute. Each tick:
      including ordinary lookups that have nothing to do with search.
   3. Alerts, so a human knows to rebuild.
 
+  4. Runs the REAL BM25 query as a canary, on both scan paths. A healthy index
+     is not a working query: on 2026-09-15 every index was valid while
+     pg_search rejected the production query and the exact channel returned
+     nothing for 13 hours under `state: ok`. Nothing else here checks queries.
+
 WHAT "SUCCESS" MEANS HERE
 -------------------------
 Search comes back DEGRADED, not whole: vector + graph + exact serve, BM25 does
@@ -24,11 +29,23 @@ human does it in an attended window.
 EXIT CODES
 ----------
   0  nothing to do, or a repair succeeded.
-  1  a database operation failed.
+  1  a database operation failed, OR a CHANGE THIS JOB MADE, or a BREAKAGE it
+     DETECTED, could not be announced -- see the two carve-outs below.
 
-Alerting failures do NOT affect the exit code: the CronJob's red history is the
-fallback signal for when PostHog is the thing that is down, so it has to mean
-"the database work failed" and nothing else.
+Alerting failures do NOT affect the exit code in general: the CronJob's red
+history is the fallback signal for when PostHog is the thing that is down, so
+it mostly has to mean "the database work failed" and nothing else.
+
+Two deliberate exceptions, both for the same reason -- a state nobody was told
+about is indistinguishable from a healthy tick, and that indistinguishability
+is the bug this job exists to remove:
+
+  * a repair that dropped an index and could not announce it
+  * a canary that caught pg_search rejecting the production query and could
+    not announce it
+
+A promotion or debris alert going undelivered stays a log line: neither changed
+the database and neither means search is degraded right now.
 
     python -m scripts.cron_pg_search_guardian [--dry-run]
 """

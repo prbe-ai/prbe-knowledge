@@ -76,6 +76,7 @@ import re
 import asyncpg
 
 from engine.retrieval.index_contracts import INDEX_CONTRACTS
+from engine.retrieval.temporal import live_version_join
 from engine.shared.logging import get_logger
 
 log = get_logger(__name__)
@@ -480,6 +481,11 @@ async def bm25_canary_probe(
     returned nothing for 13 hours. Nothing here checks queries; this is what
     lets the cron check one.
 
+    The version join comes from `live_version_join`, the shared helper, not
+    retyped: its own docstring records that this condition 'used to be inlined
+    in vector and bm25; the fetch tools then grew without it and served dead-
+    version chunks'. Retyping it here would reintroduce exactly that drift.
+
     THE SAMPLE MUST SATISFY THE SAME JOINS THE SEARCH DOES, or the canary is
     unfalsifiable in the wrong direction: a term lifted from a chunk whose
     DOCUMENT is retired or unapproved returns zero rows for a legitimate
@@ -527,19 +533,18 @@ async def bm25_canary_probe(
                 "SELECT set_config('app.current_customer_id', $1, true)", tenant
             )
             rows = await conn.fetch(
-                """
+                f"""
                 SELECT c.title, c.content
                 FROM chunks c
                 JOIN documents d
                   ON c.doc_id = d.doc_id
                  AND d.customer_id = c.customer_id
-                 AND d.version BETWEEN c.first_seen_version AND c.last_seen_version
+                 {live_version_join('d', 'c')}
                 WHERE c.customer_id = $1
                   AND c.valid_to IS NULL
                   AND d.valid_to IS NULL
                   AND c.visibility = 'approved'
                   AND d.visibility = 'approved'
-                  AND c.embedding_v2 IS NOT NULL
                 LIMIT 20
                 """,
                 tenant,

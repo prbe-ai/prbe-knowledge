@@ -272,9 +272,11 @@ async def bm25_scan_target(conn: Any, customer_id: str) -> str:
     Falls back to `chunks` when this database is not partitioned (the other
     plane, a fresh install, a test fixture) or when the tenant has no partition
     of its own, because DEFAULT holds those rows and only the parent reaches
-    them. Two catalog lookups per call; both are sub-millisecond and
-    `is_partitioned` never changes at runtime, so cache it if this ever shows
-    up in a profile.
+    them. `is_partitioned` is cached for the process lifetime in
+    `_CHUNKS_PARTITIONED` -- a table does not stop being partitioned while a
+    process runs. `partition_exists` deliberately still hits the catalog every
+    call: a tenant provisioned after this process started has a partition this
+    process has never seen, and that lookup is what notices.
     """
     global _CHUNKS_PARTITIONED
     if _CHUNKS_PARTITIONED is None:
@@ -507,8 +509,16 @@ async def bm25_search(
         #
         # This is the identical trap the customer_id clause below documents,
         # one field over. conjunction_mode requires EVERY token of the id,
-        # which is why it is a sound pre-filter; the SQL predicate is what
-        # makes the answer exact, so a tokenized near-match cannot leak.
+        # which is why it is a sound pre-filter; the SQL predicate beside it is
+        # what makes the answer exact, so a tokenized near-match cannot leak.
+        #
+        # NOTE the asymmetry with customer_id, which the long comment below
+        # spells out: for THAT field the primary control is FORCE ROW LEVEL
+        # SECURITY and the SQL predicate is a secondary backstop for when the
+        # policy does not apply, because customer_id is the partition key and
+        # the obvious `= $1` form is the shape pg_search rejects. project_id is
+        # not a partition key and carries no policy, so here the SQL predicate
+        # really is the whole correctness story.
         project_index_side = bool(project_id) and await bm25_project_scope_is_index_side(conn)
         project_must = ""
         if project_index_side:
