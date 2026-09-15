@@ -5,6 +5,22 @@
     .venv/bin/python -m scripts.convert_chunks_to_partitioned --run
     .venv/bin/python -m scripts.convert_chunks_to_partitioned --run --only anthrogen
 
+STAGED RUN (what a large plane actually wants)
+----------------------------------------------
+`--run` does copy -> build -> verify -> swap in one go, which means ingestion has
+to stay stopped for the whole thing -- on the research plane that is a 2,716 MB
+heap plus ~23 GB of index builds. `--phase` splits it so only the last step needs
+the write fence:
+
+    --phase copy    ingestion RUNNING. Bulk-copies every tenant. Resumable, and
+                    deliberately tolerant of rows arriving behind it.
+    --phase index   ingestion RUNNING. Builds the indexes on the new table, in
+                    bulk, which is far cheaper than maintaining them row by row
+                    during the copy.
+    --phase swap    ingestion STOPPED. Re-runs the copy to pick up whatever
+                    arrived during the first two phases, verifies per-tenant
+                    counts, and swaps. Minutes, not hours.
+
 WHY THIS IS NOT A MIGRATION
 ---------------------------
 `charts/research-os/templates/engine-migrate-job.yaml` runs `alembic upgrade
@@ -189,53 +205,121 @@ async def status(conn: asyncpg.Connection) -> None:
     log(f"{OLD_TABLE} rows (sum over tenants): {total:,}")
 
 
+async def _ddl(conn: asyncpg.Connection, sql: str, *, attempts: int = 30) -> None:
+    """Run one DDL statement under a lock timeout, retrying on contention.
+
+    WITHOUT THIS, a statement QUEUES. Observed on the research plane during the
+    first real run: `ALTER TABLE chunks_part ADD FOREIGN KEY ... REFERENCES
+    customers` sat waiting behind an unrelated `DELETE FROM customers` that had
+    been running 27 minutes (a tenant-deletion cascade). Prod sets
+    `lock_timeout = 0`, so it would have waited forever -- and a queued lock
+    request blocks everything that arrives after it, turning one slow neighbour
+    into an outage. Failing fast and retrying keeps the exposure to the timeout.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            async with conn.transaction():
+                await conn.execute(f"SET LOCAL lock_timeout = '{DDL_LOCK_TIMEOUT}'")
+                await conn.execute(sql)
+            return
+        except asyncpg.LockNotAvailableError:
+            if attempt == attempts:
+                raise
+            if attempt % 5 == 0:
+                log(f"    still waiting on a lock ({attempt}/{attempts}): "
+                    f"{sql.strip().splitlines()[0][:70]}")
+            await asyncio.sleep(4)
+
+
 async def _create_parent(conn: asyncpg.Connection) -> None:
-    if await _table_kind(conn, NEW_TABLE) is not None:
-        log(f"step 1: {NEW_TABLE} already exists, skipping")
-        return
-    log(f"step 1: creating {NEW_TABLE} (partitioned)")
-    # LIKE carries columns, defaults, NOT NULLs, checks and storage. Indexes and
-    # constraints are declared explicitly below so the new table gets the
-    # POST-partition index set (tenant-qualified uniques, no chunks_chunk_id_unique)
-    # rather than a copy of the old one, which a partitioned table would reject.
-    await conn.execute(
-        f"""
-        CREATE TABLE {NEW_TABLE} (
-            LIKE {OLD_TABLE}
-                INCLUDING DEFAULTS
-                INCLUDING CONSTRAINTS
-                INCLUDING STORAGE
-                INCLUDING COMMENTS
-                INCLUDING GENERATED
-        ) PARTITION BY LIST (customer_id)
-        """
-    )
+    """Create the partitioned parent. IDEMPOTENT PER STEP, not per table.
+
+    An earlier version returned early when `chunks_part` existed. A run
+    interrupted between the CREATE and the RLS policy therefore left a
+    partitioned table with no tenant isolation, and every retry skipped
+    straight past it -- which is exactly what happened on the first real run
+    against the research plane when the foreign key queued behind an unrelated
+    27-minute DELETE and was cancelled. Each step now checks for its own
+    artefact, so a retry finishes the job instead of declaring it done.
+    """
+    if await _table_kind(conn, NEW_TABLE) is None:
+        log(f"step 1: creating {NEW_TABLE} (partitioned)")
+        # LIKE carries columns, defaults, NOT NULLs, checks and storage. Indexes
+        # and constraints are declared explicitly below so the new table gets the
+        # POST-partition index set (tenant-qualified uniques, no
+        # chunks_chunk_id_unique) rather than a copy of the old one, which a
+        # partitioned table would reject.
+        await _ddl(
+            conn,
+            f"""
+            CREATE TABLE {NEW_TABLE} (
+                LIKE {OLD_TABLE}
+                    INCLUDING DEFAULTS
+                    INCLUDING CONSTRAINTS
+                    INCLUDING STORAGE
+                    INCLUDING COMMENTS
+                    INCLUDING GENERATED
+            ) PARTITION BY LIST (customer_id)
+            """,
+        )
+    else:
+        log(f"step 1: {NEW_TABLE} exists; completing any missing pieces")
+
+    existing = {
+        r["conname"]
+        for r in await conn.fetch(
+            "SELECT conname FROM pg_constraint WHERE conrelid = to_regclass($1)",
+            NEW_TABLE,
+        )
+    }
     # NAMES ARE DATABASE-WIDE, so the new table cannot reuse the live table's
     # index names while the live table still exists. Everything is built under
     # the `chunks_part%` prefix and renamed to the canonical names inside the
     # swap transaction -- otherwise the converted table would permanently carry
     # `chunks_part_*` index names, which `db/schema.sql`, the pg_search guardian
     # (`REQUIRED_PG_SEARCH_INDEXES`) and the IndexContracts all name explicitly.
-    await conn.execute(
-        f"ALTER TABLE {NEW_TABLE} ADD CONSTRAINT {NEW_TABLE}_pkey "
-        "PRIMARY KEY (customer_id, chunk_id)"
+    if f"{NEW_TABLE}_pkey" not in existing:
+        await _ddl(
+            conn,
+            f"ALTER TABLE {NEW_TABLE} ADD CONSTRAINT {NEW_TABLE}_pkey "
+            "PRIMARY KEY (customer_id, chunk_id)",
+        )
+    if f"{NEW_TABLE}_customer_doc_hash_key" not in existing:
+        await _ddl(
+            conn,
+            f"ALTER TABLE {NEW_TABLE} "
+            f"ADD CONSTRAINT {NEW_TABLE}_customer_doc_hash_key "
+            "UNIQUE (customer_id, doc_id, content_hash)",
+        )
+    if f"{NEW_TABLE}_customer_id_fkey" not in existing:
+        # Named explicitly so the idempotence check above can see it. This is
+        # the statement that queued for 27 minutes; `_ddl` bounds it now.
+        await _ddl(
+            conn,
+            f"ALTER TABLE {NEW_TABLE} ADD CONSTRAINT {NEW_TABLE}_customer_id_fkey "
+            "FOREIGN KEY (customer_id) REFERENCES customers(customer_id) "
+            "ON DELETE CASCADE",
+        )
+
+    forced = await conn.fetchval(
+        "SELECT relforcerowsecurity FROM pg_class WHERE oid = to_regclass($1)",
+        NEW_TABLE,
     )
-    await conn.execute(
-        f"ALTER TABLE {NEW_TABLE} "
-        f"ADD CONSTRAINT {NEW_TABLE}_customer_doc_hash_key "
-        "UNIQUE (customer_id, doc_id, content_hash)"
+    if not forced:
+        await _ddl(conn, f"ALTER TABLE {NEW_TABLE} ENABLE ROW LEVEL SECURITY")
+        await _ddl(conn, f"ALTER TABLE {NEW_TABLE} FORCE ROW LEVEL SECURITY")
+    has_policy = await conn.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = $1 "
+        "AND policyname = 'tenant_isolation')",
+        NEW_TABLE,
     )
-    await conn.execute(
-        f"ALTER TABLE {NEW_TABLE} ADD FOREIGN KEY (customer_id) "
-        "REFERENCES customers(customer_id) ON DELETE CASCADE"
-    )
-    await conn.execute(f"ALTER TABLE {NEW_TABLE} ENABLE ROW LEVEL SECURITY")
-    await conn.execute(f"ALTER TABLE {NEW_TABLE} FORCE ROW LEVEL SECURITY")
-    await conn.execute(
-        f"CREATE POLICY tenant_isolation ON {NEW_TABLE} "
-        "USING (customer_id = current_setting('app.current_customer_id', true))"
-    )
-    log(f"step 1: {NEW_TABLE} created")
+    if not has_policy:
+        await _ddl(
+            conn,
+            f"CREATE POLICY tenant_isolation ON {NEW_TABLE} "
+            "USING (customer_id = current_setting('app.current_customer_id', true))",
+        )
+    log(f"step 1: {NEW_TABLE} ready (constraints, RLS and policy verified)")
 
 
 async def _partition_name(customer_id: str) -> str:
@@ -245,40 +329,70 @@ async def _partition_name(customer_id: str) -> str:
 
 
 async def _create_partitions(conn: asyncpg.Connection, tenants: list[str]) -> None:
+    """DEFAULT plus one partition per tenant. Idempotent, lock-bounded.
+
+    Every statement goes through `_ddl` for the reason recorded there: prod runs
+    `lock_timeout = 0`, so an unbounded ALTER queues behind any long-running
+    neighbour and blocks everything that arrives after it.
+    """
     default_name = f"{NEW_TABLE}_default"
     if await _table_kind(conn, default_name) is None:
-        await conn.execute(
-            f"CREATE TABLE {default_name} PARTITION OF {NEW_TABLE} DEFAULT"
+        await _ddl(
+            conn, f"CREATE TABLE {default_name} PARTITION OF {NEW_TABLE} DEFAULT"
         )
         # RLS on the parent governs parent-routed queries only. Without this the
         # DEFAULT partition is the one partition any role with SELECT could read
         # across tenants by naming it directly.
-        await conn.execute(f"ALTER TABLE {default_name} ENABLE ROW LEVEL SECURITY")
-        await conn.execute(f"ALTER TABLE {default_name} FORCE ROW LEVEL SECURITY")
-        await conn.execute(
+        await _ddl(conn, f"ALTER TABLE {default_name} ENABLE ROW LEVEL SECURITY")
+        await _ddl(conn, f"ALTER TABLE {default_name} FORCE ROW LEVEL SECURITY")
+        await _ddl(
+            conn,
             f"CREATE POLICY tenant_isolation ON {default_name} "
-            "USING (customer_id = current_setting('app.current_customer_id', true))"
+            "USING (customer_id = current_setting('app.current_customer_id', true))",
         )
         log(f"step 2: DEFAULT partition {default_name} created")
+
     for t in tenants:
         part = await _partition_name(t)
-        if await _table_kind(conn, part) is not None:
+        attached = await conn.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM pg_inherits
+                WHERE inhrelid = to_regclass($1) AND inhparent = to_regclass($2)
+            )
+            """,
+            part,
+            NEW_TABLE,
+        )
+        if attached:
             continue
         literal = t.replace("'", "''")
-        # CREATE + ATTACH, not `PARTITION OF`: the latter takes ACCESS EXCLUSIVE
-        # on the parent. Irrelevant here (nothing reads the new table yet) but
-        # kept identical to the runtime path so there is one way this is done.
-        await conn.execute(f'CREATE TABLE "{part}" (LIKE {NEW_TABLE} INCLUDING ALL)')
-        await conn.execute(
+        # A previous interrupted run can leave the standalone table without its
+        # ATTACH -- which is why the check above asks `pg_inherits` rather than
+        # whether the name exists.
+        if await _table_kind(conn, part) is None:
+            await _ddl(conn, f'CREATE TABLE "{part}" (LIKE {NEW_TABLE} INCLUDING ALL)')
+        await _ddl(
+            conn,
             f"ALTER TABLE {NEW_TABLE} ATTACH PARTITION \"{part}\" "
-            f"FOR VALUES IN ('{literal}')"
+            f"FOR VALUES IN ('{literal}')",
         )
-        await conn.execute(f'ALTER TABLE "{part}" ENABLE ROW LEVEL SECURITY')
-        await conn.execute(f'ALTER TABLE "{part}" FORCE ROW LEVEL SECURITY')
-        await conn.execute(
-            f'CREATE POLICY tenant_isolation ON "{part}" '
-            "USING (customer_id = current_setting('app.current_customer_id', true))"
-        )
+        if not await conn.fetchval(
+            "SELECT relforcerowsecurity FROM pg_class WHERE oid = to_regclass($1)",
+            part,
+        ):
+            await _ddl(conn, f'ALTER TABLE "{part}" ENABLE ROW LEVEL SECURITY')
+            await _ddl(conn, f'ALTER TABLE "{part}" FORCE ROW LEVEL SECURITY')
+        if not await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = $1 "
+            "AND policyname = 'tenant_isolation')",
+            part,
+        ):
+            await _ddl(
+                conn,
+                f'CREATE POLICY tenant_isolation ON "{part}" '
+                "USING (customer_id = current_setting('app.current_customer_id', true))",
+            )
         log(f"step 2: partition {part} for {t}")
 
 
@@ -368,6 +482,42 @@ async def _build_partition_indexes(conn: asyncpg.Connection) -> None:
         started = time.time()
         await conn.execute(ddl)
         log(f"step 4: {new_name} done in {time.time() - started:.0f}s")
+
+
+async def _reconcile_deletes(conn: asyncpg.Connection, customer_id: str) -> int:
+    """Remove rows from the new table that no longer exist in the old one.
+
+    The copy only INSERTS. Anything deleted from `chunks` after this script
+    copied it therefore survives in `chunks_part`, and `_verify` then reports
+    new > old forever -- a conversion that can never finish.
+
+    Deletes are not hypothetical here: `cron_chunk_retention` prunes dead chunk
+    versions daily, and a tenant purge cascades through `chunks` (one was
+    running for 28 minutes during the first real attempt at this conversion).
+
+    Keyed on the primary key `(customer_id, chunk_id)`, scoped to one tenant so
+    the anti-join stays inside one partition on each side.
+    """
+    async with _tenant_txn(conn, customer_id):
+        return (
+            await conn.fetchval(
+                f"""
+                WITH gone AS (
+                    DELETE FROM {NEW_TABLE} n
+                    WHERE n.customer_id = $1
+                      AND NOT EXISTS (
+                          SELECT 1 FROM {OLD_TABLE} o
+                          WHERE o.customer_id = n.customer_id
+                            AND o.chunk_id = n.chunk_id
+                      )
+                    RETURNING 1
+                )
+                SELECT count(*) FROM gone
+                """,
+                customer_id,
+            )
+            or 0
+        )
 
 
 async def _verify(conn: asyncpg.Connection) -> bool:
@@ -493,7 +643,9 @@ async def _swap(conn: asyncpg.Connection) -> None:
     raise RuntimeError("could not acquire the swap lock; nothing was changed")
 
 
-async def run(conn: asyncpg.Connection, only: str | None) -> int:
+async def run(
+    conn: asyncpg.Connection, only: str | None, phase: str = "all"
+) -> int:
     if await _table_kind(conn, OLD_TABLE) == "p":
         log("already partitioned; nothing to do")
         return 0
@@ -506,6 +658,11 @@ async def run(conn: asyncpg.Connection, only: str | None) -> int:
 
     await _create_parent(conn)
     await _create_partitions(conn, tenants)
+
+    if phase == "index":
+        await _build_partition_indexes(conn)
+        log("phase index: done. Next: stop ingestion, then --phase swap")
+        return 0
 
     log("step 3: copying rows")
     # Smallest tenants first: they finish fast, so a run that has to be stopped
@@ -525,7 +682,23 @@ async def run(conn: asyncpg.Connection, only: str | None) -> int:
         log(f"  {t} ({n:,} rows)")
         await _copy_tenant(conn, t)
 
-    await _build_partition_indexes(conn)
+    if phase == "copy":
+        log("phase copy: done. Next: --phase index (ingestion may stay up)")
+        return 0
+
+    if phase == "swap":
+        # Catch-up already happened above (the copy is resumable). What the copy
+        # cannot do is notice deletions, so reconcile them before verifying --
+        # otherwise a single retention pass during the copy makes the counts
+        # disagree permanently.
+        log("step 3b: reconciling deletions")
+        for t in tenants:
+            n = await _reconcile_deletes(conn, t)
+            if n:
+                log(f"    {t}: removed {n:,} rows deleted upstream during the copy")
+
+    if phase == "all":
+        await _build_partition_indexes(conn)
 
     if only:
         log("partial run (--only): stopping before the swap")
@@ -546,6 +719,13 @@ async def main() -> int:
     ap.add_argument("--run", action="store_true")
     ap.add_argument("--only", help="copy a single tenant and stop before the swap")
     ap.add_argument(
+        "--phase",
+        choices=("all", "copy", "index", "swap"),
+        default="all",
+        help="staged run; see the module docstring. `swap` re-copies deltas, "
+        "verifies and swaps, and is the only phase needing ingestion stopped.",
+    )
+    ap.add_argument(
         "--i-have-stopped-ingestion",
         action="store_true",
         help="required for --run: rows written to the old table during the copy "
@@ -560,6 +740,11 @@ async def main() -> int:
     conn = await asyncpg.connect(dsn)
     try:
         if args.run:
+            if args.phase in ("copy", "index"):
+                # These phases are explicitly safe with writers running: the
+                # copy is resumable and `--phase swap` re-runs it to pick up
+                # anything that arrived behind it.
+                args.i_have_stopped_ingestion = True
             if not args.i_have_stopped_ingestion:
                 print(
                     "Refusing to run: pass --i-have-stopped-ingestion.\n"
@@ -568,7 +753,7 @@ async def main() -> int:
                     file=sys.stderr,
                 )
                 return 2
-            return await run(conn, args.only)
+            return await run(conn, args.only, args.phase)
         await status(conn)
         return 0
     finally:
