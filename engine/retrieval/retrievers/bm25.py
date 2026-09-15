@@ -83,6 +83,12 @@ from engine.retrieval.temporal import build_predicate, live_version_join
 from engine.shared.constants import TOP_K_BM25
 from engine.shared.db import with_tenant
 from engine.shared.models import TemporalSpec, normalize_author_id
+from engine.shared.partitions import (
+    CHUNKS_PARENT,
+    is_partitioned,
+    partition_exists,
+    partition_name_for,
+)
 
 # Pull alphanumeric/underscore runs as tokens. Hyphens split — Postgres'
 # `english` parser already produces the individual hex parts of a UUID
@@ -200,6 +206,42 @@ _BM25_V3_INDEX = "idx_chunks_bm25_v3"
 #: until it recycles. That is correct, just not optimal, and it is the safe
 #: direction: the join predicate returns the same rows, more slowly.
 _bm25_v3_available: bool | None = None
+
+
+async def bm25_scan_target(conn: Any, customer_id: str) -> str:
+    """The relation this tenant's BM25 pool scans: its partition, or `chunks`.
+
+    THE PRODUCTION SHAPE IS UNSUPPORTED ON A PARTITIONED PARENT. pg_search
+    rejects it outright -- `Unsupported query shape. Please report at
+    https://github.com/paradedb/paradedb/issues/new/choose` -- and the exact
+    channel then returns nothing while the search still reports `state: ok`.
+    Measured on the research plane the day `chunks` was partitioned: the share
+    of searches reporting `channel_degraded` went from 10% to 98% in one
+    statement, average exact hits 1.03 -> 0.42, and the first person to notice
+    was a customer whose search came back semantic-only.
+
+    It is the COMBINATION that is rejected, not scoring and not partitioning.
+    Bisected against the live database, same rows, same index:
+
+        score + ORDER BY score                              parent OK
+        ... + a `content_tsv @@ to_tsquery` projection      parent OK
+        ... + `c.customer_id = $1` + `valid_to IS NULL`     parent FAIL
+        the same query against one partition                      OK
+
+    So the pool scans the partition directly. Every BM25 query is already
+    tenant-scoped -- `paradedb.match('customer_id', ...)` is a `must` -- so one
+    partition is the whole search space anyway, and naming it also skips an
+    Append the planner would only prune.
+
+    Falls back to `chunks` when this database is not partitioned (the other
+    plane, a fresh install, a test fixture) or when the tenant has no partition
+    of its own, because DEFAULT holds those rows and only the parent reaches it.
+    """
+    if not await is_partitioned(conn):
+        return CHUNKS_PARENT
+    if not await partition_exists(conn, customer_id):
+        return CHUNKS_PARENT
+    return partition_name_for(customer_id)
 
 
 async def bm25_project_scope_is_index_side(conn: Any) -> bool:
@@ -492,6 +534,7 @@ async def bm25_search(
         visibility_must = (
             "" if include_drafts else "paradedb.term('visibility', 'approved'),"
         )
+        scan_target = await bm25_scan_target(conn, customer_id)
         pool_sql = f"""
             SELECT c.chunk_id,
                    c.doc_id,
@@ -502,7 +545,7 @@ async def bm25_search(
                    c.last_seen_version,
                    paradedb.score(c.chunk_id) AS score,
                    (c.content_tsv @@ to_tsquery('english', $4)) AS content_hit
-            FROM chunks c
+            FROM {scan_target} c
             WHERE c.customer_id = $1
               AND c.chunk_id @@@ paradedb.boolean(must => ARRAY[
                     {tenant_must},

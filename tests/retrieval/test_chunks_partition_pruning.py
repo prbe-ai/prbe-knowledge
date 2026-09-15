@@ -394,3 +394,69 @@ async def test_a_deleted_tenants_partition_is_reported_and_droppable(
         # error, because the cron will run again in ten minutes.
         assert await drop_tenant_partition(conn, tenant) is False
         assert (part, tenant) not in await find_orphan_partitions(conn)
+
+
+async def test_the_bm25_pool_shape_runs_against_the_scan_target(seeded) -> None:
+    """The exact channel's real query is UNSUPPORTED on a partitioned parent.
+
+    pg_search rejects it with `Unsupported query shape` and the channel then
+    returns nothing while the search still reports `state: ok` -- so the only
+    signal is `degraded`, and the first person to notice was a customer whose
+    results came back semantic-only. On the research plane the share of
+    searches reporting `channel_degraded` went 10% -> 98% the moment `chunks`
+    was partitioned, average exact hits 1.03 -> 0.42.
+
+    It is the COMBINATION that is rejected, not scoring and not partitioning:
+    score + ORDER BY score is fine on the parent, and so is adding a
+    `content_tsv` projection; adding the `customer_id` and `valid_to`
+    predicates on top is what tips it over. So this test pins the WHOLE shape
+    rather than any one clause, because any one of them alone passes.
+    """
+    conn = seeded
+    from engine.retrieval.retrievers.bm25 import bm25_scan_target
+
+    target = await bm25_scan_target(conn, BIG)
+    assert target == partition_name_for(BIG), (
+        "a partitioned database must scan the tenant's own partition; scanning "
+        "the parent is what pg_search rejects"
+    )
+    await conn.execute("SELECT set_config('app.current_customer_id', $1, true)", BIG)
+    # The production shape, verbatim in structure: score, an ORDER BY on it, a
+    # content_tsv projection, and both SQL predicates.
+    await conn.fetch(
+        f"""
+        SELECT c.chunk_id, paradedb.score(c.chunk_id) AS score,
+               (c.content_tsv @@ to_tsquery('english', $3)) AS content_hit
+        FROM {target} c
+        WHERE c.customer_id = $1
+          AND c.chunk_id @@@ paradedb.boolean(must => ARRAY[
+                paradedb.match('customer_id', $1, conjunction_mode => true),
+                paradedb.boolean(should => ARRAY[
+                  paradedb.boost(10.0, paradedb.match('title', $2)),
+                  paradedb.match('content', $2)])])
+          AND c.valid_to IS NULL
+        ORDER BY paradedb.score(c.chunk_id) DESC
+        LIMIT 10
+        """,
+        BIG,
+        "seed",
+        "seed",
+    )
+
+
+async def test_bm25_falls_back_to_the_parent_without_a_partition(
+    live_db: None,
+) -> None:
+    """A tenant with no partition of its own lives in DEFAULT.
+
+    Only the parent reaches DEFAULT, so pointing the scan at a partition that
+    does not exist would turn a slow search into a missing table. The fallback
+    is what lets this ship to a plane the conversion has not run on.
+    """
+    from engine.retrieval.retrievers.bm25 import bm25_scan_target
+    from engine.shared.partitions import CHUNKS_PARENT
+
+    async with db_module.raw_conn() as conn:
+        if not await is_partitioned(conn):
+            pytest.skip("chunks is not partitioned on this database")
+        assert await bm25_scan_target(conn, "tenant-with-no-partition") == CHUNKS_PARENT
