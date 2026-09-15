@@ -549,12 +549,33 @@ async def _verify(conn: asyncpg.Connection) -> bool:
             log(f"step 6:   MISMATCH {m}")
         log("step 6: refusing to swap.")
         return False
-    in_default = await conn.fetchval(
-        f"SELECT count(*) FROM ONLY {NEW_TABLE}_default"
+    # SIZE, not count(*). The DEFAULT partition inherits FORCE RLS from the
+    # parent, so `SELECT count(*) FROM ONLY chunks_part_default` on this
+    # connection -- which binds no tenant -- returns 0 no matter what is in
+    # there. The check that is supposed to catch "a tenant has no partition"
+    # would therefore pass unconditionally, which is worse than not having it.
+    # By construction this partition is created empty by step 2 and nothing in
+    # this script inserts into it deliberately, so any heap at all means rows
+    # were routed there. `find_nonempty_default_partitions` in the pg_search
+    # guardian reads it the same way, for the same reason.
+    default_bytes = await conn.fetchval(
+        "SELECT pg_relation_size(to_regclass($1))", f"{NEW_TABLE}_default"
     )
-    if in_default:
-        log(f"step 6: {in_default:,} rows landed in DEFAULT -- a tenant has no "
-            "partition. Refusing to swap.")
+    if default_bytes:
+        log(f"step 6: DEFAULT partition holds {default_bytes:,} bytes -- rows "
+            "were routed there, so some tenant has no partition of its own. "
+            "Refusing to swap.")
+        # Name the ones we can. A tenant present in `customers` should have had
+        # a partition made in step 2; one that is NOT in `customers` cannot be
+        # named from here at all, and the byte count above is the only signal.
+        for t in await _tenants(conn):
+            async with _tenant_txn(conn, t):
+                n = await conn.fetchval(
+                    f"SELECT count(*) FROM ONLY {NEW_TABLE}_default "
+                    "WHERE customer_id = $1", t
+                )
+            if n:
+                log(f"step 6:   DEFAULT holds {n:,} rows for {t}")
         return False
     return True
 
@@ -667,17 +688,13 @@ async def run(
     log("step 3: copying rows")
     # Smallest tenants first: they finish fast, so a run that has to be stopped
     # still leaves most TENANTS complete rather than most ROWS.
-    sized = sorted(
-        [
-            (
-                await conn.fetchval(
-                    f"SELECT count(*) FROM {OLD_TABLE} WHERE customer_id = $1", t
-                ),
-                t,
-            )
-            for t in tenants
-        ]
-    )
+    # `_count`, NOT a bare fetchval: `chunks` is FORCE RLS and this connection
+    # has no tenant bound, so an unbound `count(*)` returns 0 for EVERY tenant.
+    # That is not a crash -- it is a silent tie, which collapses the ordering
+    # below into alphabetical and throws away the "smallest first" property
+    # this list exists to provide. Observed on the research plane: every line
+    # logged `(0 rows)` while the copy itself (correctly bound) read 293,064.
+    sized = sorted([(await _count(conn, OLD_TABLE, t), t) for t in tenants])
     for n, t in sized:
         log(f"  {t} ({n:,} rows)")
         await _copy_tenant(conn, t)
