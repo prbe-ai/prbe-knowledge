@@ -95,6 +95,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import re
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -118,6 +119,11 @@ BUILD_PARALLEL_WORKERS = 4
 #: a long search holding ACCESS SHARE and then block every reader behind itself.
 DDL_LOCK_TIMEOUT = "5s"
 SWAP_ATTEMPTS = 20
+
+#: `_verify` refuses below this fraction of the source. It is a gross-shortfall
+#: trip, not an equality check: with ingestion live the two counts are never
+#: exactly equal and the swap fence is what makes them so.
+VERIFY_MIN_COPIED = 0.98
 
 
 def log(msg: str) -> None:
@@ -319,7 +325,78 @@ async def _create_parent(conn: asyncpg.Connection) -> None:
             f"CREATE POLICY tenant_isolation ON {NEW_TABLE} "
             "USING (customer_id = current_setting('app.current_customer_id', true))",
         )
-    log(f"step 1: {NEW_TABLE} ready (constraints, RLS and policy verified)")
+    await _copy_triggers(conn)
+    log(f"step 1: {NEW_TABLE} ready (constraints, RLS, policy and triggers "
+        "verified)")
+
+
+async def _copy_triggers(conn: asyncpg.Connection) -> None:
+    """Recreate the old table's row triggers on the new parent.
+
+    `CREATE TABLE ... (LIKE ...)` DOES NOT COPY TRIGGERS. Not with INCLUDING
+    ALL either -- there is no INCLUDING clause for them. `chunks` carries two
+    BEFORE INSERT triggers, `trg_chunks_fill_project_id` and
+    `trg_chunks_fill_title`, which fill those columns from `documents` when the
+    inserting code leaves them NULL. Swapping a trigger-less table into place
+    would not fail anything: ingestion would keep succeeding and every chunk
+    written from that moment on would have a NULL `project_id`, so
+    project-scoped search would quietly return nothing for anything newly
+    ingested. Read from `pg_trigger` rather than hardcoded, so a trigger added
+    later comes along on its own.
+
+    Both existing triggers are null-guarded (`IF NEW.project_id IS NULL`), so
+    creating them BEFORE the copy finishes is safe: rows arriving from the old
+    table already carry their values and the trigger falls straight through.
+
+    PG13+ supports BEFORE ROW triggers on a partitioned parent and propagates
+    them to every partition; neither trigger touches `customer_id`, so neither
+    can move a row across partitions (which is the one thing that would be
+    rejected). Trigger names are per-table, not database-wide, so the new table
+    can carry the same names as the live one -- no rename at swap.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT t.tgname, pg_get_triggerdef(t.oid) AS def
+        FROM pg_trigger t
+        WHERE t.tgrelid = to_regclass($1) AND NOT t.tgisinternal
+        ORDER BY t.tgname
+        """,
+        OLD_TABLE,
+    )
+    existing = {
+        r["tgname"]
+        for r in await conn.fetch(
+            "SELECT tgname FROM pg_trigger WHERE tgrelid = to_regclass($1) "
+            "AND NOT tgisinternal",
+            NEW_TABLE,
+        )
+    }
+    for r in rows:
+        if r["tgname"] in existing:
+            continue
+        # Rewrite the ONE token after ` ON `, and ask the catalog to confirm it
+        # names the old table before touching it. `pg_get_triggerdef` schema-
+        # qualifies (`ON public.chunks`) while `tgrelid::regclass::text` does
+        # not (`chunks`), so matching on either spelling directly is a coin
+        # flip that depends on the search_path.
+        m = re.search(r"\sON\s+(\S+)\s", r["def"])
+        if not m:
+            raise RuntimeError(
+                f"cannot retarget trigger {r['tgname']}: no ` ON <table> ` in "
+                f"{r['def']!r}"
+            )
+        token = m.group(1)
+        if not await conn.fetchval(
+            "SELECT to_regclass($1) = to_regclass($2)", token, OLD_TABLE
+        ):
+            raise RuntimeError(
+                f"cannot retarget trigger {r['tgname']}: ` ON {token} ` does "
+                f"not resolve to {OLD_TABLE}"
+            )
+        await _ddl(
+            conn, r["def"][: m.start(1)] + NEW_TABLE + r["def"][m.end(1) :]
+        )
+        log(f"step 1: trigger {r['tgname']} recreated on {NEW_TABLE}")
 
 
 async def _partition_name(customer_id: str) -> str:
@@ -442,6 +519,67 @@ async def _copy_tenant(conn: asyncpg.Connection, customer_id: str) -> int:
     return copied
 
 
+#: Rows the old table has and the new one does not, for one tenant. Anti-joined
+#: on the primary key, which both tables carry as `(customer_id, chunk_id)`.
+_CATCHUP_SQL = """
+    WITH batch AS (
+        SELECT {collist} FROM {old} o
+        WHERE o.customer_id = $1
+          AND NOT EXISTS (
+              SELECT 1 FROM {new} n
+              WHERE n.customer_id = o.customer_id AND n.chunk_id = o.chunk_id
+          )
+        {limit}
+    ), ins AS (
+        INSERT INTO {new} ({collist})
+        SELECT {collist} FROM batch
+        ON CONFLICT (customer_id, chunk_id) DO NOTHING
+        RETURNING 1
+    )
+    SELECT count(*) FROM ins
+"""
+
+
+async def _catchup_tenant(conn: asyncpg.Connection, customer_id: str) -> int:
+    """Copy rows the keyset pass cannot see. REQUIRED, not an optimisation.
+
+    `_copy_tenant` walks `chunk_id` ascending and remembers how far it got.
+    That is only complete if new rows always sort ABOVE the rows already
+    copied -- and they do not. `chunk_id` is
+    `f"{doc.doc_id}:{prefix}{content_hash[:16]}"` (normalizer.py), so it is
+    TEXT derived from a document id and a content hash, and a document
+    ingested a second ago sorts wherever its id happens to land. Most of the
+    time that is BELOW the high-water mark, and the keyset pass then skips it
+    permanently -- not once, but on every future run, because the cursor only
+    ever moves forward.
+
+    With ingestion stopped that is invisible, which is why the original script
+    got away with it. With ingestion RUNNING it means `_verify` finds
+    `old > new` forever and the swap can never happen. So the catch-up is an
+    anti-join: it asks which rows are missing rather than assuming where they
+    are.
+
+    Batched by LIMIT rather than by key, and re-run until it drains, because
+    each pass inserts exactly the rows it found.
+    """
+    cols = await _column_list(conn, OLD_TABLE)
+    collist = ", ".join(f'"{c}"' for c in cols)
+    moved_total = 0
+    while True:
+        async with _tenant_txn(conn, customer_id):
+            moved = await conn.fetchval(
+                _CATCHUP_SQL.format(
+                    collist=collist, old=OLD_TABLE, new=NEW_TABLE,
+                    limit=f"LIMIT {BATCH_ROWS}",
+                ),
+                customer_id,
+            )
+        if not moved:
+            return moved_total
+        moved_total += moved
+        log(f"    {customer_id}: caught up {moved_total:,}")
+
+
 async def _build_partition_indexes(conn: asyncpg.Connection) -> None:
     """Create the non-constraint indexes on the PARENT once rows are in place.
 
@@ -484,6 +622,22 @@ async def _build_partition_indexes(conn: asyncpg.Connection) -> None:
         log(f"step 4: {new_name} done in {time.time() - started:.0f}s")
 
 
+#: Rows the new table has and the old one no longer does, for one tenant. The
+#: mirror image of `_CATCHUP_SQL`; together they make the two tables equal.
+_RECONCILE_SQL = f"""
+    WITH gone AS (
+        DELETE FROM {NEW_TABLE} n
+        WHERE n.customer_id = $1
+          AND NOT EXISTS (
+              SELECT 1 FROM {OLD_TABLE} o
+              WHERE o.customer_id = n.customer_id AND o.chunk_id = n.chunk_id
+          )
+        RETURNING 1
+    )
+    SELECT count(*) FROM gone
+"""
+
+
 async def _reconcile_deletes(conn: asyncpg.Connection, customer_id: str) -> int:
     """Remove rows from the new table that no longer exist in the old one.
 
@@ -499,25 +653,7 @@ async def _reconcile_deletes(conn: asyncpg.Connection, customer_id: str) -> int:
     the anti-join stays inside one partition on each side.
     """
     async with _tenant_txn(conn, customer_id):
-        return (
-            await conn.fetchval(
-                f"""
-                WITH gone AS (
-                    DELETE FROM {NEW_TABLE} n
-                    WHERE n.customer_id = $1
-                      AND NOT EXISTS (
-                          SELECT 1 FROM {OLD_TABLE} o
-                          WHERE o.customer_id = n.customer_id
-                            AND o.chunk_id = n.chunk_id
-                      )
-                    RETURNING 1
-                )
-                SELECT count(*) FROM gone
-                """,
-                customer_id,
-            )
-            or 0
-        )
+        return await conn.fetchval(_RECONCILE_SQL, customer_id) or 0
 
 
 async def _verify(conn: asyncpg.Connection) -> bool:
@@ -544,11 +680,28 @@ async def _verify(conn: asyncpg.Connection) -> bool:
         log("step 6: SOURCE READ AS EMPTY. Either the tenant GUC is not being "
             "bound (FORCE RLS) or this database has no chunks. Refusing to swap.")
         return False
-    if mismatched:
+    if new_total < old_total * VERIFY_MIN_COPIED:
+        log(f"step 6: only {new_total / old_total:.1%} of the source is in "
+            f"{NEW_TABLE}. That is not ingestion racing the copy -- something "
+            "did not run. Refusing to swap.")
         for m in mismatched:
             log(f"step 6:   MISMATCH {m}")
-        log("step 6: refusing to swap.")
         return False
+    if mismatched:
+        # NOT fatal any more, and the reason is worth being precise about.
+        # This ran with ingestion STOPPED originally, so any difference meant a
+        # bug. It now runs against a live plane, where rows commit into the old
+        # table while this very loop counts -- the counts are a moving target
+        # and demanding exact equality here would mean never swapping at all.
+        # What makes that safe is the FENCE in `_swap`: it takes ACCESS
+        # EXCLUSIVE and then runs the catch-up and the delete-reconcile with
+        # nobody able to write, which makes the two tables equal per tenant by
+        # construction. So this is now a sanity read, and the gross-shortfall
+        # check above is the part that still refuses.
+        for m in mismatched:
+            log(f"step 6:   live delta {m}")
+        log(f"step 6: {len(mismatched)} tenant(s) drifting under live "
+            "ingestion; the swap fence settles these.")
     # SIZE, not count(*). The DEFAULT partition inherits FORCE RLS from the
     # parent, so `SELECT count(*) FROM ONLY chunks_part_default` on this
     # connection -- which binds no tenant -- returns 0 no matter what is in
@@ -615,8 +768,45 @@ async def _rename_indexes(conn: asyncpg.Connection, table: str, old: str, new: s
         await conn.execute(f'ALTER INDEX "{src}" RENAME TO "{dst}"')
 
 
-async def _swap(conn: asyncpg.Connection) -> None:
-    """Rename old out and new in, in ONE transaction, under a lock timeout.
+class _TenantsMoved(Exception):
+    """A tenant appeared or vanished between building the list and the fence."""
+
+
+async def _swap(conn: asyncpg.Connection, tenants: list[str]) -> None:
+    """Fence writers, settle the last delta, then rename -- ONE transaction.
+
+    WHY THE DELTA IS SETTLED IN HERE rather than just before. Everything up to
+    this point runs with ingestion LIVE, so between the last catch-up outside
+    this function and the rename there is a window in which a writer commits a
+    row into the old table. That row would be on the table this function
+    renames to `chunks_old` and nothing would ever read it again: no error, no
+    log line, a document that silently is not in search.
+
+    So the first thing inside the transaction is `LOCK TABLE chunks IN ACCESS
+    EXCLUSIVE MODE`. From that point no other session can read or write
+    `chunks` at all, the delta is finite and closed, and the catch-up and the
+    delete-reconcile below run against a table nobody can move. Writers that
+    were mid-flight block on the lock; when the transaction commits, Postgres
+    re-resolves the name they were waiting on and they land on the NEW table,
+    which is the behaviour that makes an atomic rename safe to do underneath
+    live traffic. `db_statement_timeout_ms` is 300s and this window is seconds,
+    so they wait rather than fail.
+
+    AFTER THE TWO PASSES THE TABLES ARE EQUAL BY CONSTRUCTION, per tenant --
+    the catch-up inserts every row old has and new does not, the reconcile
+    deletes every row new has and old does not. That is why there is no
+    `count(*)` in here: counting 1.6M rows twice would hold the exclusive lock
+    for tens of seconds to prove something the two anti-joins already
+    guarantee. The one hole is a tenant that did not exist when the list was
+    built, whose rows would be in neither pass, so the list is re-read under
+    the lock and the transaction is abandoned if it moved.
+
+    Indexes move with their tables but keep their names, and index names are
+    database-wide. So the transaction renames BOTH: the retiring table's
+    indexes get an `_old` marker to free the canonical names, and the incoming
+    table's `chunks_part%` indexes take them. Anything that names an index --
+    the pg_search guardian, `db/schema.sql`, the IndexContracts -- is then
+    correct without a follow-up.
 
     Indexes move with their tables but keep their names, and index names are
     database-wide. So the transaction renames BOTH: the retiring table's indexes
@@ -634,6 +824,41 @@ async def _swap(conn: asyncpg.Connection) -> None:
         try:
             async with conn.transaction():
                 await conn.execute(f"SET LOCAL lock_timeout = '{DDL_LOCK_TIMEOUT}'")
+                # THE FENCE. Everything below runs against a table no other
+                # session can touch. Bounded by the lock_timeout above, so a
+                # busy plane retries instead of queueing ahead of every reader.
+                await conn.execute(
+                    f"LOCK TABLE {OLD_TABLE} IN ACCESS EXCLUSIVE MODE"
+                )
+                # A tenant created since the list was built would be missed by
+                # both passes below and would land in DEFAULT. Nothing has been
+                # renamed yet, so abandoning here costs a retry and nothing else.
+                if await _tenants(conn) != tenants:
+                    raise _TenantsMoved()
+                cols = await _column_list(conn, OLD_TABLE)
+                collist = ", ".join(f'"{c}"' for c in cols)
+                settled = 0
+                for t in tenants:
+                    # `set_config(..., true)` is transaction-local and we are
+                    # already in one, so bind directly rather than via
+                    # `_tenant_txn`, which would open a nested savepoint.
+                    await conn.execute(
+                        "SELECT set_config('app.current_customer_id', $1, true)",
+                        t,
+                    )
+                    ins = await conn.fetchval(
+                        _CATCHUP_SQL.format(
+                            collist=collist, old=OLD_TABLE, new=NEW_TABLE,
+                            limit="",
+                        ),
+                        t,
+                    ) or 0
+                    gone = await conn.fetchval(_RECONCILE_SQL, t) or 0
+                    settled += ins + gone
+                    if ins or gone:
+                        log(f"step 5: {t}: +{ins:,} / -{gone:,} settled "
+                            "under the fence")
+                log(f"step 5: fence settled {settled:,} rows; renaming")
                 await conn.execute(
                     f"ALTER TABLE {OLD_TABLE} RENAME TO {RETIRED_TABLE}"
                 )
@@ -661,6 +886,13 @@ async def _swap(conn: asyncpg.Connection) -> None:
         except asyncpg.LockNotAvailableError:
             log(f"step 5: lock busy, retry {attempt}/{SWAP_ATTEMPTS}")
             await asyncio.sleep(2)
+        except _TenantsMoved:
+            log(f"step 5: tenant list changed under the fence, retry "
+                f"{attempt}/{SWAP_ATTEMPTS}")
+            tenants = await _tenants(conn)
+            await _create_partitions(conn, tenants)
+            for t in tenants:
+                await _catchup_tenant(conn, t)
     raise RuntimeError("could not acquire the swap lock; nothing was changed")
 
 
@@ -698,6 +930,10 @@ async def run(
     for n, t in sized:
         log(f"  {t} ({n:,} rows)")
         await _copy_tenant(conn, t)
+        # The keyset pass above cannot see a row whose `chunk_id` sorts below
+        # where it has already reached, and `chunk_id` is a hash-derived TEXT
+        # key, so with ingestion live that is most of what arrived behind it.
+        await _catchup_tenant(conn, t)
 
     if phase == "copy":
         log("phase copy: done. Next: --phase index (ingestion may stay up)")
@@ -722,7 +958,7 @@ async def run(
         return 0
     if not await _verify(conn):
         return 1
-    await _swap(conn)
+    await _swap(conn, tenants)
     await conn.execute("SET statement_timeout = 0")
     log("post-swap: ANALYZE chunks (the partitioned parent is never autoanalyzed)")
     await conn.execute(f"ANALYZE {OLD_TABLE}")
