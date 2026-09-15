@@ -75,6 +75,12 @@ log = get_logger(__name__)
 # serving cold. These are the large ones on the retrieval hot path.
 ANALYZE_AFTER_PROMOTION = ["chunks", "documents"]
 
+#: Bounds for the query canary. Both are well under the CronJob's
+#: activeDeadlineSeconds: the canary is the LAST thing a tick does, so
+#: overrunning it costs only the canary, never the repair.
+CANARY_PROBE_TIMEOUT_S = 30.0
+CANARY_SEARCH_TIMEOUT_S = 30.0
+
 # Indexes worth pg_prewarm'ing after a promotion -- what the DEFAULT search
 # path actually walks, in the order a cold search hits them. The LIVE partial
 # HNSW index (0124), not the full one: TemporalMode.LATEST's planner choice
@@ -238,55 +244,6 @@ async def run_once(*, dry_run: bool = False) -> int:
                     },
                 )
 
-        # ---- the query canary: a healthy index is not a working query ----
-        # Runs the REAL `bm25_search`, not a copy of its SQL -- a copy is how
-        # the original verification passed while production failed. Twice:
-        # once as production routes it (the tenant's partition) and once
-        # forced onto the parent, because the first fix for this had a
-        # fallback to the parent that was itself rejected. The exception path
-        # is the alarm; zero hits for a term lifted from the tenant's own rows
-        # is logged loudly but not alarmed, since a tokenizer edge could
-        # produce it and a false alarm costs more than a late one.
-        try:
-            probe = await bm25_canary_probe(conn)
-            if probe is None:
-                log.info("guardian.bm25_canary_skipped",
-                         reason="no active tenant yielded a sampleable token")
-            else:
-                tenant, term = probe
-                for path, override in (("partition", None), ("parent", CHUNKS_PARENT)):
-                    try:
-                        hits = await bm25_search(
-                            tenant, term, top_k=1, _scan_target_override=override
-                        )
-                    except Exception as exc:
-                        err = f"{type(exc).__name__}: {exc}"
-                        log.warning("guardian.bm25_canary_rejected", path=path,
-                                    tenant=tenant, term=term, error=err)
-                        capture(
-                            "kb_pg_search_query_rejected",
-                            {
-                                "path": path,
-                                "tenant": tenant,
-                                "term": term,
-                                "error": err[:300],
-                                "timeline_id": timeline,
-                                "state": "pg_search rejects the production BM25 "
-                                "query; the exact channel is returning nothing "
-                                "while searches report ok",
-                            },
-                        )
-                        continue
-                    if not hits:
-                        log.warning("guardian.bm25_canary_zero_hits", path=path,
-                                    tenant=tenant, term=term)
-                    else:
-                        log.info("guardian.bm25_canary_ok", path=path,
-                                 tenant=tenant, hits=len(hits))
-        except Exception as exc:
-            log.warning("guardian.bm25_canary_failed",
-                        error=f"{type(exc).__name__}: {exc}")
-
         # Statistics on a PARTITIONED PARENT are nobody else's job: PG16
         # autovacuum analyzes leaves only. Retrieval plans against the parent,
         # so stale parent stats reproduce the mis-costing this partitioning was
@@ -365,6 +322,93 @@ async def run_once(*, dry_run: bool = False) -> int:
         if not dry_run:
             await record_timeline(conn, timeline)
 
+        # ---- the query canary: a healthy index is not a working query ----
+        # AFTER record_timeline, for the reason the prewarm comment below
+        # spells out: this calls into retrieval and can block on a pool
+        # acquisition or a slow search, and a tick killed by
+        # activeDeadlineSeconds before the timeline is recorded livelocks the
+        # repair. Detection and repair are already done and durable by here;
+        # the canary is the last thing that can cost anything.
+        #
+        # Runs the REAL `bm25_search`, not a copy of its SQL -- a copy is how
+        # the original verification passed while production failed. Twice:
+        # once as production routes it (the tenant's partition) and once
+        # forced onto the parent, because the first fix for this had a
+        # fallback to the parent that was itself rejected.
+        #
+        # `wait_for` because `bm25_search` acquires its OWN pool connection
+        # while this one is still held: with a small pool that is a wait, and
+        # an unbounded wait here is the livelock this placement exists to
+        # avoid. The bound is deliberately well under the job deadline.
+        nonlocal_rejected = False
+        canary_announced = True
+        try:
+            probe = await asyncio.wait_for(
+                bm25_canary_probe(conn, offset=timeline), CANARY_PROBE_TIMEOUT_S
+            )
+            if probe is None:
+                log.info("guardian.bm25_canary_skipped",
+                         reason="no active tenant yielded a sampleable token")
+            else:
+                tenant, term = probe
+                rejected: dict[str, str] = {}
+                for path, override in (("partition", None), ("parent", CHUNKS_PARENT)):
+                    try:
+                        hits = await asyncio.wait_for(
+                            bm25_search(tenant, term, top_k=1,
+                                        _scan_target_override=override),
+                            CANARY_SEARCH_TIMEOUT_S,
+                        )
+                    except Exception as exc:
+                        rejected[path] = f"{type(exc).__name__}: {exc}"
+                        log.warning("guardian.bm25_canary_rejected", path=path,
+                                    tenant=tenant, term=term,
+                                    error=rejected[path])
+                        continue
+                    if not hits:
+                        log.warning("guardian.bm25_canary_zero_hits", path=path,
+                                    tenant=tenant, term=term)
+                    else:
+                        log.info("guardian.bm25_canary_ok", path=path,
+                                 tenant=tenant, hits=len(hits))
+                if rejected:
+                    nonlocal_rejected = True
+                    # ONE event per tick naming every failed path, not one per
+                    # path: on an unpartitioned database both paths resolve to
+                    # the same relation and would otherwise double-count the
+                    # same defect. Fired on STATE, not on transition, unlike
+                    # the absence detectors above -- an absence lasts hours by
+                    # design while a rejected query means half of every
+                    # search's recall is gone until someone deploys, which is
+                    # worth repeating every tick.
+                    canary_announced = capture(
+                        "kb_pg_search_query_rejected",
+                        {
+                            "paths": sorted(rejected),
+                            "tenant": tenant,
+                            # NO `term`. It is sampled from the tenant's own
+                            # chunk title/content, so it is customer document
+                            # text, and `capture` POSTs to PostHog. Every
+                            # sibling event here carries structural metadata
+                            # only. The literal term stays in the log lines
+                            # above, which is what an operator needs to
+                            # reproduce the rejection.
+                            "term_length": len(term),
+                            "error": next(iter(rejected.values()))[:300],
+                            "timeline_id": timeline,
+                            "state": "pg_search rejects the production BM25 "
+                            "query; the exact channel is returning nothing "
+                            "while searches report ok",
+                        },
+                    )
+        except TimeoutError:
+            log.warning("guardian.bm25_canary_timeout",
+                        reason="canary exceeded its bound; repair and timeline "
+                               "are already durable")
+        except Exception as exc:
+            log.warning("guardian.bm25_canary_failed",
+                        error=f"{type(exc).__name__}: {exc}")
+
         # Prewarm AFTER the repair and AFTER the timeline is recorded, on
         # purpose and against the reading order. The warm is minutes of
         # sequential I/O on a freshly promoted instance, and the CronJob has
@@ -393,6 +437,20 @@ async def run_once(*, dry_run: bool = False) -> int:
     # undelivered is worth a log, not a red job -- neither changed the
     # database, and reporting them the same way would make red mean "something
     # happened" instead of "a change was made and nobody was told".
+    # Same contract as the repair below, for the same reason: a detected
+    # failure nobody was told about is indistinguishable from a healthy tick,
+    # and that indistinguishability is the entire bug this canary exists to
+    # close. A rejected exact channel is a change in what search returns even
+    # though the guardian changed nothing, so it earns the red job that a
+    # promotion or debris alert does not.
+    if nonlocal_rejected and not canary_announced:
+        log.error(
+            "guardian.bm25_canary_unannounced",
+            reason="pg_search rejected the production query and the alert could "
+            "not be delivered; failing the job so it is visible in CronJob history",
+        )
+        return 1
+
     if dropped and not announced:
         log.error(
             "guardian.repair_unannounced",

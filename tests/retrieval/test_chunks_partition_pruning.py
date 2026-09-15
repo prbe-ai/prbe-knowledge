@@ -40,6 +40,7 @@ shape rather than a fabricated one.
 from __future__ import annotations
 
 import json
+import pathlib
 
 import pytest
 import pytest_asyncio
@@ -61,7 +62,12 @@ BIG = "prune-big"
 SMALL = "prune-small"
 
 
-async def _seed(conn, customer_id: str, n: int) -> None:
+async def _seed(conn, customer_id: str, n: int, doc_id: str | None = None) -> None:
+    """`doc_id` defaults to a tenant-unique one; pass a SHARED id to make a
+    cross-tenant test non-vacuous -- see
+    `test_bm25_pool_cannot_leak_across_token_sharing_tenants`.
+    """
+    doc_id = doc_id or f"{customer_id}:d1"
     await conn.execute(
         "INSERT INTO customers (customer_id, display_name, api_key_hash) "
         "VALUES ($1, $1, $1) ON CONFLICT DO NOTHING",
@@ -78,7 +84,7 @@ async def _seed(conn, customer_id: str, n: int) -> None:
                 'dh', NOW(), NOW(), NOW(), '{}'::jsonb, 'T', 'p')
         ON CONFLICT DO NOTHING
         """,
-        f"{customer_id}:d1",
+        doc_id,
         customer_id,
     )
     await conn.execute(
@@ -93,7 +99,7 @@ async def _seed(conn, customer_id: str, n: int) -> None:
         FROM generate_series(1, $4::int) g
         """,
         customer_id,
-        f"{customer_id}:d1",
+        doc_id,
         customer_id,
         n,
     )
@@ -408,9 +414,15 @@ async def test_the_bm25_pool_shape_runs_against_the_scan_target(seeded) -> None:
 
     It is the COMBINATION that is rejected, not scoring and not partitioning:
     score + ORDER BY score is fine on the parent, and so is adding a
-    `content_tsv` projection; adding the `customer_id` and `valid_to`
-    predicates on top is what tips it over. So this test pins the WHOLE shape
-    rather than any one clause, because any one of them alone passes.
+    `content_tsv` projection; adding `customer_id = $1` on top is what tips it
+    over. So this test pins the WHOLE shape rather than any one clause,
+    because any one of them alone passes.
+
+    The tenant predicate here is `current_setting(...)`, NOT `$1`, because that
+    is what production sends: a stable function is not a bound parameter, so it
+    prunes at execution time without taking the rejected path.
+    `test_the_pool_predicate_matches_production` pins the two together so this
+    literal cannot drift away from the shipped SQL again.
     """
     conn = seeded
     from engine.retrieval.retrievers.bm25 import bm25_scan_target
@@ -428,7 +440,7 @@ async def test_the_bm25_pool_shape_runs_against_the_scan_target(seeded) -> None:
         SELECT c.chunk_id, paradedb.score(c.chunk_id) AS score,
                (c.content_tsv @@ to_tsquery('english', $3)) AS content_hit
         FROM {target} c
-        WHERE c.customer_id = $1
+        WHERE c.customer_id = current_setting('app.current_customer_id', true)
           AND c.chunk_id @@@ paradedb.boolean(must => ARRAY[
                 paradedb.match('customer_id', $1, conjunction_mode => true),
                 paradedb.boolean(should => ARRAY[
@@ -467,12 +479,15 @@ async def test_bm25_pool_cannot_leak_across_token_sharing_tenants(
 ) -> None:
     """The pool has NO SQL `customer_id = $1` any more. This is what replaces it.
 
-    That predicate was removed because `customer_id` is the partition key and
-    pg_search rejects a SQL predicate on it under a partitioned parent -- the
-    whole exact channel died for 13 hours. What now makes the answer exact is
-    FORCE RLS, and the index-side `paradedb.match('customer_id', ...)` is only
-    a pre-filter. The comment that used to justify the predicate said as much;
-    a comment is not a test.
+    The BOUND-PARAMETER form was removed because `customer_id` is the
+    partition key and pg_search rejects `= $1` on it under a partitioned
+    parent -- the whole exact channel died for 13 hours. Two controls remain:
+    FORCE RLS, and an explicit `customer_id = current_setting(...)` written in
+    a shape pg_search accepts. The index-side `paradedb.match('customer_id',
+    ...)` is only a tokenized pre-filter and is NOT sufficient alone: verified
+    live that with the GUC bound to `probe-demo`, an index-side match for
+    `probe` matched 9,924 of probe-demo's rows. The comments that justify all
+    this are comments; this is the test.
 
     The pair is chosen to be the WORST case for the pre-filter: every token of
     the shorter id appears in the longer one, so `conjunction_mode` on
@@ -488,11 +503,21 @@ async def test_bm25_pool_cannot_leak_across_token_sharing_tenants(
     from engine.shared.partitions import CHUNKS_PARENT
 
     a, b = "leak-probe", "leak-probe-demo"
+    # ONE doc_id, BOTH tenants. Without this the test is VACUOUS: the pool's
+    # outer query joins `documents d ON k.doc_id = d.doc_id AND
+    # d.customer_id = $1`, so with tenant-unique doc_ids that join discards a
+    # foreign chunk no matter how it got into the pool -- and the test would
+    # pass with the tenant control deleted outright. Sharing the id (legal:
+    # documents' identity is (customer_id, doc_id, version)) means the join
+    # resolves for BOTH tenants and the pool's own scoping is the only thing
+    # left that can separate them. Real corpora do this: GitHub and Notion
+    # document ids repeat across tenants.
+    shared_doc = "shared:doc-1"
     async with db_module.raw_conn() as conn:
         if not await is_partitioned(conn):
             pytest.skip("chunks is not partitioned on this database")
-        await _seed(conn, a, 60)
-        await _seed(conn, b, 60)
+        await _seed(conn, a, 60, doc_id=shared_doc)
+        await _seed(conn, b, 60, doc_id=shared_doc)
 
     for path, override in (("partition", None), ("parent", CHUNKS_PARENT)):
         for me, other in ((a, b), (b, a)):
@@ -505,3 +530,116 @@ async def test_bm25_pool_cannot_leak_across_token_sharing_tenants(
             assert all(h.chunk_id.startswith(f"{me}:") for h in hits), (
                 f"[{path}] {me}: a hit belongs to neither tenant"
             )
+
+
+async def test_scan_target_override_refuses_an_unrecognized_relation() -> None:
+    """The one identifier this module interpolates instead of binding.
+
+    `_scan_target_override` reaches `FROM {scan_target} c` as text, because no
+    bind parameter can carry a relation name. `partition_name_for` already
+    refuses an unsafe customer_id loudly rather than quoting and hoping; this
+    is the same gate one layer up. Without it a future caller could point the
+    BM25 pool at any table in the database, and FORCE RLS on `chunks` protects
+    nothing once the FROM target is a different relation.
+    """
+    import inspect
+
+    from engine.retrieval.retrievers.bm25 import _validated_scan_target, bm25_search
+    from engine.shared.partitions import CHUNKS_PARENT
+
+    assert _validated_scan_target(None) is None
+    assert _validated_scan_target(CHUNKS_PARENT) == CHUNKS_PARENT
+    for tenant in ("monarcha", "probe-demo", "a-b"):
+        name = partition_name_for(tenant)
+        assert _validated_scan_target(name) == name
+
+    for hostile in (
+        "customers",                    # another table entirely
+        "pg_authid",                    # the password catalog
+        "chunks_old",                   # a retired copy with no RLS guarantee
+        "chunks; DROP TABLE customers",
+        'chunks_p_x"; --',
+        "chunks_p_" + "a" * 60,         # past the identifier budget
+        "",
+    ):
+        with pytest.raises(ValueError, match="unrecognized relation"):
+            _validated_scan_target(hostile)
+
+    # Keyword-only: nothing reaches this positionally by miscounting arguments.
+    kind = inspect.signature(bm25_search).parameters["_scan_target_override"].kind
+    assert kind is inspect.Parameter.KEYWORD_ONLY
+
+
+async def test_the_pool_predicate_matches_production() -> None:
+    """The shape test copies SQL. This is what stops the copy from drifting.
+
+    A hand-copied query that no longer matches the shipped one is worse than
+    no test: it reports on a shape production does not send. The incident this
+    file documents was exactly a claim about the SQL that had stopped being
+    true, so the copy gets pinned to its original.
+    """
+    import inspect
+
+    from engine.retrieval.retrievers import bm25
+
+    prod = inspect.getsource(bm25.bm25_search)
+    assert "c.customer_id = current_setting('app.current_customer_id', true)" in prod, (
+        "production's tenant predicate changed; the copied shape test below is "
+        "now testing something else"
+    )
+    assert "c.customer_id = $1\n" not in prod, (
+        "`customer_id = $1` is the shape pg_search REJECTS on a partitioned "
+        "parent -- it must never come back into the pool query"
+    )
+    here = pathlib.Path(__file__).read_text()
+    shape = here[
+        here.index("async def test_the_bm25_pool_shape_runs_against_the_scan_target")
+        : here.index("async def test_bm25_falls_back_to_the_parent_without_a_partition")
+    ]
+    assert "c.customer_id = current_setting('app.current_customer_id', true)" in shape
+
+
+async def test_the_parent_scan_still_prunes_to_one_partition(seeded) -> None:
+    """The claim that makes dropping `= $1` affordable, asserted not asserted-in-a-comment.
+
+    Removing the bound-parameter predicate was only safe because the tenant
+    qual still prunes -- RLS's `current_setting()` and the explicit copy of it
+    both resolve at execution time. If a planner or version change ever stops
+    that, every search silently becomes an Append over all 16 partitions:
+    correct rows, the cost blow-up partitioning was built to remove, and no
+    error anywhere. That is the same silent-regression shape as the incident,
+    so it gets a test rather than a measurement in a docstring.
+
+    Asserted on the PARENT path specifically, because that is the one the
+    guardian canary forces every tick and the one a tenant without its own
+    partition uses in production.
+    """
+    conn = seeded
+    # SESSION scope (`false`), not transaction-local. `set_config(..., true)`
+    # outside an explicit transaction is discarded before the next statement,
+    # the qual then compares against NULL, and every real partition prunes
+    # away -- which is how the first draft of this test "passed" by touching
+    # only DEFAULT. The same trap the conversion script's docstring documents.
+    await conn.execute("SELECT set_config('app.current_customer_id', $1, false)", BIG)
+    rows = await conn.fetch(
+        """
+        EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+        SELECT c.chunk_id, paradedb.score(c.chunk_id) AS score
+        FROM chunks c
+        WHERE c.customer_id = current_setting('app.current_customer_id', true)
+          AND c.chunk_id @@@ paradedb.boolean(must => ARRAY[
+                paradedb.match('customer_id', $1, conjunction_mode => true),
+                paradedb.match('content', $2)])
+        ORDER BY paradedb.score(c.chunk_id) DESC
+        LIMIT 10
+        """,
+        BIG,
+        "content",
+    )
+    plan = json.loads(rows[0][0])[0]["Plan"]
+    touched = {r for r in _relations(plan) if r.startswith("chunks")}
+    assert touched == {partition_name_for(BIG)}, (
+        f"the parent scan touched {sorted(touched)}; only {BIG}'s own partition "
+        "should survive pruning, otherwise this is reading every tenant"
+    )
+    await conn.execute("SELECT set_config('app.current_customer_id', '', false)")

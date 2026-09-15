@@ -464,8 +464,14 @@ async def required_bm25_index(conn: asyncpg.Connection) -> str:
 #: enough that almost any chunk carries one.
 _CANARY_TOKEN = re.compile(r"[A-Za-z]{5,}")
 
+#: How many tenants one probe walks per tick. Applied AFTER rotation, so
+#: successive ticks still reach every tenant.
+CANARY_MAX_TENANTS_SCANNED = 40
 
-async def bm25_canary_probe(conn: asyncpg.Connection) -> tuple[str, str] | None:
+
+async def bm25_canary_probe(
+    conn: asyncpg.Connection, *, offset: int = 0
+) -> tuple[str, str] | None:
     """A (tenant, term) pair for which the exact channel MUST return a row.
 
     A healthy index is not a working query. On 2026-09-15 every BM25 index was
@@ -474,31 +480,66 @@ async def bm25_canary_probe(conn: asyncpg.Connection) -> tuple[str, str] | None:
     returned nothing for 13 hours. Nothing here checks queries; this is what
     lets the cron check one.
 
-    The term is sampled FROM THE TENANT'S OWN CHUNKS, which matters more than
-    it looks: pg_search rejects the bad shape at execution, not at planning,
-    so a query for a nonsense term "succeeds" with zero rows and a canary
-    built on one would pass forever. A token lifted from a live chunk is
-    guaranteed to match at least that chunk.
+    THE SAMPLE MUST SATISFY THE SAME JOINS THE SEARCH DOES, or the canary is
+    unfalsifiable in the wrong direction: a term lifted from a chunk whose
+    DOCUMENT is retired or unapproved returns zero rows for a legitimate
+    reason, and a zero-hit canary then means nothing. So this repeats the
+    inner query's document join and both visibility filters rather than
+    checking the chunk alone.
+
+    The term is sampled FROM THE TENANT'S OWN ROWS, which matters for the
+    other direction: pg_search rejects the bad shape at EXECUTION, not at
+    planning, so a query for a nonsense term "succeeds" with zero rows and a
+    canary built on one would pass forever.
+
+    `offset` rotates the starting tenant. Without it the alphabetically-first
+    tenant is sampled on every tick forever and a rejection that affects only
+    later tenants is never seen. Sampling also ADVANCES past a tenant that
+    yields no usable token instead of giving up, so one empty tenant cannot
+    mask the rest.
 
     Reads under the tenant GUC, because `chunks` is FORCE RLS and this runs as
     the owner. Returns None rather than guessing when no tenant yields a
     token -- a skipped canary is logged; a false alarm trains people to ignore
     the real one.
     """
-    tenants = await conn.fetch(
-        "SELECT customer_id FROM customers WHERE status = 'active' ORDER BY customer_id"
-    )
-    for r in tenants:
-        tenant = r["customer_id"]
+    # ROTATE FIRST, THEN CAP. A `LIMIT` in the SQL would defeat the rotation it
+    # sits next to: the slice would always be the same alphabetically-first
+    # tenants and `offset` would only reshuffle within it, so a rejection that
+    # affects tenant 41 onwards would never be sampled no matter how many ticks
+    # elapsed -- exactly the blindness the rotation exists to remove. The cap
+    # still applies, to the ROTATED order, so one tick stays bounded while
+    # successive ticks reach everyone.
+    all_tenants = [
+        r["customer_id"]
+        for r in await conn.fetch(
+            "SELECT customer_id FROM customers WHERE status = 'active' "
+            "ORDER BY customer_id"
+        )
+    ]
+    if not all_tenants:
+        return None
+    start = offset % len(all_tenants)
+    rotated = all_tenants[start:] + all_tenants[:start]
+    for tenant in rotated[:CANARY_MAX_TENANTS_SCANNED]:
         async with conn.transaction():
             await conn.execute(
                 "SELECT set_config('app.current_customer_id', $1, true)", tenant
             )
             rows = await conn.fetch(
                 """
-                SELECT title, content FROM chunks
-                WHERE customer_id = $1 AND valid_to IS NULL
-                  AND visibility = 'approved'
+                SELECT c.title, c.content
+                FROM chunks c
+                JOIN documents d
+                  ON c.doc_id = d.doc_id
+                 AND d.customer_id = c.customer_id
+                 AND d.version BETWEEN c.first_seen_version AND c.last_seen_version
+                WHERE c.customer_id = $1
+                  AND c.valid_to IS NULL
+                  AND d.valid_to IS NULL
+                  AND c.visibility = 'approved'
+                  AND d.visibility = 'approved'
+                  AND c.embedding_v2 IS NOT NULL
                 LIMIT 20
                 """,
                 tenant,
@@ -509,7 +550,6 @@ async def bm25_canary_probe(conn: asyncpg.Connection) -> tuple[str, str] | None:
                 if m:
                     return tenant, m.group(0).lower()
     return None
-
 
 async def find_absent_required_indexes(conn: asyncpg.Connection) -> list[str]:
     """Required pg_search indexes that do not exist at all.
