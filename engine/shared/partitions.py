@@ -140,6 +140,99 @@ async def partition_exists(
     )
 
 
+async def find_orphan_partitions(
+    conn: asyncpg.Connection, *, parent: str = CHUNKS_PARENT
+) -> list[tuple[str, str]]:
+    """Attached partitions whose tenant no longer exists. (partition, tenant).
+
+    `ensure_tenant_partition` had no counterpart, so deleting a tenant left its
+    partition attached forever. The rows go -- `chunks.customer_id` carries
+    ON DELETE CASCADE from `customers` -- but the TABLE and its 15 indexes
+    stay, and nothing will ever route a row to them again because no
+    `customer_id` matches the bound.
+
+    Observed on the research plane 2026-09-15: purging `richards-research-team`
+    left `chunks_p_richards_research_team_40743306` holding 609 MB of dead
+    tuples with the customer row already gone.
+
+    That is not only wasted space. Locks are taken per RELATION, so every
+    orphan permanently adds itself plus its indexes to the lock footprint of
+    any query that does not prune -- the cost grows with the number of tenants
+    ever deleted, not the number that exist.
+
+    The bound value is read from the catalog rather than reversed out of the
+    relation name, which is sanitized and hashed and cannot be turned back into
+    a customer_id. The DEFAULT partition is never reported: it holds no bound
+    and is meant to be empty.
+    """
+    rows = await conn.fetch(
+        r"""
+        SELECT c.relname AS partition,
+               substring(pg_get_expr(c.relpartbound, c.oid)
+                         from 'FOR VALUES IN \(''(.*)''\)') AS tenant
+        FROM pg_class c
+        JOIN pg_inherits h ON h.inhrelid = c.oid
+        WHERE h.inhparent = to_regclass($1)
+          AND c.relpartbound IS NOT NULL
+          AND pg_get_expr(c.relpartbound, c.oid) <> 'DEFAULT'
+        ORDER BY c.relname
+        """,
+        parent,
+    )
+    orphans: list[tuple[str, str]] = []
+    for r in rows:
+        tenant = r["tenant"]
+        if tenant is None:
+            continue
+        exists = await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM customers WHERE customer_id = $1)", tenant
+        )
+        if not exists:
+            orphans.append((r["partition"], tenant))
+    return orphans
+
+
+async def drop_tenant_partition(
+    conn: asyncpg.Connection,
+    customer_id: str,
+    *,
+    parent: str = CHUNKS_PARENT,
+    lock_timeout: str = PARTITION_LOCK_TIMEOUT,
+) -> bool:
+    """DETACH then DROP one tenant's partition. Returns True if it dropped one.
+
+    REFUSES while the tenant still exists in `customers`. This drops a table
+    and every row in it, and the only thing that makes that safe is that the
+    tenant is already gone -- at which point the rows are gone too, by cascade,
+    and the partition can never receive another. Without that gate this is a
+    one-call way to delete a live tenant's entire corpus.
+
+    DETACH before DROP, and both in one transaction. Dropping an attached
+    partition works, but DETACH first means a failure between the two leaves a
+    standalone table rather than a parent that briefly had a partition
+    disappear underneath a concurrent plan.
+    """
+    if not await is_partitioned(conn, parent):
+        return False
+    part = partition_name_for(customer_id)
+    if not await partition_exists(conn, customer_id, parent=parent):
+        return False
+    still_there = await conn.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM customers WHERE customer_id = $1)", customer_id
+    )
+    if still_there:
+        raise ValueError(
+            f"refusing to drop the partition for {customer_id!r}: the tenant is "
+            f"still in `customers`. Delete the tenant first; the rows go by "
+            f"cascade and this reclaims what is left."
+        )
+    async with conn.transaction():
+        await conn.execute(f"SET LOCAL lock_timeout = '{lock_timeout}'")
+        await conn.execute(f'ALTER TABLE {parent} DETACH PARTITION "{part}"')
+        await conn.execute(f'DROP TABLE "{part}"')
+    return True
+
+
 async def ensure_tenant_partition(
     conn: asyncpg.Connection,
     customer_id: str,
@@ -314,7 +407,9 @@ __all__ = [
     "CHUNKS_PARENT",
     "UnsafeCustomerId",
     "default_partition_name",
+    "drop_tenant_partition",
     "ensure_tenant_partition",
+    "find_orphan_partitions",
     "is_partitioned",
     "partition_exists",
     "partition_name_for",

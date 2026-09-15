@@ -42,6 +42,10 @@ import sys
 from engine.shared.db import close_pool, get_pool, init_pool
 from engine.shared.logging import configure_logging, get_logger
 from engine.shared.ops_alert import capture
+from engine.shared.partitions import (
+    drop_tenant_partition,
+    find_orphan_partitions,
+)
 from engine.shared.pg_search_guardian import (
     analyze_partitioned_parents,
     analyze_tables,
@@ -116,6 +120,13 @@ async def run_once(*, dry_run: bool = False) -> int:
         # The conversion is attended and out of band, so a plane can sit at
         # alembic head with a flat `chunks`. Expected, briefly; invisible, never.
         unpartitioned = await find_unpartitioned_tables(conn)
+        # A deleted tenant's partition stays ATTACHED: the rows go by cascade
+        # from `customers`, the table and its 15 indexes do not. Nothing will
+        # ever route a row to it again, and because locks are taken per
+        # RELATION it permanently adds itself plus its indexes to the lock
+        # footprint of every query that does not prune. Left alone this grows
+        # with the number of tenants ever deleted.
+        orphans = await find_orphan_partitions(conn)
 
         log.info(
             "guardian.tick",
@@ -128,6 +139,7 @@ async def run_once(*, dry_run: bool = False) -> int:
             partitions_missing_index=len(partitions_missing_index),
             default_partition_bytes=sum(int(d["heap_bytes"]) for d in default_rows),
             unpartitioned=unpartitioned,
+            orphan_partitions=[p for p, _ in orphans],
             dry_run=dry_run,
         )
 
@@ -188,6 +200,40 @@ async def run_once(*, dry_run: bool = False) -> int:
                     "shared ANN index; run split_default() for the named tenants",
                 },
             )
+
+        if orphans:
+            # SWEPT, not alarmed-and-left. The gate that makes dropping a table
+            # safe is already proven by the time we get here: the tenant is
+            # absent from `customers`, so its rows went by cascade and no
+            # future row can match the bound. `drop_tenant_partition` re-checks
+            # that itself and raises rather than trusting this caller.
+            dropped: list[str] = []
+            for partition, tenant in orphans:
+                if dry_run:
+                    log.info("guardian.orphan_partition_dry_run",
+                             partition=partition, tenant=tenant)
+                    continue
+                try:
+                    if await drop_tenant_partition(conn, tenant):
+                        dropped.append(partition)
+                        log.info("guardian.orphan_partition_dropped",
+                                 partition=partition, tenant=tenant)
+                except Exception as exc:
+                    # must not kill the tick before `record_timeline`, which is
+                    # the same reason the broken-index repair is wrapped below.
+                    log.warning("guardian.orphan_partition_failed",
+                                partition=partition, tenant=tenant,
+                                error=f"{type(exc).__name__}: {exc}")
+            if dropped:
+                capture(
+                    "kb_chunks_orphan_partition_dropped",
+                    {
+                        "partitions": dropped,
+                        "timeline_id": timeline,
+                        "state": "a deleted tenant's partition was detached and "
+                        "dropped; its rows were already gone by cascade",
+                    },
+                )
 
         # Statistics on a PARTITIONED PARENT are nobody else's job: PG16
         # autovacuum analyzes leaves only. Retrieval plans against the parent,
