@@ -47,7 +47,9 @@ import pytest_asyncio
 from engine.shared import db as db_module
 from engine.shared.partitions import (
     default_partition_name,
+    drop_tenant_partition,
     ensure_tenant_partition,
+    find_orphan_partitions,
     is_partitioned,
     partition_name_for,
     split_default,
@@ -333,3 +335,62 @@ async def test_partition_names_never_collide(live_db: None) -> None:
     assert partition_name_for("anthrogen") == partition_name_for("anthrogen")
     # Fits PostgreSQL's 63-byte identifier limit even for a long id.
     assert len(partition_name_for("x" * 62)) <= 63
+
+
+async def test_a_deleted_tenants_partition_is_reported_and_droppable(
+    live_db: None,
+) -> None:
+    """`ensure_tenant_partition` had no counterpart, so deletes leaked tables.
+
+    Deleting a tenant takes its ROWS (`chunks.customer_id` carries ON DELETE
+    CASCADE from `customers`) but leaves the PARTITION attached, with its
+    indexes, forever. Nothing routes a row there again because no `customer_id`
+    matches the bound. Seen on the research plane 2026-09-15: purging
+    `richards-research-team` left a 609 MB partition behind with the customer
+    row already gone.
+
+    It is not only wasted space. Locks are taken per RELATION, so each orphan
+    permanently adds itself and its indexes to the lock footprint of every
+    query that does not prune -- a cost that grows with the number of tenants
+    ever deleted rather than the number that exist.
+    """
+    tenant = "orphan-sweep-test"
+    async with db_module.raw_conn() as conn:
+        if not await is_partitioned(conn):
+            pytest.skip("chunks is not partitioned on this database")
+        await conn.execute(
+            "INSERT INTO customers (customer_id, display_name, api_key_hash,"
+            " r2_bucket) VALUES ($1, $1, $1, $1)"
+            " ON CONFLICT (customer_id) DO NOTHING",
+            tenant,
+        )
+        await ensure_tenant_partition(conn, tenant)
+        part = partition_name_for(tenant)
+
+        # While the tenant EXISTS the drop must refuse. Without this gate the
+        # helper is a one-call way to delete a live tenant's whole corpus.
+        assert (tenant, part) not in [(t, p) for p, t in
+                                      await find_orphan_partitions(conn)]
+        with pytest.raises(ValueError, match="still in `customers`"):
+            await drop_tenant_partition(conn, tenant)
+        assert await conn.fetchval("SELECT to_regclass($1)", part) is not None
+
+        # Delete the tenant: rows go by cascade, the partition does not.
+        await conn.execute("DELETE FROM customers WHERE customer_id = $1", tenant)
+        assert await conn.fetchval("SELECT to_regclass($1)", part) is not None, (
+            "the partition should SURVIVE the cascade -- that is the leak this "
+            "test exists for"
+        )
+
+        orphans = await find_orphan_partitions(conn)
+        assert (part, tenant) in orphans, (
+            f"{part} should be reported as an orphan once {tenant} is gone; "
+            f"got {orphans}"
+        )
+
+        assert await drop_tenant_partition(conn, tenant) is True
+        assert await conn.fetchval("SELECT to_regclass($1)", part) is None
+        # Idempotent: a second sweep over the same tenant is a no-op, not an
+        # error, because the cron will run again in ten minutes.
+        assert await drop_tenant_partition(conn, tenant) is False
+        assert (part, tenant) not in await find_orphan_partitions(conn)
