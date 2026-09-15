@@ -108,6 +108,30 @@ TRUNCATE_SQL = """
 # `UndefinedTableError`, before a single assertion ran.
 
 
+#: TRUNCATE empties a partitioned table but leaves its PARTITIONS in place, so
+#: a tenant partition created by one test survives into the next. That is not
+#: cosmetic: a later test that expects its rows to land in DEFAULT finds a
+#: partition already waiting for them, and the assertion fails for a reason that
+#: has nothing to do with the code under test. (Observed exactly that:
+#: `test_split_default_moves_a_stranded_tenant` passed alone and failed in the
+#: suite.) The DEFAULT partition is kept -- schema.sql declares it.
+DROP_TEST_PARTITIONS_SQL = """
+DO $$
+DECLARE part record;
+BEGIN
+    FOR part IN
+        SELECT c.relname
+        FROM pg_inherits h
+        JOIN pg_class c ON c.oid = h.inhrelid
+        WHERE h.inhparent = to_regclass('chunks')
+          AND pg_get_expr(c.relpartbound, c.oid) <> 'DEFAULT'
+    LOOP
+        EXECUTE format('DROP TABLE IF EXISTS %I', part.relname);
+    END LOOP;
+END $$;
+"""
+
+
 @pytest_asyncio.fixture
 async def live_db(settings: Settings) -> AsyncIterator[None]:
     """Initialize a fresh pool on the current event loop, truncate, yield, close."""
@@ -117,9 +141,11 @@ async def live_db(settings: Settings) -> AsyncIterator[None]:
     await db_module.init_pool(settings)
     async with db_module.raw_conn() as conn:
         await conn.execute(TRUNCATE_SQL)
+        await conn.execute(DROP_TEST_PARTITIONS_SQL)
     try:
         yield None
     finally:
         async with db_module.raw_conn() as conn:
             await conn.execute(TRUNCATE_SQL)
+            await conn.execute(DROP_TEST_PARTITIONS_SQL)
         await db_module.close_pool()

@@ -64,9 +64,26 @@ class _Dispatcher:
         self.topup_rows: dict[str, list[dict[str, Any]]] = {}
         self.fetched: list[tuple[str, tuple[Any, ...]]] = []
         self.executed: list[str] = []
+        self.read_back: list[str] = []
 
     async def execute(self, sql: str, *args: Any) -> None:
         self.executed.append(sql)
+
+    async def fetchval(self, sql: str, *params: Any) -> Any:
+        """`_enable_iterative_scan` reads the GUC back through this.
+
+        Mirrors `RecordingConn.fetchval` in tests/retrieval/conftest.py. A
+        double missing a method the real connection has proves only that the
+        double is stale.
+        """
+        # Deliberately NOT recorded in `executed`: that list is what the
+        # "one SET per ANN connection" assertions count, and a `SHOW
+        # hnsw.iterative_scan` read-back would be counted as a SET because it
+        # names the same GUC. Reads and writes are different things here.
+        self.read_back.append(sql)
+        if "SHOW" in sql.upper():
+            return "relaxed_order"
+        return None
 
     async def fetch(self, sql: str, *params: Any) -> list[Any]:
         self.fetched.append((sql, params))

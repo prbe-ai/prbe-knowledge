@@ -103,7 +103,12 @@ async def live_objects(conn: asyncpg.Connection) -> tuple[set[str], set[str]]:
             SELECT c.relname
             FROM pg_class c
             JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE c.relkind = 'r' AND n.nspname = ANY($1::text[])
+            -- 'p' as well as 'r': `chunks` is PARTITIONED BY LIST (customer_id),
+            -- and a partitioned parent is relkind 'p'. Filtering to 'r' alone
+            -- reports the single most important table in the schema as MISSING,
+            -- permanently, on every converted plane -- which is the drift this
+            -- checker exists to catch, produced by the checker itself.
+            WHERE c.relkind IN ('r', 'p') AND n.nspname = ANY($1::text[])
             """,
             list(_SEARCH_SCHEMAS),
         )

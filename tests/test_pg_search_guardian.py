@@ -92,6 +92,12 @@ def _row(
 ) -> dict[str, Any]:
     return {
         "index_name": index_name,
+        # Partitioned indexes exist twice in the catalog: a storage-less parent
+        # carrying the declared name and one auto-named child per partition.
+        # The detector allowlists on the ROOT so a 0-byte CHILD of a declared
+        # parent is still caught. On an unpartitioned index root == self, which
+        # is what these fabricated rows represent.
+        "root_index_name": index_name,
         "table_name": table,
         "access_method": am,
         "index_bytes": size,

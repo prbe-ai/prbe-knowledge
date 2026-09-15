@@ -16,6 +16,7 @@ from asyncpg.exceptions import UniqueViolationError
 from engine.shared.db import raw_conn
 from engine.shared.exceptions import PrbeError
 from engine.shared.logging import get_logger
+from engine.shared.partitions import ensure_tenant_partition
 from engine.shared.storage import get_store
 
 log = get_logger(__name__)
@@ -48,7 +49,13 @@ async def create_customer(customer_id: str, display_name: str) -> str:
     api_key = _generate_api_key()
     api_key_hash = _hash_api_key(api_key)
     try:
-        async with raw_conn() as conn:
+        async with raw_conn() as conn, conn.transaction():
+            # ONE TRANSACTION over both. `raw_conn()` is autocommit, so without
+            # this the customer row commits first and a partition failure leaves
+            # a tenant that exists, has no partition, never received its API key
+            # (the exception propagates before the return), and cannot be
+            # retried -- every attempt now raises CustomerAlreadyExists. Wrapped,
+            # a failure means the tenant was never created and a retry works.
             await conn.execute(
                 """
                 INSERT INTO customers (customer_id, display_name, api_key_hash)
@@ -58,6 +65,13 @@ async def create_customer(customer_id: str, display_name: str) -> str:
                 display_name,
                 api_key_hash,
             )
+            # The tenant's `chunks` partition is part of creating the tenant,
+            # not a later cleanup: a tenant without one writes into DEFAULT,
+            # which is a shared relation with a shared ANN index -- the exact
+            # cost-mispricing partitioning removed, silently restored for them.
+            # ~7 ms (CREATE + ATTACH, SHARE UPDATE EXCLUSIVE), and a no-op on a
+            # database where the conversion has not run.
+            await ensure_tenant_partition(conn, customer_id)
     except UniqueViolationError as exc:
         raise CustomerAlreadyExists(
             "customer already exists", customer_id=customer_id

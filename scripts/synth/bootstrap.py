@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 
 from engine.shared.encryption import encrypt_token
 from engine.shared.logging import get_logger
+from engine.shared.partitions import ensure_tenant_partition
 
 if TYPE_CHECKING:
     from engine.shared.storage import ObjectStore
@@ -76,6 +77,11 @@ async def init_tenant(profile: Profile, db, bucket: ObjectStore) -> None:
         display_name,
         placeholder_hash,
     )
+    # Synth tenants get a chunks partition like any other tenant. Without it
+    # their rows land in DEFAULT, which trips the guardian's DEFAULT alarm
+    # during a perfectly normal synth run -- and, worse, makes synth-measured
+    # retrieval latency unrepresentative of a real tenant's.
+    await ensure_tenant_partition(db, customer_id)
 
     bucket_name = await bucket.bucket_for(customer_id)
     await bucket.ensure_bucket(bucket_name)

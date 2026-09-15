@@ -144,27 +144,52 @@ async def find_broken_pg_search_indexes(conn: asyncpg.Connection) -> list[dict[s
     """
     rows = await conn.fetch(
         """
+        WITH RECURSIVE idx_root AS (
+            -- Roots: indexes that are nobody's partition child.
+            SELECT i.indexrelid AS idx, i.indexrelid AS root
+            FROM pg_index i
+            WHERE NOT EXISTS (
+                SELECT 1 FROM pg_inherits h WHERE h.inhrelid = i.indexrelid
+            )
+          UNION ALL
+            SELECT h.inhrelid, r.root
+            FROM pg_inherits h
+            JOIN idx_root r ON h.inhparent = r.idx
+        )
         SELECT
-            i.indexrelid::regclass::text  AS index_name,
-            c.relname                     AS table_name,
-            am.amname                     AS access_method,
-            pg_relation_size(i.indexrelid) AS index_bytes,
-            c.reltuples                   AS table_reltuples
+            ic.relname                     AS index_name,
+            rootc.relname                  AS root_index_name,
+            c.relname                      AS table_name,
+            am.amname                      AS access_method,
+            pg_relation_size(i.indexrelid)  AS index_bytes,
+            c.reltuples                    AS table_reltuples
         FROM pg_index i
-        JOIN pg_class ic ON ic.oid = i.indexrelid
-        JOIN pg_class c  ON c.oid  = i.indrelid
-        JOIN pg_am am    ON am.oid = ic.relam
+        JOIN pg_class ic   ON ic.oid = i.indexrelid
+        JOIN pg_class c    ON c.oid  = i.indrelid
+        JOIN pg_am am      ON am.oid = ic.relam
+        JOIN idx_root r    ON r.idx  = i.indexrelid
+        JOIN pg_class rootc ON rootc.oid = r.root
         WHERE am.amname = ANY($1::text[])
           AND i.indisvalid
+          -- 'i' = an index with storage. 'I' = a PARTITIONED index, which is a
+          -- catalog entry with `relfilenode = 0` and therefore ALWAYS reports
+          -- `pg_relation_size = 0`. Without this filter the parent of a
+          -- perfectly healthy partitioned BM25 index is reported broken on
+          -- every tick, and the guardian's repair would DROP it -- taking
+          -- every child with it. Verified on paradedb 0.23.4-pg16.
+          AND ic.relkind = 'i'
           AND pg_relation_size(i.indexrelid) = 0
         """,
         list(PG_SEARCH_ACCESS_METHODS),
     )
     broken: list[dict[str, object]] = []
     for r in rows:
-        # `regclass` renders schema-qualified only when the index is outside
-        # search_path; compare on the bare name the contracts declare.
-        bare_name = r["index_name"].split(".")[-1].strip('"')
+        # Partition children are auto-named (`chunks_anthrogen_..._idx`) and no
+        # contract declares them, so the allowlist is checked against the ROOT
+        # index -- the name the contract does declare. A 0-byte child of an
+        # allowlisted parent is exactly the fault this detector exists for; it
+        # was simply invisible before partitioning, when root == self.
+        bare_name = r["root_index_name"]
         if bare_name not in ALLOWED_INDEX_NAMES:
             log.info(
                 "guardian.skip_unlisted_index",
@@ -180,7 +205,12 @@ async def find_broken_pg_search_indexes(conn: asyncpg.Connection) -> list[dict[s
             continue
         broken.append(
             {
-                "index": bare_name,
+                # The CHILD name: that is the relation with the 0-byte file and
+                # the thing a repair must act on. `root_index` carries the
+                # contract-declared name so a reader can tell which index this
+                # belongs to. On an unpartitioned index the two are equal.
+                "index": r["index_name"],
+                "root_index": bare_name,
                 "table": r["table_name"],
                 "access_method": r["access_method"],
                 "index_bytes": int(r["index_bytes"]),
@@ -217,7 +247,9 @@ async def find_invalid_index_debris(conn: asyncpg.Connection) -> list[str]:
     return [n for n in names if n in ALLOWED_INDEX_NAMES]
 
 
-async def drop_broken_index(conn: asyncpg.Connection, index_name: str) -> bool:
+async def drop_broken_index(
+    conn: asyncpg.Connection, index_name: str, *, allowlist_as: str | None = None
+) -> bool:
     """Drop one broken index. True if dropped, False if the lock was unavailable.
 
     Bounded by `lock_timeout` so the guardian yields to live traffic rather
@@ -230,8 +262,17 @@ async def drop_broken_index(conn: asyncpg.Connection, index_name: str) -> bool:
     string literals in `index_contracts.py` -- it never carries a value derived
     from user input or from the database.
     """
-    if index_name not in ALLOWED_INDEX_NAMES:
-        raise ValueError(f"refusing to drop index outside the allowlist: {index_name!r}")
+    # `allowlist_as` exists because of partitioning: the thing to DROP is the
+    # child (`chunks_p_<tenant>_<hash>_..._idx`, auto-named, in no allowlist),
+    # while the name a contract declares is its partitioned PARENT. Validating
+    # the child would raise ValueError on every partitioned repair -- uncaught
+    # in the cron, killing the tick before `record_timeline`, which by this
+    # module's own note re-fires the promotion alert every minute forever.
+    # Callers pass the root for validation and the child for the DDL; when the
+    # index is unpartitioned the two are the same name.
+    checked = allowlist_as or index_name
+    if checked not in ALLOWED_INDEX_NAMES:
+        raise ValueError(f"refusing to drop index outside the allowlist: {checked!r}")
     try:
         async with conn.transaction():
             await conn.execute(f"SET LOCAL lock_timeout = '{DROP_LOCK_TIMEOUT}'")
@@ -457,6 +498,222 @@ async def find_absent_required_indexes(conn: asyncpg.Connection) -> list[str]:
                 continue
         absent.append(index_name)
     return absent
+
+
+#: Partitioned parents whose planner statistics the guardian maintains, and how
+#: stale they may get before it re-analyzes.
+#:
+#: PostgreSQL 16 autovacuum analyzes LEAF partitions only -- it never analyzes a
+#: partitioned parent (`ANALYZE` docs, "the parent table's statistics are not
+#: collected automatically"). Nothing else will do it. That is tolerable for a
+#: table nobody plans against directly, and NOT tolerable here: every retrieval
+#: query names the parent, and the whole point of partitioning `chunks` was to
+#: make the planner's cost comparison honest. An un-analyzed parent reports
+#: `reltuples = -1` and the planner guesses -- which is the class of mistake
+#: that produced the 14.7s search this work exists to fix.
+PARTITIONED_PARENTS_TO_ANALYZE: tuple[str, ...] = ("chunks",)
+PARENT_ANALYZE_MAX_AGE_HOURS = 24
+
+#: Tables whose DEFAULT partition must stay empty.
+#:
+#: A tenant with no partition of its own lands in DEFAULT, which is a shared
+#: relation with a shared index -- silently restoring the exact fault
+#: partitioning removed, for that tenant only, with no error anywhere.
+#: `create_tenant()` makes the partition at provisioning time; this is the
+#: backstop for every path that does not go through it.
+TABLES_WITH_DEFAULT_PARTITION: tuple[str, ...] = ("chunks",)
+
+
+async def find_unpartitioned_tables(
+    conn: asyncpg.Connection,
+    tables: tuple[str, ...] = PARTITIONED_PARENTS_TO_ANALYZE,
+) -> list[str]:
+    """Tables that `db/schema.sql` declares partitioned but this database has flat.
+
+    A fresh database is born from `db/schema.sql` (partitioned) and stamped head;
+    an existing one is converted by `scripts/convert_chunks_to_partitioned.py`,
+    out of band and attended. Between those two facts sits a window where a plane
+    reports alembic head while its `chunks` is still flat -- and a flat `chunks`
+    is the shared-index cost-mispricing this whole change removed, still live.
+
+    That window is EXPECTED. Being unable to see it is not: migration 0112
+    records `system_settings` sitting in the same kind of gap on the managed
+    plane for five weeks, fail-open, with the global ingestion killswitch
+    silently doing nothing the entire time. This is the signal that keeps the
+    gap to hours instead.
+    """
+    flat: list[str] = []
+    for table in tables:
+        relkind = await conn.fetchval(
+            "SELECT relkind FROM pg_class WHERE oid = to_regclass($1)", table
+        )
+        if relkind == "r":
+            flat.append(table)
+    return flat
+
+
+async def find_partitions_missing_required_index(
+    conn: asyncpg.Connection,
+) -> list[dict[str, str]]:
+    """Partitions of a required index's table that carry no child of it.
+
+    `ATTACH PARTITION` creates the missing children automatically, so the happy
+    path cannot produce this. A partition created by hand, a failed ATTACH, or a
+    restore can. The symptom is the one this module exists to make impossible:
+    lexical search silently returns nothing FOR ONE TENANT while every other
+    tenant is fine and every tick reads `broken_count: 0`.
+
+    Reported, never repaired here -- building a BM25 index is the rebuild cron's
+    job, and it already knows how.
+    """
+    required = dict(REQUIRED_PG_SEARCH_INDEXES)
+    bm25_table = required.pop(BM25_INDEX_V3, None)
+    if bm25_table is not None:
+        required[await required_bm25_index(conn)] = bm25_table
+
+    missing: list[dict[str, str]] = []
+    for index_name, table_name in required.items():
+        # An ABSENT index is `find_absent_required_indexes`' job, not this one.
+        # Without this guard `to_regclass($2)` is NULL, `inhparent = NULL` is
+        # never true, and NOT EXISTS holds for EVERY partition -- so any
+        # database without pg_search, and every minute of an attended multi-hour
+        # BM25 rebuild, would report every partition missing, with no transition
+        # dedupe to quiet it.
+        if await conn.fetchval("SELECT to_regclass($1)", index_name) is None:
+            continue
+        rows = await conn.fetch(
+            """
+            SELECT part.relname AS partition_name
+            FROM pg_inherits th
+            JOIN pg_class part ON part.oid = th.inhrelid
+            WHERE th.inhparent = to_regclass($1)
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM pg_inherits ih
+                  JOIN pg_index ci ON ci.indexrelid = ih.inhrelid
+                  WHERE ih.inhparent = to_regclass($2)
+                    AND ci.indrelid = part.oid
+              )
+            """,
+            table_name,
+            index_name,
+        )
+        for r in rows:
+            missing.append(
+                {"index": index_name, "table": table_name, "partition": r["partition_name"]}
+            )
+    return missing
+
+
+async def analyze_partitioned_parents(
+    conn: asyncpg.Connection,
+    parents: tuple[str, ...] = PARTITIONED_PARENTS_TO_ANALYZE,
+    max_age_hours: int = PARENT_ANALYZE_MAX_AGE_HOURS,
+) -> list[str]:
+    """ANALYZE partitioned parents whose statistics have aged out.
+
+    Returns the parents it analyzed. Best-effort for the same reason
+    `analyze_tables` is: this runs on a tick that must reach its end to record
+    state, so a missing table on a self-host must not abort it.
+
+    Skips a table that is not partitioned, so this is a no-op on a database
+    where the conversion has not run yet -- the same code ships before and
+    after.
+    """
+    analyzed: list[str] = []
+    for table in parents:
+        if not table.replace("_", "").isalnum():
+            raise ValueError(f"refusing to ANALYZE suspicious identifier: {table!r}")
+        try:
+            relkind = await conn.fetchval(
+                "SELECT relkind FROM pg_class WHERE oid = to_regclass($1)", table
+            )
+            if relkind is None:
+                continue
+            if relkind != "p":
+                # Not partitioned (yet). Autovacuum handles a plain table.
+                continue
+            stale = await conn.fetchval(
+                """
+                SELECT COALESCE(
+                    GREATEST(last_analyze, last_autoanalyze) <
+                        now() - make_interval(hours => $2),
+                    true
+                )
+                FROM pg_stat_user_tables WHERE relid = to_regclass($1)
+                """,
+                table,
+                max_age_hours,
+            )
+            if not stale:
+                continue
+            # SET LOCAL inside a transaction: a bare SET would leave
+            # statement_timeout disabled on this pooled connection for the rest
+            # of its life, and the next borrower would inherit the hole.
+            async with conn.transaction():
+                await conn.execute("SET LOCAL statement_timeout = 0")
+                await conn.execute(f'ANALYZE "{table}"')
+            analyzed.append(table)
+            log.info("guardian.analyzed_partitioned_parent", table=table)
+        except Exception as exc:
+            log.warning(
+                "guardian.analyze_parent_failed", table=table, error=str(exc)
+            )
+    return analyzed
+
+
+async def find_nonempty_default_partitions(
+    conn: asyncpg.Connection,
+    tables: tuple[str, ...] = TABLES_WITH_DEFAULT_PARTITION,
+) -> list[dict[str, object]]:
+    """DEFAULT partitions that hold data.
+
+    Non-empty DEFAULT means some tenant has no partition of its own and is back
+    on a shared index -- the exact fault partitioning removed, restored for that
+    tenant, with no error anywhere. It is not an outage (their results are still
+    correct, just slow), so this alerts and never repairs: moving rows between
+    partitions is `split_default()`'s job and not something an unattended
+    minute-tick should start.
+
+    CATALOG-ONLY, like every other detector here, and for two reasons rather
+    than one. The module's own rule is that a detector must not plan a query
+    against the table it is watching. On top of that, `chunks` partitions carry
+    FORCE RLS with a `current_setting('app.current_customer_id')` policy, and
+    the guardian sets no tenant GUC -- so `SELECT count(*)` would return 0 on a
+    partition full of rows and the alarm would never fire.
+
+    `pg_relation_size` is the signal: a partition that has ever held rows has
+    heap pages, an empty one has none. It over-reports after a delete-and-
+    vacuum-less cycle, which is the right direction for an alarm that means
+    "go look". `reltuples` rides along as the estimate and is `-1` until
+    something analyzes the partition.
+    """
+    found: list[dict[str, object]] = []
+    for table in tables:
+        rows = await conn.fetch(
+            """
+            SELECT
+                part.relname                     AS partition_name,
+                pg_relation_size(part.oid)       AS heap_bytes,
+                part.reltuples                   AS est_rows
+            FROM pg_inherits h
+            JOIN pg_class part ON part.oid = h.inhrelid
+            WHERE h.inhparent = to_regclass($1)
+              AND pg_get_expr(part.relpartbound, part.oid) = 'DEFAULT'
+              AND pg_relation_size(part.oid) > 0
+            """,
+            table,
+        )
+        for r in rows:
+            found.append(
+                {
+                    "table": table,
+                    "partition": r["partition_name"],
+                    "heap_bytes": int(r["heap_bytes"]),
+                    "est_rows": int(r["est_rows"]),
+                }
+            )
+    return found
 
 
 async def read_known_absent(conn: asyncpg.Connection) -> frozenset[str]:

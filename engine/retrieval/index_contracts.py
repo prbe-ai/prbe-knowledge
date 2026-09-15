@@ -54,6 +54,22 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Final
 
+#: `chunks` is PARTITIONED BY LIST (customer_id), so its indexes exist twice in
+#: the catalog: a partitioned PARENT (`relkind = 'I'`, `relfilenode = 0`, no
+#: storage) carrying the declared name, and one auto-named CHILD per partition
+#: (`chunks_p_<tenant>_<hash>_..._idx`) carrying the data.
+#:
+#: These contracts keep naming the PARENT, and that is correct rather than
+#: incidental: they are matched against the index definition in
+#: `db/schema.sql`, which declares the parent, and the definition text is
+#: unchanged by partitioning. What DOES read child names is anything that
+#: inspects a live plan or a live catalog -- `EXPLAIN` shows the child that was
+#: scanned, and `pg_relation_size` of the parent is always 0. The pg_search
+#: guardian walks `pg_inherits` for exactly that reason
+#: (`find_broken_pg_search_indexes`), and a plan-shape assertion must match on
+#: the partition, not on this name. See
+#: `tests/retrieval/test_chunks_partition_pruning.py`.
+
 
 @dataclass(frozen=True, slots=True)
 class IndexContract:

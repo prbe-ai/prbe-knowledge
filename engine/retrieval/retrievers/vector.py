@@ -381,20 +381,106 @@ def _build_inner_query(
     return inner_sql, params, ann_order_sql, outer_order_sql
 
 
+#: Set once per process, after the first SET is proven to have taken effect.
+#: `None` = not yet checked; the verification costs two extra round trips and
+#: runs exactly once, never on the steady-state hot path.
+_ITERSCAN_VERIFIED: bool | None = None
+
+_ITERSCAN_GUC = "hnsw.iterative_scan"
+_ITERSCAN_WANT = "relaxed_order"
+
+
 async def _enable_iterative_scan(conn: asyncpg.Connection) -> None:
     """Let a filtered ANN scan widen until the LIMIT is satisfied.
 
     with_tenant runs inside a transaction, so SET LOCAL scopes to this
-    query and cannot leak across a pgbouncer-pooled connection. The
-    savepoint makes the missing-GUC case (pgvector < 0.8) a soft no-op
-    instead of poisoning the transaction.
+    query and cannot leak across a pgbouncer-pooled connection.
+
+    THE SAVEPOINT USED TO BE THE WHOLE GUARD, AND IT GUARDED NOTHING. Its old
+    docstring claimed it made "the missing-GUC case (pgvector < 0.8) a soft
+    no-op". In fact PostgreSQL accepts ANY assignment to a namespaced
+    `foo.bar` setting as a placeholder when the owning library is not loaded --
+    proven live against the kb database:
+
+        SET LOCAL hnsw.totally_made_up_guc = 'banana'   -> succeeds, SHOW returns 'banana'
+        SET LOCAL hnsw.iterative_scan = 'not_a_real_mode' -> succeeds
+
+    So the except branch could never fire, and a typo, a rename upstream, or a
+    value pgvector stopped accepting would silently disable iterative scan --
+    turning filtered ANN searches into quiet under-returns with no error and no
+    log line anywhere.
+
+    The placeholder IS reconciled once pgvector loads (verified: production
+    order yields `relaxed_order`), so the mechanism works. It just was not
+    checked. This reads the value back after forcing the library to load, once
+    per process, and says so loudly if it did not take.
     """
+    global _ITERSCAN_VERIFIED
+
     await conn.execute("SAVEPOINT iterscan")
     try:
-        await conn.execute("SET LOCAL hnsw.iterative_scan = 'relaxed_order'")
+        await conn.execute(f"SET LOCAL {_ITERSCAN_GUC} = '{_ITERSCAN_WANT}'")
         await conn.execute("RELEASE SAVEPOINT iterscan")
     except asyncpg.PostgresError:
         await conn.execute("ROLLBACK TO SAVEPOINT iterscan")
+        _ITERSCAN_VERIFIED = False
+        log.error(
+            "vector.iterative_scan_rejected",
+            guc=_ITERSCAN_GUC,
+            reason="SET was refused outright; filtered ANN scans will under-return",
+        )
+        return
+
+    if _ITERSCAN_VERIFIED is False:
+        # Keep saying so. The verification itself runs once per process (two
+        # round trips), but a single startup log line is the wrong signal for a
+        # fault whose entire character is that it is invisible: a pod that came
+        # up mis-set would log once and then under-return on every filtered ANN
+        # search for days. Re-logging costs nothing -- no query, no round trip --
+        # and puts the line next to the searches it is degrading.
+        log.error(
+            "vector.iterative_scan_not_applied",
+            guc=_ITERSCAN_GUC,
+            expected=_ITERSCAN_WANT,
+            reason="filtered ANN scans are silently under-returning",
+        )
+        return
+    if _ITERSCAN_VERIFIED is True:
+        return
+
+    # A namespaced GUC only resolves to its real definition once the owning
+    # library is in the session, so touching a vector operator first is what
+    # makes the read-back meaningful rather than a second look at the
+    # placeholder. Cheap: a literal-on-literal distance, no table involved.
+    await conn.execute("SAVEPOINT iterscan_verify")
+    try:
+        await conn.fetchval("SELECT '[1,0]'::vector <=> '[0,1]'::vector")
+        actual = await conn.fetchval(f"SHOW {_ITERSCAN_GUC}")
+        await conn.execute("RELEASE SAVEPOINT iterscan_verify")
+    except asyncpg.PostgresError as exc:
+        await conn.execute("ROLLBACK TO SAVEPOINT iterscan_verify")
+        _ITERSCAN_VERIFIED = False
+        log.warning(
+            "vector.iterative_scan_unverified",
+            guc=_ITERSCAN_GUC,
+            error=str(exc),
+            reason="could not read the setting back; proceeding, but filtered "
+            "ANN scans may under-return without saying so",
+        )
+        return
+
+    _ITERSCAN_VERIFIED = actual == _ITERSCAN_WANT
+    if not _ITERSCAN_VERIFIED:
+        log.error(
+            "vector.iterative_scan_not_applied",
+            guc=_ITERSCAN_GUC,
+            expected=_ITERSCAN_WANT,
+            actual=actual,
+            reason="the SET was accepted as a placeholder but pgvector did not "
+            "adopt it; filtered ANN scans will silently under-return",
+        )
+    else:
+        log.info("vector.iterative_scan_verified", guc=_ITERSCAN_GUC, value=actual)
 
 
 async def _per_source_ann_search(

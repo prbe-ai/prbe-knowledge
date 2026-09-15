@@ -213,6 +213,22 @@ from contextlib import asynccontextmanager  # noqa: E402
 from typing import Any  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _reset_iterscan_verification():
+    """`_enable_iterative_scan` verifies the GUC ONCE per process and caches it.
+
+    That is right in production (two round trips on the first query, none after)
+    and wrong in a test process, where it would make "did the verification run"
+    depend on which test happened to go first. Reset around every test so each
+    one exercises the same path.
+    """
+    from engine.retrieval.retrievers import vector as _v
+
+    _v._ITERSCAN_VERIFIED = None
+    yield
+    _v._ITERSCAN_VERIFIED = None
+
+
 class RecordingConn:
     """Captures every SQL statement `vector_search` builds; returns no rows.
 
@@ -226,6 +242,7 @@ class RecordingConn:
         self.params: tuple[Any, ...] = ()
         self.statements: list[str] = []
         self.fetched: list[tuple[str, tuple[Any, ...]]] = []
+        self.read_back: list[str] = []
         self._rows = rows or []
 
     async def execute(self, sql: str, *args: Any) -> None:
@@ -237,6 +254,23 @@ class RecordingConn:
         self.params = params
         self.fetched.append((sql, params))
         return list(self._rows)
+
+    async def fetchval(self, sql: str, *params: Any) -> Any:
+        """`_enable_iterative_scan` reads the GUC back through this.
+
+        A double that lacks a method the real connection has does not prove the
+        code works -- it proves the double is out of date, and the failure
+        arrives as AttributeError at some unrelated call site. Answering the
+        verification honestly (the GUC took) keeps these SQL-shape tests about
+        SQL shape.
+        """
+        # NOT appended to `statements`: that list is what the SQL-shape
+        # assertions inspect, and a `SHOW hnsw.iterative_scan` read-back names
+        # the same GUC as the SET it verifies.
+        self.read_back.append(sql)
+        if "SHOW" in sql.upper():
+            return "relaxed_order"
+        return None
 
 
 class FakeEmbedder:

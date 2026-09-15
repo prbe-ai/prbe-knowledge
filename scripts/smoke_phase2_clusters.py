@@ -21,6 +21,7 @@ import asyncio
 from datetime import UTC, datetime
 
 from engine.shared.db import close_pool, init_pool, raw_conn
+from engine.shared.partitions import ensure_tenant_partition
 
 CUSTOMER = "smoke-phase2-cust"
 NOW = datetime(2026, 5, 15, 12, 0, tzinfo=UTC)
@@ -38,6 +39,7 @@ async def main() -> None:
                 """,
                 CUSTOMER,
             )
+            await ensure_tenant_partition(conn, CUSTOMER)
             for doc_id, author in [("d-1", "richardwei6"), ("d-2", "mahit@prbe.ai")]:
                 await conn.execute(
                     """
