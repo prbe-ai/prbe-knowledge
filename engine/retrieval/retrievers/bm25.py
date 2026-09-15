@@ -89,6 +89,7 @@ from engine.shared.models import TemporalSpec, normalize_author_id
 from engine.shared.partitions import (
     CHUNKS_PARENT,
     PARTITION_PREFIX,
+    UnsafeCustomerId,
     is_partitioned,
     partition_exists,
     partition_name_for,
@@ -280,12 +281,30 @@ async def bm25_scan_target(conn: Any, customer_id: str) -> str:
         _CHUNKS_PARTITIONED = await is_partitioned(conn)
     if not _CHUNKS_PARTITIONED:
         return CHUNKS_PARENT
-    # NOT cached: a tenant provisioned after this process started has a
-    # partition this process has never seen, and `partition_exists` is the
-    # lookup that notices. Only the table-shape answer is process-stable.
-    if not await partition_exists(conn, customer_id):
+    try:
+        # NOT cached: a tenant provisioned after this process started has a
+        # partition this process has never seen, and `partition_exists` is the
+        # lookup that notices. Only the table-shape answer is process-stable.
+        if not await partition_exists(conn, customer_id):
+            return CHUNKS_PARENT
+        return partition_name_for(customer_id)
+    except UnsafeCustomerId:
+        # `customers.customer_id` is bare TEXT with no CHECK, so an id outside
+        # `_SAFE_CUSTOMER_ID` (a space, non-ASCII, 64+ chars) is storable --
+        # and `partition_name_for` refuses to build DDL for it, correctly.
+        # Raising HERE would be wrong: it would kill the exact channel on
+        # EVERY search for that tenant, forever, surfaced only as `degraded`,
+        # which is the precise failure this whole file exists to stop. Such a
+        # tenant has no partition and its rows are in DEFAULT, which only the
+        # parent reaches, so the parent is both the safe answer and the
+        # correct one.
+        log.warning(
+            "bm25.unsafe_customer_id_falls_back_to_parent",
+            customer_id=customer_id,
+            reason="no partition can be named for this id; DEFAULT holds its "
+            "rows and only the parent reaches them",
+        )
         return CHUNKS_PARENT
-    return partition_name_for(customer_id)
 
 
 async def bm25_project_scope_is_index_side(conn: Any) -> bool:

@@ -106,6 +106,26 @@ async def _seed(conn, customer_id: str, n: int, doc_id: str | None = None) -> No
 
 
 @pytest_asyncio.fixture
+async def seeded_bm25(pg_search_db):
+    """`seeded`, but skipped when the database has no pg_search.
+
+    CI runs `pgvector/pgvector:pg16`, which has neither pg_search nor AGE. A
+    test that only skips on "not partitioned" therefore FAILS there on
+    `schema "paradedb" does not exist` rather than skipping -- which is how
+    the BM25 tests below turned the PR red while claiming to pin the fix.
+    `pg_search_db` is the fixture that already makes the skip loud and
+    visible; these tests just were not using it.
+    """
+    async with db_module.raw_conn() as conn:
+        if not await is_partitioned(conn):
+            pytest.skip("chunks is not partitioned on this database")
+        await _seed(conn, BIG, 4000)
+        await _seed(conn, SMALL, 40)
+        await conn.execute("ANALYZE chunks")
+        yield conn
+
+
+@pytest_asyncio.fixture
 async def seeded(live_db: None):
     """Two tenants of very different sizes in the same table."""
     async with db_module.raw_conn() as conn:
@@ -402,7 +422,7 @@ async def test_a_deleted_tenants_partition_is_reported_and_droppable(
         assert (part, tenant) not in await find_orphan_partitions(conn)
 
 
-async def test_the_bm25_pool_shape_runs_against_the_scan_target(seeded) -> None:
+async def test_the_bm25_pool_shape_runs_against_the_scan_target(seeded_bm25) -> None:
     """The exact channel's real query is UNSUPPORTED on a partitioned parent.
 
     pg_search rejects it with `Unsupported query shape` and the channel then
@@ -424,7 +444,7 @@ async def test_the_bm25_pool_shape_runs_against_the_scan_target(seeded) -> None:
     `test_the_pool_predicate_matches_production` pins the two together so this
     literal cannot drift away from the shipped SQL again.
     """
-    conn = seeded
+    conn = seeded_bm25
     from engine.retrieval.retrievers.bm25 import bm25_scan_target
 
     target = await bm25_scan_target(conn, BIG)
@@ -475,7 +495,7 @@ async def test_bm25_falls_back_to_the_parent_without_a_partition(
 
 
 async def test_bm25_pool_cannot_leak_across_token_sharing_tenants(
-    live_db: None,
+    pg_search_db,
 ) -> None:
     """The pool has NO SQL `customer_id = $1` any more. This is what replaces it.
 
@@ -599,7 +619,7 @@ async def test_the_pool_predicate_matches_production() -> None:
     assert "c.customer_id = current_setting('app.current_customer_id', true)" in shape
 
 
-async def test_the_parent_scan_still_prunes_to_one_partition(seeded) -> None:
+async def test_the_parent_scan_still_prunes_to_one_partition(seeded_bm25) -> None:
     """The claim that makes dropping `= $1` affordable, asserted not asserted-in-a-comment.
 
     Removing the bound-parameter predicate was only safe because the tenant
@@ -614,7 +634,7 @@ async def test_the_parent_scan_still_prunes_to_one_partition(seeded) -> None:
     guardian canary forces every tick and the one a tenant without its own
     partition uses in production.
     """
-    conn = seeded
+    conn = seeded_bm25
     # SESSION scope (`false`), not transaction-local. `set_config(..., true)`
     # outside an explicit transaction is discarded before the next statement,
     # the qual then compares against NULL, and every real partition prunes

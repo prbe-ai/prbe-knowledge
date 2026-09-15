@@ -38,7 +38,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+import time
 
+from engine.retrieval.retrievers.bm25 import bm25_scan_target as _resolve_scan_target
 from engine.retrieval.retrievers.bm25 import bm25_search
 from engine.shared.db import close_pool, get_pool, init_pool
 from engine.shared.logging import configure_logging, get_logger
@@ -78,6 +80,22 @@ ANALYZE_AFTER_PROMOTION = ["chunks", "documents"]
 #: Bounds for the query canary. Both are well under the CronJob's
 #: activeDeadlineSeconds: the canary is the LAST thing a tick does, so
 #: overrunning it costs only the canary, never the repair.
+#: pg_search's own words when it refuses a query shape. Matching on it keeps
+#: the rejection alarm about rejections.
+_PG_SEARCH_REJECTION = "Unsupported query shape"
+
+def _canary_tick() -> int:
+    """A number that ACTUALLY advances every tick, for canary rotation.
+
+    The first version rotated on `timeline`, the Postgres timeline id -- which
+    changes only on a failover, so it read 12 on every tick and the rotation it
+    fed never rotated at all: one tenant probed forever, every other tenant's
+    exact channel unwatched. A wall-clock minute is monotonic, needs no stored
+    state, and the CronJob's own schedule is per-minute.
+    """
+    return int(time.time() // 60)
+
+
 CANARY_PROBE_TIMEOUT_S = 30.0
 CANARY_SEARCH_TIMEOUT_S = 30.0
 
@@ -344,7 +362,7 @@ async def run_once(*, dry_run: bool = False) -> int:
         canary_announced = True
         try:
             probe = await asyncio.wait_for(
-                bm25_canary_probe(conn, offset=timeline), CANARY_PROBE_TIMEOUT_S
+                bm25_canary_probe(conn, offset=_canary_tick()), CANARY_PROBE_TIMEOUT_S
             )
             if probe is None:
                 log.info("guardian.bm25_canary_skipped",
@@ -352,7 +370,14 @@ async def run_once(*, dry_run: bool = False) -> int:
             else:
                 tenant, term = probe
                 rejected: dict[str, str] = {}
-                for path, override in (("partition", None), ("parent", CHUNKS_PARENT)):
+                # The RESOLVED relation, not the requested path: for a tenant
+                # without its own partition both runs scan the parent, and
+                # logging "partition" there claims coverage that did not happen.
+                resolved_partition = await _resolve_scan_target(conn, tenant)
+                for path, override in (
+                    (resolved_partition, None),
+                    (CHUNKS_PARENT, CHUNKS_PARENT),
+                ):
                     try:
                         hits = await asyncio.wait_for(
                             bm25_search(tenant, term, top_k=1,
