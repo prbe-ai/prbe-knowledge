@@ -12,6 +12,11 @@ Runs every minute. Each tick:
      including ordinary lookups that have nothing to do with search.
   3. Alerts, so a human knows to rebuild.
 
+  4. Runs the REAL BM25 query as a canary, on both scan paths. A healthy index
+     is not a working query: on 2026-09-15 every index was valid while
+     pg_search rejected the production query and the exact channel returned
+     nothing for 13 hours under `state: ok`. Nothing else here checks queries.
+
 WHAT "SUCCESS" MEANS HERE
 -------------------------
 Search comes back DEGRADED, not whole: vector + graph + exact serve, BM25 does
@@ -24,11 +29,23 @@ human does it in an attended window.
 EXIT CODES
 ----------
   0  nothing to do, or a repair succeeded.
-  1  a database operation failed.
+  1  a database operation failed, OR a CHANGE THIS JOB MADE, or a BREAKAGE it
+     DETECTED, could not be announced -- see the two carve-outs below.
 
-Alerting failures do NOT affect the exit code: the CronJob's red history is the
-fallback signal for when PostHog is the thing that is down, so it has to mean
-"the database work failed" and nothing else.
+Alerting failures do NOT affect the exit code in general: the CronJob's red
+history is the fallback signal for when PostHog is the thing that is down, so
+it mostly has to mean "the database work failed" and nothing else.
+
+Two deliberate exceptions, both for the same reason -- a state nobody was told
+about is indistinguishable from a healthy tick, and that indistinguishability
+is the bug this job exists to remove:
+
+  * a repair that dropped an index and could not announce it
+  * a canary that caught pg_search rejecting the production query and could
+    not announce it
+
+A promotion or debris alert going undelivered stays a log line: neither changed
+the database and neither means search is degraded right now.
 
     python -m scripts.cron_pg_search_guardian [--dry-run]
 """
@@ -38,17 +55,22 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+import time
 
+from engine.retrieval.retrievers.bm25 import bm25_scan_target as _resolve_scan_target
+from engine.retrieval.retrievers.bm25 import bm25_search
 from engine.shared.db import close_pool, get_pool, init_pool
 from engine.shared.logging import configure_logging, get_logger
 from engine.shared.ops_alert import capture
 from engine.shared.partitions import (
+    CHUNKS_PARENT,
     drop_tenant_partition,
     find_orphan_partitions,
 )
 from engine.shared.pg_search_guardian import (
     analyze_partitioned_parents,
     analyze_tables,
+    bm25_canary_probe,
     current_timeline_id,
     drop_broken_index,
     find_absent_required_indexes,
@@ -71,6 +93,28 @@ log = get_logger(__name__)
 # surprise workload on an instance that has just been promoted and is already
 # serving cold. These are the large ones on the retrieval hot path.
 ANALYZE_AFTER_PROMOTION = ["chunks", "documents"]
+
+#: Bounds for the query canary. Both are well under the CronJob's
+#: activeDeadlineSeconds: the canary is the LAST thing a tick does, so
+#: overrunning it costs only the canary, never the repair.
+#: pg_search's own words when it refuses a query shape. Matching on it keeps
+#: the rejection alarm about rejections.
+_PG_SEARCH_REJECTION = "Unsupported query shape"
+
+def _canary_tick() -> int:
+    """A number that ACTUALLY advances every tick, for canary rotation.
+
+    The first version rotated on `timeline`, the Postgres timeline id -- which
+    changes only on a failover, so it read 12 on every tick and the rotation it
+    fed never rotated at all: one tenant probed forever, every other tenant's
+    exact channel unwatched. A wall-clock minute is monotonic, needs no stored
+    state, and the CronJob's own schedule is per-minute.
+    """
+    return int(time.time() // 60)
+
+
+CANARY_PROBE_TIMEOUT_S = 30.0
+CANARY_SEARCH_TIMEOUT_S = 30.0
 
 # Indexes worth pg_prewarm'ing after a promotion -- what the DEFAULT search
 # path actually walks, in the order a cold search hits them. The LIVE partial
@@ -313,6 +357,100 @@ async def run_once(*, dry_run: bool = False) -> int:
         if not dry_run:
             await record_timeline(conn, timeline)
 
+        # ---- the query canary: a healthy index is not a working query ----
+        # AFTER record_timeline, for the reason the prewarm comment below
+        # spells out: this calls into retrieval and can block on a pool
+        # acquisition or a slow search, and a tick killed by
+        # activeDeadlineSeconds before the timeline is recorded livelocks the
+        # repair. Detection and repair are already done and durable by here;
+        # the canary is the last thing that can cost anything.
+        #
+        # Runs the REAL `bm25_search`, not a copy of its SQL -- a copy is how
+        # the original verification passed while production failed. Twice:
+        # once as production routes it (the tenant's partition) and once
+        # forced onto the parent, because the first fix for this had a
+        # fallback to the parent that was itself rejected.
+        #
+        # `wait_for` because `bm25_search` acquires its OWN pool connection
+        # while this one is still held: with a small pool that is a wait, and
+        # an unbounded wait here is the livelock this placement exists to
+        # avoid. The bound is deliberately well under the job deadline.
+        nonlocal_rejected = False
+        canary_announced = True
+        try:
+            probe = await asyncio.wait_for(
+                bm25_canary_probe(conn, offset=_canary_tick()), CANARY_PROBE_TIMEOUT_S
+            )
+            if probe is None:
+                log.info("guardian.bm25_canary_skipped",
+                         reason="no active tenant yielded a sampleable token")
+            else:
+                tenant, term = probe
+                rejected: dict[str, str] = {}
+                # The RESOLVED relation, not the requested path: for a tenant
+                # without its own partition both runs scan the parent, and
+                # logging "partition" there claims coverage that did not happen.
+                resolved_partition = await _resolve_scan_target(conn, tenant)
+                for path, override in (
+                    (resolved_partition, None),
+                    (CHUNKS_PARENT, CHUNKS_PARENT),
+                ):
+                    try:
+                        hits = await asyncio.wait_for(
+                            bm25_search(tenant, term, top_k=1,
+                                        _scan_target_override=override),
+                            CANARY_SEARCH_TIMEOUT_S,
+                        )
+                    except Exception as exc:
+                        rejected[path] = f"{type(exc).__name__}: {exc}"
+                        log.warning("guardian.bm25_canary_rejected", path=path,
+                                    tenant=tenant, term=term,
+                                    error=rejected[path])
+                        continue
+                    if not hits:
+                        log.warning("guardian.bm25_canary_zero_hits", path=path,
+                                    tenant=tenant, term=term)
+                    else:
+                        log.info("guardian.bm25_canary_ok", path=path,
+                                 tenant=tenant, hits=len(hits))
+                if rejected:
+                    nonlocal_rejected = True
+                    # ONE event per tick naming every failed path, not one per
+                    # path: on an unpartitioned database both paths resolve to
+                    # the same relation and would otherwise double-count the
+                    # same defect. Fired on STATE, not on transition, unlike
+                    # the absence detectors above -- an absence lasts hours by
+                    # design while a rejected query means half of every
+                    # search's recall is gone until someone deploys, which is
+                    # worth repeating every tick.
+                    canary_announced = capture(
+                        "kb_pg_search_query_rejected",
+                        {
+                            "paths": sorted(rejected),
+                            "tenant": tenant,
+                            # NO `term`. It is sampled from the tenant's own
+                            # chunk title/content, so it is customer document
+                            # text, and `capture` POSTs to PostHog. Every
+                            # sibling event here carries structural metadata
+                            # only. The literal term stays in the log lines
+                            # above, which is what an operator needs to
+                            # reproduce the rejection.
+                            "term_length": len(term),
+                            "error": next(iter(rejected.values()))[:300],
+                            "timeline_id": timeline,
+                            "state": "pg_search rejects the production BM25 "
+                            "query; the exact channel is returning nothing "
+                            "while searches report ok",
+                        },
+                    )
+        except TimeoutError:
+            log.warning("guardian.bm25_canary_timeout",
+                        reason="canary exceeded its bound; repair and timeline "
+                               "are already durable")
+        except Exception as exc:
+            log.warning("guardian.bm25_canary_failed",
+                        error=f"{type(exc).__name__}: {exc}")
+
         # Prewarm AFTER the repair and AFTER the timeline is recorded, on
         # purpose and against the reading order. The warm is minutes of
         # sequential I/O on a freshly promoted instance, and the CronJob has
@@ -341,6 +479,20 @@ async def run_once(*, dry_run: bool = False) -> int:
     # undelivered is worth a log, not a red job -- neither changed the
     # database, and reporting them the same way would make red mean "something
     # happened" instead of "a change was made and nobody was told".
+    # Same contract as the repair below, for the same reason: a detected
+    # failure nobody was told about is indistinguishable from a healthy tick,
+    # and that indistinguishability is the entire bug this canary exists to
+    # close. A rejected exact channel is a change in what search returns even
+    # though the guardian changed nothing, so it earns the red job that a
+    # promotion or debris alert does not.
+    if nonlocal_rejected and not canary_announced:
+        log.error(
+            "guardian.bm25_canary_unannounced",
+            reason="pg_search rejected the production query and the alert could "
+            "not be delivered; failing the job so it is visible in CronJob history",
+        )
+        return 1
+
     if dropped and not announced:
         log.error(
             "guardian.repair_unannounced",

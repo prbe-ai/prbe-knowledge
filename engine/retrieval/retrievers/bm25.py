@@ -78,11 +78,24 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
 
+import asyncpg
+
 from engine.retrieval.helpers import origin_of, project_scope_predicate, source_key_predicate
 from engine.retrieval.temporal import build_predicate, live_version_join
 from engine.shared.constants import TOP_K_BM25
 from engine.shared.db import with_tenant
+from engine.shared.logging import get_logger
 from engine.shared.models import TemporalSpec, normalize_author_id
+from engine.shared.partitions import (
+    CHUNKS_PARENT,
+    PARTITION_PREFIX,
+    UnsafeCustomerId,
+    is_partitioned,
+    partition_exists,
+    partition_name_for,
+)
+
+log = get_logger(__name__)
 
 # Pull alphanumeric/underscore runs as tokens. Hyphens split — Postgres'
 # `english` parser already produces the individual hex parts of a UUID
@@ -200,6 +213,100 @@ _BM25_V3_INDEX = "idx_chunks_bm25_v3"
 #: until it recycles. That is correct, just not optimal, and it is the safe
 #: direction: the join predicate returns the same rows, more slowly.
 _bm25_v3_available: bool | None = None
+
+
+#: A relation this pool is allowed to scan: the parent, or a partition named the
+#: way `partition_name_for` names them. Anything else is refused rather than
+#: quoted, matching `_SAFE_CUSTOMER_ID` in engine/shared/partitions.py.
+#: `fullmatch`, not a `$` anchor: in Python `$` also matches just before one
+#: trailing newline, so `"chunks\n"` would pass a `^...$` form.
+_SAFE_SCAN_TARGET = re.compile(
+    rf"(?:{re.escape(CHUNKS_PARENT)}|{re.escape(PARTITION_PREFIX)}[a-z0-9_]{{1,55}})"
+)
+
+
+#: Process-lifetime cache: a table does not stop being partitioned while a
+#: process runs, and the conversion is an attended, out-of-band operation
+#: whose last step rolls every pod. Same shape as `_bm25_v3_available`.
+_CHUNKS_PARTITIONED: bool | None = None
+
+
+def _validated_scan_target(name: str | None) -> str | None:
+    """Gate for the one identifier this module interpolates rather than binds."""
+    if name is None:
+        return None
+    if not _SAFE_SCAN_TARGET.fullmatch(name):
+        raise ValueError(
+            f"refusing to scan an unrecognized relation: {name!r}. The BM25 pool "
+            f"may only target {CHUNKS_PARENT!r} or a {PARTITION_PREFIX!r} partition."
+        )
+    return name
+
+
+async def bm25_scan_target(conn: Any, customer_id: str) -> str:
+    """The relation this tenant's BM25 pool scans: its partition, or `chunks`.
+
+    A SPEED OPTIMISATION, NOT A CORRECTNESS REQUIREMENT -- and it matters
+    which, because the first version of this was the other thing. It was
+    written as the fix for pg_search rejecting the pool query on a partitioned
+    parent, which made its own fallback a lie: `chunks` was returned for a
+    tenant without a partition and then rejected by exactly the shape this
+    was meant to route around. The actual defect was a SQL predicate on the
+    partition key (see the pool query's comment), and with that gone the pool
+    query is valid against the parent and against a partition alike.
+
+    So the fallback is real now, and what this buys is time. Both paths prune
+    to one partition -- RLS's `current_setting()` qual prunes at execution
+    time -- but under an Append pg_search cannot push its top-K into the scan,
+    so the outer sort does the work. Measured on the research plane, the real
+    pool shape, LIMIT 400:
+
+        tenant      parent (pruned to 1)    partition by name
+        monarcha            100 ms                  73 ms
+        probe             1,412 ms                 406 ms
+
+    Every BM25 query is tenant-scoped -- the `customer_id` match is a `must`
+    -- so one partition IS the whole search space, and naming it costs nothing
+    in recall.
+
+    Falls back to `chunks` when this database is not partitioned (the other
+    plane, a fresh install, a test fixture) or when the tenant has no partition
+    of its own, because DEFAULT holds those rows and only the parent reaches
+    them. `is_partitioned` is cached for the process lifetime in
+    `_CHUNKS_PARTITIONED` -- a table does not stop being partitioned while a
+    process runs. `partition_exists` deliberately still hits the catalog every
+    call: a tenant provisioned after this process started has a partition this
+    process has never seen, and that lookup is what notices.
+    """
+    global _CHUNKS_PARTITIONED
+    if _CHUNKS_PARTITIONED is None:
+        _CHUNKS_PARTITIONED = await is_partitioned(conn)
+    if not _CHUNKS_PARTITIONED:
+        return CHUNKS_PARENT
+    try:
+        # NOT cached: a tenant provisioned after this process started has a
+        # partition this process has never seen, and `partition_exists` is the
+        # lookup that notices. Only the table-shape answer is process-stable.
+        if not await partition_exists(conn, customer_id):
+            return CHUNKS_PARENT
+        return partition_name_for(customer_id)
+    except UnsafeCustomerId:
+        # `customers.customer_id` is bare TEXT with no CHECK, so an id outside
+        # `_SAFE_CUSTOMER_ID` (a space, non-ASCII, 64+ chars) is storable --
+        # and `partition_name_for` refuses to build DDL for it, correctly.
+        # Raising HERE would be wrong: it would kill the exact channel on
+        # EVERY search for that tenant, forever, surfaced only as `degraded`,
+        # which is the precise failure this whole file exists to stop. Such a
+        # tenant has no partition and its rows are in DEFAULT, which only the
+        # parent reaches, so the parent is both the safe answer and the
+        # correct one.
+        log.warning(
+            "bm25.unsafe_customer_id_falls_back_to_parent",
+            customer_id=customer_id,
+            reason="no partition can be named for this id; DEFAULT holds its "
+            "rows and only the parent reaches them",
+        )
+        return CHUNKS_PARENT
 
 
 async def bm25_project_scope_is_index_side(conn: Any) -> bool:
@@ -333,6 +440,8 @@ async def bm25_search(
     source_keys_include_keyless: bool = False,
     project_id: str | None = None,
     per_source_top_k: int | None = None,
+    *,
+    _scan_target_override: str | None = None,
 ) -> list[BM25Hit]:
     """`include_drafts` defaults to False — retrieval hides ``visibility='draft'``
     rows (see migration 0082 + Plan A Component 6). Reviewer surfaces pass
@@ -400,8 +509,16 @@ async def bm25_search(
         #
         # This is the identical trap the customer_id clause below documents,
         # one field over. conjunction_mode requires EVERY token of the id,
-        # which is why it is a sound pre-filter; the SQL predicate is what
-        # makes the answer exact, so a tokenized near-match cannot leak.
+        # which is why it is a sound pre-filter; the SQL predicate beside it is
+        # what makes the answer exact, so a tokenized near-match cannot leak.
+        #
+        # NOTE the asymmetry with customer_id, which the long comment below
+        # spells out: for THAT field the primary control is FORCE ROW LEVEL
+        # SECURITY and the SQL predicate is a secondary backstop for when the
+        # policy does not apply, because customer_id is the partition key and
+        # the obvious `= $1` form is the shape pg_search rejects. project_id is
+        # not a partition key and carries no policy, so here the SQL predicate
+        # really is the whole correctness story.
         project_index_side = bool(project_id) and await bm25_project_scope_is_index_side(conn)
         project_must = ""
         if project_index_side:
@@ -483,15 +600,77 @@ async def bm25_search(
         # hyphenated tenant (verified live). conjunction_mode requires every
         # token of the id, which is correct and cheap.
         #
-        # The SQL predicates STAY, because the index-side clause is a
-        # pre-filter, not the correctness filter: tokenized ids overlap
-        # ('probe' matches probe-demo's first token), and under FORCE RLS the
-        # policy qual re-applies the tenant check regardless. Belt and braces,
-        # in that order.
+        # THERE IS DELIBERATELY NO `c.customer_id = $1` IN THE SQL. It used to
+        # be here as belt-and-braces over the index-side clause, on the
+        # reasoning that tokenized ids overlap ('probe' matches probe-demo's
+        # first token). The reasoning was right; the predicate was the bug.
+        #
+        # `customer_id` is the PARTITION KEY. A SQL equality on it engages
+        # partition pruning, and pg_search's custom scan cannot sit under that
+        # on a partitioned parent: the whole pool query is rejected with
+        # `Unsupported query shape`, the channel returns nothing, and the
+        # search still reports `state: ok`. Bisected live, same rows, same
+        # index -- every other clause and the projection pass in every
+        # combination; this one predicate fails in every combination. It took
+        # the exact channel from 10% degraded to 98% the moment `chunks` was
+        # partitioned, and a customer noticed before we did.
+        #
+        # A SECOND CONTROL IS STILL HERE, just written in a shape pg_search
+        # accepts: `customer_id = current_setting(...)` rather than
+        # `customer_id = $1`. It is the partition key either way, but a stable
+        # function is not a bound parameter, so it prunes at EXECUTION time and
+        # never takes the rejected path -- measured on the parent, 400 rows, 1
+        # partition scanned, same as the bare query. That matters because it is
+        # the layer RLS cannot be: an explicit predicate in the query text still
+        # applies when the policy does NOT -- a superuser, a role with
+        # BYPASSRLS, or a future `NO FORCE`. Losing that was the one real
+        # regression in dropping the `$1` form, and it costs nothing to keep.
+        #
+        # Why it is not merely redundant with the policy it duplicates: verified
+        # live that the tokenized pre-filter alone is NOT sufficient. With the
+        # GUC bound to `probe-demo` and the index-side match asking for `probe`,
+        # the pre-filter matched 9,924 of probe-demo's rows -- `probe` is a
+        # conjunction token of `probe-demo` -- and only the tenant qual
+        # separated them.
+        #
+        # The primary control remains FORCE ROW LEVEL SECURITY:
+        # the policy qual `customer_id = current_setting(...)` is applied to
+        # every row, owner included, and because it is a stable function
+        # rather than a bound parameter it prunes at execution time WITHOUT
+        # taking the rejected path (measured: 1 partition scanned, 15
+        # subplans removed). The index-side clause below stays as the cheap
+        # pre-filter it always was. `test_bm25_pool_cannot_leak_across_
+        # token_sharing_tenants` pins the isolation that this comment used to
+        # merely assert.
         tenant_must = "paradedb.match('customer_id', $1, conjunction_mode => true)"
         visibility_must = (
             "" if include_drafts else "paradedb.term('visibility', 'approved'),"
         )
+        # `_scan_target_override` is the pg_search guardian's seam and nothing
+        # else's: the canary runs this exact function once as production does
+        # and once forced onto the parent, because the first fix for the
+        # partitioned-parent rejection had a fallback to the parent that was
+        # itself rejected -- dead code that read as a safety net. Forcing the
+        # path is the only way to know the fallback is alive.
+        #
+        # VALIDATED, not trusted, because it is interpolated as a RELATION NAME
+        # and no bind parameter can carry one. `partition_name_for` already
+        # refuses an unsafe customer_id loudly rather than quoting and hoping;
+        # this is the same gate one layer up, and it is what keeps a future
+        # caller -- or a stray argument -- from pointing the pool at an
+        # arbitrary table, where FORCE RLS on `chunks` would protect nothing.
+        # Keyword-only for the same reason: nothing should reach it positionally.
+        scan_target = _validated_scan_target(_scan_target_override) or (
+            await bm25_scan_target(conn, customer_id)
+        )
+        # No lock is held between resolving that name and running the query, and
+        # the guardian's orphan sweeper DETACHes and DROPs a deleted tenant's
+        # partition. Reproduced live: the window is real and raises
+        # UndefinedTableError. The parent always exists, so one retry there
+        # turns a lost channel into a served one -- and the tenant is already
+        # being deleted, so the answer is empty either way. Retrying is about
+        # not raising, not about the rows.
+        parent_retry_ok = scan_target != CHUNKS_PARENT
         pool_sql = f"""
             SELECT c.chunk_id,
                    c.doc_id,
@@ -502,8 +681,8 @@ async def bm25_search(
                    c.last_seen_version,
                    paradedb.score(c.chunk_id) AS score,
                    (c.content_tsv @@ to_tsquery('english', $4)) AS content_hit
-            FROM chunks c
-            WHERE c.customer_id = $1
+            FROM {scan_target} c
+            WHERE c.customer_id = current_setting('app.current_customer_id', true)
               AND c.chunk_id @@@ paradedb.boolean(must => ARRAY[
                     {tenant_must},
                     {visibility_must}
@@ -601,7 +780,23 @@ async def bm25_search(
         else:
             sql = f"{inner_sql}\n            ORDER BY {order_by_sql}\n            LIMIT $3"
 
-        rows = await conn.fetch(sql, *params)
+        try:
+            rows = await conn.fetch(sql, *params)
+        except asyncpg.exceptions.UndefinedTableError:
+            # The partition resolved above was dropped before the query ran.
+            if not parent_retry_ok:
+                raise
+            log.warning(
+                "bm25.scan_target_vanished",
+                customer_id=customer_id,
+                scan_target=scan_target,
+                reason="partition dropped between resolution and query; "
+                "retrying on the parent",
+            )
+            rows = await conn.fetch(
+                sql.replace(f"FROM {scan_target} c", f"FROM {CHUNKS_PARENT} c", 1),
+                *params,
+            )
 
     return [
         BM25Hit(
