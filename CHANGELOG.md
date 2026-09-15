@@ -6,6 +6,27 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Fixed
+
+- Indexed the three foreign keys whose absence made a tenant purge impossible. Postgres indexes
+  the REFERENCED side of a foreign key and never the REFERENCING side, so a delete of a
+  referenced row runs an RI check against the child table — and with no index that check is a
+  sequential scan, once per deleted row. `documents.ingestion_event_id` (`ON DELETE SET NULL`,
+  4 GB / 928,402 rows) had recorded **277,693 such scans and 241 billion tuples read** on the
+  research plane; 3,869 `ingestion_events` rows were unpurgeable at any batch size, and
+  research-os's purge reaper spent 45 minutes timing out on them. With the index the same purge
+  finished in 9 seconds. `graph_edges.from_node_id` / `.to_node_id` are the same shape and were
+  next in line — `idx_graph_edges_from` / `_to` look like they cover them but lead with
+  `customer_id`, so neither serves the RI check's bare `from_node_id = $1`.
+
+  All three were built attended via `CREATE INDEX CONCURRENTLY` on the research plane, so
+  migration `0135` is a no-op there; it exists for every other plane, and `db/schema.sql` carries
+  them for fresh installs, which bootstrap from schema rather than replaying the chain.
+
+  Not changed, deliberately: `documents.ingestion_event_id` is NULL in 100% of rows, so that
+  foreign key may not be earning its keep at all — but dropping a constraint is a decision and an
+  index is not.
+
 ### Added
 
 - **`/retrieve` takes a pre-search scope.** `scope: {project_id}` hard-filters

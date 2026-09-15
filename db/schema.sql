@@ -276,6 +276,12 @@ CREATE INDEX idx_documents_title_trgm ON documents USING GIN (title gin_trgm_ops
 
 -- GIN over the weighted title tsvector (migration 0099).
 CREATE INDEX idx_documents_title_tsv ON documents USING GIN (title_tsv);
+-- Supports the FK below to ingestion_events. Postgres indexes the REFERENCED
+-- side of a foreign key and never the REFERENCING side, so without this every
+-- DELETE from ingestion_events sequentially scans this whole table, once per
+-- deleted row. Measured on the research plane: 277,693 such scans, 241 billion
+-- tuples read, and a tenant purge that could not complete at any batch size.
+CREATE INDEX idx_documents_ingestion_event_id ON documents (ingestion_event_id);
 -- Partial index keeps the doc-type listing path from scanning draft rows
 -- once visibility='draft' artifacts start appearing. See migration 0082.
 CREATE INDEX IF NOT EXISTS documents_visibility_approved_idx
@@ -960,6 +966,11 @@ CREATE TABLE graph_edges (
 CREATE INDEX idx_graph_edges_customer_type ON graph_edges (customer_id, edge_type);
 CREATE INDEX idx_graph_edges_from ON graph_edges (customer_id, from_node_id, edge_type);
 CREATE INDEX idx_graph_edges_to ON graph_edges (customer_id, to_node_id, edge_type);
+-- The two above lead with customer_id and therefore do NOT serve the RI checks
+-- for the node FKs, which ask for a bare `from_node_id = $1`. Without these,
+-- deleting one graph_nodes row sequentially scans graph_edges twice.
+CREATE INDEX idx_graph_edges_from_node_id_fk ON graph_edges (from_node_id);
+CREATE INDEX idx_graph_edges_to_node_id_fk ON graph_edges (to_node_id);
 CREATE INDEX idx_graph_edges_confidence
     ON graph_edges (customer_id, edge_type, confidence);
 -- Lane B: partial index for prompt-version invalidation queries.
