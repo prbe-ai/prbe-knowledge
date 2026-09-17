@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 import structlog
 
 from engine.ingest.secret_redaction import available, redact_documents_async
+from engine.shared.exceptions import ScanUnavailable
 from engine.shared.db import with_tenant
 from engine.shared.exceptions import ScanUnavailable
 
