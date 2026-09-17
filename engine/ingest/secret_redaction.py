@@ -69,11 +69,13 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
 import structlog
 
+from engine.ingest import redactd
 from engine.shared.config import get_settings
 from engine.shared.exceptions import ScanUnavailable
 
@@ -112,6 +114,34 @@ class Redaction:
     line: int
 
 
+_supervisor: redactd.RedactdSupervisor | None = None
+_supervisor_lock = threading.Lock()
+
+
+def _shared_supervisor() -> redactd.RedactdSupervisor:
+    """One daemon per process, started on first use.
+
+    Lazy rather than at import: importing this module must not fork anything,
+    or every CLI script and test collection that touches it inherits a child.
+    """
+    global _supervisor
+    with _supervisor_lock:
+        if _supervisor is None:
+            sup = redactd.RedactdSupervisor()
+            sup.start()
+            _supervisor = sup
+        return _supervisor
+
+
+def shutdown_supervisor() -> None:
+    """Stop the process-wide daemon, if one was started."""
+    global _supervisor
+    with _supervisor_lock:
+        if _supervisor is not None:
+            _supervisor.stop()
+            _supervisor = None
+
+
 def binary_path() -> str | None:
     """The gitleaks binary, or None when this deployment has none."""
     override = os.environ.get(_BIN_ENV)
@@ -121,6 +151,10 @@ def binary_path() -> str | None:
 
 
 def available() -> bool:
+    """Is a scanner present at all? Either transport counts: the sweep uses
+    this to refuse to report "0 findings" on a deployment that cannot scan."""
+    if not redactd.disabled() and redactd.binary_path() is not None:
+        return True
     return binary_path() is not None
 
 
@@ -137,18 +171,67 @@ def find_secrets(text: str) -> list[tuple[str, str, int]]:
     that may have re-wrapped the text. They are held in memory for the length
     of one call and MUST NOT be logged, persisted, or put in an exception.
     """
+    return scan_many([text])[0]
+
+
+def scan_many(texts: list[str]) -> list[list[tuple[str, str, int]]]:
+    """`find_secrets` for several texts at once, one result list per input.
+
+    With `redactd` this is ONE round trip of a few hundred microseconds. On the
+    CLI path it is one subprocess per window per text, which is why the daemon
+    exists. Same contract either way: an empty list means "scanned, clean", and
+    anything that is not a verdict raises `ScanUnavailable`.
+    """
+    if not texts:
+        return []
+    if redactd.disabled():
+        return [_find_secrets_via_cli(t) for t in texts]
+    supervisor = _shared_supervisor()
+    # Windowing still applies: the daemon has the same 8 MiB ceiling, and a
+    # document over it must be scanned in parts rather than truncated.
+    windowed: list[str] = []
+    spans: list[tuple[int, int]] = []
+    for text in texts:
+        start = len(windowed)
+        if not text or not text.strip():
+            spans.append((start, start))
+            continue
+        for window in _windows(text.encode("utf-8", errors="replace")):
+            windowed.append(window.decode("utf-8", errors="replace"))
+        spans.append((start, len(windowed)))
+    if not windowed:
+        return [[] for _ in texts]
+
+    results: list[list[tuple[str, str, int]]] = []
+    # Chunked so one very large batch cannot exceed the server's own ceilings.
+    scanned: list[list[tuple[str, str, int]]] = []
+    for i in range(0, len(windowed), redactd.MAX_TEXTS):
+        scanned.extend(supervisor.scan(windowed[i : i + redactd.MAX_TEXTS]))
+    for start, end in spans:
+        seen: set[tuple[str, str]] = set()
+        merged: list[tuple[str, str, int]] = []
+        for per_window in scanned[start:end]:
+            for rule, secret, line in per_window:
+                # Windows overlap, so the same credential can be reported twice.
+                if (rule, secret) in seen:
+                    continue
+                seen.add((rule, secret))
+                merged.append((rule, secret, line))
+        results.append(merged)
+    return results
+
+
+def _find_secrets_via_cli(text: str) -> list[tuple[str, str, int]]:
+    """The pre-daemon path. Selected by PROBE_REDACTD_DISABLED, and used by the
+    differential test as the oracle the daemon is checked against."""
     if not text or not text.strip():
         return []
     binary = binary_path()
     if binary is None:
-        # A deployment-shape problem, not a scan failure, but the consequence
-        # is identical: this text is unscanned. Fail closed unless the operator
-        # has said this deployment ships without a scanner.
         if get_settings().secret_redaction_fail_closed:
             raise ScanUnavailable("credential scanner binary not found", env_var=_BIN_ENV)
         log.warning("secret_redaction.binary_missing", env_var=_BIN_ENV)
         return []
-
     encoded = text.encode("utf-8", errors="replace")
     out: list[tuple[str, str, int]] = []
     seen: set[tuple[str, str]] = set()
