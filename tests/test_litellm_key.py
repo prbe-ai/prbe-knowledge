@@ -187,9 +187,11 @@ async def test_context_unbinds_on_exception() -> None:
 
     transport = httpx.MockTransport(handler)
     with pytest.raises(RuntimeError):
-        async with httpx.AsyncClient(transport=transport) as http:
-            async with tenant_virtual_key_context("cust-xyz", http=http):
-                raise RuntimeError("boom")
+        async with (
+            httpx.AsyncClient(transport=transport) as http,
+            tenant_virtual_key_context("cust-xyz", http=http),
+        ):
+            raise RuntimeError("boom")
     assert current_tenant_virtual_key() is None
 
 
@@ -213,12 +215,14 @@ async def test_acompletion_uses_tenant_key_over_env_key(
     fake = AsyncMock(return_value="resp")
     transport = httpx.MockTransport(handler)
     with patch.object(llm.litellm, "acompletion", fake):
-        async with httpx.AsyncClient(transport=transport) as http:
-            async with tenant_virtual_key_context("cust-abc", http=http):
-                await llm.acompletion(
-                    "anthropic/claude-sonnet-4-6",
-                    [{"role": "user", "content": "x"}],
-                )
+        async with (
+            httpx.AsyncClient(transport=transport) as http,
+            tenant_virtual_key_context("cust-abc", http=http),
+        ):
+            await llm.acompletion(
+                "anthropic/claude-sonnet-4-6",
+                [{"role": "user", "content": "x"}],
+            )
 
     kwargs = fake.await_args.kwargs
     assert kwargs["api_base"] == "http://litellm.litellm.svc.cluster.local:4000"
@@ -257,9 +261,11 @@ async def test_acompletion_no_api_key_without_gateway_url(
     transport = httpx.MockTransport(handler)
     fake = AsyncMock(return_value="resp")
     with patch.object(llm.litellm, "acompletion", fake):
-        async with httpx.AsyncClient(transport=transport) as http:
-            async with tenant_virtual_key_context("cust-abc", http=http):
-                await llm.acompletion("anthropic/claude-sonnet-4-6", [])
+        async with (
+            httpx.AsyncClient(transport=transport) as http,
+            tenant_virtual_key_context("cust-abc", http=http),
+        ):
+            await llm.acompletion("anthropic/claude-sonnet-4-6", [])
 
     # Without LLM_GATEWAY_URL the wrapper sends neither api_base nor api_key.
     assert "api_base" not in fake.await_args.kwargs
@@ -279,13 +285,15 @@ async def test_caller_api_key_still_wins(monkeypatch: pytest.MonkeyPatch) -> Non
     transport = httpx.MockTransport(handler)
     fake = AsyncMock(return_value="resp")
     with patch.object(llm.litellm, "acompletion", fake):
-        async with httpx.AsyncClient(transport=transport) as http:
-            async with tenant_virtual_key_context("cust-abc", http=http):
-                await llm.acompletion(
-                    "anthropic/claude-sonnet-4-6",
-                    [],
-                    api_key="sk-explicit-override",
-                )
+        async with (
+            httpx.AsyncClient(transport=transport) as http,
+            tenant_virtual_key_context("cust-abc", http=http),
+        ):
+            await llm.acompletion(
+                "anthropic/claude-sonnet-4-6",
+                [],
+                api_key="sk-explicit-override",
+            )
 
     assert fake.await_args.kwargs["api_key"] == "sk-explicit-override"
 
