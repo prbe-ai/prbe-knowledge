@@ -175,6 +175,7 @@ jobs:
           tests/test_queue_tiers.py
           tests/test_redactd.py
           tests/test_claim_protocol.py
+          tests/test_queue_age.py
 
       # Scoped to the STORAGE suite (Postgres + MinIO), not `tests/` wholesale.
       # The full suite has ~42 pre-existing failures unrelated to storage: tests that

@@ -671,12 +671,20 @@ CREATE TABLE ingestion_queue (
     status               TEXT NOT NULL DEFAULT 'pending',
     attempts             INT  NOT NULL DEFAULT 0,
     error                TEXT,
-    priority             SMALLINT NOT NULL DEFAULT 100,
+    -- 75 = PRIORITY_LIVE_INTEGRATION (shared.constants). Was 100, which under
+    -- the tier table means PRIORITY_RESEARCH_CONTENT -- the TOP tier for any
+    -- insert that forgets to name one.
+    priority             SMALLINT NOT NULL DEFAULT 75,
     -- Monotonic counter, bumped on every UPSERT into the row. Worker
     -- captures it on claim and CAS-commits on it, so any batch landing
     -- mid-Phase-A triggers a clean re-claim with the extended array.
     version              INT NOT NULL DEFAULT 0,
     enqueued_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- When the work ARRIVED. `enqueued_at` is bumped by every transcript
+    -- batch (session_completer reads MAX(enqueued_at) as an idle signal), so
+    -- an active session looks permanently young and a queue that is not
+    -- draining reads as a queue with nothing old in it. Set once, on insert.
+    first_enqueued_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     started_at           TIMESTAMPTZ,
     heartbeat_at         TIMESTAMPTZ,
     completed_at         TIMESTAMPTZ,
@@ -684,6 +692,7 @@ CREATE TABLE ingestion_queue (
 );
 CREATE INDEX idx_queue_pending_priority ON ingestion_queue (priority DESC, enqueued_at) WHERE status = 'pending';
 CREATE INDEX idx_queue_processing ON ingestion_queue (status, heartbeat_at) WHERE status = 'processing';
+CREATE INDEX ingestion_queue_pending_first_enqueued_idx ON ingestion_queue (first_enqueued_at) WHERE status IN ('pending', 'processing');
 CREATE INDEX idx_queue_customer_status ON ingestion_queue (customer_id, status, enqueued_at);
 
 -- ---------------------------------------------------------------------------
