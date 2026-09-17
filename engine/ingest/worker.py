@@ -16,6 +16,7 @@ from typing import Any
 
 import asyncpg
 
+from engine.ingest import queue_age
 from engine.ingest.handlers.base import ConnectorContext
 from engine.ingest.normalizer import Normalizer
 from engine.shared.constants import (
@@ -1082,6 +1083,13 @@ def _build_health_app(drain_stall_threshold_seconds: float | None = None):
             drain_ok = stalled_for < drain_stall_threshold_seconds
             body["drain_idle_seconds"] = round(stalled_for, 1)
             body["drain_stall_threshold_seconds"] = drain_stall_threshold_seconds
+        # Backlog age rides along, read from the sampler's snapshot -- NEVER
+        # queried here. A scan-shaped query behind a liveness probe turns "the
+        # queue is deep" into "restart the thing that drains it".
+        body.update(queue_age.latest().as_body())
+        # Deliberately NOT part of `ok`. A deep queue is a thing to alert a
+        # human about, not a reason for kubelet to kill the only worker
+        # draining it.
         ok = db_ok and drain_ok
         body["status"] = "ok" if ok else "degraded"
         body["drain"] = drain_ok

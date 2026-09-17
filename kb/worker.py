@@ -21,6 +21,7 @@ import asyncpg
 
 from engine.ingest import secret_redaction
 from engine.ingest.handlers.base import ConnectorContext, make_default_context
+from engine.ingest.queue_age import QueueAgeReporter
 from engine.ingest.worker import ReclaimLoop, Worker, _build_health_app
 from engine.shared.constants import (
     GRANOLA_REFRESH_CHANNEL,
@@ -290,6 +291,10 @@ async def run_worker_forever() -> None:
     # reads it to break its poll sleep early. Single asyncio.Event because
     # both live in the same process.
     wake_event = asyncio.Event()
+    # Constructed with its siblings: `handle_signal` closes over it, so a
+    # SIGTERM arriving between the handler being armed and this line would
+    # raise NameError inside the shutdown path.
+    queue_age_reporter = QueueAgeReporter()
     ingestion_worker = Worker(
         ctx,
         max_attempts=settings.worker_max_attempts,
@@ -360,6 +365,7 @@ async def run_worker_forever() -> None:
         granola_listener.shutdown()
         reclaim_loop.shutdown()
         integration_poller.shutdown()
+        queue_age_reporter.shutdown()
         secret_redaction.shutdown_supervisor()
         if poll_scheduler is not None:
             poll_scheduler.stop()
@@ -376,6 +382,7 @@ async def run_worker_forever() -> None:
 
     coroutines = [
         ingestion_worker.run(poll_interval=settings.worker_poll_interval_seconds),
+        queue_age_reporter.run(),
         backfill_worker.run(),
         github_control_worker.run(),
         granola_listener.run(),
