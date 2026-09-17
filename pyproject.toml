@@ -76,7 +76,12 @@ dev = [
     "pytest-asyncio>=0.24.0",
     "pytest-mock>=3.14.0",
     "respx>=0.21.0",
-    "ruff>=0.7.0",
+    # Upper-bounded on purpose. CI runs a bare `ruff check .` against whatever
+    # version resolves, so a MINOR ruff release can turn main red with no code
+    # change: 0.16.0 widened SIM117 to `async with` and a test untouched since
+    # 2026-08-29 started failing every PR. Raise the bound deliberately, in a
+    # change that also fixes whatever the new rules find.
+    "ruff>=0.7.0,<0.17",
     "mypy>=1.13.0",
     "types-python-dateutil",
 ]
