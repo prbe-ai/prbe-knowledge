@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+from datetime import datetime
 from typing import Any
 
 import structlog
@@ -164,6 +165,19 @@ class CredentialSweepRequest(BaseModel):
     #: sweep that writes first and asks later is one nobody will point at a
     #: customer's data.
     dry_run: bool = True
+    #: Only documents ingested at or after this moment. The shape you want
+    #: after fixing a scanner regression: the exposed window is known, and
+    #: re-sweeping a corpus an earlier run already cleared is hours of work
+    #: for nothing.
+    since: datetime | None = None
+    #: Resume a long sweep. Documents are walked in `doc_id` order and the
+    #: response carries `last_doc_id`; pass it back to continue.
+    after_doc_id: str | None = Field(default=None, max_length=512)
+    #: Bound ONE call. This endpoint is synchronous -- an operator who has just
+    #: been told a live key is in a customer's index wants the answer, not a
+    #: poll token -- so a full-corpus sweep must be walked in bounded calls
+    #: rather than held open in a single request until something times out.
+    max_documents: int = Field(default=2000, ge=1, le=20000)
 
 
 @router.post("/credentials", dependencies=[Depends(verify_internal_knowledge_key)])
@@ -183,7 +197,12 @@ async def sweep_stored_credentials(
     Rewrites, never deletes. The transcript stays; the credential does not.
     """
     result = await sweep_credentials(
-        customer_id, doc_ids=body.doc_ids or None, dry_run=body.dry_run
+        customer_id,
+        doc_ids=body.doc_ids or None,
+        dry_run=body.dry_run,
+        since=body.since,
+        after_doc_id=body.after_doc_id,
+        max_documents=body.max_documents,
     )
     if result.scan_failed:
         # Same reasoning as skipped_no_binary one branch down: a partial answer

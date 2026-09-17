@@ -157,6 +157,7 @@ jobs:
           tests/handlers/test_codex_registration.py
           tests/handlers/test_pi_registration.py
           tests/test_secret_redaction.py
+          tests/test_credential_sweep.py
 
       # Scoped to the STORAGE suite (Postgres + MinIO), not `tests/` wholesale.
       # The full suite has ~42 pre-existing failures unrelated to storage: tests that
