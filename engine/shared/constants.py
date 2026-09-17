@@ -852,17 +852,45 @@ QUEUE_ERROR_BACKOFF_SECONDS = 5.0
 # slow DB write without ever declaring a working worker dead.
 WORKER_DRAIN_STALL_THRESHOLD_SECONDS = 180.0
 
-# Default queue priority at enqueue time. Worker._claim_one orders by
-# priority DESC, so higher numbers claim first. Tiers:
+# Queue tiers. `Worker._claim_one` orders by priority DESC, so higher claims
+# first. ONE table, referenced by every connector and by backfill_runner --
+# the literals used to be spread across five files and three comments, which
+# is how the old comment came to describe a tier order the code no longer had.
 #
-#   100  — interactive webhooks: github, slack, notion, linear, granola, sentry
-#    75  — bursty agent/custom batches (claude_code, codex, custom_ingest)
-#    50  — backfill rows (set in backfill_runner.py); never blocks live work
+#   100  PRIORITY_RESEARCH_CONTENT   what a researcher deliberately wrote:
+#                                    notes, runs, experiments, artifacts,
+#                                    papers (custom_ingest)
+#    75  PRIORITY_LIVE_INTEGRATION   a human did something in a connected tool
+#                                    just now: slack, github, linear, notion,
+#                                    granola, sentry, manual uploads, incidents
+#    60  PRIORITY_AGENT_CAPTURE      automatic coding-agent transcripts:
+#                                    claude_code, codex, pi
+#    50  PRIORITY_BACKGROUND         backfills and code_graph; never blocks
+#                                    anything live
 #
-# Per-source overrides live on the connector classes and are read through
-# shared.source_registry (see SourceProfile.ingestion_priority); sources
-# without a registered profile fall back to this default.
-DEFAULT_INGESTION_PRIORITY = 100
+# WHY CONTENT OUTRANKS WEBHOOKS. Measured 2026-09-16: custom_ingest was 65,805
+# of the 79,000 rows in seven days and transcripts were 11,614, and they shared
+# ONE tier -- so a `probe note add` queued behind every other tenant's
+# transcript backlog, median 33 minutes to become searchable. Transcripts are
+# captured whether or not anyone is waiting; a note is written because someone
+# wanted it findable. Richard's call, 2026-09-16, with the mix on the table.
+#
+# WHY 60 AND NOT 50 FOR TRANSCRIPTS. 50 shares a tier with onboarding
+# backfills, oldest-first, so a new tenant's history import would sit ahead of
+# every live transcript for as long as it ran.
+#
+# What this tier table does NOT do: separate a deliberate write from a bulk
+# import, because the custom-ingest envelope carries nothing that says which
+# it is. `worker_per_customer_max_inflight` bounds the damage per lane; an
+# envelope priority hint is the real fix and is filed in TODOS.md.
+PRIORITY_RESEARCH_CONTENT = 100
+PRIORITY_LIVE_INTEGRATION = 75
+PRIORITY_AGENT_CAPTURE = 60
+PRIORITY_BACKGROUND = 50
+
+# Sources without a registered profile fall back to this. Live integrations are
+# the overwhelming majority of unregistered keys, so that is the safe default.
+DEFAULT_INGESTION_PRIORITY = PRIORITY_LIVE_INTEGRATION
 
 TOP_K_VECTOR = 50
 TOP_K_BM25 = 50

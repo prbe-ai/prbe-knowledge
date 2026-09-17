@@ -120,8 +120,8 @@ class Connector(ABC):
     #
     # Dotted prefix of this source's DocType family ("slack.", "github.", ...).
     doc_type_prefix: ClassVar[str] = DEFAULT_DOC_TYPE_PREFIX
-    # Queue priority at enqueue time (worker claims priority DESC): 100
-    # interactive webhooks, 75 bursty agent/custom batches, 50 backfill-tier.
+    # Queue priority at enqueue time (worker claims priority DESC). The tier
+    # table is shared.constants.PRIORITY_*; see it for what each tier means.
     ingestion_priority: ClassVar[int] = DEFAULT_INGESTION_PRIORITY
     # Post-RRF doc-score multiplier (< 1.0 demotes at equal relevance).
     score_multiplier: ClassVar[float] = DEFAULT_SCORE_MULTIPLIER

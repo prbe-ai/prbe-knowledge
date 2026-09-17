@@ -293,7 +293,7 @@ async def run_worker_forever() -> None:
         ctx,
         max_attempts=settings.worker_max_attempts,
         concurrency=settings.worker_max_concurrent,
-        per_customer_max_inflight=settings.worker_per_customer_max_inflight,
+        per_customer_max_inflight=settings.per_customer_cap(),
     )
     backfill_worker = BackfillWorker(
         ctx,

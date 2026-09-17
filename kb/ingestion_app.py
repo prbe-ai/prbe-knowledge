@@ -942,6 +942,12 @@ async def _enqueue(
                 ON CONFLICT (customer_id, source_system, source_event_id) DO UPDATE
                     SET payload_s3_keys = ingestion_queue.payload_s3_keys
                                           || EXCLUDED.payload_s3_keys,
+                        -- Take the tier from THIS enqueue, not the row's. A
+                        -- session row is created once and resumed for as long
+                        -- as the session lives, so without this a re-tier only
+                        -- reaches sessions that start after the deploy: old
+                        -- ones keep the priority they were born with, forever.
+                        priority = EXCLUDED.priority,
                         status = 'pending',
                         version = ingestion_queue.version + 1,
                         completed_at = NULL,

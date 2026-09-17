@@ -74,7 +74,7 @@ class Worker:
         ctx: ConnectorContext,
         max_attempts: int = 5,
         concurrency: int = 1,
-        per_customer_max_inflight: int = 10,
+        per_customer_max_inflight: int = 3,
         claim_coalesce_max: int | None = None,
     ) -> None:
         self._ctx = ctx
@@ -202,10 +202,12 @@ class Worker:
         single-element), version (monotonic counter for the CAS commit),
         attempts.
 
-        Higher `priority` claims first. Tier order at insert time
-        (shared.source_registry, registered per connector): live(100) >
-        claude_code(75) > backfill(50). One chatty CC user can't block
-        github/slack/notion/linear/granola/sentry traffic.
+        Higher `priority` claims first; the tier table is
+        `shared.constants.PRIORITY_*`, registered per connector through
+        shared.source_registry. Research content (100) > live integrations
+        (75) > agent captures (60) > background (50), so neither a chatty
+        transcript stream nor a backfill can sit in front of a note someone
+        deliberately wrote.
 
         Coalescing collapses N batches of the same Claude Code session
         into one queue row (services/ingestion/main.py:_enqueue UPSERTs
@@ -215,24 +217,36 @@ class Worker:
         approximated this in PR #33 is now dead code, removed here.
         """
         async with get_pool().acquire() as conn, conn.transaction():
-            # Per-customer in-flight cap: a customer with N rows already in
-            # `processing` is excluded from this claim. Soft cap (snapshot
-            # count, not a hard lock) — the goal is preventing one
-            # workspace's install-time burst from monopolizing the fleet,
-            # not strict enforcement. Two racing claim loops can both pass
-            # the threshold and over-spill by 1; that's fine.
+            # Per-customer, PER-TIER in-flight cap: a customer with N rows
+            # already `processing` IN THIS TIER is excluded from this claim.
+            # Soft cap (snapshot count, not a hard lock) — the goal is
+            # preventing one workspace's install-time burst from monopolizing
+            # the fleet, not strict enforcement. Two racing claim loops can
+            # both pass the threshold and over-spill by 1; that's fine.
+            #
+            # KEYED ON (customer_id, priority), not customer_id alone. Counted
+            # per customer, a tenant's own background work locks it out of its
+            # own foreground: three of its transcripts in flight made its next
+            # `probe note add` ineligible while worker slots sat idle, which is
+            # the exact starvation the tier table exists to prevent. Per tier,
+            # a burst can still only hold the cap's worth of slots in the lane
+            # it is bursting in. The cap is DERIVED from the loop count
+            # (`Settings.per_customer_cap`), so it can never quietly rise above
+            # the number of loops and stop capping anything, which is what 30
+            # against 6 had been doing.
             row = await conn.fetchrow(
                 """
                     WITH inflight AS (
-                        SELECT customer_id, COUNT(*) AS cnt
+                        SELECT customer_id, priority, COUNT(*) AS cnt
                         FROM ingestion_queue
                         WHERE status = $2
-                        GROUP BY customer_id
+                        GROUP BY customer_id, priority
                     )
                     SELECT q.queue_id, q.customer_id, q.source_system, q.source_event_id,
                            q.payload_s3_key, q.payload_s3_keys, q.version, q.attempts
                     FROM ingestion_queue q
-                    LEFT JOIN inflight i ON i.customer_id = q.customer_id
+                    LEFT JOIN inflight i
+                           ON i.customer_id = q.customer_id AND i.priority = q.priority
                     WHERE q.status = $1
                       AND COALESCE(i.cnt, 0) < $3
                     ORDER BY q.priority DESC, q.enqueued_at
@@ -271,15 +285,16 @@ class Worker:
             rows = await conn.fetch(
                 """
                     WITH inflight AS (
-                        SELECT customer_id, COUNT(*) AS cnt
+                        SELECT customer_id, priority, COUNT(*) AS cnt
                         FROM ingestion_queue
                         WHERE status = $2
-                        GROUP BY customer_id
+                        GROUP BY customer_id, priority
                     ),
                     pick AS (
                         SELECT q.customer_id, q.source_system
                         FROM ingestion_queue q
-                        LEFT JOIN inflight i ON i.customer_id = q.customer_id
+                        LEFT JOIN inflight i
+                               ON i.customer_id = q.customer_id AND i.priority = q.priority
                         WHERE q.status = $1
                           AND COALESCE(i.cnt, 0) < $3
                         ORDER BY q.priority DESC, q.enqueued_at
