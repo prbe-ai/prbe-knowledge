@@ -31,6 +31,19 @@ class _Proc:
 
 
 @pytest.fixture
+def cli_transport(monkeypatch):
+    """Force the gitleaks-CLI path.
+
+    The failure taxonomy below is the CLI's: timeout, spawn failure, non-zero
+    exit, unparseable report. `redactd` has its own, covered in
+    tests/test_redactd.py. Both must fail closed, and both are exercised --
+    but a test that monkeypatches `subprocess.run` is testing the CLI, and
+    silently passing because the daemon answered instead would make it
+    decoration."""
+    monkeypatch.setenv("PROBE_REDACTD_DISABLED", "1")
+
+
+@pytest.fixture
 def fresh_settings():
     """`get_settings` is `lru_cache`d, so a test that moves an env var must
     clear it BOTH ways: once before so the test sees its own value, and once
@@ -190,7 +203,7 @@ def test_findings_carry_no_value(monkeypatch) -> None:
         assert set(vars(finding)) == {"rule", "line"}
 
 
-def test_missing_binary_fails_closed(monkeypatch, fresh_settings) -> None:
+def test_missing_binary_fails_closed(monkeypatch, fresh_settings, cli_transport) -> None:
     """A deployment that should have the scanner and does not must not quietly
     store unscanned text. `ScanUnavailable` is transient, so the queue row
     retries instead of persisting."""
@@ -200,7 +213,7 @@ def test_missing_binary_fails_closed(monkeypatch, fresh_settings) -> None:
         secret_redaction.redact_documents([f"AWS Access Key ID [None]: {_AWS_ID}"])
 
 
-def test_missing_binary_can_be_opted_out_of(monkeypatch, fresh_settings) -> None:
+def test_missing_binary_can_be_opted_out_of(monkeypatch, fresh_settings, cli_transport) -> None:
     """The one deployment shape that may run without a scanner says so
     explicitly, and then gets the old pass-through."""
     monkeypatch.setenv("PROBE_GITLEAKS_BIN", "/nonexistent/gitleaks")
@@ -211,7 +224,7 @@ def test_missing_binary_can_be_opted_out_of(monkeypatch, fresh_settings) -> None
     assert findings == []
 
 
-def test_scanner_exiting_non_zero_is_not_a_clean_scan(monkeypatch) -> None:
+def test_scanner_exiting_non_zero_is_not_a_clean_scan(monkeypatch, cli_transport) -> None:
     """The failure that was completely silent until 2026-09-17: a rules file the
     installed gitleaks rejects produced no stdout, returned [], and the text was
     stored as if it had been cleared."""
@@ -224,7 +237,7 @@ def test_scanner_exiting_non_zero_is_not_a_clean_scan(monkeypatch) -> None:
     assert "bad config" in str(exc.value)
 
 
-def test_unparseable_report_is_not_a_clean_scan(monkeypatch) -> None:
+def test_unparseable_report_is_not_a_clean_scan(monkeypatch, cli_transport) -> None:
     monkeypatch.setattr(
         secret_redaction.subprocess, "run",
         lambda *a, **k: _Proc(returncode=0, stdout=b"{not json", stderr=b""),
@@ -233,7 +246,7 @@ def test_unparseable_report_is_not_a_clean_scan(monkeypatch) -> None:
         secret_redaction.find_secrets("anything at all")
 
 
-def test_spawn_failure_is_not_a_clean_scan(monkeypatch) -> None:
+def test_spawn_failure_is_not_a_clean_scan(monkeypatch, cli_transport) -> None:
     def _boom(*a, **k):
         raise OSError("no fork for you")
     monkeypatch.setattr(secret_redaction.subprocess, "run", _boom)
@@ -241,7 +254,7 @@ def test_spawn_failure_is_not_a_clean_scan(monkeypatch) -> None:
         secret_redaction.find_secrets("anything at all")
 
 
-def test_a_timeout_retries_once_then_fails_closed(monkeypatch) -> None:
+def test_a_timeout_retries_once_then_fails_closed(monkeypatch, cli_transport) -> None:
     """The 2026-09-16 shape: 328 timeouts in 22h under CPU starvation, each one
     a document stored unscanned. One retry, because a starved scan often clears
     on the next attempt; then closed."""

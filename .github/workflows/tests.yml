@@ -131,6 +131,20 @@ jobs:
       # Without it that suite SKIPS, which reads as a pass — so the suite
       # raises in CI when the binary is absent rather than quietly skipping,
       # and this step is what keeps it present.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache-dependency-path: tools/redactd/go.sum
+
+      - name: Build redactd
+        # The differential suite compares the daemon against the CLI on the
+        # outage corpus. Without the binary those tests SKIP, and a skip that
+        # looks like a pass is how a credential gate stops gating -- so
+        # tests/test_redactd.py raises in CI rather than skipping.
+        run: |
+          go -C tools/redactd build -o "$RUNNER_TEMP/redactd" .
+          echo "PROBE_REDACTD_BIN=$RUNNER_TEMP/redactd" >> "$GITHUB_ENV"
+
       - name: Install gitleaks
         run: |
           set -euo pipefail
@@ -159,6 +173,7 @@ jobs:
           tests/test_secret_redaction.py
           tests/test_credential_sweep.py
           tests/test_queue_tiers.py
+          tests/test_redactd.py
 
       # Scoped to the STORAGE suite (Postgres + MinIO), not `tests/` wholesale.
       # The full suite has ~42 pre-existing failures unrelated to storage: tests that

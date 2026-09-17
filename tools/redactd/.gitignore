@@ -1,0 +1,3 @@
+# Built by the image's Go stage and by CI; never committed. A 20MB binary in
+# git is a 20MB binary in every clone, forever.
+/redactd

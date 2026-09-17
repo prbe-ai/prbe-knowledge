@@ -19,6 +19,7 @@ from typing import NoReturn
 
 import asyncpg
 
+from engine.ingest import secret_redaction
 from engine.ingest.handlers.base import ConnectorContext, make_default_context
 from engine.ingest.worker import ReclaimLoop, Worker, _build_health_app
 from engine.shared.constants import (
@@ -359,6 +360,7 @@ async def run_worker_forever() -> None:
         granola_listener.shutdown()
         reclaim_loop.shutdown()
         integration_poller.shutdown()
+        secret_redaction.shutdown_supervisor()
         if poll_scheduler is not None:
             poll_scheduler.stop()
         health_server.should_exit = True
