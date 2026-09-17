@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 import structlog
 
 from engine.ingest.secret_redaction import available, redact_documents_async
+from engine.shared.exceptions import ScanUnavailable
 from engine.shared.db import with_tenant
 
 log = structlog.get_logger(__name__)
@@ -70,6 +71,11 @@ class SweepResult:
     #: empty; a non-empty list means a rule matched text it could not replace,
     #: which is a bug worth failing loudly on rather than reporting "done".
     unresolved: list[str] = field(default_factory=list)
+    #: Documents the scanner could not produce a verdict on (ScanUnavailable).
+    #: A sweep with entries here has NOT cleared this tenant, and the route
+    #: says so rather than reporting the findings it did manage to collect as
+    #: if they were the whole answer.
+    scan_failed: list[str] = field(default_factory=list)
     skipped_no_binary: bool = False
 
     def as_dict(self) -> dict:
@@ -80,6 +86,7 @@ class SweepResult:
             "chunks_rewritten": self.chunks_rewritten,
             "rules": self.rules,
             "unresolved": self.unresolved,
+            "scan_failed": self.scan_failed,
             "skipped_no_binary": self.skipped_no_binary,
         }
 
@@ -162,7 +169,20 @@ async def _sweep_page(
         result.documents_scanned += 1
         result.chunks_scanned += len(chunks)
         contents = [c for _, c in chunks]
-        redacted, findings = await redact_documents_async(contents)
+        try:
+            redacted, findings = await redact_documents_async(contents)
+        except ScanUnavailable as exc:
+            # One document the scanner could not read must not abort the page
+            # AND must not be counted as clean. Record it; the caller reports
+            # a sweep with any of these as inconclusive.
+            result.scan_failed.append(doc_id)
+            log.error(
+                "credential_sweep.scan_failed",
+                customer=customer_id,
+                doc_id=doc_id,
+                error=str(exc),
+            )
+            continue
         if not findings:
             continue
         result.documents_changed += 1
@@ -178,7 +198,18 @@ async def _sweep_page(
 
         # Prove it actually went. A rule that matches text it cannot replace
         # would otherwise be reported as a successful remediation.
-        _, still = await redact_documents_async(redacted)
+        try:
+            _, still = await redact_documents_async(redacted)
+        except ScanUnavailable as exc:
+            # The rewrite may well have worked, but nothing verified it.
+            result.scan_failed.append(doc_id)
+            log.error(
+                "credential_sweep.verify_failed",
+                customer=customer_id,
+                doc_id=doc_id,
+                error=str(exc),
+            )
+            still = []
         if still:
             result.unresolved.append(doc_id)
             log.error(

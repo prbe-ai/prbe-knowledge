@@ -185,6 +185,25 @@ async def sweep_stored_credentials(
     result = await sweep_credentials(
         customer_id, doc_ids=body.doc_ids or None, dry_run=body.dry_run
     )
+    if result.scan_failed:
+        # Same reasoning as skipped_no_binary one branch down: a partial answer
+        # that looks like a whole one is the failure mode this endpoint exists
+        # to avoid. The counts collected so far ride along in the detail so the
+        # operator can see what WAS covered.
+        log.error(
+            "purge.credential_sweep_inconclusive",
+            customer=customer_id,
+            dry_run=body.dry_run,
+            **result.as_dict(),
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "reason": "credential scanner failed on some documents; no conclusion drawn",
+                "scan_failed": len(result.scan_failed),
+                "partial": result.as_dict(),
+            },
+        )
     if result.skipped_no_binary:
         # A sweep that could not scan must not answer with a clean-looking
         # zero. 503: the capability is missing, the question is unanswered.

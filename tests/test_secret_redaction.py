@@ -13,10 +13,33 @@ from __future__ import annotations
 
 import os
 import shutil
+from dataclasses import dataclass
 
 import pytest
 
 from engine.ingest import secret_redaction
+from engine.shared.exceptions import ScanUnavailable
+
+
+@dataclass
+class _Proc:
+    """Stand-in for `subprocess.CompletedProcess` — the three fields read."""
+
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+
+
+@pytest.fixture
+def fresh_settings():
+    """`get_settings` is `lru_cache`d, so a test that moves an env var must
+    clear it BOTH ways: once before so the test sees its own value, and once
+    after so the next test does not inherit it."""
+    from engine.shared import config
+
+    config.get_settings.cache_clear()
+    yield
+    config.get_settings.cache_clear()
 
 # A SKIP that looks like a PASS is how a gate stops gating. Locally, skipping is
 # right — not every developer has the binary. In CI it is not: the whole point
@@ -167,15 +190,123 @@ def test_findings_carry_no_value(monkeypatch) -> None:
         assert set(vars(finding)) == {"rule", "line"}
 
 
-def test_missing_binary_fails_open_and_says_so(monkeypatch, caplog) -> None:
-    """A deployment without the scanner must pass text through unchanged rather
-    than block ingestion — and must never look like a clean scan."""
+def test_missing_binary_fails_closed(monkeypatch, fresh_settings) -> None:
+    """A deployment that should have the scanner and does not must not quietly
+    store unscanned text. `ScanUnavailable` is transient, so the queue row
+    retries instead of persisting."""
     monkeypatch.setenv("PROBE_GITLEAKS_BIN", "/nonexistent/gitleaks")
     assert secret_redaction.available() is False
+    with pytest.raises(ScanUnavailable):
+        secret_redaction.redact_documents([f"AWS Access Key ID [None]: {_AWS_ID}"])
+
+
+def test_missing_binary_can_be_opted_out_of(monkeypatch, fresh_settings) -> None:
+    """The one deployment shape that may run without a scanner says so
+    explicitly, and then gets the old pass-through."""
+    monkeypatch.setenv("PROBE_GITLEAKS_BIN", "/nonexistent/gitleaks")
+    monkeypatch.setenv("SECRET_REDACTION_FAIL_CLOSED", "false")
     text = f"AWS Access Key ID [None]: {_AWS_ID}"
     out, findings = secret_redaction.redact_documents([text])
-    assert out == [text], "ingestion must continue"
+    assert out == [text]
     assert findings == []
+
+
+def test_scanner_exiting_non_zero_is_not_a_clean_scan(monkeypatch) -> None:
+    """The failure that was completely silent until 2026-09-17: a rules file the
+    installed gitleaks rejects produced no stdout, returned [], and the text was
+    stored as if it had been cleared."""
+    monkeypatch.setattr(
+        secret_redaction.subprocess, "run",
+        lambda *a, **k: _Proc(returncode=1, stdout=b"", stderr=b"bad config"),
+    )
+    with pytest.raises(ScanUnavailable) as exc:
+        secret_redaction.find_secrets("anything at all")
+    assert "bad config" in str(exc.value)
+
+
+def test_unparseable_report_is_not_a_clean_scan(monkeypatch) -> None:
+    monkeypatch.setattr(
+        secret_redaction.subprocess, "run",
+        lambda *a, **k: _Proc(returncode=0, stdout=b"{not json", stderr=b""),
+    )
+    with pytest.raises(ScanUnavailable):
+        secret_redaction.find_secrets("anything at all")
+
+
+def test_spawn_failure_is_not_a_clean_scan(monkeypatch) -> None:
+    def _boom(*a, **k):
+        raise OSError("no fork for you")
+    monkeypatch.setattr(secret_redaction.subprocess, "run", _boom)
+    with pytest.raises(ScanUnavailable):
+        secret_redaction.find_secrets("anything at all")
+
+
+def test_a_timeout_retries_once_then_fails_closed(monkeypatch) -> None:
+    """The 2026-09-16 shape: 328 timeouts in 22h under CPU starvation, each one
+    a document stored unscanned. One retry, because a starved scan often clears
+    on the next attempt; then closed."""
+    calls = {"n": 0}
+
+    def _always_timeout(*a, **k):
+        calls["n"] += 1
+        raise secret_redaction.subprocess.TimeoutExpired(cmd="gitleaks", timeout=20.0)
+
+    monkeypatch.setattr(secret_redaction.subprocess, "run", _always_timeout)
+    with pytest.raises(ScanUnavailable):
+        secret_redaction.find_secrets("anything at all")
+    assert calls["n"] == secret_redaction.SCAN_ATTEMPTS
+
+    calls["n"] = 0
+
+    def _timeout_then_ok(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise secret_redaction.subprocess.TimeoutExpired(cmd="gitleaks", timeout=20.0)
+        return _Proc(returncode=0, stdout=b"[]", stderr=b"")
+
+    monkeypatch.setattr(secret_redaction.subprocess, "run", _timeout_then_ok)
+    assert secret_redaction.find_secrets("anything at all") == []
+    assert calls["n"] == 2
+
+
+def test_oversize_input_is_windowed_not_truncated() -> None:
+    """The old code cut at MAX_SCAN_BYTES and logged; the tail of a large
+    transcript was never scanned. A credential past the cut must still be
+    found."""
+    filler = "lorem ipsum dolor sit amet " * 4000  # ~108 KB
+    window = 64 * 1024
+    original = secret_redaction.MAX_SCAN_BYTES
+    try:
+        secret_redaction.MAX_SCAN_BYTES = window
+        text = filler + f"\nAWS Secret Access Key [None]: {_AWS_SECRET}\n" + filler
+        assert len(text.encode()) > window * 2, "fixture must span several windows"
+        found = secret_redaction.find_secrets(text)
+        assert any(rule == "probe-anchored-secret" for rule, _, _ in found)
+        secrets = [s for _, s, _ in found]
+        assert len(secrets) == len(set(secrets)), "overlap must not double-report"
+    finally:
+        secret_redaction.MAX_SCAN_BYTES = original
+
+
+def test_a_credential_across_a_window_boundary_is_still_found() -> None:
+    """The reason windows overlap. Place the credential so a naive split lands
+    inside it."""
+    original = secret_redaction.MAX_SCAN_BYTES
+    try:
+        window = 64 * 1024
+        secret_redaction.MAX_SCAN_BYTES = window
+        line = f"AWS Secret Access Key [None]: {_AWS_SECRET}"
+        # Straddle the END of window 0: the first window holds only the first
+        # half of the credential, so only the overlap in window 1 can find it.
+        head = "x" * (window - len(line) // 2) + "\n"
+        text = head + line + "\n" + ("y" * window)
+        found = secret_redaction.find_secrets(text)
+        assert any(rule == "probe-anchored-secret" for rule, _, _ in found), (
+            "a credential straddling a window edge was lost — the overlap is "
+            "the whole reason windows are not a plain split"
+        )
+    finally:
+        secret_redaction.MAX_SCAN_BYTES = original
 
 
 def test_empty_and_whitespace_inputs_are_cheap() -> None:
