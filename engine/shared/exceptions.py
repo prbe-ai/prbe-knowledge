@@ -111,6 +111,23 @@ class GitHubIdentityConflict(NormalizationError):
     """A protocol-v2 projection collided with unowned legacy GitHub data."""
 
 
+class ScanUnavailable(IngestionError):
+    """The credential scanner could not produce a verdict on this text.
+
+    NOT "found nothing" -- "could not look". Transient on purpose: the queue
+    row goes back to pending and retries, so no text is ever persisted that
+    the scanner did not clear. The alternative, storing it and hoping a sweep
+    catches up, is how a live AWS key sat in five searchable chunks for ten
+    days (2026-09-12).
+
+    `worker_max_attempts` (50) bounds the retry. A row that exhausts it
+    dead-letters with this reason on it, which is the loud failure a silent
+    backstop can never give you.
+    """
+
+    transient = True
+
+
 class SourceAPIError(IngestionError):
     transient = True
 

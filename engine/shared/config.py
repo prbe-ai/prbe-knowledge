@@ -307,6 +307,12 @@ class Settings(BaseSettings):
     # is still possible for deterministic errors via PrbeError(transient=
     # False) — that path is unchanged.
     worker_max_attempts: int = 50
+    # Credential scanning is a gate, not a best-effort garnish: a scan that
+    # cannot produce a verdict raises ScanUnavailable (transient) and the row
+    # retries rather than persisting text nobody looked at. Set false ONLY for
+    # a deployment that deliberately ships without the gitleaks binary; the
+    # binary-missing warning then fires on every document, which is the point.
+    secret_redaction_fail_closed: bool = True
     # Soft per-customer cap on simultaneously processing rows. Original
     # value (10) was conservative against the per-row-loop contention model
     # in graph_writer/normalizer that PR #41 retired (batched writes +
