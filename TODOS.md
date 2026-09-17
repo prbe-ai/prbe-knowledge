@@ -177,6 +177,105 @@ size today the queue absorbs and drains overnight at worst.
 
 ---
 
+### Envelope `priority_hint` so bulk imports stop riding the top tier
+
+**Where:** `engine/shared/custom_ingest.py` (envelope), `engine/ingest/handlers/custom_ingest.py`,
+and research-os `app/indexing/relay.py` + `index_outbox`.
+
+`custom_ingest` now sits at `PRIORITY_RESEARCH_CONTENT` (100) because a note
+someone deliberately wrote should not queue behind every tenant's automatic
+transcripts. But the envelope carries nothing that distinguishes a typed note
+from a 21,000-row bulk import or from the reconciler re-pushing drift, and all
+three arrive as `custom_ingest`. Measured 2026-09-16: bucket-robotics pushed
+21,153 rows in three days, one per document, no churn -- a mirror import
+wearing a researcher's badge.
+
+Today the per-(customer, tier) in-flight cap bounds the damage to half the
+loops in that lane. The real fix is for research-os to say which kind a push
+is: a `priority_hint` on the envelope (`interactive` | `mirror` | `reconcile`),
+mapped to 100 / 60 / 50 by the connector, with anything unhinted staying where
+it is now.
+
+**Depends on:** the tier table (shipped). **Cost:** two repos, an origin column
+on `index_outbox`, two deploys. **Trigger:** a tenant's import measurably
+delaying another tenant's writes, which the queue-age signal will now show.
+
+---
+
+### Per-session parse cache for transcript re-normalization
+
+**Where:** `kb/handlers/claude_code.py` (`fetch_supplementary`), `engine/ingest/worker.py`.
+
+Every run of a transcript row re-fetches and re-parses EVERY batch in
+`payload_s3_keys`, so the fixed cost of a run grows with session length: one
+row on 2026-09-16 carried 2,485 keys. Fitted over 327 runs that day, a run cost
+`12.0s x new_documents + 8.8s` -- the 8.8s is this, and it is not constant, it
+is proportional to how long the session has been going.
+
+The claim-protocol fix stopped two slots doing this at once, and the CPU raise
+made each pass faster, but the work itself is still O(session length) per
+batch. A per-session parse cache keyed on the R2 key set, invalidated on
+reclaim, would make it O(new batches).
+
+**Depends on:** re-measuring after the worker is off half a core.
+**Cost:** a day, mostly cache-invalidation care.
+
+---
+
+### Reconciler churn: six documents per tenant re-index every ~3 hours
+
+**Where:** research-os `app/indexing/reconcile.py` (30-minute CronJob).
+
+Measured on 2026-09-16: for tenant `probe`, six paper documents re-enqueued
+about every three hours with a changed `source_content_hash`, and `anthrogen`
+showed the same shape at 148 rows for 7 documents. Something in the projection
+is not stable across recomputation, so the reconciler sees drift where there
+is none and pays a full re-index -- including re-embedding -- for it.
+
+Small in absolute terms; worth one afternoon because it is pure waste and it
+pollutes every queue measurement taken from now on.
+
+**Cost:** an afternoon on the research-os side, diffing one document's
+projected payload across two reconcile passes.
+
+---
+
+### `attempts` on a hot transcript row is ~3.6x the runs it actually made
+
+**Where:** `engine/ingest/worker.py`.
+
+Row 41234 finished with `attempts=1510` and `version=1840`, while the worker
+log showed 218 `normalizer.start` lines for it. Every increment path is
+accounted for in code, so the gap is unexplained rather than wrong -- but
+`worker_max_attempts` is 50, and a row whose `attempts` climbs 3.6x faster
+than its real work reaches the dead-letter ceiling 3.6x sooner. Today's
+effective-retry-forever setting hides it.
+
+One log line at claim time carrying `attempts` would settle it in a day of
+traffic.
+
+**Cost:** an hour to instrument, a day to observe.
+
+---
+
+### Second worker replica
+
+**Where:** research-os `charts/research-os/values.yaml` (`engine.worker.replicas`).
+
+One replica is a single point of failure: a crash stops ALL ingestion for
+every tenant until Kubernetes restarts it, and nothing alerts on the gap
+except the drain-stall beacon.
+
+Not yet, deliberately. Two replicas multiply claim contention, and the
+per-(customer, tier) cap and the claim-then-release protocol should be watched
+under real traffic on one replica first. The queue-age signal is what will say
+whether one replica is actually the constraint.
+
+**Depends on:** the per-tier cap and claim-protocol changes running in prod.
+**Cost:** a chart value, plus a week of watching before trusting it.
+
+---
+
 ## P3 — connector completeness
 
 ### GitHub `identify_workspaces`
