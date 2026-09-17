@@ -643,11 +643,17 @@ class Worker:
         The UPDATE has `WHERE version = $captured_version`. If a new batch
         landed during Phase A (UPSERT in services/ingestion/main.py:_enqueue
         bumps version), the row's version advanced and the WHERE matches
-        0 rows. We log `worker.cas_retry` and leave the row at 'processing'
-        — the heartbeat reclaim cron picks it up at the threshold and the
-        worker re-runs Phase A on the now-extended payload_s3_keys array.
-        Phase A is naturally idempotent: chunks dedupe by content_hash,
-        so re-running only re-embeds genuinely new content.
+        0 rows. We log `worker.cas_retry` and return the row to `pending`
+        IMMEDIATELY so it re-claims on the next tick against the extended
+        payload_s3_keys array. Phase A is naturally idempotent: chunks dedupe
+        by content_hash, so re-running only re-embeds genuinely new content.
+
+        It used to leave the row at 'processing' for the reclaim loop to pick
+        up at QUEUE_RECLAIM_THRESHOLD_SECONDS (300s). That was five minutes of
+        latency on the rows that need it least -- a session whose batches are
+        arriving right now -- and it held a slot against that tenant's
+        in-flight cap the whole time. Nothing else changes: the release below
+        is exactly what reclaim would have done, five minutes sooner.
         """
         async with get_pool().acquire() as conn, conn.transaction():
             done_row = await conn.fetchrow(
@@ -671,6 +677,21 @@ class Worker:
                     queue_id=queue_id,
                     captured_version=captured_version,
                     reason="new batch arrived during processing",
+                )
+                # Return it to pending NOW rather than waiting out the 300s
+                # reclaim. Guarded on status, not version: the version has
+                # ALREADY moved (that is why the CAS missed), and the guard
+                # that matters is not resurrecting a row another path has
+                # since finished or dead-lettered.
+                await conn.execute(
+                    """
+                    UPDATE ingestion_queue
+                    SET status = $1, started_at = NULL, heartbeat_at = NULL
+                    WHERE queue_id = $2 AND status = $3
+                    """,
+                    QueueStatus.PENDING.value,
+                    queue_id,
+                    QueueStatus.PROCESSING.value,
                 )
                 return
             await conn.execute(
@@ -727,6 +748,21 @@ class Worker:
                     queue_id=queue_id,
                     captured_version=captured_version,
                     reason="new batch arrived during processing (skipped path)",
+                )
+                # Return it to pending NOW rather than waiting out the 300s
+                # reclaim. Guarded on status, not version: the version has
+                # ALREADY moved (that is why the CAS missed), and the guard
+                # that matters is not resurrecting a row another path has
+                # since finished or dead-lettered.
+                await conn.execute(
+                    """
+                    UPDATE ingestion_queue
+                    SET status = $1, started_at = NULL, heartbeat_at = NULL
+                    WHERE queue_id = $2 AND status = $3
+                    """,
+                    QueueStatus.PENDING.value,
+                    queue_id,
+                    QueueStatus.PROCESSING.value,
                 )
                 return
             await conn.execute(
@@ -867,6 +903,21 @@ class Worker:
                 captured_version=captured_version,
                 reason="new batch arrived during processing (error path)",
             )
+            # The third CAS path, and the one a two-edit fix misses. Same
+            # release as the done/skipped paths: without it a row that errored
+            # AND raced a new batch sits `processing` for the full 300s
+            # reclaim, holding a slot against its tenant's in-flight cap.
+            async with get_pool().acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE ingestion_queue
+                    SET status = $1, started_at = NULL, heartbeat_at = NULL
+                    WHERE queue_id = $2 AND status = $3
+                    """,
+                    QueueStatus.PENDING.value,
+                    queue_id,
+                    QueueStatus.PROCESSING.value,
+                )
             return False
         return dead
 

@@ -948,7 +948,27 @@ async def _enqueue(
                         -- reaches sessions that start after the deploy: old
                         -- ones keep the priority they were born with, forever.
                         priority = EXCLUDED.priority,
-                        status = 'pending',
+                        -- DO NOT yank a row out from under the worker. This
+                        -- said plain 'pending', including while a slot had
+                        -- the row in `processing`: a second slot claimed it,
+                        -- both re-normalized the whole session from every
+                        -- batch, and the loser's CAS commit failed. Measured
+                        -- 2026-09-16: 259 such runs in 22 hours, and one row
+                        -- at attempts=1510. It also opens the documented
+                        -- `_upsert_document` check-then-act race (TODOS.md P1)
+                        -- for exactly the rows most likely to hit it.
+                        --
+                        -- A row already `processing` keeps that status; the
+                        -- version bump below is what tells the running worker
+                        -- its payload grew, and its CAS-commit miss now flips
+                        -- the row straight back to pending (see
+                        -- Worker._mark_done) rather than waiting out the 300s
+                        -- reclaim.
+                        status = CASE
+                            WHEN ingestion_queue.status = 'processing'
+                            THEN ingestion_queue.status
+                            ELSE 'pending'
+                        END,
                         version = ingestion_queue.version + 1,
                         completed_at = NULL,
                         error = NULL,
