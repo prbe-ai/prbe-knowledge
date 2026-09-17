@@ -2,6 +2,7 @@
 
 import kb.handlers  # noqa: F401  (registers source profiles)
 from engine.shared.constants import (
+    PRIORITY_LIVE_INTEGRATION,
     SOURCE_DISPLAY_NAMES,
     DocType,
     SourceSystem,
@@ -31,8 +32,14 @@ def test_new_sources_in_display_names() -> None:
 
 
 def test_new_sources_in_ingestion_priority() -> None:
-    assert get_source_profile(SourceSystem.PAGERDUTY.value).ingestion_priority == 100
-    assert get_source_profile(SourceSystem.INCIDENT_IO.value).ingestion_priority == 100
+    assert (
+        get_source_profile(SourceSystem.PAGERDUTY.value).ingestion_priority
+        == PRIORITY_LIVE_INTEGRATION
+    )
+    assert (
+        get_source_profile(SourceSystem.INCIDENT_IO.value).ingestion_priority
+        == PRIORITY_LIVE_INTEGRATION
+    )
 
 
 def test_pagerduty_half_life_days() -> None:

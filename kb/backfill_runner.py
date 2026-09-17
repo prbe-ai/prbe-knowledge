@@ -28,7 +28,7 @@ from engine.ingest.connectedness import is_source_connected
 from engine.ingest.handlers.base import ConnectorContext
 from engine.ingest.handlers.registry import build_connector
 from engine.shared.config import get_settings
-from engine.shared.constants import BackfillStatus, QueueStatus, SourceSystem
+from engine.shared.constants import PRIORITY_BACKGROUND, BackfillStatus, QueueStatus, SourceSystem
 from engine.shared.db import get_pool, raw_conn, with_tenant
 from engine.shared.encryption import decrypt_token
 from engine.shared.exceptions import NotSupportedByConnector, PermanentSourceError
@@ -203,16 +203,16 @@ async def _flush_batch(
     ]
 
     async def _insert(conn) -> None:
-        # Backfill rows always land at priority 50 (never block live).
+        # Backfill rows always land at PRIORITY_BACKGROUND (never block live).
         # Both columns are populated for the migration window:
         # `payload_s3_key` for back-compat readers, `payload_s3_keys`
         # for the new array-based normalizer/worker path.
         await conn.executemany(
-            """
+            f"""
             INSERT INTO ingestion_queue
                 (customer_id, source_system, source_event_id,
                  payload_s3_key, payload_s3_keys, status, priority)
-            VALUES ($1, $2, $3, $4, ARRAY[$4], $5, 50)
+            VALUES ($1, $2, $3, $4, ARRAY[$4], $5, {PRIORITY_BACKGROUND})
             ON CONFLICT DO NOTHING
             """,
             rows,

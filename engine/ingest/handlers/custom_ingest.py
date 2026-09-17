@@ -11,6 +11,7 @@ from engine.ingest.chunker import count_tokens
 from engine.ingest.handlers.base import Connector
 from engine.ingest.handlers.registry import register_connector
 from engine.shared.constants import (
+    PRIORITY_RESEARCH_CONTENT,
     DocClass,
     EdgeType,
     IngestionEventType,
@@ -44,7 +45,7 @@ class CustomIngestConnector(Connector):
     # Queue priority 75: customer batches are bursty and search-indexable,
     # not user-blocking — same tier as agent-session sources so a large
     # custom push can't preempt interactive webhooks (100).
-    ingestion_priority: ClassVar[int] = 75
+    ingestion_priority: ClassVar[int] = PRIORITY_RESEARCH_CONTENT
 
     def verify_signature(
         self,

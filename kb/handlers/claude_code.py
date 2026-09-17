@@ -32,6 +32,7 @@ from engine.ingest.handlers.registry import register_connector
 from engine.shared import claude_code_extraction as _ext
 from engine.shared.config import get_settings
 from engine.shared.constants import (
+    PRIORITY_AGENT_CAPTURE,
     DocClass,
     DocType,
     EdgeType,
@@ -93,7 +94,7 @@ class ClaudeCodeConnector(Connector):
     # Queue priority 75: bursty, deprioritized vs interactive webhooks (100).
     # Sessions are search-indexable, not user-blocking; one chatty CC user
     # shouldn't block other connectors at the queue claim layer.
-    ingestion_priority: ClassVar[int] = 75
+    ingestion_priority: ClassVar[int] = PRIORITY_AGENT_CAPTURE
     # CC transcripts are high-volume and lower-signal-density than authored
     # team artifacts (Slack threads, Linear tickets, PR descriptions); the
     # 0.5 post-RRF demotion keeps authored content surfacing first.

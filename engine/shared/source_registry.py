@@ -47,8 +47,9 @@ class SourceProfile:
         (``"slack."``, ``"github."``, ...). Used by the retrieval doc-type
         resolver to narrow unqualified tokens by a sources filter.
       ingestion_priority: queue priority at enqueue time. Worker claims order
-        by priority DESC. Tiers (see connector modules for the rationale):
-        100 interactive webhooks, 75 bursty agent/custom batches, 50 backfill.
+        by priority DESC. The tier table and its rationale live in
+        shared.constants (PRIORITY_RESEARCH_CONTENT / PRIORITY_LIVE_INTEGRATION
+        / PRIORITY_AGENT_CAPTURE / PRIORITY_BACKGROUND).
       score_multiplier: post-RRF doc-score multiplier applied by fusion.
         Values < 1.0 demote a source's docs at equal vector relevance.
       half_life_days: per-source recency half-life override for fusion decay.

@@ -300,6 +300,13 @@ class Settings(BaseSettings):
     # Tier 1 (1M TPM) → 2; Tier 5 (10M TPM) → 6 today (OpenAI permits 8+;
     # 3gb VM memory is the actual ceiling — resize before pushing higher).
     worker_max_concurrent: int = 2
+
+    def per_customer_cap(self) -> int:
+        """Per-(customer, tier) in-flight cap: the override, else half the
+        loops, never below 1 and never above the loop count."""
+        if self.worker_per_customer_max_inflight is not None:
+            return max(1, min(self.worker_per_customer_max_inflight, self.worker_max_concurrent))
+        return max(1, self.worker_max_concurrent // 2)
     # Effectively retry-forever for transient errors (TimeoutError, lock
     # waits, network blips). The queue is the buffer; rows that hit the
     # ceiling here are data we silently dropped on the customer's behalf,
@@ -313,17 +320,20 @@ class Settings(BaseSettings):
     # a deployment that deliberately ships without the gitleaks binary; the
     # binary-missing warning then fires on every document, which is the point.
     secret_redaction_fail_closed: bool = True
-    # Soft per-customer cap on simultaneously processing rows. Original
-    # value (10) was conservative against the per-row-loop contention model
-    # in graph_writer/normalizer that PR #41 retired (batched writes +
-    # sorted lock order + 5min timeout + 50 retries). With those layers in
-    # place, 30 is comfortable: 30 contending txs on a hot node serialize
-    # at ~5ms per acquisition, well under the 5min ceiling. Sized to keep
-    # at least 2-3 customers' worth of headroom against the 108-slot
-    # fleet (18 machines * 6 concurrency) when several burst at once.
-    # Snapshot count, not a hard lock — slight over-spill under racing
-    # claims is fine.
-    worker_per_customer_max_inflight: int = 30
+    # Soft per-customer, PER-TIER cap on simultaneously processing rows.
+    # Keyed on (customer_id, priority) since 2026-09-17: counted per customer
+    # alone, a tenant's own background work locked it out of its own
+    # foreground -- three transcripts in flight made that tenant's next
+    # deliberate write ineligible while worker slots sat idle.
+    #
+    # DERIVED, not a second number to keep in step. It was 30 against a
+    # worker_max_concurrent of 2 in code and 6 on the cluster, so it capped
+    # nothing -- one tenant's import burst could hold every slot in the fleet.
+    # A cap only means something relative to the loop count, so leave this None
+    # and `per_customer_cap()` gives half the loops (min 1); set it to pin a
+    # value. Two constants that must stay in a ratio are one constant and a
+    # bug waiting for someone to move the other.
+    worker_per_customer_max_inflight: int | None = None
 
     # GitHub backfill: how many repos walk in parallel via the GraphQL v4
     # engine. Each walker holds one in-flight POST /graphql at a time; sized

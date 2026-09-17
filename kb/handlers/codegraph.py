@@ -26,7 +26,7 @@ from typing import Any, ClassVar
 from engine.ingest.handlers.base import Connector
 from engine.ingest.handlers.registry import register_connector
 from engine.shared.backend_client import fetch_github_installation_token
-from engine.shared.constants import SourceSystem
+from engine.shared.constants import PRIORITY_BACKGROUND, SourceSystem
 from engine.shared.db import with_tenant
 from engine.shared.exceptions import (
     GitHubAuthError,
@@ -86,7 +86,7 @@ class CodeGraphConnector(Connector):
     # search-indexable, not user-facing latency-critical — sits in the same
     # tier as backfill rows so a large repo onboarding can't block live
     # webhooks.
-    ingestion_priority: ClassVar[int] = 50
+    ingestion_priority: ClassVar[int] = PRIORITY_BACKGROUND
     # CODE_GRAPH chunks are over-represented in top-K relative to their
     # signal strength: production query_traces (7d, acme) showed code_graph
     # at 36.5% of top-5 results despite an avg post-fusion score ~3.4x lower
