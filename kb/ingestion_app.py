@@ -270,12 +270,12 @@ async def create_manual_uploads(
         file_sha256 = hashlib.sha256(body).hexdigest()
 
         try:
-            # Inspect all original container members before storing anything.
-            # A changed extracted view cannot make the original archive safe:
-            # refuse that file rather than uploading altered document bytes.
-            await asyncio.to_thread(
+            # Inspect readable original members before storing anything and
+            # report any hidden content the scanner cannot inspect. A changed
+            # extracted view cannot make credential-bearing original bytes safe.
+            inspection = await asyncio.to_thread(
                 inspect_bytes, body,
-                scan_policy=ScanPolicy(max_bytes=64 * 1024 * 1024, allow_opaque=False),
+                scan_policy=ScanPolicy(max_bytes=64 * 1024 * 1024, allow_opaque=True),
             )
             parsed = await asyncio.to_thread(parse_manual_upload, filename, content_type, body)
             if await redact_payload_async(parsed.text) != parsed.text:
@@ -296,6 +296,11 @@ async def create_manual_uploads(
             )
             continue
 
+        inspection_fields = {
+            "fully_inspected": inspection.fully_inspected,
+            "warnings": list(inspection.warnings),
+            "warning": inspection.warning_message,
+        }
         payload = {
             "upload_id": upload_id,
             "filename": parsed.filename,
@@ -309,6 +314,7 @@ async def create_manual_uploads(
             "parse_engine": parsed.parse_engine,
             "doc_type": parsed.doc_type,
             "doc_id": doc_id,
+            **inspection_fields,
         }
         payload = await redact_payload_async(payload)
         envelope = orjson.dumps(
@@ -321,6 +327,11 @@ async def create_manual_uploads(
         )
         payload_key = _payload_key(SourceSystem.MANUAL_UPLOAD, customer_id, upload_id)
 
+        if inspection.warning_message:
+            log.warning(
+                "manual_upload.inspection_incomplete", customer=customer_id,
+                upload_id=upload_id, warning=inspection.warning_message,
+            )
         try:
             await store.put(bucket, staging_key, body, content_type=content_type)
         except PrbeError as exc:
@@ -383,16 +394,20 @@ async def create_manual_uploads(
                 "uploaded_at": uploaded_at.isoformat(),
                 "indexed_at": None,
                 "original_deleted_at": None,
+                **inspection_fields,
             }
         )
 
+    warnings = list(dict.fromkeys(u["warning"] for u in uploads if u.get("warning")))
     return JSONResponse(
         {
             "trace_id": trace_id,
             "uploads": uploads,
             "accepted": sum(1 for u in uploads if u["status"] == "queued"),
             "failed": sum(1 for u in uploads if u["status"] == "failed_parse"),
-        }
+            "warnings": warnings,
+        },
+        headers={"X-Probe-Inspection-Warning": "; ".join(warnings)} if warnings else {},
     )
 
 
