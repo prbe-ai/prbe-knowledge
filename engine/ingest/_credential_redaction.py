@@ -113,6 +113,14 @@ def scrub_string(value: str, *, _depth: int = 0) -> str:
     """Scrub secrets in prose without removing ordinary paths or identifiers."""
     from ._credential_secrets import redact
 
+    # Inspect the original credential before ordinary scrubbing can remove
+    # its prefix and leave a NUL-separated suffix behind. The inspection view
+    # is never returned. Recursive JSON/encoded-text inspection uses this too.
+    if "\x00" in value:
+        view = value.replace("\x00", "")
+        if scrub_string(view, _depth=_depth) != view:
+            return "<redacted>"
+
     if _ENCODED_ESCAPE.search(value):
         if _depth >= 4:
             raise ValueError("encoded content exceeds scrubber nesting limit")
@@ -150,7 +158,7 @@ def default_scrub(value: Any, *, key: str = "") -> Any:
     # `synthetic_credentials_absent`. Strings and numbers still use key context.
     if value is None or isinstance(value, bool):
         return value
-    if is_sensitive_key(key):
+    if is_sensitive_key(key.replace("\x00", "")):
         return value if isinstance(value, str) and _indirect_value(value) else "<redacted>"
     if isinstance(value, (bool, int, float)):
         return value
