@@ -8,6 +8,9 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Fixed
 
+- Preserve typed boolean status fields during ingestion scrubbing and artifact
+  inspection while continuing to redact strings and numeric credential values.
+
 - Scrub transcript and custom-ingest content before raw object storage, including
   metadata, URLs and pre-chunked document content before indexing. Manual uploads
   are inspected before staging originals. Invalid scanner verdicts fail closed;

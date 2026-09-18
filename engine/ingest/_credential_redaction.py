@@ -146,8 +146,10 @@ def scrub_string(value: str, *, _depth: int = 0) -> str:
 
 def default_scrub(value: Any, *, key: str = "") -> Any:
     """Scrub credential keys and contents recursively, including opaque reprs."""
-    if value is None:
-        return None
+    # Typed flags are not credentials, even under names such as
+    # `synthetic_credentials_absent`. Strings and numbers still use key context.
+    if value is None or isinstance(value, bool):
+        return value
     if is_sensitive_key(key):
         return value if isinstance(value, str) and _indirect_value(value) else "<redacted>"
     if isinstance(value, (bool, int, float)):
