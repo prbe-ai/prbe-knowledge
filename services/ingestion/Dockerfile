@@ -1,3 +1,12 @@
+# Match the module's pinned toolchain floor; compile the same scanner for every
+# standalone ingress/worker image. No Go runtime or compiler ships in the final image.
+FROM golang:1.24.11-bookworm AS redactd-build
+WORKDIR /build/redactd
+COPY tools/redactd/go.mod tools/redactd/go.sum ./
+RUN go mod download
+COPY tools/redactd/ ./
+RUN CGO_ENABLED=0 go build -mod=readonly -trimpath -ldflags="-s -w" -o /out/redactd .
+
 FROM python:3.12-slim AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -9,16 +18,10 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends build-essential libpq-dev curl \
  && rm -rf /var/lib/apt/lists/*
 
-# gitleaks — the credential scanner `engine/ingest/secret_redaction.py` shells
-# to before any chunk is persisted. Pinned: the rule corpus is the detector, so
-# an unpinned upgrade silently changes what we redact (and what we miss).
-#
-# WITHOUT THIS BINARY the redactor fails open — text passes through unredacted
-# with a warning — so a missing install does not break ingestion. It just
-# removes the backstop. /health reports `secret_scanner: false` so the absence
-# is visible, but nothing REFUSES traffic over it (that would trade a silent
-# gap for an outage), which is why the install is pinned here rather than left
-# to a probe to catch.
+# Admission and normalization fail closed when scanner inspection is unavailable.
+# Install the default daemon and the explicit CLI fallback with the same pinned
+# gitleaks rule corpus. The rules file is included below with engine/.
+COPY --from=redactd-build /out/redactd /usr/local/bin/redactd
 ARG GITLEAKS_VERSION=8.30.1
 RUN curl -fsSL -o /tmp/gitleaks.tar.gz \
       "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \

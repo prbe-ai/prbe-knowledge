@@ -122,6 +122,104 @@ def batch(**changes):
 
 
 @pytest.mark.asyncio
+async def test_credential_redaction_precedes_raw_storage_without_changing_receipt(database):
+    import json
+
+    _tenant, admin = database
+    key = "ghp_" + "8a29Df63bC17eA94fE61dB82aC03eF75dA19"
+    body = batch(cwd="/work/" + key, device_id=key)
+    body["events"][0]["raw"]["message"]["content"] = "token " + key
+    body["events"][1]["raw"]["metadata"] = {"password": "Harbor7!", "eos_token": "</s>"}
+    digest = hashlib.sha256(sr.canonical_payload(body)).hexdigest()
+    store = Store()
+    result = await sr.accept(body, "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    assert result["receipt"]["body_sha256"] == digest
+    assert store.blobs
+    stored = next(iter(store.blobs.values())).decode()
+    assert key not in stored and "Harbor7!" not in stored
+    assert "</s>" in stored and len(json.loads(stored)["payload"]["events"]) == 2
+    assert await admin.fetchval("SELECT body_sha256 FROM session_batch_receipts") == digest
+    assert await admin.fetchval("SELECT count(*) FROM ingestion_queue") == 1
+    assert key not in await admin.fetchval("SELECT uploader_device_id FROM session_streams")
+    repeat = await sr.accept(body, "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    assert repeat["status"] == "duplicate" and store.writes == 1
+
+
+def filesystem_store(root):
+    """Production ObjectStore put/get with a local file-backed S3 adapter."""
+    from engine.shared.storage import ObjectStore
+
+    class LocalClient:
+        writes = 0
+        def head_bucket(self, **kwargs):
+            (root / kwargs['Bucket']).mkdir(parents=True, exist_ok=True)
+        def put_object(self, **kwargs):
+            self.writes += 1
+            path = root / kwargs['Bucket'] / kwargs['Key']
+            path.parent.mkdir(parents=True,exist_ok=True)
+            path.write_bytes(kwargs['Body'])
+        def get_object(self, **kwargs):
+            return {'Body':(root / kwargs['Bucket'] / kwargs['Key']).open('rb')}
+
+    class LocalStore(ObjectStore):
+        def __init__(self):
+            self._client = LocalClient()
+        async def bucket_for(self, customer):
+            return customer
+
+    return LocalStore()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('protocol',['legacy','v2'])
+async def test_first_persistent_object_is_scrubbed_and_readable(database, tmp_path, protocol):
+    import json
+    _tenant,admin=database
+    secret='ghp_'+hashlib.sha256(b'synthetic disk receipt test').hexdigest()[:36]
+    body=batch(cwd='/work/'+secret)
+    body['events'][0]['raw']['message']['content']='copied '+secret
+    body['events'][1]['raw']['metadata']={'nested':[{'password':'Harbor7!'}],'eos_token':'</s>'}
+    store=filesystem_store(tmp_path)
+    if protocol=='v2':
+        await sr.accept(body,'tenant-a',SourceSystem.CLAUDE_CODE,store)
+    else:
+        body.pop('protocol_version')
+        envelope=json.dumps({'payload':body,'_headers':{'x-test-token':secret}}).encode()
+        assert await sr.accept_legacy(body,envelope,'tenant-a',SourceSystem.CLAUDE_CODE,store,'raw/synthetic.json',None)
+    assert store._client.writes==1
+    key=await admin.fetchval('SELECT payload_s3_key FROM ingestion_queue')
+    data=await store.get('tenant-a',key)
+    assert data==(tmp_path/'tenant-a'/key).read_bytes()
+    assert secret.encode() not in data and b'Harbor7!' not in data
+    assert b'</s>' in data and len(json.loads(data)['payload']['events'])==2
+    assert await admin.fetchval('SELECT count(*) FROM ingestion_queue')==1
+    assert await admin.fetchval('SELECT count(*) FROM session_batch_receipts')==(1 if protocol=='v2' else 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('protocol',['legacy','v2'])
+async def test_scanner_failure_precedes_every_persistent_write(database,tmp_path,monkeypatch,protocol):
+    import json
+
+    from engine.ingest import payload_redaction
+    from engine.shared.exceptions import ScanUnavailable
+    _tenant,admin=database
+    store=filesystem_store(tmp_path)
+    body=batch()
+    def unavailable(*args):raise ScanUnavailable('synthetic scanner unavailable')
+    monkeypatch.setattr(payload_redaction,'redact_documents',unavailable)
+    with pytest.raises(ScanUnavailable):
+        if protocol=='v2':
+            await sr.accept(body,'tenant-a',SourceSystem.CLAUDE_CODE,store)
+        else:
+            body.pop('protocol_version')
+            await sr.accept_legacy(body,json.dumps({'payload':body}).encode(),'tenant-a',SourceSystem.CLAUDE_CODE,store,'raw/synthetic.json',None)
+    assert store._client.writes==0 and not list(tmp_path.rglob('*.json'))
+    for table in ('session_batch_receipts','session_streams','ingestion_queue'):
+        assert await admin.fetchval(f'SELECT count(*) FROM {table}')==0
+
+
+@pytest.mark.asyncio
 async def test_same_key_retry_race_has_one_blob_receipt_and_queue_reference(database):
     tenant, admin = database
     store = Store()

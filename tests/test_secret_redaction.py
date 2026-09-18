@@ -234,7 +234,9 @@ def test_scanner_exiting_non_zero_is_not_a_clean_scan(monkeypatch, cli_transport
     )
     with pytest.raises(ScanUnavailable) as exc:
         secret_redaction.find_secrets("anything at all")
-    assert "bad config" in str(exc.value)
+    # Scanner diagnostics may contain input. Preserve the exit code, not stderr.
+    assert "returncode=1" in str(exc.value)
+    assert "bad config" not in str(exc.value)
 
 
 def test_unparseable_report_is_not_a_clean_scan(monkeypatch, cli_transport) -> None:

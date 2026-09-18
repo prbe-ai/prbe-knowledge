@@ -2,7 +2,8 @@
 
 The upload endpoint accepts any file, but this module only admits files where
 we can extract useful text without OCR/multimedia/PDF parsing. Original bytes
-are staged in R2 first, then deleted after the queued payload normalizes.
+are inspected and parsed before staging in R2, then deleted after the queued
+payload normalizes.
 """
 
 from __future__ import annotations

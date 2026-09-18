@@ -39,6 +39,7 @@ from engine.ingest.chunker import (
 from engine.ingest.graph_writer import upsert_edges, upsert_nodes
 from engine.ingest.handlers.base import Connector, ConnectorContext
 from engine.ingest.handlers.registry import build_connector
+from engine.ingest.payload_redaction import redact_payload_async
 from engine.ingest.secret_redaction import redact_documents_async
 from engine.shared.chunk_reconstruction import (
     reconstruct_chunk_text,
@@ -1018,6 +1019,20 @@ class Normalizer:
         same role as `_metadata_piece(doc)` for the metadata chunk slot.
         Both default to the standard chunker path for backwards compat.
         """
+        # Text-only scanning is insufficient: these fields also persist in SQL
+        # and may be returned independently of chunks. Scrub before any reuse,
+        # metadata-piece construction or embedding. Keep typed model fields.
+        content_fields = {
+            name: getattr(doc, name) for name in
+            ("title", "body", "body_preview", "source_url", "author_id", "metadata")
+        }
+        nested = doc.model_dump(mode="json", include={"entities", "attachments", "doc_references"})
+        content_fields.update(nested)
+        clean = await redact_payload_async(content_fields)
+        validated = Document.model_validate({**doc.model_dump(), **clean})
+        for name in content_fields:
+            setattr(doc, name, getattr(validated, name))
+
         # Deleted docs: no body → chunks is empty → every live chunk gets closed out.
         # The metadata chunk also disappears for deleted docs (joins the removed
         # set just like content chunks).
@@ -1027,6 +1042,19 @@ class Normalizer:
         elif pre_chunked is not None:
             new_pieces = pre_chunked
             metadata_piece = pre_chunked_metadata
+            # These pieces bypass Document.body. Historical raw payloads and
+            # connector-supplied chunks need the same structured/encoded
+            # scrubber before the gitleaks backstop, hashes, reuse or embedding.
+            targets = list(new_pieces) + ([metadata_piece] if metadata_piece else [])
+            cleaned_contents = await redact_payload_async([piece.content for piece in targets])
+            rewritten = [
+                replace(piece, content=content)
+                for piece, content in zip(targets, cleaned_contents, strict=True)
+            ]
+            if metadata_piece is not None:
+                new_pieces, metadata_piece = rewritten[:-1], rewritten[-1]
+            else:
+                new_pieces = rewritten
         else:
             new_pieces = chunk_text(_stringify_body(doc))
             metadata_piece = _metadata_piece(doc)

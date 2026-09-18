@@ -177,7 +177,7 @@ class RedactdSupervisor:
                     "redactd exited during startup", returncode=self._proc.returncode
                 )
             try:
-                if self._request_locked({"op": "ping"}).get("ok"):
+                if self._request_locked({"op": "ping"}).get("ok") is True:
                     return
             except Exception as exc:
                 last = exc
@@ -230,18 +230,18 @@ class RedactdSupervisor:
                 out = self._request_locked({"op": "scan", "texts": texts})
             except ScanUnavailable:
                 raise
-            except Exception as first:
+            except Exception:
                 # One restart, then one retry. A wedged or crashed daemon
                 # recovers without the caller knowing; a broken one fails.
-                log.warning("redactd.request_failed", error=str(first))
+                log.warning("redactd.request_failed")
                 self._restart_locked()
                 try:
                     out = self._request_locked({"op": "scan", "texts": texts})
-                except Exception as second:
-                    raise ScanUnavailable("redactd unreachable", error=str(second)) from second
+                except Exception:
+                    raise ScanUnavailable("redactd unreachable") from None
 
-        if not out.get("ok"):
-            raise ScanUnavailable("redactd refused the scan", error=str(out.get("error", "")))
+        if out.get("ok") is not True:
+            raise ScanUnavailable("redactd refused the scan")
         findings = out.get("findings")
         if not isinstance(findings, list) or len(findings) != len(texts):
             raise ScanUnavailable(
@@ -253,13 +253,16 @@ class RedactdSupervisor:
         for per_text in findings:
             if not isinstance(per_text, list):
                 raise ScanUnavailable("redactd returned a malformed findings entry")
-            parsed.append(
-                [
-                    (f["rule"], f["secret"], int(f.get("line") or 0))
-                    for f in per_text
-                    if isinstance(f, dict) and f.get("rule") and f.get("secret")
-                ]
-            )
+            rows = []
+            for finding in per_text:
+                if not isinstance(finding, dict):
+                    raise ScanUnavailable("redactd returned a malformed finding")
+                rule, secret, line = finding.get("rule"), finding.get("secret"), finding.get("line", 0)
+                if not (isinstance(rule, str) and rule and isinstance(secret, str) and secret
+                        and isinstance(line, int) and not isinstance(line, bool) and line >= 0):
+                    raise ScanUnavailable("redactd returned a malformed finding")
+                rows.append((rule, secret, line))
+            parsed.append(rows)
         return parsed
 
 

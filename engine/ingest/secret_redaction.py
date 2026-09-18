@@ -205,8 +205,17 @@ def scan_many(texts: list[str]) -> list[list[tuple[str, str, int]]]:
     results: list[list[tuple[str, str, int]]] = []
     # Chunked so one very large batch cannot exceed the server's own ceilings.
     scanned: list[list[tuple[str, str, int]]] = []
-    for i in range(0, len(windowed), redactd.MAX_TEXTS):
-        scanned.extend(supervisor.scan(windowed[i : i + redactd.MAX_TEXTS]))
+    batch: list[str] = []
+    batch_bytes = 0
+    for text in windowed:
+        size = len(text.encode("utf-8", errors="replace"))
+        if batch and (len(batch) >= redactd.MAX_TEXTS or batch_bytes + size > redactd.MAX_REQUEST_BYTES):
+            scanned.extend(supervisor.scan(batch))
+            batch, batch_bytes = [], 0
+        batch.append(text)
+        batch_bytes += size
+    if batch:
+        scanned.extend(supervisor.scan(batch))
     for start, end in spans:
         seen: set[tuple[str, str]] = set()
         merged: list[tuple[str, str, int]] = []
@@ -266,7 +275,7 @@ def _scan_once(binary: str, payload: bytes) -> list[tuple[str, str, int]]:
     cmd = [
         binary, "stdin",
         "--report-format", "json",
-        "--report-path", "/dev/stdout",
+        "--report-path", "-",
         "--no-banner",
         # Findings are the normal case here, not an error condition.
         "--exit-code", "0",
@@ -293,8 +302,8 @@ def _scan_once(binary: str, payload: bytes) -> list[tuple[str, str, int]]:
                 attempt=attempt,
                 of=SCAN_ATTEMPTS,
             )
-        except OSError as exc:
-            raise ScanUnavailable("credential scanner would not start", error=str(exc)) from exc
+        except OSError:
+            raise ScanUnavailable("credential scanner would not start") from None
     if proc is None:
         raise ScanUnavailable(
             "credential scanner timed out",
@@ -311,9 +320,7 @@ def _scan_once(binary: str, payload: bytes) -> list[tuple[str, str, int]]:
         raise ScanUnavailable(
             "credential scanner exited non-zero",
             returncode=proc.returncode,
-            # stderr is gitleaks' own diagnostics; its stdout can carry secrets
-            # on a partial write, so only stderr is ever echoed, and truncated.
-            stderr=proc.stderr.decode("utf-8", errors="replace")[:500],
+            # Neither output channel is safe to echo: diagnostics can include input.
         )
     if not raw:
         return []
@@ -324,11 +331,21 @@ def _scan_once(binary: str, payload: bytes) -> list[tuple[str, str, int]]:
         raise ScanUnavailable("credential scanner report was unparseable", bytes=len(raw)) from exc
 
     out: list[tuple[str, str, int]] = []
-    for item in findings if isinstance(findings, list) else []:
+    if findings is None:
+        # gitleaks can emit null for its nil clean finding slice.
+        return []
+    if not isinstance(findings, list):
+        raise ScanUnavailable("credential scanner report was not a findings list")
+    for item in findings:
+        if not isinstance(item, dict):
+            raise ScanUnavailable("credential scanner returned a malformed finding")
         secret = item.get("Secret")
         rule = item.get("RuleID")
-        if isinstance(secret, str) and secret and isinstance(rule, str):
-            out.append((rule, secret, int(item.get("StartLine") or 0)))
+        line = item.get("StartLine", 0)
+        if not (isinstance(secret, str) and secret and isinstance(rule, str) and rule
+                and isinstance(line, int) and not isinstance(line, bool) and line >= 0):
+            raise ScanUnavailable("credential scanner returned a malformed finding")
+        out.append((rule, secret, line))
     return out
 
 
