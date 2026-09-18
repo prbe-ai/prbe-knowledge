@@ -38,6 +38,7 @@ from fastapi.responses import JSONResponse
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from engine.ingest import secret_redaction
+from engine.ingest._credential_gate import CredentialBlocked, ScanPolicy, inspect_bytes
 from engine.ingest.connectedness import is_source_connected
 from engine.ingest.custom_ingest_routes import router as custom_ingest_router
 from engine.ingest.entity_clusters_routes import (
@@ -59,6 +60,7 @@ from engine.ingest.manual_uploads import (
     parse_manual_upload,
     safe_filename,
 )
+from engine.ingest.payload_redaction import redact_payload_async
 from engine.shared.community import ensure_default_customer
 from engine.shared.config import get_settings
 from engine.shared.constants import SourceSystem
@@ -184,7 +186,11 @@ async def create_manual_uploads(
     x_trace_id: str | None = Header(default=None),
     x_prbe_customer: str | None = Header(default=None),
 ) -> JSONResponse:
-    """Accept dashboard manual uploads, stage originals, and enqueue extracted text."""
+    """Inspect dashboard uploads before staging admitted originals and text.
+
+    Multipart handling may already have spooled an UploadFile locally. This
+    boundary guarantees inspection before our first object-store write.
+    """
     _verify_internal_key(request)
 
     ks = await get_ingestion_killswitch()
@@ -210,6 +216,16 @@ async def create_manual_uploads(
 
     customer_id = x_prbe_customer
     trace_id = x_trace_id or f"manual-{int(datetime.now().timestamp() * 1000)}"
+    safe_headers = {
+        key: value for key, value in request.headers.items()
+        if key.lower() not in _SENSITIVE_HEADERS
+    }
+    metadata = await redact_payload_async({
+        "uploaded_by": uploaded_by, "trace_id": trace_id, "headers": safe_headers,
+    })
+    uploaded_by, trace_id, safe_headers = (
+        metadata["uploaded_by"], metadata["trace_id"], metadata["headers"]
+    )
     bind_trace(trace_id)
 
     store = request.app.state.store
@@ -224,8 +240,12 @@ async def create_manual_uploads(
     for upload in files:
         uploaded_at = datetime.now(UTC)
         upload_id = f"manual-{uuid.uuid4().hex}"
-        filename = safe_filename(upload.filename)
-        content_type = upload.content_type or "application/octet-stream"
+        file_metadata = await redact_payload_async({
+            "filename": safe_filename(upload.filename),
+            "content_type": upload.content_type or "application/octet-stream",
+        })
+        filename = safe_filename(file_metadata["filename"])
+        content_type = file_metadata["content_type"]
         file_size = _upload_file_size(upload)
         staging_key = _manual_staging_key(customer_id, upload_id, filename, uploaded_at)
         doc_id = f"manual_upload:{upload_id}"
@@ -250,21 +270,17 @@ async def create_manual_uploads(
         file_sha256 = hashlib.sha256(body).hexdigest()
 
         try:
-            await store.put(
-                bucket,
-                staging_key,
-                body,
-                content_type=content_type,
+            # Inspect all original container members before storing anything.
+            # A changed extracted view cannot make the original archive safe:
+            # refuse that file rather than uploading altered document bytes.
+            await asyncio.to_thread(
+                inspect_bytes, body,
+                scan_policy=ScanPolicy(max_bytes=64 * 1024 * 1024, allow_opaque=False),
             )
-        except PrbeError as exc:
-            log.error("manual_upload.stage_failed", customer=customer_id, error=str(exc))
-            raise HTTPException(status_code=503, detail="storage unavailable") from exc
-
-        try:
             parsed = await asyncio.to_thread(parse_manual_upload, filename, content_type, body)
-        except ManualUploadParseError as exc:
-            with contextlib.suppress(PrbeError):
-                await store.delete(bucket, staging_key)
+            if await redact_payload_async(parsed.text) != parsed.text:
+                raise CredentialBlocked("extracted text contains credentials")
+        except (ManualUploadParseError, CredentialBlocked):
             uploads.append(
                 await _record_rejected_manual_upload(
                     customer_id=customer_id,
@@ -275,8 +291,7 @@ async def create_manual_uploads(
                     file_sha256=file_sha256,
                     uploaded_by=uploaded_by,
                     uploaded_at=uploaded_at,
-                    parse_error=str(exc),
-                    original_deleted=True,
+                    parse_error="file could not be safely inspected or contains credentials",
                 )
             )
             continue
@@ -295,11 +310,7 @@ async def create_manual_uploads(
             "doc_type": parsed.doc_type,
             "doc_id": doc_id,
         }
-        safe_headers = {
-            k: v
-            for k, v in request.headers.items()
-            if k.lower() not in _SENSITIVE_HEADERS
-        }
+        payload = await redact_payload_async(payload)
         envelope = orjson.dumps(
             {
                 "_headers": safe_headers,
@@ -309,6 +320,12 @@ async def create_manual_uploads(
             }
         )
         payload_key = _payload_key(SourceSystem.MANUAL_UPLOAD, customer_id, upload_id)
+
+        try:
+            await store.put(bucket, staging_key, body, content_type=content_type)
+        except PrbeError as exc:
+            log.error("manual_upload.stage_failed", customer=customer_id, error=str(exc))
+            raise HTTPException(status_code=503, detail="storage unavailable") from exc
 
         try:
             await store.put(bucket, payload_key, envelope)
@@ -459,7 +476,7 @@ async def webhook(
             headers={"Retry-After": "300"},
         )
 
-    trace_id = x_trace_id or f"wh-{int(datetime.now().timestamp() * 1000)}"
+    trace_id = await redact_payload_async(x_trace_id or f"wh-{int(datetime.now().timestamp() * 1000)}")
     bind_trace(trace_id)
 
     try:
@@ -531,8 +548,9 @@ async def webhook(
         parsed = connector.parse_webhook_event(
             customer_id, dict(request.headers), payload
         )
-    except InvalidWebhookPayload as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except InvalidWebhookPayload:
+        # Connector diagnostics may interpolate original provider content.
+        raise HTTPException(status_code=400, detail="invalid webhook payload") from None
 
     if parsed is None:
         # Connector recognized the payload but doesn't ingest this event
@@ -540,14 +558,24 @@ async def webhook(
         # github events the connector filters out). Log so silent drops
         # are visible — pre-fix we returned a 200 with no log line and
         # operators couldn't tell signal from noise.
+        # Ignored events skip the persistence scrub below, but provider fields
+        # still need inspection before entering persistent structured logs.
+        event_type = await redact_payload_async(
+            payload.get("type") if isinstance(payload, dict) else None
+        )
         log.info(
             "ingestion.ignored",
             source=source,
             customer=customer_id,
-            event_type=payload.get("type") if isinstance(payload, dict) else None,
+            event_type=event_type,
             trace_id=trace_id,
         )
         return JSONResponse({"status": "ignored", "trace_id": trace_id})
+
+    # Routing identifiers form object keys and queue identity. Refuse an unsafe
+    # one rather than collapsing distinct events onto a redaction placeholder.
+    if await redact_payload_async(parsed.source_event_id) != parsed.source_event_id:
+        raise HTTPException(status_code=422, detail="event identifier contains credential material")
 
     # Headers are persisted with the raw payload for replayability. Strip
     # bearer/cookie/api-key headers before write — even though the gateway
@@ -558,6 +586,8 @@ async def webhook(
         for k, v in request.headers.items()
         if k.lower() not in _SENSITIVE_HEADERS
     }
+    payload = await redact_payload_async(payload)
+    safe_headers = await redact_payload_async(safe_headers)
     envelope = orjson.dumps(
         {
             "_headers": safe_headers,

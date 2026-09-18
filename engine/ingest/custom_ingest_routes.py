@@ -28,6 +28,7 @@ from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
+from engine.ingest.payload_redaction import redact_payload_async
 from engine.shared.config import get_settings
 from engine.shared.constants import QueueStatus, SourceSystem
 from engine.shared.custom_ingest import (
@@ -87,6 +88,9 @@ async def custom_ingest_documents(
         raise HTTPException(status_code=400, detail="invalid JSON") from exc
 
     try:
+        # Validate and hash the persisted representation, never an unsanitized
+        # body that a later indexing pass merely hides from search.
+        payload = await redact_payload_async(payload)
         envelope = CustomIngestEnvelope.model_validate(payload)
         _validate_document_limits(envelope)
     except (ValidationError, ValueError) as exc:
@@ -103,7 +107,7 @@ async def custom_ingest_documents(
             headers={"Retry-After": "300"},
         )
 
-    trace_id = x_trace_id or f"custom-ingest-{int(datetime.now().timestamp() * 1000)}"
+    trace_id = await redact_payload_async(x_trace_id or f"custom-ingest-{int(datetime.now().timestamp() * 1000)}")
     bind_trace(trace_id)
 
     store = getattr(request.app.state, "store", None) or get_store()

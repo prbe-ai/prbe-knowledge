@@ -171,9 +171,13 @@ jobs:
           tests/handlers/test_codex_registration.py
           tests/handlers/test_pi_registration.py
           tests/test_secret_redaction.py
+          tests/test_secret_persistence_boundaries.py
+          tests/test_manual_upload_secret_boundary.py
+          tests/test_webhook_log_redaction.py
           tests/test_credential_sweep.py
           tests/test_queue_tiers.py
           tests/test_redactd.py
+          tests/test_scanner_image_packaging.py
           tests/test_claim_protocol.py
           tests/test_queue_age.py
 

@@ -16,6 +16,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 
 from engine.ingest.connectedness import is_source_connected
+from engine.ingest.payload_redaction import redact_payload_async
 from engine.shared.constants import SourceSystem
 from engine.shared.db import with_tenant
 from engine.shared.source_registry import ingestion_priority_for
@@ -138,6 +139,9 @@ async def accept_legacy(payload, envelope, customer, source, store, key, enqueue
     """Fence old producers atomically with first protocol-2 stream acceptance."""
     if not await is_source_connected(customer, source):
         return False
+    # Authentication/parse happened upstream. Never persist the original
+    # envelope, even for an old capture client that did not redact locally.
+    envelope = json.dumps(await redact_payload_async(json.loads(envelope))).encode()
     async with with_tenant(customer) as conn:
         await _lock(conn, customer, source.value, payload["session_id"])
         await reject_legacy_writer(conn, customer, source.value, payload["session_id"])
@@ -184,6 +188,9 @@ async def accept(payload: dict, customer: str, source: SourceSystem, store) -> d
         raise HTTPException(409, "session capture source is disconnected")
     sid = payload["session_id"]
     digest = hashlib.sha256(canonical_payload(payload)).hexdigest()
+    # The receipt identifies the original request, which clients retry byte
+    # for byte. Only the stored representation changes, not that identity.
+    stored_payload = await redact_payload_async(payload)
     # Date-independent and content-addressed: no other body can overwrite this key.
     key = f"raw/{source.value}/{customer}/sessions-v2/{sid}/{payload['batch_seq']}-{digest}.json"
     async with with_tenant(customer) as conn:
@@ -210,7 +217,7 @@ async def accept(payload: dict, customer: str, source: SourceSystem, store) -> d
                 sid,
                 payload["stream_id"],
                 EMPTY_HASH,
-                payload.get("device_id"),
+                stored_payload.get("device_id"),
             )
             stream = {
                 "stream_id": payload["stream_id"],
@@ -267,7 +274,7 @@ async def accept(payload: dict, customer: str, source: SourceSystem, store) -> d
         bucket = await store.bucket_for(customer)
         await store.ensure_bucket(bucket)
         # Include authenticated uploader metadata for display, never as original authorship proof.
-        envelope = json.dumps({"payload": payload}, sort_keys=True, separators=(",", ":")).encode()
+        envelope = json.dumps({"payload": stored_payload}, sort_keys=True, separators=(",", ":")).encode()
         await store.put(bucket, key, envelope)
         await _enqueue_agent(conn, customer, source, sid, key)
         row = await conn.fetchrow(

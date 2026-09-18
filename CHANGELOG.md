@@ -8,6 +8,12 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Fixed
 
+- Scrub transcript and custom-ingest content before raw object storage, including
+  metadata, URLs and pre-chunked document content before indexing. Manual uploads
+  are inspected before staging originals. Invalid scanner verdicts fail closed;
+  scanner diagnostics no longer copy input into stored errors. Receipt digests
+  continue to identify original requests while stored content is sanitized.
+
 - Indexed the three foreign keys whose absence made a tenant purge impossible. Postgres indexes
   the REFERENCED side of a foreign key and never the REFERENCING side, so a delete of a
   referenced row runs an RI check against the child table — and with no index that check is a
