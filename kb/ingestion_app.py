@@ -557,11 +557,16 @@ async def webhook(
         # github events the connector filters out). Log so silent drops
         # are visible — pre-fix we returned a 200 with no log line and
         # operators couldn't tell signal from noise.
+        # Ignored events skip the persistence scrub below, but provider fields
+        # still need inspection before entering persistent structured logs.
+        event_type = await redact_payload_async(
+            payload.get("type") if isinstance(payload, dict) else None
+        )
         log.info(
             "ingestion.ignored",
             source=source,
             customer=customer_id,
-            event_type=payload.get("type") if isinstance(payload, dict) else None,
+            event_type=event_type,
             trace_id=trace_id,
         )
         return JSONResponse({"status": "ignored", "trace_id": trace_id})
