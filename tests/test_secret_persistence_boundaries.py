@@ -314,3 +314,17 @@ async def test_webhook_trace_and_parsed_event_id_never_persist_raw(monkeypatch, 
         assert response.status_code == 200
         assert puts and queued
     assert KEY not in json.dumps({'puts':puts, 'queue':queued, 'logs':logs})
+
+
+@pytest.mark.parametrize('lookup', ["os.environ['ANTHROPIC_API_KEY']", "os.getenv('ANTHROPIC_API_KEY')"])
+@pytest.mark.parametrize('literal_suffix', ['', ' + "FabricatedCredential42!"'])
+def test_combined_ingress_scrubber_preserves_only_complete_environment_references(lookup, literal_suffix):
+    from engine.ingest.payload_redaction import redact_payload
+
+    expression = lookup + literal_suffix
+    payload = {'content': 'api_key = ' + expression, 'api_key': expression}
+    clean = redact_payload(payload)
+    if not literal_suffix:
+        assert clean == payload
+    else:
+        assert 'FabricatedCredential42!' not in json.dumps(clean)

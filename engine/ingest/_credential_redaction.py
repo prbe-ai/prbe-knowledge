@@ -203,13 +203,26 @@ _AUTH_VALUE = re.compile(
     r"(?i)(\bauthorization[\"']?\s*[:=]\s*[\"']?(?:Bearer|Basic)\s+)"
     r"([^\s\"'<>;,]+)"
 )
+_ENV_NAME = r"(?:'[A-Za-z_][A-Za-z0-9_]*'|\"[A-Za-z_][A-Za-z0-9_]*\")"
+_ENV_LOOKUP = re.compile(
+    r"os\.(?:environ[ \t]*\[[ \t]*" + _ENV_NAME + r"[ \t]*\]"
+    r"|getenv[ \t]*\([ \t]*" + _ENV_NAME + r"[ \t]*\))"
+)
 _KEYED_VALUE = re.compile(
     r"(?<![A-Za-z0-9_.-])(?P<q>['\"]?)(?P<key>[A-Za-z_][A-Za-z0-9_.-]*)(?P=q)\s*[:=]\s*"
-    r"(?P<value>\$\{[A-Za-z_][A-Za-z0-9_]*\}|\"(?:\\.|[^\"\\])*(?:\"|$)|'(?:\\.|[^'\\])*(?:'|$)|(?:\\.|[^\s,&;)}\]\"'\\])+)"
+    # Keep an environment expression's whole RHS together. Only a complete
+    # lookup is indirect; concatenation/default literals remain credential data.
+    r"(?P<value>os\.(?:environ|getenv)\b[^\r\n;]*|\$\{[A-Za-z_][A-Za-z0-9_]*\}|\"(?:\\.|[^\"\\])*(?:\"|$)|'(?:\\.|[^'\\])*(?:'|$)|(?:\\.|[^\s,&;)}\]\"'\\])+)"
 )
 
 
-def _indirect_value(value: str) -> bool:
+def _indirect_value(value: str, *, allow_lookup: bool = True) -> bool:
+    if allow_lookup and _ENV_LOOKUP.fullmatch(value.strip()):
+        from ._credential_secrets import redact
+
+        # An environment reference is not a waiver for a recognizable credential
+        # embedded in its variable name.
+        return not _TOKEN_PREFIXED.search(value) and not redact(value)[1]
     return value == "" or bool(re.fullmatch(
         r"\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*|<redacted(?::[a-z0-9-]+)?>",
         value,
@@ -223,9 +236,10 @@ def _keyed(match: re.Match[str]) -> str:
         prefix = match.group(0)[:match.start("value") - match.start()]
         return prefix + scrub_string(match.group("value"))
     value = match.group("value")
+    quoted = value[:1] in ("'", '"')
     if len(value) >= 2 and value[0] in ("'", '"') and value[-1] == value[0]:
         value = value[1:-1]
-    if _indirect_value(value):
+    if _indirect_value(value, allow_lookup=not quoted):
         return match.group(0)
     return f"{match.group('q')}{match.group('key')}{match.group('q')}=<redacted>"
 
