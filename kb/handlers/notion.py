@@ -45,6 +45,7 @@ from typing import Any, ClassVar
 from engine.ingest.chunker import count_tokens
 from engine.ingest.handlers.base import Connector
 from engine.ingest.handlers.registry import register_connector
+from engine.ingest.payload_redaction import redact_payload
 from engine.shared.constants import (
     DocClass,
     DocType,
@@ -476,7 +477,7 @@ class NotionConnector(Connector):
             log.info(
                 "notion.webhook_deferred",
                 event_type=event_type,
-                entity_id=(raw_payload.get("entity") or {}).get("id"),
+                entity_id=redact_payload((raw_payload.get("entity") or {}).get("id")),
             )
             return None
         if event_type not in _ACCEPTED_EVENT_TYPES:

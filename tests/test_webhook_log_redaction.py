@@ -33,9 +33,9 @@ def ignored_notion(monkeypatch):
         ingestion_app, "build_connector", lambda *args: object.__new__(NotionConnector)
     )
 
-    async def invoke(event_type):
+    async def invoke(event_type, *, entity_id="synthetic", entity_type="page"):
         raw = json.dumps(
-            {"type": event_type, "entity": {"id": "synthetic", "type": "page"}}
+            {"type": event_type, "entity": {"id": entity_id, "type": entity_type}}
         ).encode()
 
         async def receive():
@@ -69,6 +69,28 @@ async def test_ignored_notion_event_is_safe_at_structured_log_boundary(ignored_n
     assert len(ignored) == 1
     if event_type != KEY:
         assert ignored[0]["event_type"] == event_type
+
+
+@pytest.mark.asyncio
+async def test_deferred_notion_entity_is_safe_at_structured_log_boundary(ignored_notion):
+    with capture_logs() as logs:
+        response = await ignored_notion("comment.created", entity_id=KEY)
+    assert response.status_code == 200
+    assert any(row.get("event") == "notion.webhook_deferred" for row in logs)
+    credential_exposed = KEY in json.dumps(logs)
+    assert not credential_exposed
+
+
+@pytest.mark.asyncio
+async def test_invalid_provider_payload_does_not_reflect_connector_exception(ignored_notion):
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as caught:
+        await ignored_notion("page.created", entity_id=KEY, entity_type="unsupported")
+    assert caught.value.status_code == 400
+    credential_exposed = KEY in str(caught.value.detail)
+    assert not credential_exposed
+    assert caught.value.detail == "invalid webhook payload"
 
 
 @pytest.mark.asyncio

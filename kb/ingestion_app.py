@@ -548,8 +548,9 @@ async def webhook(
         parsed = connector.parse_webhook_event(
             customer_id, dict(request.headers), payload
         )
-    except InvalidWebhookPayload as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except InvalidWebhookPayload:
+        # Connector diagnostics may interpolate original provider content.
+        raise HTTPException(status_code=400, detail="invalid webhook payload") from None
 
     if parsed is None:
         # Connector recognized the payload but doesn't ingest this event
