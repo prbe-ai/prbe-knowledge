@@ -6,6 +6,13 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Added
+
+- Add authenticated `/retrieve/direct` for interactive search: one query embedding,
+  parallel vector/BM25 lookup, document rank fusion and a final live-version/scope
+  check. Each channel is bounded and failures are reported explicitly; this path
+  never invokes the gatherer or query synthesis.
+
 ### Fixed
 
 - Preserve typed boolean status fields during ingestion scrubbing and artifact
