@@ -2,6 +2,7 @@
 
 Endpoints exposed:
     POST /retrieve         raw chunks pipeline (vector + BM25 + graph fusion)
+    POST /retrieve/direct  bounded vector + BM25 lookup, no gatherer
     POST /query            /retrieve + LLM synthesis (cited answer)
     POST /query/stream     /query as SSE stream
     POST /graph/explore    knowledge-graph viz: default mode (top-N by degree)
@@ -18,6 +19,7 @@ The pipeline itself lives in:
     list_pipeline.py    deterministic SQL window/aggregate path
     search_pipeline.py  vector + BM25 + graph + RRF + dedup + ACL path
     graph_explore.py    /graph/explore + /graph/search SQL-only paths
+    direct.py           interactive vector/BM25 lookup + live document gate
     auth.py             auth resolution helpers
     helpers.py          shared utilities (entity filter, embedding fetch)
     retrievers/         retriever implementations
@@ -41,6 +43,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 
 from engine.retrieval.auth import authenticate_query
+from engine.retrieval.direct import DirectRetrieveRequest, DirectRetrieveResponse, retrieve_direct
 from engine.retrieval.graph_explore import (
     EXPLORE_CONFIDENCES,
     EXPLORE_EDGE_TYPES,
@@ -248,6 +251,15 @@ async def retrieve(
         stage_ms=resp.timing_ms,
     )
     return resp
+
+
+@app.post("/retrieve/direct", response_model=DirectRetrieveResponse)
+async def direct_retrieve(
+    req: DirectRetrieveRequest,
+    customer_id: str = Depends(authenticate_query),
+) -> DirectRetrieveResponse:
+    """Direct vector + BM25 index lookup for interactive entity navigation."""
+    return await retrieve_direct(req, customer_id)
 
 
 @app.post("/query", response_model=AnswerResponse)
