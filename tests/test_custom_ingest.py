@@ -509,6 +509,6 @@ def test_resolve_retired_label_passes_everything_else_through() -> None:
 
     assert resolve_retired_label("Run", "experiment:x") == ("Run", "experiment:x")
     assert resolve_retired_label("Experiment", "experiment:x") == ("Project", "project:x")
-    # An id this map does not understand keeps its id: the label still maps,
-    # so the document ingests, but nothing is guessed about the identity.
-    assert resolve_retired_label("Experiment", "legacy-7") == ("Project", "legacy-7")
+    # An id without the retired prefix is not guessed at: it keeps the retired
+    # label, which validation then refuses like any unknown one.
+    assert resolve_retired_label("Experiment", "legacy-7") == ("Experiment", "legacy-7")

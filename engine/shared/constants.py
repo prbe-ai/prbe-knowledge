@@ -252,13 +252,16 @@ def resolve_retired_label(label: str, canonical_id: str) -> tuple[str, str]:
     every node and endpoint without first asking whether it is retired.
     """
     retired = RETIRED_NODE_LABELS.get(label)
-    if retired is None:
+    if retired is None or not canonical_id.startswith(retired.canonical_prefix):
+        # An id without the retired prefix is NOT mapped: relabelling it would
+        # mint a Project node unrelated to any real one. It keeps the retired
+        # label and is refused like any unknown label -- research-os only ever
+        # sent the prefixed form, and the node-retire script skips the same
+        # shape, so the two agree.
         return label, canonical_id
-    if canonical_id.startswith(retired.canonical_prefix):
-        canonical_id = retired.replacement_prefix + canonical_id.removeprefix(
-            retired.canonical_prefix
-        )
-    return retired.replacement.value, canonical_id
+    return retired.replacement.value, retired.replacement_prefix + canonical_id.removeprefix(
+        retired.canonical_prefix
+    )
 
 
 class CodeSymbolKind(StrEnum):

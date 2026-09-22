@@ -45,6 +45,7 @@ async def _seed() -> dict[str, int]:
             "exp_odd": await node("Experiment", "legacy-7", 0),
             "parent": await node("Project", "project:parent", 1),
             "run": await node("Run", "run:r1", 2),
+            "run2": await node("Run", "run:r2", 0),
             "file_doc": await node("Document", "custom_ingest:x:file:f1", 1),
             "b_doc": await node("Document", "custom_ingest:x:file:f2", 1),
         }
@@ -76,8 +77,19 @@ async def _seed() -> dict[str, int]:
         await conn.execute(
             "INSERT INTO pending_edges (customer_id, missing_label, missing_canonical_id, "
             "edge_type, from_label, from_canonical_id, to_label, to_canonical_id, source_system) "
-            "VALUES ($1, 'Experiment', 'experiment:c', 'MEMBER_OF', 'Run', 'run:r9', "
+            "VALUES ($1, 'Experiment', 'experiment:c', 'MEMBER_OF', 'Experiment', 'legacy-7', "
             "'Experiment', 'experiment:c', 'custom_ingest')",
+            CID,
+        )
+        # Waiting on experiment A, whose Project node has ALREADY landed -- and
+        # stamped with a lease a failed drain left behind. Nothing would ever
+        # claim it again unless the script clears the lease and drains it.
+        await conn.execute(
+            "INSERT INTO pending_edges (customer_id, missing_label, missing_canonical_id, "
+            "edge_type, from_label, from_canonical_id, to_label, to_canonical_id, source_system, "
+            "locked_until) "
+            "VALUES ($1, 'Experiment', 'experiment:a', 'MEMBER_OF', 'Run', 'run:r2', "
+            "'Experiment', 'experiment:a', 'custom_ingest', now() + interval '1 hour')",
             CID,
         )
     return ids
@@ -111,14 +123,15 @@ async def test_retire_folds_relabels_and_is_idempotent(live_db: None) -> None:
     before_nodes, before_edges = await _nodes(), await _edges()
 
     dry = await retire_customer(CID, dry_run=True)
-    assert (dry.nodes, dry.merged, dry.relabelled, dry.pending_rewritten) == (3, 1, 1, 1)
+    assert (dry.nodes, dry.merged, dry.relabelled, dry.pending_rewritten) == (3, 1, 1, 2)
     assert dry.skipped_ids == ["legacy-7"]
     assert await _nodes() == before_nodes and await _edges() == before_edges, "dry run wrote"
 
     stats = await retire_customer(CID)
     assert (stats.merged, stats.relabelled, stats.duplicate_edges_dropped) == (1, 1, 1)
     assert stats.edges_repointed == 2  # the file edge and the parent edge
-    assert stats.pending_rewritten == 1
+    assert stats.pending_rewritten == 2
+    assert stats.pending_drained == 1  # the row whose Project node had landed
 
     nodes = await _nodes()
     # A was FOLDED: gone, and its project node carries everything it had.
@@ -128,10 +141,13 @@ async def test_retire_folds_relabels_and_is_idempotent(live_db: None) -> None:
         ("MEMBER_OF", ids["run"], ids["proj_a"]),
         ("MEMBER_OF", ids["proj_a"], ids["parent"]),
         ("TOUCHES", ids["exp_b"], ids["b_doc"]),
+        # Drained from pending_edges onto the project node that had landed.
+        ("MEMBER_OF", ids["run2"], ids["proj_a"]),
     }
-    # Degrees RECOUNTED from the rows: the project node gained two edges and
-    # the run lost its duplicate.
-    assert nodes[ids["proj_a"]] == ("Project", "project:a", 3)
+    # Degrees RECOUNTED from the rows: the project node gained two re-pointed
+    # edges (plus the drained one, which graph_writer counts), and the run
+    # lost its duplicate.
+    assert nodes[ids["proj_a"]] == ("Project", "project:a", 4)
     assert nodes[ids["run"]][2] == 1
     # B was RELABELLED in place: same node, same edge, new name.
     assert nodes[ids["exp_b"]] == ("Project", "project:b", 1)
@@ -142,19 +158,25 @@ async def test_retire_folds_relabels_and_is_idempotent(live_db: None) -> None:
         provenance = await conn.fetchval(
             "SELECT count(*) FROM graph_node_provenance WHERE node_id = $1", ids["proj_a"]
         )
-        pending = await conn.fetchrow(
-            "SELECT missing_label, missing_canonical_id, from_label, to_label, to_canonical_id "
-            "FROM pending_edges WHERE customer_id = $1",
+        pending = await conn.fetch(
+            "SELECT missing_label, missing_canonical_id, from_label, from_canonical_id, "
+            "to_label, to_canonical_id, locked_until FROM pending_edges WHERE customer_id = $1",
             CID,
         )
     assert provenance == 1
-    assert dict(pending) == {
-        "missing_label": "Project",
-        "missing_canonical_id": "project:c",
-        "from_label": "Run",
-        "to_label": "Project",
-        "to_canonical_id": "project:c",
-    }
+    # Only the row still waiting (project:c has not landed) remains, rewritten
+    # per pair: the odd `legacy-7` endpoint is NOT mangled into `project:`.
+    assert [dict(r) for r in pending] == [
+        {
+            "missing_label": "Project",
+            "missing_canonical_id": "project:c",
+            "from_label": "Experiment",
+            "from_canonical_id": "legacy-7",
+            "to_label": "Project",
+            "to_canonical_id": "project:c",
+            "locked_until": None,
+        }
+    ]
 
     again = await retire_customer(CID)
     assert (again.merged, again.relabelled, again.pending_rewritten) == (0, 0, 0)
