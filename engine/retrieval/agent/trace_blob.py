@@ -151,6 +151,11 @@ def build_trace_blob(
         blob["rendered_doc_ids"] = sorted(state.rendered_doc_ids)
         blob["request_recency_half_life_days"] = state.request_recency_half_life_days
         blob["request_recall_floor_mode"] = state.request_recall_floor_mode
+        # Which selector picked the results, and its full record -- including
+        # the top of Jev's ranking, so any later selection rule is an offline
+        # re-read of the trace rather than a re-run against the API.
+        blob["selector"] = state.selector
+        blob["selection"] = state.selection
     else:
         # Pre-loop failure (e.g. grounding raised before state was constructed
         # in a future refactor). Keep the keys present so analyzer schema
@@ -184,6 +189,8 @@ def build_trace_blob(
         blob["rendered_doc_ids"] = []
         blob["request_recency_half_life_days"] = None
         blob["request_recall_floor_mode"] = None
+        blob["selector"] = None
+        blob["selection"] = {}
 
     if gathered is not None:
         blob["gathered"] = gathered.model_dump(mode="json")

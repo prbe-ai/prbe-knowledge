@@ -62,6 +62,11 @@ GathererStatus = Literal[
     # `timing_ms.loop_budget_ms` now rides every trace so the next occurrence
     # is one query away instead of an archaeology project.
     "loop_budget_starved",
+    # The `jev` selector could not score the pool (no key, timeout, provider
+    # error, every batch failed) and the recall floor answered alone. Degraded:
+    # the caller got floor-quality results -- the same as the `floor` selector
+    # -- instead of what it asked for.
+    "jev_unavailable",
     "schema_violation",
     # The response gate could not re-verify the emitted chunks against the
     # live documents rows (DB error) on an UNSCOPED request. The chunks are
