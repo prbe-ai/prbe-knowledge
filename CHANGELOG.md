@@ -6,6 +6,17 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Changed
+
+- Retire the `Experiment` graph node label and the `experiment` entity type:
+  research-os made every experiment a Project of kind 'experiment' with the same
+  id. An arriving `Experiment` node or edge endpoint is mapped to `Project`
+  (`experiment:<id>` becomes `project:<id>`) instead of refused, so a straggler
+  from an older research-os pod cannot dead-letter the indexing relay.
+  `scripts/retire_experiment_nodes.py` folds existing Experiment nodes into their
+  Project node (or relabels them in place), keeping every edge. Deploy only after
+  research-os has stopped emitting the label; run the script one tenant first.
+
 ### Added
 
 - Choose what picks a search's results with the new `selector` option: `gatherer` (today's

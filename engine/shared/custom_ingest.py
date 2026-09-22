@@ -10,7 +10,7 @@ from typing import Any
 import orjson
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from engine.shared.constants import DocType, EdgeType, NodeLabel
+from engine.shared.constants import DocType, EdgeType, NodeLabel, resolve_retired_label
 from engine.shared.source_registry import DEFAULT_DOC_TYPE_PREFIX
 
 # Colon allowed (after the first char) so consumers can namespace dynamic
@@ -20,6 +20,18 @@ from engine.shared.source_registry import DEFAULT_DOC_TYPE_PREFIX
 # additive-only.
 _SOURCE_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9:_-]{0,127}$")
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _map_retired_endpoint(data: Any, label_key: str, id_key: str) -> None:
+    """Rewrite one (label, canonical id) pair in a raw payload IN PLACE when the
+    label is retired (constants.RETIRED_NODE_LABELS), BEFORE field validation
+    sees it -- so a retired label is mapped rather than refused with the 422
+    that dead-letters a whole relay lane."""
+    if not isinstance(data, dict):
+        return
+    label, canonical_id = data.get(label_key), data.get(id_key)
+    if isinstance(label, str) and isinstance(canonical_id, str):
+        data[label_key], data[id_key] = resolve_retired_label(label.strip(), canonical_id)
 
 
 def is_valid_source_key(value: str) -> bool:
@@ -57,6 +69,14 @@ class CustomIngestNode(BaseModel):
     canonical_id: str = Field(min_length=1, max_length=256)
     name: str = Field(min_length=1, max_length=512)
     properties: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_retired_label(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            data = dict(data)
+            _map_retired_endpoint(data, "label", "canonical_id")
+        return data
 
     @field_validator("label")
     @classmethod
@@ -97,6 +117,15 @@ class CustomIngestEdge(BaseModel):
     to_label: str = Field(min_length=1, max_length=64)
     to_canonical_id: str = Field(min_length=1, max_length=256)
     properties: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_retired_labels(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            data = dict(data)
+            _map_retired_endpoint(data, "from_label", "from_canonical_id")
+            _map_retired_endpoint(data, "to_label", "to_canonical_id")
+        return data
 
     @field_validator("edge_type")
     @classmethod

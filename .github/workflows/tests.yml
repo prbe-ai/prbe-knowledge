@@ -222,7 +222,9 @@ jobs:
       # / LIMIT the HNSW index can serve; they were not on the list when the
       # recency path silently dropped its LIMIT. test_custom_ingest and
       # test_backfill_custom_doc_types cover the custom.<type> doc_type mapping
-      # and its backfill. NEVER put a `#` comment INSIDE the folded `run: >-`
+      # and its backfill; test_retire_experiment_nodes covers folding the retired
+      # Experiment graph nodes into their Project nodes (T6).
+      # NEVER put a `#` comment INSIDE the folded `run: >-`
       # scalar below: YAML folds it into one line and the first `#` comments
       # out every path after it -- CI stays green and runs none of them.
       - name: Tests (storage + workflow-memory suites)
@@ -266,3 +268,4 @@ jobs:
           tests/test_bm25_index_generations.py
           tests/test_custom_ingest.py
           tests/test_backfill_custom_doc_types.py
+          tests/test_retire_experiment_nodes.py

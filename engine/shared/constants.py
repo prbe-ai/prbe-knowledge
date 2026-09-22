@@ -164,9 +164,14 @@ class NodeLabel(StrEnum):
 
     # ---- Research domain ----
     # Generic experiment-tracking vocabulary, not specific to any one
-    # tracker: a Project groups Experiments, an Experiment has Runs, a Run
-    # produces Artifacts, an Asset is a reusable input/output pinned across
-    # runs. Any custom-ingest client modelling that shape can address these.
+    # tracker: a Project nests Projects and has Runs, a Run produces
+    # Artifacts, an Asset is a reusable input/output pinned across runs. Any
+    # custom-ingest client modelling that shape can address these.
+    #
+    # There is no Experiment label any more. research-os made an experiment a
+    # Project of kind 'experiment' (sharing its id), and its projections name a
+    # `Project` node for one. A client still SENDING the old label is mapped,
+    # not refused -- see RETIRED_NODE_LABELS below for why.
     #
     # These are deliberately NOT collapsed into DOCUMENT the way migration
     # 0091 collapsed PR/Issue/Ticket/Channel/Repo. That collapse applied to
@@ -179,7 +184,6 @@ class NodeLabel(StrEnum):
     # it: the graph retriever's neighbour join is `AND n.label = 'Document'`,
     # so an entity node is an ANCHOR to traverse from, never a returned hit.
     PROJECT = "Project"
-    EXPERIMENT = "Experiment"
     RUN = "Run"
     ARTIFACT = "Artifact"
     ASSET = "Asset"
@@ -201,6 +205,60 @@ class NodeLabel(StrEnum):
     # parked in pending_edges until the reaper drops it. Non-Document labels
     # pass through untouched.
     AGENT_SESSION = "AgentSession"
+
+
+@dataclass(frozen=True)
+class RetiredNodeLabel:
+    """A label the engine no longer has, and what an arriving one now means.
+
+    `canonical_prefix` -> `replacement_prefix` rewrites the node's canonical id
+    along with its label, so the node lands on the SAME node the replacement
+    label already names instead of minting a second one beside it.
+    """
+
+    replacement: "NodeLabel"
+    canonical_prefix: str
+    replacement_prefix: str
+
+
+#: Labels retired from NodeLabel that custom-ingest still ACCEPTS, mapped to
+#: what replaced them.
+#:
+#: WHY A MAP AND NOT A REFUSAL. An unknown label is a 422, and the research-os
+#: relay treats a 422 as poison: the document dead-letters permanently. That
+#: relay is in-process and FIFO across every corpus, so a refused label stalls
+#: indexing for every tenant, not just the document that carried it. The label
+#: was retired only after research-os stopped emitting it, but a straggler can
+#: still arrive -- a row enqueued by a pod from before that release, or a
+#: dead-lettered row somebody replays. Mapping it costs one dict lookup; a
+#: refusal is an outage.
+#:
+#: `Experiment` -> `Project`: research-os made every experiment a Project of
+#: kind 'experiment' sharing the experiment's id, so `experiment:<uuid>` and
+#: `project:<uuid>` name the same thing.
+RETIRED_NODE_LABELS: dict[str, RetiredNodeLabel] = {
+    "Experiment": RetiredNodeLabel(
+        replacement=NodeLabel.PROJECT,
+        canonical_prefix="experiment:",
+        replacement_prefix="project:",
+    ),
+}
+
+
+def resolve_retired_label(label: str, canonical_id: str) -> tuple[str, str]:
+    """`(label, canonical_id)` with a retired label mapped to its replacement.
+
+    Anything else passes through untouched, so a caller can apply this to
+    every node and endpoint without first asking whether it is retired.
+    """
+    retired = RETIRED_NODE_LABELS.get(label)
+    if retired is None:
+        return label, canonical_id
+    if canonical_id.startswith(retired.canonical_prefix):
+        canonical_id = retired.replacement_prefix + canonical_id.removeprefix(
+            retired.canonical_prefix
+        )
+    return retired.replacement.value, canonical_id
 
 
 class CodeSymbolKind(StrEnum):
@@ -327,7 +385,6 @@ ENTITY_TYPE_REGISTRY: tuple[EntityTypeSpec, ...] = (
     # Research-domain entities. Each keeps its own label (see NodeLabel) and
     # carries no kind discriminator, so reverse resolution is label-only.
     EntityTypeSpec("project", NodeLabel.PROJECT),
-    EntityTypeSpec("experiment", NodeLabel.EXPERIMENT),
     EntityTypeSpec("run", NodeLabel.RUN),
     EntityTypeSpec("artifact", NodeLabel.ARTIFACT),
     EntityTypeSpec("asset", NodeLabel.ASSET),
