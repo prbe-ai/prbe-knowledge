@@ -2439,7 +2439,11 @@ def _coerce_lenient(raw: dict[str, Any], state: LoopState | None = None) -> dict
         # and even when it does, its copy is a transcription of text we already
         # hold verbatim. This is what retires the old failure where a chunk
         # the model named correctly was DROPPED because it fumbled the retype.
-        stored = stored_chunks.get(ch_out["chunk_id"])
+        # A non-strict provider can emit a list or object as `chunk_id`; a
+        # dict lookup on that raises TypeError OUTSIDE the validation handler
+        # and would fail the whole search instead of degrading it.
+        cid = ch_out["chunk_id"]
+        stored = stored_chunks.get(cid) if isinstance(cid, str) else None
         if stored is not None:
             ch_out["content"] = stored.get("content") or ""
         elif not ch_out.get("content"):

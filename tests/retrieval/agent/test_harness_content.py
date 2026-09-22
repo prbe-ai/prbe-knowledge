@@ -59,3 +59,13 @@ def test_the_prompt_tells_the_model_not_to_retype():
 
     text = build_system_prompt(datetime.now(UTC))
     assert "Do NOT" in text and "copy the passage text into `content`" in text
+
+
+def test_a_malformed_chunk_id_does_not_raise():
+    # A list/object id must reach Pydantic validation (and its recovery path),
+    # not blow up the coercer with a TypeError on a dict lookup.
+    out = _coerce_lenient({"chunks": [
+        {"doc_id": "slack:d1", "chunk_id": ["not", "a", "string"], "content": "x"},
+        {"doc_id": "slack:d1", "chunk_id": "slack:d1#0"},
+    ], "gatherer_notes": {}}, _state())
+    assert any(c["chunk_id"] == "slack:d1#0" for c in out["chunks"])
