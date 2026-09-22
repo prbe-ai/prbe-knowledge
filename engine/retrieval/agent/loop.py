@@ -2957,7 +2957,9 @@ async def _select_without_gatherer(
 
     try:
         await _score(pool)
-    except (jev.JevError, TimeoutError) as exc:
+    # Broad on purpose: Jev is an outside service, and whatever it raises --
+    # typed or not -- must cost this search its ranking, never the search.
+    except Exception as exc:
         sel["fallback"] = f"{type(exc).__name__}: {str(exc)[:160] or '<empty>'}"
         log.warning(
             "agent.jev_unavailable",
@@ -2978,7 +2980,7 @@ async def _select_without_gatherer(
         fresh = {c: h for c, h in grown.items() if c not in scores}
         try:
             await _score(fresh)
-        except (jev.JevError, TimeoutError) as exc:
+        except Exception as exc:
             # The first pass already scored: keep it, report the gap.
             sel["rewrite"]["rescore_error"] = f"{type(exc).__name__}"
         pool = grown
@@ -3029,7 +3031,8 @@ async def _jev_extraction_or_none(query: str) -> jev.ExtractionChoice | None:
             jev.extract_options(query, api_key=_get_settings().typesafe_api_key),
             timeout=JEV_SELECTION_TIMEOUT_SECONDS,
         )
-    except (jev.JevError, TimeoutError) as exc:
+    # Broad on purpose: an experiment must never be able to fail a search.
+    except Exception as exc:
         log.info("agent.extract_jev_unavailable", reason=f"{type(exc).__name__}")
         return None
 

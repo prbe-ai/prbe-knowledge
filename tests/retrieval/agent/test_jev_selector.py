@@ -286,7 +286,7 @@ async def test_jev_picks_carry_their_real_channels_not_recall_floor():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("exc", [jev.JevError("no key"), TimeoutError()])
+@pytest.mark.parametrize("exc", [jev.JevError("no key"), TimeoutError(), RuntimeError("an untyped surprise")])
 async def test_any_jev_failure_degrades_to_the_floor_never_fails(exc):
     async def boom(*a, **k):
         raise exc

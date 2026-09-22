@@ -187,6 +187,25 @@ class ScoreResult:
     elapsed_ms: float = 0.0
 
 
+#: One pooled client per running event loop. A client per search paid a fresh
+#: TLS handshake to api.typesafe.ai on every request -- on the order of the
+#: ~0.2s the scoring call itself takes. Keyed by loop because an AsyncClient is
+#: bound to the loop that created it, and test runners start a new loop per
+#: test.
+_CLIENTS: dict[int, httpx.AsyncClient] = {}
+
+
+def _shared_client() -> httpx.AsyncClient:
+    loop_id = id(asyncio.get_running_loop())
+    client = _CLIENTS.get(loop_id)
+    if client is None or client.is_closed:
+        client = httpx.AsyncClient(
+            limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
+        )
+        _CLIENTS[loop_id] = client
+    return client
+
+
 async def _post(
     client: httpx.AsyncClient,
     api_key: str,
@@ -279,18 +298,13 @@ async def score_pool(
     if not pool:
         return out
     t0 = time.perf_counter()
-    own = client is None
-    client = client or httpx.AsyncClient()
-    try:
-        await asyncio.gather(
-            *(
-                _score_batch(client, api_key, query, pool, cids, out)
-                for cids in batch_pool(pool, query=query)
-            )
+    client = client or _shared_client()
+    await asyncio.gather(
+        *(
+            _score_batch(client, api_key, query, pool, cids, out)
+            for cids in batch_pool(pool, query=query)
         )
-    finally:
-        if own:
-            await client.aclose()
+    )
     out.elapsed_ms = (time.perf_counter() - t0) * 1000
     if not out.scores:
         raise JevError("; ".join(out.errors[:3]) or "no scores returned")
@@ -452,21 +466,16 @@ async def extract_options(
     if not api_key:
         raise JevError("TYPESAFE_API_KEY is not configured")
     t0 = time.perf_counter()
-    own = client is None
-    client = client or httpx.AsyncClient()
+    client = client or _shared_client()
     try:
-        try:
-            resp = await _post(
-                client,
-                api_key,
-                {"query": query},
-                {"sort": _SORT_QUESTION, "doc_class": _CLASS_QUESTION},
-            )
-        except httpx.HTTPError as exc:
-            raise JevError(f"{type(exc).__name__}: {str(exc)[:160] or '<empty>'}") from exc
-    finally:
-        if own:
-            await client.aclose()
+        resp = await _post(
+            client,
+            api_key,
+            {"query": query},
+            {"sort": _SORT_QUESTION, "doc_class": _CLASS_QUESTION},
+        )
+    except httpx.HTTPError as exc:
+        raise JevError(f"{type(exc).__name__}: {str(exc)[:160] or '<empty>'}") from exc
     if resp.status_code != 200:
         raise JevError(f"http_{resp.status_code}: {resp.text[:160]}")
     try:
