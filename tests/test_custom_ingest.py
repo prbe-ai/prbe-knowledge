@@ -404,3 +404,111 @@ def test_custom_doc_type_keeps_the_family_default_for_missing_or_malformed_kinds
     # A kind literally named "document" maps to the family default, which keeps
     # the value set closed under re-mapping (the backfill relies on it).
     assert custom_doc_type("document") == "custom.document"
+
+
+# ============================================================
+# Retired node labels: MAPPED, never refused (experiments-as-subprojects T6)
+# ============================================================
+
+
+def test_the_experiment_label_is_retired_from_the_vocabulary() -> None:
+    from engine.shared.constants import ENTITY_TYPE_REGISTRY, NodeLabel
+
+    assert "Experiment" not in {label.value for label in NodeLabel}
+    assert "experiment" not in {spec.entity_type for spec in ENTITY_TYPE_REGISTRY}
+
+
+@pytest.mark.asyncio
+async def test_a_straggler_experiment_label_is_mapped_onto_its_project_node() -> None:
+    """research-os stopped emitting `Experiment` before this release, but an
+    outbox row enqueued by an older pod -- or a dead-lettered one somebody
+    replays -- still can. Refusing it is a 422, which the relay dead-letters on
+    a FIFO lane every corpus shares. So it lands on the SAME `Project` node the
+    current projections name (research-os shares the id): `experiment:<uuid>`
+    becomes `project:<uuid>`, on nodes and on both ends of every edge."""
+    document = {
+        **_payload()["documents"][0],
+        "nodes": [
+            {"label": "Experiment", "canonical_id": "experiment:e1", "name": "sweep"},
+            {"label": " Experiment ", "canonical_id": "experiment:e2", "name": "padded"},
+        ],
+        "edges": [
+            {
+                "edge_type": "MEMBER_OF",
+                "from_label": "Run",
+                "from_canonical_id": "run:r1",
+                "to_label": "Experiment",
+                "to_canonical_id": "experiment:e1",
+            },
+            {
+                "edge_type": "MEMBER_OF",
+                "from_label": "Experiment",
+                "from_canonical_id": "experiment:e1",
+                "to_label": "Project",
+                "to_canonical_id": "project:p1",
+            },
+        ],
+    }
+    async with httpx.AsyncClient() as client:
+        connector = CustomIngestConnector(ConnectorContext(settings=get_settings(), http=client))
+        result = await connector.normalize(
+            WebhookEvent(
+                customer_id=CUSTOMER,
+                source_system=SourceSystem.CUSTOM_INGEST,
+                source_event_id="acme_internal_incidents:doc:hash",
+                received_at=datetime(2026, 5, 5, 19, 31, tzinfo=UTC),
+                raw_payload={
+                    "source_key": "acme_internal_incidents",
+                    "batch_id": "batch-1",
+                    "source_event_id": "acme_internal_incidents:doc:hash",
+                    "content_hash": "abc123",
+                    "received_at": "2026-05-05T19:31:00Z",
+                    "document": document,
+                },
+            ),
+            {},
+        )
+
+    entity_nodes = {
+        (n.label.value, n.canonical_id) for n in result.graph_nodes if n.label.value != "Document"
+        and n.label.value != "Person"
+    }
+    assert entity_nodes == {("Project", "project:e1"), ("Project", "project:e2")}
+    endpoints = {
+        (e.from_label.value, e.from_canonical_id, e.to_label.value, e.to_canonical_id)
+        for e in result.graph_edges
+        if e.edge_type.value == "MEMBER_OF"
+    }
+    assert endpoints == {
+        ("Run", "run:r1", "Project", "project:e1"),
+        ("Project", "project:e1", "Project", "project:p1"),
+    }
+
+
+def test_a_genuinely_unknown_label_is_still_refused() -> None:
+    """The map is a compatibility door for ONE retired label, not a relaxation
+    of the vocabulary: an unknown label still fails validation."""
+    from pydantic import ValidationError
+
+    from engine.shared.custom_ingest import CustomIngestEdge, CustomIngestNode
+
+    with pytest.raises(ValidationError, match="unknown node label"):
+        CustomIngestNode(label="Group", canonical_id="group:g1", name="g")
+    with pytest.raises(ValidationError, match="unknown node label"):
+        CustomIngestEdge(
+            edge_type="TOUCHES",
+            from_label="Group",
+            from_canonical_id="group:g1",
+            to_label="Document",
+            to_canonical_id="d",
+        )
+
+
+def test_resolve_retired_label_passes_everything_else_through() -> None:
+    from engine.shared.constants import resolve_retired_label
+
+    assert resolve_retired_label("Run", "experiment:x") == ("Run", "experiment:x")
+    assert resolve_retired_label("Experiment", "experiment:x") == ("Project", "project:x")
+    # An id this map does not understand keeps its id: the label still maps,
+    # so the document ingests, but nothing is guessed about the identity.
+    assert resolve_retired_label("Experiment", "legacy-7") == ("Project", "legacy-7")

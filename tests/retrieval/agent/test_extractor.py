@@ -254,13 +254,25 @@ async def test_extract_keeps_research_entities_and_drops_only_invalid(
 
     Also pins that rejection is per-entity and not entity_type-specific: the
     bad `confidence` member is dropped on its own, without discarding the rest.
+
+    `experiment` is no longer an entity type at all (an experiment is a Project
+    of kind 'experiment' now, T6), which makes it the sharpest case of the
+    same rule: a model that still names one loses THAT entity, never the
+    extraction. Constrained decoding keeps a well-behaved model from emitting
+    it; this is the path for one that does anyway.
     """
     payload = json.dumps({
         "entities": [
             {
-                "entity_type": "experiment",
+                "entity_type": "run",
                 "canonical_id": "abag-leg3",
                 "display_name": "AbAg Leg 3",
+                "confidence": 0.9,
+            },
+            {
+                "entity_type": "experiment",
+                "canonical_id": "retired-type",
+                "display_name": "Retired",
                 "confidence": 0.9,
             },
             {
@@ -291,4 +303,4 @@ async def test_extract_keeps_research_entities_and_drops_only_invalid(
     )
 
     kept = {e.canonical_id: e.entity_type for e in result.entities}
-    assert kept == {"abag-leg3": "experiment", "anthrogen": "project"}
+    assert kept == {"abag-leg3": "run", "anthrogen": "project"}
