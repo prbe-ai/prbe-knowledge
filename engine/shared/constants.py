@@ -1905,7 +1905,12 @@ DB_INIT_RETRY_BACKOFF_CAP_SECONDS = 5.0
 # (see the env-flags memory), and the two planes are deployed by different
 # pipelines. A code default moves both planes together, on merge.
 SEARCH_SELECTOR_VALUES = ("gatherer", "floor", "jev")
-SEARCH_SELECTOR_DEFAULT = os.getenv("SEARCH_SELECTOR_DEFAULT", "gatherer")
+# Rollout step 1 (2026-09-22): `floor` for everyone. Phase 0 found the
+# gatherer's LLM turn no better than the floor (6.0% vs 7.4% useful documents
+# where they differ, p=0.06, floor nominally ahead; answering the query 10.9% vs
+# 10.6%), so this returns ~$293/month and ~1.9s per search at no measured cost
+# in quality. `gatherer` stays one request field away as the rollback.
+SEARCH_SELECTOR_DEFAULT = os.getenv("SEARCH_SELECTOR_DEFAULT", "floor")
 # Tenants whose searches may use `jev` AT ALL -- by default, by rollout, or by
 # asking for it with `QueryRequest.selector`. `jev` sends the query and the
 # retrieved passages to an outside company (TypeSafe), so a tenant is only ever
@@ -1918,9 +1923,10 @@ SEARCH_SELECTOR_JEV_ALLOWED = frozenset(
 )
 # Tenants that run `jev` whatever the default is -- the one-tenant step of the
 # rollout. Comma-separated customer ids; each must also be allowed above.
+# Rollout step 2 (2026-09-22): our own tenant first.
 SEARCH_SELECTOR_JEV_CUSTOMERS = frozenset(
     c.strip()
-    for c in os.getenv("SEARCH_SELECTOR_JEV_CUSTOMERS", "").split(",")
+    for c in os.getenv("SEARCH_SELECTOR_JEV_CUSTOMERS", "probe").split(",")
     if c.strip()
 )
 
