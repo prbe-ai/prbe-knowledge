@@ -8,6 +8,8 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Changed
 
+- Every tenant's searches now pick their results with Jev. If Jev fails or is slow, that
+  search is served by the recall floor instead.
 - Retire the `Experiment` graph node label and the `experiment` entity type:
   research-os made every experiment a Project of kind 'experiment' with the same
   id. An arriving `Experiment` node or edge endpoint is mapped to `Project`

@@ -945,10 +945,10 @@ async def test_extraction_successes_do_not_mask_a_scoring_outage(monkeypatch):
 
 
 def test_the_shipped_defaults_are_the_rollout_step():
-    """Pins what production runs: the floor for everyone, Jev for `probe` only.
+    """Pins what production runs: Jev for every tenant.
     Read from the constants module, not the test-pinned loop attribute."""
     from engine.shared import constants as C
 
-    assert C.SEARCH_SELECTOR_DEFAULT == "floor"
-    assert frozenset({"probe"}) == C.SEARCH_SELECTOR_JEV_CUSTOMERS
-    assert frozenset({"probe"}) == C.SEARCH_SELECTOR_JEV_ALLOWED
+    assert C.SEARCH_SELECTOR_DEFAULT == "jev"
+    assert frozenset() == C.SEARCH_SELECTOR_JEV_CUSTOMERS
+    assert frozenset({"*"}) == C.SEARCH_SELECTOR_JEV_ALLOWED
