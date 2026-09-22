@@ -90,18 +90,41 @@ def test_delivered_split_reads_the_harness_appended_flag():
         {"doc_id": "d2", "chunk_id": "d2#0", "harness_appended": True},
         {"doc_id": "d1", "chunk_id": "d1#1", "harness_appended": False},  # same doc
     ]
-    ordered, model, appended = js.delivered_docs(_blob(chunks=chunks))
+    ordered, model, appended, known = js.delivered_docs(_blob(chunks=chunks))
     assert ordered == ["d1", "d2"]          # order preserved, docs deduped
     assert model == {"d1"} and appended == {"d2"}
+    assert known is True
 
 
-def test_delivered_treats_a_missing_flag_as_a_model_pick():
-    # v1-era blobs predate `harness_appended`; defaulting them to "appended"
-    # would credit the floor with work the model did.
-    _, model, appended = js.delivered_docs(
+def test_a_blob_without_the_flag_reports_provenance_UNKNOWN_not_model():
+    """`harness_appended` shipped 2026-09-12. Before it, nobody recorded who
+    chose a chunk -- and defaulting that to "the model did" invents a clean,
+    false cliff on the day the field landed: every older trace reads as 100%
+    model-supplied. Absence of a record is not evidence of authorship.
+    """
+    ordered, model, appended, known = js.delivered_docs(
         _blob(chunks=[{"doc_id": "d1", "chunk_id": "d1#0"}])
     )
-    assert model == {"d1"} and appended == set()
+    assert known is False
+    assert ordered == ["d1"]           # still delivered, still comparable
+    assert model == set() and appended == set()
+
+
+def test_provenance_is_known_when_any_chunk_carries_the_flag():
+    assert js.has_provenance(_blob(chunks=[
+        {"doc_id": "d1", "chunk_id": "d1#0", "harness_appended": False},
+    ])) is True
+    assert js.has_provenance(_blob(chunks=[{"doc_id": "d1", "chunk_id": "d1#0"}])) is False
+
+
+def test_arms_still_compare_without_provenance():
+    # The A/B comparison needs the delivered set and a reconstruction, not the
+    # flag -- so a pre-09-12 trace is still a valid row.
+    pool = [_hit(f"d{i}") for i in range(12)]
+    blob = _blob(vector=pool, chunks=[{"doc_id": "d0", "chunk_id": "d0#0"}])
+    cmp = js.compare_a_b(blob)
+    assert cmp.provenance_known is False
+    assert cmp.a_docs and cmp.b_docs
 
 
 # ------------------------------------------------------------- the arms
@@ -261,6 +284,7 @@ def test_compare_a_b_counts_the_overlap_both_ways():
     assert cmp.shared + cmp.a_only == len(cmp.a_docs)
     assert cmp.shared + cmp.b_only == len(cmp.b_docs)
     assert cmp.n_model_picked == 1 and cmp.n_appended == 1
+    assert cmp.provenance_known is True
     assert cmp.pool_chunks == 12 and cmp.pool_docs == 12
 
 

@@ -169,13 +169,36 @@ def doc_of(chunk_id: str, hit: dict[str, Any]) -> str:
     return hit.get("doc_id") or chunk_id
 
 
-def delivered_docs(blob: dict[str, Any]) -> tuple[list[str], set[str], set[str]]:
-    """What the user got: `(ordered_doc_ids, model_picked, harness_appended)`.
+def has_provenance(blob: dict[str, Any]) -> bool:
+    """Does this trace record WHO chose each delivered chunk?
 
-    `harness_appended` is persisted per chunk (`GatheredChunk.harness_appended`),
-    so the split between "a model chose this" and "the floor topped it up" is a
-    recorded fact rather than an inference. Order is delivery order.
+    `GatheredChunk.harness_appended` did not exist before 2026-09-12. Its
+    absence is not "the model picked this" -- it is "nobody wrote it down", and
+    conflating the two is a live trap: defaulting missing-to-model turns every
+    older trace into one where the gatherer supplied 100% of the answer, and
+    produces a clean, false cliff on the day the field shipped.
+
+    The A-vs-B arms do NOT need this (arm A is the delivered set, arm B is a
+    reconstruction), so a trace without provenance still takes part in the
+    comparison. Only the model-versus-floor attribution is withheld.
     """
+    for ch in (blob.get("gathered") or {}).get("chunks") or []:
+        if isinstance(ch, dict) and "harness_appended" in ch:
+            return True
+    return False
+
+
+def delivered_docs(
+    blob: dict[str, Any],
+) -> tuple[list[str], set[str], set[str], bool]:
+    """What the user got: `(ordered, model_picked, appended, provenance_known)`.
+
+    When `provenance_known` is False the two sets are empty -- not because
+    nothing was delivered, but because the blob never recorded which side chose
+    it. Callers must branch on the flag rather than reading an empty set as a
+    finding. Order is delivery order.
+    """
+    known = has_provenance(blob)
     ordered: list[str] = []
     model: set[str] = set()
     appended: set[str] = set()
@@ -187,8 +210,9 @@ def delivered_docs(blob: dict[str, Any]) -> tuple[list[str], set[str], set[str]]
             continue
         if doc not in ordered:
             ordered.append(doc)
-        (appended if ch.get("harness_appended") else model).add(doc)
-    return ordered, model, appended
+        if known:
+            (appended if ch.get("harness_appended") else model).add(doc)
+    return ordered, model, appended, known
 
 
 # --------------------------------------------------------------------------
@@ -197,7 +221,7 @@ def delivered_docs(blob: dict[str, Any]) -> tuple[list[str], set[str], set[str]]
 
 def arm_today(blob: dict[str, Any], budget: int = DELIVERY_BUDGET_DOCS) -> list[str]:
     """Arm A -- exactly what this search delivered, cut to the budget."""
-    ordered, _, _ = delivered_docs(blob)
+    ordered, _, _, _ = delivered_docs(blob)
     return ordered[:budget]
 
 
@@ -345,6 +369,7 @@ class ArmComparison:
     """The counts one trace contributes to the report."""
 
     trace_id: str
+    day: str
     customer_id: str
     status: str
     pool_chunks: int
@@ -355,6 +380,7 @@ class ArmComparison:
     b_docs: list[str]
     n_model_picked: int
     n_appended: int
+    provenance_known: bool
     a_only: int
     b_only: int
     shared: int
@@ -378,10 +404,11 @@ def compare_a_b(blob: dict[str, Any]) -> ArmComparison:
     chars = sum(len(h.get("content") or "") for h in pool.values())
     a = arm_today(blob)
     b = arm_floor_only(blob)
-    _, model, appended = delivered_docs(blob)
+    _, model, appended, known = delivered_docs(blob)
     sa, sb = set(a), set(b)
     return ArmComparison(
         trace_id=blob.get("trace_id") or "",
+        day=(blob.get("timestamp_utc") or "")[:10],
         customer_id=blob.get("customer_id") or "",
         status=blob.get("status") or "",
         pool_chunks=len(pool),
@@ -392,6 +419,7 @@ def compare_a_b(blob: dict[str, Any]) -> ArmComparison:
         b_docs=b,
         n_model_picked=len(model),
         n_appended=len(appended),
+        provenance_known=known,
         a_only=len(sa - sb),
         b_only=len(sb - sa),
         shared=len(sa & sb),
