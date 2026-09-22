@@ -1970,7 +1970,9 @@ SEARCH_SELECTOR_VALUES = ("gatherer", "floor", "jev")
 # where they differ, p=0.06, floor nominally ahead; answering the query 10.9% vs
 # 10.6%), so this returns ~$293/month and ~1.9s per search at no measured cost
 # in quality. `gatherer` stays one request field away as the rollback.
-SEARCH_SELECTOR_DEFAULT = os.getenv("SEARCH_SELECTOR_DEFAULT", "floor")
+# Rollout step 3 (2026-09-22, Richard's call): `jev` for every tenant. Any
+# Jev failure still serves the recall floor for that search.
+SEARCH_SELECTOR_DEFAULT = os.getenv("SEARCH_SELECTOR_DEFAULT", "jev")
 # Tenants whose searches may use `jev` AT ALL -- by default, by rollout, or by
 # asking for it with `QueryRequest.selector`. `jev` sends the query and the
 # retrieved passages to an outside company (TypeSafe), so a tenant is only ever
@@ -1978,7 +1980,7 @@ SEARCH_SELECTOR_DEFAULT = os.getenv("SEARCH_SELECTOR_DEFAULT", "floor")
 # else is downgraded, not honoured. `*` allows every tenant. `probe` is our own.
 SEARCH_SELECTOR_JEV_ALLOWED = frozenset(
     c.strip()
-    for c in os.getenv("SEARCH_SELECTOR_JEV_ALLOWED", "probe").split(",")
+    for c in os.getenv("SEARCH_SELECTOR_JEV_ALLOWED", "*").split(",")
     if c.strip()
 )
 # Tenants that run `jev` whatever the default is -- the one-tenant step of the
@@ -1986,7 +1988,7 @@ SEARCH_SELECTOR_JEV_ALLOWED = frozenset(
 # Rollout step 2 (2026-09-22): our own tenant first.
 SEARCH_SELECTOR_JEV_CUSTOMERS = frozenset(
     c.strip()
-    for c in os.getenv("SEARCH_SELECTOR_JEV_CUSTOMERS", "probe").split(",")
+    for c in os.getenv("SEARCH_SELECTOR_JEV_CUSTOMERS", "").split(",")
     if c.strip()
 )
 
