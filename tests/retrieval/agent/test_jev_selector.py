@@ -950,5 +950,5 @@ def test_the_shipped_defaults_are_the_rollout_step():
     from engine.shared import constants as C
 
     assert C.SEARCH_SELECTOR_DEFAULT == "floor"
-    assert C.SEARCH_SELECTOR_JEV_CUSTOMERS == frozenset({"probe"})
-    assert C.SEARCH_SELECTOR_JEV_ALLOWED == frozenset({"probe"})
+    assert frozenset({"probe"}) == C.SEARCH_SELECTOR_JEV_CUSTOMERS
+    assert frozenset({"probe"}) == C.SEARCH_SELECTOR_JEV_ALLOWED
