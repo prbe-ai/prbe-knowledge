@@ -19,6 +19,9 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Added
 
+- The gatherer no longer re-types the passages it picks. It names each chunk and the engine
+  fills in the stored text, so a correctly named passage is never dropped because the model
+  garbled its copy, and the gatherer's answers are shorter and faster to produce.
 - Searches now pick their results with the recall floor by default instead of the gatherer's
   LLM turn, which measured no better on 3,048 replayed searches and cost ~$293/month and ~1.9s
   a search. Our own tenant (`probe`) runs Jev. Ask for `selector="gatherer"` to get the old

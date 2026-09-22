@@ -122,6 +122,9 @@ TERMINAL — call this to end the loop
   The arguments ARE the final GathererOutput. Call this when you've
   curated the answer. The loop ends as soon as you call it — do NOT
   call any other tool in the same turn.
+  For each chunk give `doc_id` and `chunk_id` exactly as shown. Do NOT
+  copy the passage text into `content` — the harness already holds it
+  and fills it in. Only a chunk you fetched with a tool needs `content`.
 
 ================================================================
 HAPPY PATH
