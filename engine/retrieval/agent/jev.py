@@ -283,7 +283,12 @@ class _Breaker:
             self.open_until = time.monotonic() + JEV_BREAKER_SECONDS
 
 
+#: Scoring and the extraction shadow get SEPARATE breakers. They hit the same
+#: service with very different payloads (a full pool vs one query), and small
+#: extraction calls succeeding would otherwise keep resetting a breaker that
+#: full-pool scoring keeps tripping -- so a scoring outage never opens it.
 BREAKER = _Breaker()
+EXTRACT_BREAKER = _Breaker()
 
 
 def _err(exc: BaseException) -> str:
@@ -571,7 +576,7 @@ async def extract_options(
     -- transport, status, or an answer of the wrong shape."""
     if not api_key:
         raise JevError("TYPESAFE_API_KEY is not configured")
-    if BREAKER.is_open():
+    if EXTRACT_BREAKER.is_open():
         raise JevError("breaker_open")
     t0 = time.perf_counter()
     client = client or _shared_client()
@@ -583,10 +588,10 @@ async def extract_options(
             {"sort": _SORT_QUESTION, "doc_class": _CLASS_QUESTION},
         )
     except httpx.HTTPError as exc:
-        BREAKER.failure()
+        EXTRACT_BREAKER.failure()
         raise JevError(_err(exc)) from exc
     if resp.status_code != 200:
-        BREAKER.failure()
+        EXTRACT_BREAKER.failure()
         raise JevError(f"http_{resp.status_code}:{_error_type(resp)}")
     try:
         answers = resp.json().get("answers") or {}
@@ -599,7 +604,7 @@ async def extract_options(
         class_conf = float(cls.get("confidence") or 0.0)
     except (ValueError, KeyError, AttributeError, TypeError) as exc:
         raise JevError(f"malformed answer: {type(exc).__name__}") from exc
-    BREAKER.success()
+    EXTRACT_BREAKER.success()
     return ExtractionChoice(
         sort=sort_choice,
         sort_confidence=sort_conf,

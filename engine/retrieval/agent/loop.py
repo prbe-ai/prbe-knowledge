@@ -341,6 +341,11 @@ class LoopState:
     # Set once the single Phase 2 query rewrite has been spent, so no path can
     # trigger a second one.
     rewrite_used: bool = False
+    # How many documents the response will actually carry (`QueryRequest.top_k`,
+    # capped at the floor's 10). A partial Jev answer reserves slots for the
+    # floor WITHIN this limit -- reserved beyond it, the final truncation
+    # would throw the floor's picks away.
+    response_limit: int = 10
 
 
 # Floor for the remaining-loop budget. Setup (grounding + extraction +
@@ -3081,7 +3086,10 @@ async def _select_without_gatherer(
         # fill the rest from retrieval's own order -- and say so: this is a
         # degraded answer, not an `ok` one.
         share = len(scores) / max(1, len(pool))
-        ranked = ranked[: max(1, int(_RECALL_FLOOR_DOCS * share))]
+        limit = max(1, min(_RECALL_FLOOR_DOCS, state.response_limit))
+        # Floor, not round: with any part unscored the floor keeps >= 1 slot
+        # (unless the limit is 1, where Jev's single best must stand).
+        ranked = ranked[: max(1, min(limit - 1, int(limit * share)) if limit > 1 else 1)]
         status = "jev_partial"
 
     channels = jev.channels_by_chunk(state.prefanout)
@@ -3680,6 +3688,7 @@ async def run_gatherer(
         request_recall_floor_mode=request_recall_floor_mode,
         rendered_doc_ids=rendered_doc_ids,
         selector=selector,
+        response_limit=max(1, min(_RECALL_FLOOR_DOCS, req.top_k or _RECALL_FLOOR_DOCS)),
         grounding_json=_grounding_json,
         extraction_json=_extraction_json,
         request_temporal=request_temporal,

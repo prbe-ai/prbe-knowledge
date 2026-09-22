@@ -230,6 +230,7 @@ def _stubs(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(get_settings(), "typesafe_api_key", "test-key-not-real")
     monkeypatch.setattr(L, "_jev_extraction_or_none", AsyncMock(return_value=None))
     jev.BREAKER.success()
+    jev.EXTRACT_BREAKER.success()
     monkeypatch.setattr(L, "_build_bundle_with_token_fallback",
                         AsyncMock(return_value=GroundingBundle()))
     monkeypatch.setattr(L, "extract_entities_with_llm",
@@ -714,6 +715,7 @@ async def test_the_breaker_opens_after_repeated_failures_and_skips_jev(monkeypat
         await jev.score_pool("q", pool, api_key="k", client=_client(handler))
     assert calls["n"] == n  # the open breaker made no request
     jev.BREAKER.success()
+    jev.EXTRACT_BREAKER.success()
 
 
 @pytest.mark.asyncio
@@ -727,6 +729,7 @@ async def test_every_extraction_failure_is_a_jev_error(resp):
     with pytest.raises(jev.JevError):
         await jev.extract_options("q", api_key="k", client=_client(resp))
     jev.BREAKER.success()
+    jev.EXTRACT_BREAKER.success()
 
 
 @pytest.mark.asyncio
@@ -757,6 +760,7 @@ async def test_splitting_stops_at_the_depth_limit():
     assert out.splits <= 2 ** jev.JEV_MAX_SPLIT_DEPTH - 1
     assert out.scores == {}
     jev.BREAKER.success()
+    jev.EXTRACT_BREAKER.success()
 
 
 def test_hits_without_a_doc_id_are_not_scoreable():
@@ -890,6 +894,7 @@ async def test_a_selection_timeout_counts_toward_the_breaker(monkeypatch):
         await L.run_gatherer(_req(selector="jev"), customer_id="c1", request=_state())
     assert jev.BREAKER.failures == before + 1
     jev.BREAKER.success()
+    jev.EXTRACT_BREAKER.success()
 
 
 @pytest.mark.asyncio
@@ -902,3 +907,38 @@ async def test_each_request_keeps_the_pool_wait_bound():
 
     await jev.score_pool("q", {"c": _hit("d")}, api_key="k", client=_client(handler))
     assert seen.get("pool") == jev.JEV_POOL_WAIT_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_partial_answers_leave_the_floor_room_inside_top_k(monkeypatch):
+    async def most(query, pool, *, api_key, client=None):
+        out = jev.ScoreResult(requests=1)
+        keys = list(pool)
+        out.scores = {c: 0.9 for c in keys[: int(len(keys) * 0.7)]}
+        out.errors = ["http_503:unknown"]
+        return out
+
+    fr = _state()
+    with patch.object(jev, "score_pool", new=most):
+        resp = await L.run_gatherer(_req(selector="jev", top_k=5), customer_id="c1", request=fr)
+    assert len(resp.results) == 5
+    assert any(any(m.channel == "recall_floor" for m in r.matched_via) for r in resp.results), \
+        "a partial answer must leave the floor at least one of the slots the caller will see"
+
+
+@pytest.mark.asyncio
+async def test_extraction_successes_do_not_mask_a_scoring_outage(monkeypatch):
+    monkeypatch.setattr(jev, "JEV_BREAKER_FAILURES", 2)
+    jev.BREAKER.success()
+    jev.EXTRACT_BREAKER.success()
+    jev.EXTRACT_BREAKER.success()
+    ok_extract = lambda r: _choice_resp()  # noqa: E731
+    down = lambda r: httpx.Response(503, text="down")  # noqa: E731
+    for _ in range(2):
+        await jev.extract_options("q", api_key="k", client=_client(ok_extract))
+        with pytest.raises(jev.JevError):
+            await jev.score_pool("q", {"c": _hit("d")}, api_key="k", client=_client(down))
+    assert jev.BREAKER.is_open()
+    assert not jev.EXTRACT_BREAKER.is_open()
+    jev.BREAKER.success()
+    jev.EXTRACT_BREAKER.success()
