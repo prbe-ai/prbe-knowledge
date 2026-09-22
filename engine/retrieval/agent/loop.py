@@ -3030,6 +3030,11 @@ async def _select_without_gatherer(
     # Broad on purpose: Jev is an outside service, and whatever it raises --
     # typed or not -- must cost this search its ranking, never the search.
     except Exception as exc:
+        if isinstance(exc, TimeoutError):
+            # `wait_for` cancelled score_pool before it could count this. A
+            # vendor that is merely SLOW must trip the breaker too, or every
+            # search pays the full timeout for as long as it stays slow.
+            jev.BREAKER.failure()
         sel["fallback"] = f"{type(exc).__name__}: {str(exc)[:160] or '<empty>'}"
         log.warning(
             "agent.jev_unavailable",
@@ -3089,9 +3094,10 @@ async def _select_without_gatherer(
         )
         for r in ranked
     ]
-    # What Jev actually read -- the whole pool -- for the recall-floor
-    # accounting that separates "rejected" from "never examined".
-    state.rendered_doc_ids = _scoreable_doc_ids(pool)
+    # What Jev actually SCORED, for the recall-floor accounting that separates
+    # "rejected" from "never examined": a doc in a batch that failed was not
+    # examined, and must not be reported as Jev turning it down.
+    state.rendered_doc_ids = _scoreable_doc_ids({c: h for c, h in pool.items() if c in scores})
     best = ranked[0].score if ranked else None
     sel["scored"] = len(scores)
     sel["pool"] = len(pool)
@@ -4128,11 +4134,19 @@ async def run_gatherer(
     # graded recall isn't capped by hand-curation. Latency-neutral — no
     # added LLM turn. Also recovers recall on degraded paths (loop_timeout
     # / schema_violation) where `gathered` is empty but the pool has hits.
+    # A Jev answer that is partial or missing reserved its empty slots FOR the
+    # floor: `conditional` mode must not skip the top-up just because the
+    # scored part looks confident.
+    floor_mode: RecallFloorMode = (
+        "always"
+        if status in ("jev_partial", "jev_unavailable")
+        else state.request_recall_floor_mode
+    )
     floor = _backfill_recall_floor(
         gathered,
         state.prefanout,
         half_life_days=state.request_recency_half_life_days,
-        mode=state.request_recall_floor_mode,
+        mode=floor_mode,
         examined_doc_ids=state.rendered_doc_ids,
     )
     _log_recall_floor(
@@ -4140,7 +4154,7 @@ async def run_gatherer(
         customer_id=customer_id,
         trace_id=trace_id,
         status=status,
-        mode=state.request_recall_floor_mode,
+        mode=floor_mode,
         total_chunks=len(gathered.chunks),
     )
 

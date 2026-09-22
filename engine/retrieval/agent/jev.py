@@ -302,7 +302,9 @@ async def _post(
         f"{JEV_BASE_URL}/v1/systemone",
         headers={"Authorization": f"Bearer {api_key}"},
         json={"model": JEV_MODEL, "state": state, "questions": questions},
-        timeout=JEV_REQUEST_TIMEOUT_SECONDS,
+        # Explicit Timeout, not a scalar: a scalar here would override the
+        # client's own and silently drop the separate pool-wait bound.
+        timeout=httpx.Timeout(JEV_REQUEST_TIMEOUT_SECONDS, pool=JEV_POOL_WAIT_SECONDS),
     )
 
 

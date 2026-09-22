@@ -854,3 +854,51 @@ async def test_a_slow_rewrite_keeps_the_first_pass(monkeypatch):
         resp = await L.run_gatherer(_req(selector="jev"), customer_id="c1", request=fr)
     assert cap["state"].selection["rewrite"]["outcome"] == "timeout"
     assert resp.results[0].doc_id == "v2"  # the first pass stood
+
+
+@pytest.mark.asyncio
+async def test_partial_answers_force_the_floor_even_in_conditional_mode(monkeypatch):
+    from engine.shared.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "recall_floor_conditional_enabled", True)
+
+    async def half(query, pool, *, api_key, client=None):
+        out = jev.ScoreResult(requests=1)
+        out.scores = {c: 0.9 for c in list(pool)[: len(pool) // 2]}
+        out.errors = ["http_503:unknown"]
+        return out
+
+    fr = _state()
+    with patch.object(jev, "score_pool", new=half):
+        resp = await L.run_gatherer(
+            _req(selector="jev", recall_floor_mode="conditional"), customer_id="c1", request=fr
+        )
+    assert fr.state.gatherer_status == "jev_partial"
+    assert len(resp.results) == 10
+
+
+@pytest.mark.asyncio
+async def test_a_selection_timeout_counts_toward_the_breaker(monkeypatch):
+    import asyncio
+
+    async def hang(*a, **k):
+        await asyncio.sleep(10)
+
+    monkeypatch.setattr(L, "JEV_SELECTION_TIMEOUT_SECONDS", 0.02)
+    before = jev.BREAKER.failures
+    with patch.object(jev, "score_pool", new=hang):
+        await L.run_gatherer(_req(selector="jev"), customer_id="c1", request=_state())
+    assert jev.BREAKER.failures == before + 1
+    jev.BREAKER.success()
+
+
+@pytest.mark.asyncio
+async def test_each_request_keeps_the_pool_wait_bound():
+    seen = {}
+
+    def handler(req):
+        seen.update(req.extensions.get("timeout") or {})
+        return _ok(json.loads(req.content)["questions"])
+
+    await jev.score_pool("q", {"c": _hit("d")}, api_key="k", client=_client(handler))
+    assert seen.get("pool") == jev.JEV_POOL_WAIT_SECONDS
