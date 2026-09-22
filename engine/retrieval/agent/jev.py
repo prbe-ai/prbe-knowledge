@@ -39,7 +39,9 @@ fallback to the recall floor.
 from __future__ import annotations
 
 import asyncio
+import math
 import time
+import weakref
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -47,12 +49,20 @@ import httpx
 
 from engine.shared.constants import (
     JEV_BASE_URL,
+    JEV_BREAKER_FAILURES,
+    JEV_BREAKER_SECONDS,
     JEV_CHARS_PER_TOKEN,
+    JEV_CONFIDENCE_HIGH_AT,
     JEV_MAX_CHUNK_CHARS,
+    JEV_MAX_CONNECTIONS,
+    JEV_MAX_SPLIT_DEPTH,
     JEV_MODEL,
+    JEV_POOL_WAIT_SECONDS,
     JEV_REQUEST_TIMEOUT_SECONDS,
     JEV_TOKEN_BUDGET,
     JEV_TOKENS_PER_QUESTION,
+    LOG_ERROR_MAX_CHARS,
+    SEARCH_REWRITE_BELOW_SCORE,
 )
 
 #: Channels whose hits are content passages. Order matters for provenance
@@ -65,6 +75,23 @@ _NOUL_INSTRUCTIONS = (
     "The passage at key {cid!r} in state.chunks answers, or directly supports "
     "an answer to, state.query."
 )
+
+
+def _error_type(resp: httpx.Response) -> str:
+    """The vendor's machine-readable error type, never its free text.
+
+    An error body can echo the request -- tenant passages or the query -- and
+    these strings reach pod logs and trace blobs. Keep only the type code.
+    """
+    try:
+        detail = resp.json().get("detail")
+    except (ValueError, AttributeError):
+        return "unparseable"
+    if isinstance(detail, dict):
+        return str(detail.get("error_type") or "unknown")[:60]
+    if isinstance(detail, list):
+        return "validation_error"
+    return "unknown"
 
 
 class JevError(RuntimeError):
@@ -92,7 +119,12 @@ def pool_chunks(prefanout: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
                     continue
                 cid = hit.get("chunk_id")
                 content = hit.get("content")
-                if not cid or not (isinstance(content, str) and content.strip()):
+                # A hit with no doc_id cannot be cited -- the floor skips it
+                # too, and the response's live-row gate would drop it after it
+                # had taken one of the ten slots.
+                if not cid or not hit.get("doc_id"):
+                    continue
+                if not (isinstance(content, str) and content.strip()):
                     continue
                 out.setdefault(cid, hit)
     return out
@@ -180,30 +212,84 @@ class ScoreResult:
     """What one pool's scoring produced, and what it cost."""
 
     scores: dict[str, float] = field(default_factory=dict)
+    batches: int = 0
     requests: int = 0
     input_tokens: int = 0
     splits: int = 0
     errors: list[str] = field(default_factory=list)
     elapsed_ms: float = 0.0
 
+    @property
+    def partial(self) -> bool:
+        """Some batch failed: part of the pool was never scored."""
+        return bool(self.errors)
+
 
 #: One pooled client per running event loop. A client per search paid a fresh
 #: TLS handshake to api.typesafe.ai on every request -- on the order of the
-#: ~0.2s the scoring call itself takes. Keyed by loop because an AsyncClient is
-#: bound to the loop that created it, and test runners start a new loop per
-#: test.
-_CLIENTS: dict[int, httpx.AsyncClient] = {}
+#: ~0.2s the scoring call itself takes. Keyed WEAKLY by the loop object, because
+#: an AsyncClient is bound to the loop that created it: a dead loop's entry must
+#: go with it, and an `id()` reused by a new loop must never inherit it.
+_CLIENTS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClient] = (
+    weakref.WeakKeyDictionary()
+)
 
 
 def _shared_client() -> httpx.AsyncClient:
-    loop_id = id(asyncio.get_running_loop())
-    client = _CLIENTS.get(loop_id)
+    loop = asyncio.get_running_loop()
+    client = _CLIENTS.get(loop)
     if client is None or client.is_closed:
         client = httpx.AsyncClient(
-            limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
+            limits=httpx.Limits(
+                max_connections=JEV_MAX_CONNECTIONS,
+                max_keepalive_connections=JEV_MAX_CONNECTIONS // 2,
+            ),
+            # Waiting for a free connection is bounded on its own, so local
+            # queueing shows up as PoolTimeout -- not as vendor latency.
+            timeout=httpx.Timeout(JEV_REQUEST_TIMEOUT_SECONDS, pool=JEV_POOL_WAIT_SECONDS),
         )
-        _CLIENTS[loop_id] = client
+        _CLIENTS[loop] = client
     return client
+
+
+# --------------------------------------------------------------------------
+# outage breaker
+
+
+@dataclass(slots=True)
+class _Breaker:
+    """Stop calling Jev for a while after repeated failures.
+
+    Without it, an outage charges EVERY search a full timeout -- twice, once
+    for the extraction shadow and once for scoring. With it, a handful of
+    searches pay, then Jev is skipped (and the recall floor answers) until the
+    window passes and one call probes it again. Process-local on purpose: each
+    worker learns about an outage from its own traffic within a few requests.
+    """
+
+    failures: int = 0
+    open_until: float = 0.0
+
+    def is_open(self) -> bool:
+        return time.monotonic() < self.open_until
+
+    def success(self) -> None:
+        self.failures = 0
+        self.open_until = 0.0
+
+    def failure(self) -> None:
+        self.failures += 1
+        if self.failures >= JEV_BREAKER_FAILURES:
+            self.open_until = time.monotonic() + JEV_BREAKER_SECONDS
+
+
+BREAKER = _Breaker()
+
+
+def _err(exc: BaseException) -> str:
+    """Class name AND message: httpx timeouts stringify EMPTY, and a blank
+    reason in a log is how an outage reads as nothing."""
+    return f"{type(exc).__name__}: {str(exc)[:LOG_ERROR_MAX_CHARS] or '<empty>'}"
 
 
 async def _post(
@@ -247,12 +333,10 @@ async def _score_batch(
     try:
         resp = await _post(client, api_key, state, questions)
     except httpx.HTTPError as exc:
-        # Class name AND message: httpx timeouts stringify EMPTY, and a blank
-        # reason in the log is how an outage reads as nothing.
-        out.errors.append(f"{type(exc).__name__}: {str(exc)[:160] or '<empty>'}")
+        out.errors.append(_err(exc))
         return
     overflow = resp.status_code == 400 and "max_tokens_exceeded" in resp.text
-    if overflow and len(cids) > 1 and depth < 4:
+    if overflow and len(cids) > 1 and depth < JEV_MAX_SPLIT_DEPTH:
         out.splits += 1
         mid = len(cids) // 2
         await asyncio.gather(
@@ -261,20 +345,34 @@ async def _score_batch(
         )
         return
     if resp.status_code != 200:
-        out.errors.append(f"http_{resp.status_code}: {resp.text[:160]}")
+        out.errors.append(f"http_{resp.status_code}:{_error_type(resp)}")
         return
     try:
         body = resp.json()
-    except ValueError:
-        out.errors.append("malformed_json")
+        answers = body.get("answers") or {}
+        tokens = int(((body.get("usage") or {}).get("input_tokens")) or 0)
+        items = list(answers.items())
+    except (ValueError, TypeError, AttributeError):
+        # A 200 of the wrong shape costs this batch, never its siblings.
+        out.errors.append("malformed_answer")
         return
     out.requests += 1
-    out.input_tokens += int(((body.get("usage") or {}).get("input_tokens")) or 0)
-    for cid, ans in (body.get("answers") or {}).items():
+    out.input_tokens += tokens
+    asked = set(cids)
+    for cid, ans in items:
         val = ans.get("noul") if isinstance(ans, dict) else None
-        # An answer missing for a chunk is ABSENT, not zero: reading "the
-        # server did not answer" as "irrelevant" silently deletes a document.
-        if isinstance(val, (int, float)) and cid in pool:
+        # A probability, or nothing. NaN sorts ahead of 0.99 and disables the
+        # weak-score check; a bool is an int to Python; an id this batch did
+        # not ask about is not an answer. An answer missing for a chunk is
+        # ABSENT, not zero: reading "the server did not answer" as
+        # "irrelevant" silently deletes a document.
+        if (
+            cid in asked
+            and isinstance(val, (int, float))
+            and not isinstance(val, bool)
+            and math.isfinite(val)
+            and 0.0 <= val <= 1.0
+        ):
             out.scores[cid] = float(val)
 
 
@@ -297,17 +395,25 @@ async def score_pool(
     out = ScoreResult()
     if not pool:
         return out
+    if BREAKER.is_open():
+        raise JevError("breaker_open")
     t0 = time.perf_counter()
     client = client or _shared_client()
-    await asyncio.gather(
-        *(
-            _score_batch(client, api_key, query, pool, cids, out)
-            for cids in batch_pool(pool, query=query)
-        )
+    batches = batch_pool(pool, query=query)
+    out.batches = len(batches)
+    results = await asyncio.gather(
+        *(_score_batch(client, api_key, query, pool, cids, out) for cids in batches),
+        # One batch raising must not cancel -- and throw away -- the others.
+        return_exceptions=True,
     )
+    for r in results:
+        if isinstance(r, BaseException):
+            out.errors.append(_err(r))
     out.elapsed_ms = (time.perf_counter() - t0) * 1000
     if not out.scores:
+        BREAKER.failure()
         raise JevError("; ".join(out.errors[:3]) or "no scores returned")
+    BREAKER.success()
     return out
 
 
@@ -357,11 +463,12 @@ def confidence_for(best_score: float | None) -> str:
 
     Cut from Phase 0's answerability data (gpt-4.1-mini grader, 368 traces):
     with the best doc below 0.4 the delivered set answered the query 0.8% of
-    the time, against 37.7% above it.
+    the time, against 37.7% above it -- the same cut that triggers the rewrite,
+    so the two move together.
     """
-    if best_score is None or best_score < 0.4:
+    if best_score is None or best_score < SEARCH_REWRITE_BELOW_SCORE:
         return "low"
-    return "high" if best_score >= 0.7 else "medium"
+    return "high" if best_score >= JEV_CONFIDENCE_HIGH_AT else "medium"
 
 
 def near_copy(a: str, b: str, *, threshold: float = 0.8) -> bool:
@@ -390,21 +497,31 @@ def near_copy(a: str, b: str, *, threshold: float = 0.8) -> bool:
 # (extractor.py, "search_options.doc_types"), so both are choosing from the
 # same menu.
 
-DOC_CLASSES: dict[str, list[str] | None] = {
-    "no_class": None,
-    "pull_requests": ["github.pull_request"],
-    "github_issues": ["github.issue"],
-    "commits": ["github.commit"],
-    "code_reviews": ["github.review"],
-    "releases": ["github.release"],
-    "tickets": ["linear.issue"],
-    "ticket_comments": ["linear.comment"],
-    "slack_messages": ["slack.message", "slack.thread"],
-    "notion_pages": ["notion.page", "notion.database"],
-    "sentry_errors": ["sentry.issue", "sentry.event"],
-    "meetings": ["granola.meeting"],
-    "claude_code_sessions": ["claude_code.session"],
+#: class -> (doc_types, what Jev is told the class means). ONE table: the
+#: question's criteria and the class -> doc_types map are both derived from it,
+#: so they cannot drift apart. `tests/.../test_jev_selector.py` pins every
+#: doc_type here against the DocType registry.
+_DOC_CLASS_TABLE: dict[str, tuple[list[str] | None, str]] = {
+    "no_class": (None, "a specific item or a topic, not a class of items"),
+    "pull_requests": (["github.pull_request"], "GitHub pull requests / PRs"),
+    "github_issues": (["github.issue"], "GitHub issues"),
+    "commits": (["github.commit"], "git commits"),
+    "code_reviews": (["github.review"], "code reviews / PR reviews"),
+    "releases": (["github.release"], "releases"),
+    "tickets": (["linear.issue"], "tickets (Linear)"),
+    "ticket_comments": (["linear.comment"], "comments on tickets"),
+    "slack_messages": (["slack.message", "slack.thread"], "Slack messages"),
+    "notion_pages": (["notion.page", "notion.database"], "Notion pages"),
+    "sentry_errors": (["sentry.issue", "sentry.event"], "Sentry issues, errors or incidents"),
+    "meetings": (["granola.meeting"], "meetings (Granola notes)"),
+    # All three coding agents' sessions: a "sessions" question that filtered to
+    # Claude Code alone would hide Codex (2,510 live on `probe`) and pi.
+    "agent_sessions": (
+        ["claude_code.session", "codex.session", "pi.session"],
+        "coding-agent sessions (Claude Code, Codex, pi)",
+    ),
 }
+DOC_CLASSES: dict[str, list[str] | None] = {k: v[0] for k, v in _DOC_CLASS_TABLE.items()}
 
 _SORT_QUESTION = {
     "type": "choice",
@@ -428,21 +545,7 @@ _CLASS_QUESTION = {
         "error message, a concept. When unsure, choose `no_class`: a wrong "
         "class hides every other result."
     ),
-    "criteria": {
-        "no_class": "a specific item or a topic, not a class of items",
-        "pull_requests": "GitHub pull requests / PRs",
-        "github_issues": "GitHub issues",
-        "commits": "git commits",
-        "code_reviews": "code reviews / PR reviews",
-        "releases": "releases",
-        "tickets": "tickets (Linear)",
-        "ticket_comments": "comments on tickets",
-        "slack_messages": "Slack messages",
-        "notion_pages": "Notion pages",
-        "sentry_errors": "Sentry issues, errors or incidents",
-        "meetings": "meetings (Granola notes)",
-        "claude_code_sessions": "Claude Code sessions",
-    },
+    "criteria": {k: v[1] for k, v in _DOC_CLASS_TABLE.items()},
 }
 
 
@@ -462,9 +565,12 @@ async def extract_options(
     api_key: str,
     client: httpx.AsyncClient | None = None,
 ) -> ExtractionChoice:
-    """Jev's answer for `sort` and `doc_types`. Raises `JevError` on failure."""
+    """Jev's answer for `sort` and `doc_types`. Raises `JevError` on ANY failure
+    -- transport, status, or an answer of the wrong shape."""
     if not api_key:
         raise JevError("TYPESAFE_API_KEY is not configured")
+    if BREAKER.is_open():
+        raise JevError("breaker_open")
     t0 = time.perf_counter()
     client = client or _shared_client()
     try:
@@ -475,22 +581,28 @@ async def extract_options(
             {"sort": _SORT_QUESTION, "doc_class": _CLASS_QUESTION},
         )
     except httpx.HTTPError as exc:
-        raise JevError(f"{type(exc).__name__}: {str(exc)[:160] or '<empty>'}") from exc
+        BREAKER.failure()
+        raise JevError(_err(exc)) from exc
     if resp.status_code != 200:
-        raise JevError(f"http_{resp.status_code}: {resp.text[:160]}")
+        BREAKER.failure()
+        raise JevError(f"http_{resp.status_code}:{_error_type(resp)}")
     try:
         answers = resp.json().get("answers") or {}
-        sort = answers["sort"]
-        cls = answers["doc_class"]
-    except (ValueError, KeyError, AttributeError) as exc:
+        sort, cls = answers["sort"], answers["doc_class"]
+        if not isinstance(sort, dict) or not isinstance(cls, dict):
+            raise TypeError("answer is not an object")
+        sort_choice = sort.get("choice") if sort.get("choice") in ("relevance", "recency") else "relevance"
+        class_choice = cls.get("choice") if cls.get("choice") in DOC_CLASSES else "no_class"
+        sort_conf = float(sort.get("confidence") or 0.0)
+        class_conf = float(cls.get("confidence") or 0.0)
+    except (ValueError, KeyError, AttributeError, TypeError) as exc:
         raise JevError(f"malformed answer: {type(exc).__name__}") from exc
-    sort_choice = sort.get("choice") if sort.get("choice") in ("relevance", "recency") else "relevance"
-    class_choice = cls.get("choice") if cls.get("choice") in DOC_CLASSES else "no_class"
+    BREAKER.success()
     return ExtractionChoice(
         sort=sort_choice,
-        sort_confidence=float(sort.get("confidence") or 0.0),
+        sort_confidence=sort_conf,
         doc_class=class_choice,
         doc_types=DOC_CLASSES[class_choice],
-        class_confidence=float(cls.get("confidence") or 0.0),
+        class_confidence=class_conf,
         elapsed_ms=(time.perf_counter() - t0) * 1000,
     )

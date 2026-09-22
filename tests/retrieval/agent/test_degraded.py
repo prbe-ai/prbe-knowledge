@@ -73,6 +73,9 @@ _DEGRADED = {
     # the recall floor answered alone. The caller holds floor-quality results
     # -- the same as asking for `floor` -- not what it asked for.
     "jev_unavailable",
+    # Degraded, deliberately: Jev scored only part of the pool, so the best
+    # documents may sit in the batches that never came back.
+    "jev_partial",
 }
 
 

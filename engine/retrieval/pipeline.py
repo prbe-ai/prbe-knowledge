@@ -64,12 +64,6 @@ from engine.shared.telemetry import new_trace_id
 log = get_logger(__name__)
 
 
-#: Moved to `grounding.py` so the gatherer can use it too -- `pipeline`
-#: imports `agent.loop`, so the gatherer cannot import back from here.
-#: Kept as an alias: the name appears in this module's own tests.
-_bundle_to_jsonable = bundle_to_jsonable
-
-
 @dataclass(slots=True)
 class ResolvedIntent:
     """Compat shape for the streaming endpoint.
@@ -174,7 +168,7 @@ async def run_router_phase(
 
     if request is not None:
         try:
-            request.state.grounding_bundle = _bundle_to_jsonable(bundle)
+            request.state.grounding_bundle = bundle_to_jsonable(bundle)
         except Exception:
             log.warning("pipeline.grounding_bundle_serialize_failed")
             request.state.grounding_bundle = None

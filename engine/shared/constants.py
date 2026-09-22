@@ -1906,8 +1906,18 @@ DB_INIT_RETRY_BACKOFF_CAP_SECONDS = 5.0
 # pipelines. A code default moves both planes together, on merge.
 SEARCH_SELECTOR_VALUES = ("gatherer", "floor", "jev")
 SEARCH_SELECTOR_DEFAULT = os.getenv("SEARCH_SELECTOR_DEFAULT", "gatherer")
+# Tenants whose searches may use `jev` AT ALL -- by default, by rollout, or by
+# asking for it with `QueryRequest.selector`. `jev` sends the query and the
+# retrieved passages to an outside company (TypeSafe), so a tenant is only ever
+# scored there once it is on this list: an explicit `selector="jev"` from anyone
+# else is downgraded, not honoured. `*` allows every tenant. `probe` is our own.
+SEARCH_SELECTOR_JEV_ALLOWED = frozenset(
+    c.strip()
+    for c in os.getenv("SEARCH_SELECTOR_JEV_ALLOWED", "probe").split(",")
+    if c.strip()
+)
 # Tenants that run `jev` whatever the default is -- the one-tenant step of the
-# rollout. Comma-separated customer ids.
+# rollout. Comma-separated customer ids; each must also be allowed above.
 SEARCH_SELECTOR_JEV_CUSTOMERS = frozenset(
     c.strip()
     for c in os.getenv("SEARCH_SELECTOR_JEV_CUSTOMERS", "").split(",")
@@ -1944,10 +1954,9 @@ JEV_SELECTION_TIMEOUT_SECONDS = float(os.getenv("JEV_SELECTION_TIMEOUT_SECONDS",
 # what stops a search chasing an answer that does not exist.
 SEARCH_REWRITE_BELOW_SCORE = float(os.getenv("SEARCH_REWRITE_BELOW_SCORE", "0.4"))
 SEARCH_REWRITE_ENABLED = os.getenv("SEARCH_REWRITE_ENABLED", "1") not in ("0", "false", "False")
-# Stop after the rewrite's fan-out when this share of its documents was
-# already in the first pool: the data has nothing more on the topic.
-SEARCH_REWRITE_OVERLAP_STOP = float(os.getenv("SEARCH_REWRITE_OVERLAP_STOP", "0.8"))
-SEARCH_REWRITE_MAX_TOKENS = 600
+# Bounds gpt-oss reasoning AND the one-line answer together; too tight and the
+# reasoning eats it and the rewrite comes back empty (outcome `no_rewrite`).
+SEARCH_REWRITE_MAX_TOKENS = 1500
 SEARCH_REWRITE_TIMEOUT_SECONDS = float(os.getenv("SEARCH_REWRITE_TIMEOUT_SECONDS", "4.0"))
 
 # ---- Extraction on Jev: shadow first, then a sampled A/B ---------------------
@@ -1963,3 +1972,36 @@ SEARCH_EXTRACTION_JEV_APPLY_RATE = float(os.getenv("SEARCH_EXTRACTION_JEV_APPLY_
 SEARCH_EXTRACTION_JEV_CLASS_MIN_CONFIDENCE = float(
     os.getenv("SEARCH_EXTRACTION_JEV_CLASS_MIN_CONFIDENCE", "0.8")
 )
+
+# ---- Jev: confidence bands, outage breaker, pool, trace caps ------------------
+# The response's `confidence` from the best document's Jev score. The low band
+# is the same Phase 0 cut as the rewrite trigger (0.8% answerable below it), so
+# it follows SEARCH_REWRITE_BELOW_SCORE rather than holding its own copy.
+JEV_CONFIDENCE_HIGH_AT = 0.7
+# After this many CONSECUTIVE Jev failures, stop calling Jev for this long. An
+# outage then costs a few searches their ranking instead of charging every
+# search a full timeout (twice: extraction shadow + scoring).
+JEV_BREAKER_FAILURES = max(1, _env_int("JEV_BREAKER_FAILURES", 5))
+JEV_BREAKER_SECONDS = float(os.getenv("JEV_BREAKER_SECONDS", "30"))
+# Connections shared by every concurrent search on one worker (1 extraction +
+# 1-3 scoring batches per search). Waiting for a free slot is bounded
+# separately so local queueing is not reported as vendor latency.
+JEV_MAX_CONNECTIONS = max(8, _env_int("JEV_MAX_CONNECTIONS", 96))
+JEV_POOL_WAIT_SECONDS = 0.5
+# Stop halving an over-cap batch after this many levels (2^4 = 16 requests).
+JEV_MAX_SPLIT_DEPTH = 4
+# How long the shadow Jev extraction may run PAST the real extractor before it
+# is abandoned. It is a shadow: it must never make a search wait.
+JEV_EXTRACTION_GRACE_SECONDS = 0.25
+# The rewrite is skipped when less than this is left of the agent stage budget:
+# it costs an LLM call, a fan-out and a rescore (~2-3s typical).
+SEARCH_REWRITE_MIN_BUDGET_SECONDS = float(os.getenv("SEARCH_REWRITE_MIN_BUDGET_SECONDS", "8.0"))
+# Titles of the first pool shown to the rewrite, and caps on what it returns.
+SEARCH_REWRITE_TITLE_SAMPLE = 8
+SEARCH_REWRITE_MAX_QUERY_CHARS = 300
+# The gatherer's raw emit in the trace blob. Observed max ~4.7k completion
+# tokens (~20KB); 64KB keeps every realistic emit without letting a runaway
+# generation bloat every blob.
+TRACE_TERMINAL_RAW_MAX_CHARS = 65_536
+# Error strings carried into logs and traces.
+LOG_ERROR_MAX_CHARS = 160

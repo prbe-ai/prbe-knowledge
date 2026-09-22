@@ -75,9 +75,11 @@ def test_a_dict_argument_is_captured_too():
 
 
 def test_a_runaway_emit_is_capped_not_stored_whole():
+    from engine.shared.constants import TRACE_TERMINAL_RAW_MAX_CHARS
+
     st = _state()
     _parse_terminal_args(json.dumps({"chunks": [], "pad": "x" * 500_000}), st)
-    assert len(st.terminal_raw) == 262_144
+    assert len(st.terminal_raw) == TRACE_TERMINAL_RAW_MAX_CHARS
 
 
 def test_capture_is_optional_so_callers_without_state_still_parse():
@@ -100,6 +102,8 @@ def test_v3_carries_the_capture_fields():
         request_recency_half_life_days=14.0,
     )
     st.rendered_doc_ids = {"slack:d2", "slack:d1"}
+    st.selector = "jev"
+    st.selection = {"ranked": [["slack:d1", 0.9]], "best": 0.9}
     blob = build_trace_blob(
         state=st, gathered=None, status="ok", timing={}, query="q",
         customer_id="c", trace_id="t", model="m",
@@ -112,6 +116,9 @@ def test_v3_carries_the_capture_fields():
     assert blob["rendered_doc_ids"] == ["slack:d1", "slack:d2"]
     assert blob["request_recency_half_life_days"] == 14.0
     assert blob["request_recall_floor_mode"] == "always"
+    # The offline study reads these two: which selector ran and its ranking.
+    assert blob["selector"] == "jev"
+    assert blob["selection"]["ranked"] == [["slack:d1", 0.9]]
 
 
 def test_the_pre_loop_failure_path_still_has_every_v3_key():
@@ -123,7 +130,8 @@ def test_the_pre_loop_failure_path_still_has_every_v3_key():
         customer_id="c", trace_id="t", model="m",
     )
     for k in ("terminal_raw", "grounding", "extraction", "rendered_doc_ids",
-              "request_recency_half_life_days", "request_recall_floor_mode"):
+              "request_recency_half_life_days", "request_recall_floor_mode",
+              "selector", "selection"):
         assert k in blob, k
 
 
@@ -141,14 +149,18 @@ def test_version_was_bumped_with_the_shape():
 
 # ------------------------------------------- the shared bundle serializer
 
-def test_pipeline_and_the_gatherer_share_one_serializer():
-    """`pipeline` imports `agent.loop`, so the gatherer cannot import back from
-    it -- which is why this helper lives in `grounding.py`. A second copy would
-    drift, and the query_traces middleware writes this shape into JSONB.
-    """
+def test_pipeline_uses_the_shared_serializer():
+    """One serializer for both callers, living beside the type it serializes:
+    `pipeline` imports `agent.loop`, so the gatherer cannot import back from
+    the pipeline. A second copy would drift, and the query_traces middleware
+    writes this shape into JSONB."""
+    import inspect
+
     from engine.retrieval import pipeline
 
-    assert pipeline._bundle_to_jsonable is bundle_to_jsonable
+    src = inspect.getsource(pipeline)
+    assert "bundle_to_jsonable(bundle)" in src
+    assert "def _bundle_to_jsonable" not in src
 
 
 def test_the_serialized_bundle_keeps_its_stored_shape():

@@ -182,8 +182,9 @@ async def search_knowledge(
         repeats, say the search was partial rather than reporting the gap as
         an absence — this is the one reason where "I found nothing about X"
         is most likely to be wrong.
-      * `jev_unavailable` — the result scorer was down or slow, so the
-        top documents by retrieval score came back instead. Real results,
+      * `jev_unavailable`, `jev_partial` — the result scorer was down,
+        slow, or answered for only part of the pool, so some or all of the
+        results are the top documents by retrieval score. Real results,
         ranked less precisely. Transient: re-run ONCE.
       * `no_llm_configured` — deployment-level. Do not retry. Surface it.
       * `schema_violation`, `passthrough_harness_fallback` — the agent

@@ -190,7 +190,8 @@ async def test_every_batch_failing_raises_with_a_readable_reason():
 
 
 @pytest.mark.asyncio
-async def test_one_failed_batch_keeps_the_others():
+async def test_one_failed_batch_keeps_the_others(monkeypatch):
+    monkeypatch.setattr(jev, "JEV_TOKEN_BUDGET", 24_000)
     calls = {"n": 0}
 
     def handler(req):
@@ -201,8 +202,9 @@ async def test_one_failed_batch_keeps_the_others():
         return _ok(qs)
 
     pool = {f"c{i}": _hit(f"d{i}", chunk=f"c{i}", content="x" * 40_000) for i in range(4)}
+    assert len(jev.batch_pool(pool, query="q")) >= 2  # precondition, not luck
     res = await jev.score_pool("q", pool, api_key="k", client=_client(handler))
-    assert "c0" not in res.scores and res.scores
+    assert "c0" not in res.scores and res.scores and res.partial
     assert any("http_503" in e for e in res.errors)
 
 
@@ -219,6 +221,15 @@ POOL = _pf(
 @pytest.fixture(autouse=True)
 def _stubs(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(L, "_no_llm_configured", lambda: False)
+    # The end-to-end tests run as tenant "c1"; allow it to use jev, give the
+    # plane a (fake) key so `jev` resolves, and NEVER let a test reach the real
+    # service: the extraction shadow is stubbed out and the breaker reset.
+    monkeypatch.setattr(L, "SEARCH_SELECTOR_JEV_ALLOWED", frozenset({"c1"}))
+    from engine.shared.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "typesafe_api_key", "test-key-not-real")
+    monkeypatch.setattr(L, "_jev_extraction_or_none", AsyncMock(return_value=None))
+    jev.BREAKER.success()
     monkeypatch.setattr(L, "_build_bundle_with_token_fallback",
                         AsyncMock(return_value=GroundingBundle()))
     monkeypatch.setattr(L, "extract_entities_with_llm",
@@ -381,11 +392,34 @@ async def test_an_empty_pool_rescued_by_the_rewrite_is_scored(monkeypatch):
 
 
 def test_explicit_selector_beats_rollout_and_default(monkeypatch):
+    monkeypatch.setattr(L, "SEARCH_SELECTOR_JEV_ALLOWED", frozenset({"c1"}))
     monkeypatch.setattr(L, "SEARCH_SELECTOR_JEV_CUSTOMERS", frozenset({"c1"}))
     monkeypatch.setattr(L, "SEARCH_SELECTOR_DEFAULT", "floor")
     assert L._resolve_selector(_req(), "c1") == "jev"
     assert L._resolve_selector(_req(), "c2") == "floor"
     assert L._resolve_selector(_req(selector="gatherer"), "c1") == "gatherer"
+
+
+def test_jev_is_never_honoured_for_a_tenant_not_allowed(monkeypatch):
+    """`jev` sends passages to an outside company: an explicit request, a
+    rollout entry, or a jev default must all be refused for a tenant that is
+    not on the allow-list."""
+    monkeypatch.setattr(L, "SEARCH_SELECTOR_JEV_ALLOWED", frozenset({"probe"}))
+    monkeypatch.setattr(L, "SEARCH_SELECTOR_JEV_CUSTOMERS", frozenset({"other"}))
+    monkeypatch.setattr(L, "SEARCH_SELECTOR_DEFAULT", "floor")
+    assert L._resolve_selector(_req(selector="jev"), "other") == "floor"
+    assert L._resolve_selector(_req(), "other") == "floor"
+    monkeypatch.setattr(L, "SEARCH_SELECTOR_DEFAULT", "jev")
+    assert L._resolve_selector(_req(), "other") == "floor"
+    assert L._resolve_selector(_req(), "probe") == "jev"
+    monkeypatch.setattr(L, "SEARCH_SELECTOR_JEV_ALLOWED", frozenset({"*"}))
+    assert L._resolve_selector(_req(), "other") == "jev"
+
+
+def test_vendor_error_text_is_never_logged():
+    resp = httpx.Response(422, json={"detail": {"error_type": "bad", "input": "SECRET PASSAGE"}})
+    assert jev._error_type(resp) == "bad"
+    assert jev._error_type(httpx.Response(500, text="SECRET PASSAGE")) == "unparseable"
 
 
 def test_an_unknown_default_falls_back_to_the_gatherer(monkeypatch):
@@ -453,10 +487,14 @@ def test_the_sampled_arm_uses_jev_for_sort_and_a_confident_class(monkeypatch):
     assert out.search_options.doc_types == ["github.pull_request"]
 
 
-def test_an_unsure_class_is_left_off_even_in_the_sampled_arm(monkeypatch):
-    # A wrong class zeroes the pool; below the confidence floor, no filter.
+def test_an_unsure_jev_class_keeps_the_extractors_own_filter(monkeypatch):
+    # A wrong class zeroes the pool. Below the confidence floor Jev's class is
+    # not applied -- and gpt-oss's own decision stands rather than being dropped.
     monkeypatch.setattr(L, "SEARCH_EXTRACTION_JEV_APPLY_RATE", 1.0)
     out, _ = L._merge_jev_extraction(_gpt(doc_types=["linear.issue"]), _jc(cconf=0.52),
+                                     customer_id="c", trace_id="t")
+    assert out.search_options.doc_types == ["linear.issue"]
+    out, _ = L._merge_jev_extraction(_gpt(doc_types=None), _jc(cconf=0.52),
                                      customer_id="c", trace_id="t")
     assert out.search_options.doc_types is None
 
@@ -490,3 +528,329 @@ async def test_extraction_on_jev_runs_only_for_jev_searches(monkeypatch):
     called.reset_mock()
     await L.run_gatherer(_req(selector="floor"), customer_id="c1", request=_state())
     assert called.await_count == 0
+
+
+# =====================================================================
+# review follow-ups: budgets, breaker, partial scoring, every failure branch
+# =====================================================================
+
+
+def _capture_state(monkeypatch):
+    captured = {}
+    real = L._stash_for_trace_persist
+
+    def spy(request, **kw):
+        captured["state"] = kw["state"]
+        return real(request, **kw)
+
+    monkeypatch.setattr(L, "_stash_for_trace_persist", spy)
+    return captured
+
+
+@pytest.mark.asyncio
+async def test_a_hanging_jev_is_cut_by_its_timeout_and_the_floor_answers(monkeypatch):
+    import asyncio
+    import time
+
+    async def hang(*a, **k):
+        await asyncio.sleep(10)
+
+    monkeypatch.setattr(L, "JEV_SELECTION_TIMEOUT_SECONDS", 0.05)
+    fr = _state()
+    t0 = time.perf_counter()
+    with patch.object(jev, "score_pool", new=hang):
+        resp = await L.run_gatherer(_req(selector="jev"), customer_id="c1", request=fr)
+    assert time.perf_counter() - t0 < 2.0
+    assert fr.state.gatherer_status == "jev_unavailable"
+    assert fr.state.router_model == "recall_floor"  # the floor answered; say so
+    assert len(resp.results) == 10
+
+
+@pytest.mark.asyncio
+async def test_partial_scoring_is_degraded_and_the_floor_fills_the_rest(monkeypatch):
+    async def half(query, pool, *, api_key, client=None):
+        out = jev.ScoreResult(requests=1)
+        keys = list(pool)
+        out.scores = {c: 0.9 for c in keys[: len(keys) // 2]}
+        out.errors = ["http_503:unknown"]
+        return out
+
+    fr = _state()
+    with patch.object(jev, "score_pool", new=half):
+        resp = await L.run_gatherer(_req(selector="jev"), customer_id="c1", request=fr)
+    assert fr.state.gatherer_status == "jev_partial"
+    assert resp.degraded is True
+    assert len(resp.results) == 10
+    floor_filled = [r for r in resp.results
+                    if any(m.channel == "recall_floor" for m in r.matched_via)]
+    assert floor_filled, "the floor must fill the slots Jev could not rank"
+
+
+@pytest.mark.asyncio
+async def test_no_key_means_the_floor_as_a_healthy_answer(monkeypatch):
+    from engine.shared.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "typesafe_api_key", "")
+    fr = _state()
+    resp = await L.run_gatherer(_req(selector="jev"), customer_id="c1", request=fr)
+    assert fr.state.gatherer_status == "ok" and resp.degraded is False
+    assert fr.state.router_model == "recall_floor"
+
+
+@pytest.mark.asyncio
+async def test_rescore_failure_after_a_rewrite_keeps_the_first_pass(monkeypatch):
+    extra = _pf(vector=[_hit("new1")])
+    monkeypatch.setattr(L, "execute_search",
+                        AsyncMock(side_effect=[json.loads(json.dumps(POOL)), extra]))
+    calls = {"n": 0}
+
+    async def flaky(query, pool, *, api_key, client=None):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise jev.JevError("down")
+        out = jev.ScoreResult(requests=1)
+        out.scores = {c: 0.1 for c in pool}
+        return out
+
+    cap = _capture_state(monkeypatch)
+    fr = _state()
+    with patch.object(L, "acompletion", new=_llm_says("session token rotation gateway")), \
+         patch.object(jev, "score_pool", new=flaky):
+        resp = await L.run_gatherer(_req(selector="jev"), customer_id="c1", request=fr)
+    # The first pass stands; the rewrite's new passage went unscored, so the
+    # answer is honestly partial rather than `ok`.
+    assert fr.state.gatherer_status == "jev_partial" and resp.results
+    assert cap["state"].selection["rewrite"]["rescore_error"] == "JevError"
+
+
+@pytest.mark.asyncio
+async def test_a_refanout_error_is_recorded_not_raised(monkeypatch):
+    monkeypatch.setattr(L, "execute_search",
+                        AsyncMock(side_effect=[json.loads(json.dumps(POOL)), RuntimeError("db")]))
+    cap = _capture_state(monkeypatch)
+    with patch.object(L, "acompletion", new=_llm_says("session token rotation gateway")), \
+         patch.object(jev, "score_pool", new=_scored({})):
+        resp = await L.run_gatherer(_req(selector="jev"), customer_id="c1", request=_state())
+    assert resp.results
+    assert cap["state"].selection["rewrite"]["outcome"] == "refanout_error:RuntimeError"
+
+
+@pytest.mark.asyncio
+async def test_a_rewrite_llm_error_is_recorded_not_raised(monkeypatch):
+    from engine.shared.llm import LLMError
+
+    cap = _capture_state(monkeypatch)
+    with patch.object(L, "acompletion", new=AsyncMock(side_effect=LLMError("gateway 503"))), \
+         patch.object(jev, "score_pool", new=_scored({})):
+        resp = await L.run_gatherer(_req(selector="jev"), customer_id="c1", request=_state())
+    rec = cap["state"].selection["rewrite"]
+    assert resp.results and rec["outcome"] == "no_rewrite" and "LLMError" in rec["error"]
+    assert "ms" in rec
+
+
+@pytest.mark.asyncio
+async def test_rewrite_disabled_never_calls_the_llm_or_searches_twice(monkeypatch):
+    monkeypatch.setattr(L, "SEARCH_REWRITE_ENABLED", False)
+    search = AsyncMock(return_value=json.loads(json.dumps(POOL)))
+    monkeypatch.setattr(L, "execute_search", search)
+    with patch.object(L, "acompletion", new=AsyncMock()) as llm, \
+         patch.object(jev, "score_pool", new=_scored({})):
+        await L.run_gatherer(_req(selector="jev"), customer_id="c1", request=_state())
+    llm.assert_not_called()
+    assert search.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_no_rewrite_when_the_stage_budget_is_nearly_spent(monkeypatch):
+    monkeypatch.setattr(L, "SEARCH_REWRITE_MIN_BUDGET_SECONDS", 10_000.0)
+    cap = _capture_state(monkeypatch)
+    with patch.object(L, "acompletion", new=AsyncMock()) as llm, \
+         patch.object(jev, "score_pool", new=_scored({})):
+        await L.run_gatherer(_req(selector="jev"), customer_id="c1", request=_state())
+    llm.assert_not_called()
+    assert cap["state"].selection["rewrite"]["outcome"] == "no_budget"
+
+
+@pytest.mark.asyncio
+async def test_non_gatherer_selectors_render_no_prompt(monkeypatch):
+    built = AsyncMock()
+    monkeypatch.setattr(L, "_build_user_message", built)
+    cap = _capture_state(monkeypatch)
+    await L.run_gatherer(_req(selector="floor"), customer_id="c1", request=_state())
+    built.assert_not_called()
+    assert cap["state"].messages == []
+
+
+@pytest.mark.asyncio
+async def test_the_extraction_shadow_never_makes_a_search_wait(monkeypatch):
+    import asyncio
+    import time
+
+    async def slow(query):
+        await asyncio.sleep(5)
+
+    monkeypatch.setattr(L, "_jev_extraction_or_none", slow)
+    t0 = time.perf_counter()
+    with patch.object(jev, "score_pool", new=_scored({"v1#0": 0.9})):
+        await L.run_gatherer(_req(selector="jev"), customer_id="c1", request=_state())
+    assert time.perf_counter() - t0 < 2.0
+
+
+@pytest.mark.asyncio
+async def test_the_breaker_opens_after_repeated_failures_and_skips_jev(monkeypatch):
+    monkeypatch.setattr(jev, "JEV_BREAKER_FAILURES", 2)
+    calls = {"n": 0}
+
+    def handler(req):
+        calls["n"] += 1
+        return httpx.Response(503, text="down")
+
+    pool = {"c": _hit("d")}
+    for _ in range(2):
+        with pytest.raises(jev.JevError):
+            await jev.score_pool("q", pool, api_key="k", client=_client(handler))
+    n = calls["n"]
+    with pytest.raises(jev.JevError, match="breaker_open"):
+        await jev.score_pool("q", pool, api_key="k", client=_client(handler))
+    assert calls["n"] == n  # the open breaker made no request
+    jev.BREAKER.success()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resp", [
+    lambda r: httpx.Response(200, json={"answers": {"sort": "recency", "doc_class": "no_class"}}),
+    lambda r: httpx.Response(200, json={"answers": {"sort": {"choice": "recency", "confidence": "high"},
+                                                     "doc_class": {"choice": "no_class"}}}),
+    lambda r: httpx.Response(500, text="boom"),
+])
+async def test_every_extraction_failure_is_a_jev_error(resp):
+    with pytest.raises(jev.JevError):
+        await jev.extract_options("q", api_key="k", client=_client(resp))
+    jev.BREAKER.success()
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_200_costs_one_batch_not_the_pool(monkeypatch):
+    monkeypatch.setattr(jev, "JEV_TOKEN_BUDGET", 24_000)
+
+    def handler(req):
+        qs = json.loads(req.content)["questions"]
+        if "c0" in qs:
+            return httpx.Response(200, json={"answers": "not a dict", "usage": {"input_tokens": "x"}})
+        return _ok(qs)
+
+    pool = {f"c{i}": _hit(f"d{i}", chunk=f"c{i}", content="x" * 40_000) for i in range(4)}
+    res = await jev.score_pool("q", pool, api_key="k", client=_client(handler))
+    assert res.scores and "c0" not in res.scores and "malformed_answer" in res.errors
+
+
+@pytest.mark.asyncio
+async def test_splitting_stops_at_the_depth_limit():
+    def handler(req):
+        return httpx.Response(400, json={"detail": {"error_type": "max_tokens_exceeded"}})
+
+    with pytest.raises(jev.JevError):
+        await jev.score_pool("q", {"c": _hit("d")}, api_key="k", client=_client(handler))
+    pool = {f"c{i}": _hit(f"d{i}", chunk=f"c{i}") for i in range(32)}
+    out = jev.ScoreResult()
+    await jev._score_batch(_client(handler), "k", "q", pool, list(pool), out)
+    assert out.splits <= 2 ** jev.JEV_MAX_SPLIT_DEPTH - 1
+    assert out.scores == {}
+    jev.BREAKER.success()
+
+
+def test_hits_without_a_doc_id_are_not_scoreable():
+    pf = _pf(vector=[{"chunk_id": "x#0", "content": "orphan"}, _hit("d1")])
+    assert list(jev.pool_chunks(pf)) == ["d1#0"]
+
+
+def test_every_doc_class_maps_to_a_real_doc_type():
+    from engine.shared.constants import DocType
+
+    known = {d.value for d in DocType} | {"codex.session", "pi.session"}
+    for cls, types in jev.DOC_CLASSES.items():
+        for t in types or []:
+            assert t in known, (cls, t)
+    assert set(jev._CLASS_QUESTION["criteria"]) == set(jev.DOC_CLASSES)
+
+
+def test_the_request_literal_and_the_selector_constant_agree():
+    from typing import get_args
+
+    from engine.shared.constants import SEARCH_SELECTOR_VALUES
+    from engine.shared.models import QueryRequest
+
+    ann = QueryRequest.model_fields["selector"].annotation
+    literal = next(a for a in get_args(ann) if get_args(a))
+    assert set(get_args(literal)) == set(SEARCH_SELECTOR_VALUES)
+
+
+@pytest.mark.asyncio
+async def test_invalid_probabilities_are_not_scores():
+    def handler(req):
+        return httpx.Response(200, json={"answers": {
+            "c0": {"noul": "NaN"},
+            "c1": {"noul": 1.7}, "c2": {"noul": True}, "c3": {"noul": 0.4},
+            "stranger": {"noul": 0.99},
+        }})
+
+    pool = {f"c{i}": _hit(f"d{i}", chunk=f"c{i}") for i in range(4)}
+    res = await jev.score_pool("q", pool, api_key="k", client=_client(handler))
+    assert res.scores == {"c3": 0.4}
+
+
+@pytest.mark.asyncio
+async def test_a_200_that_skips_answers_is_partial_not_ok(monkeypatch):
+    async def skippy(query, pool, *, api_key, client=None):
+        out = jev.ScoreResult(requests=1)
+        out.scores = {c: 0.9 for c in list(pool)[:3]}  # no errors, just gaps
+        return out
+
+    fr = _state()
+    with patch.object(jev, "score_pool", new=skippy):
+        resp = await L.run_gatherer(_req(selector="jev"), customer_id="c1", request=fr)
+    assert fr.state.gatherer_status == "jev_partial" and len(resp.results) == 10
+
+
+@pytest.mark.asyncio
+async def test_a_new_passage_in_a_seen_document_is_kept(monkeypatch):
+    same_doc_new_chunk = _pf(vector=[_hit("v1", chunk="v1#9", content="the actual answer")])
+    monkeypatch.setattr(L, "execute_search",
+                        AsyncMock(side_effect=[json.loads(json.dumps(POOL)), same_doc_new_chunk]))
+    with patch.object(L, "acompletion", new=_llm_says("session token rotation gateway")), \
+         patch.object(jev, "score_pool", new=_scored({"v1#9": 0.95})):
+        resp = await L.run_gatherer(_req(selector="jev"), customer_id="c1", request=_state())
+    assert resp.results[0].doc_id == "v1"
+    assert any(c.chunk_id == "v1#9" for c in resp.results[0].chunks)
+
+
+@pytest.mark.asyncio
+async def test_floor_answers_on_a_plane_with_no_llm_configured(monkeypatch):
+    monkeypatch.setattr(L, "_no_llm_configured", lambda: True)
+    fr = _state()
+    resp = await L.run_gatherer(_req(selector="floor"), customer_id="c1", request=fr)
+    assert len(resp.results) == 10 and fr.state.gatherer_status == "ok"
+
+
+@pytest.mark.asyncio
+async def test_a_slow_rewrite_keeps_the_first_pass(monkeypatch):
+    import asyncio
+
+    async def slow_search(*a, **k):
+        if slow_search.calls:
+            await asyncio.sleep(10)
+        slow_search.calls += 1
+        return json.loads(json.dumps(POOL))
+    slow_search.calls = 0
+
+    monkeypatch.setattr(L, "execute_search", slow_search)
+    monkeypatch.setattr(L, "SEARCH_AGENT_LOOP_TIMEOUT_SECONDS", 30.0)
+    monkeypatch.setattr(L, "SEARCH_REWRITE_MIN_BUDGET_SECONDS", 1.0)
+    monkeypatch.setattr(L, "JEV_SELECTION_TIMEOUT_SECONDS", 29.8)
+    cap = _capture_state(monkeypatch)
+    fr = _state()
+    with patch.object(L, "acompletion", new=_llm_says("session token rotation gateway")), \
+         patch.object(jev, "score_pool", new=_scored({"v2#0": 0.2})):
+        resp = await L.run_gatherer(_req(selector="jev"), customer_id="c1", request=fr)
+    assert cap["state"].selection["rewrite"]["outcome"] == "timeout"
+    assert resp.results[0].doc_id == "v2"  # the first pass stood

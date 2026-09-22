@@ -67,6 +67,10 @@ GathererStatus = Literal[
     # the caller got floor-quality results -- the same as the `floor` selector
     # -- instead of what it asked for.
     "jev_unavailable",
+    # Jev scored only PART of the pool (some batches failed). It keeps its
+    # share of the ten slots and the recall floor fills the rest. Degraded:
+    # the best documents may have been in the batches that were never scored.
+    "jev_partial",
     "schema_violation",
     # The response gate could not re-verify the emitted chunks against the
     # live documents rows (DB error) on an UNSCOPED request. The chunks are
@@ -387,12 +391,10 @@ class GathererOutput(BaseModel):
 # loop) reads the query and proposes entities. Results merge with grounding
 # before pre-fan-out.
 #
-# It runs AFTER grounding, not alongside it -- grounding's candidates are
+# It runs AFTER grounding, not alongside it: grounding's candidates are
 # rendered into the extractor's prompt as `<candidates>`, which is the entire
-# point of grounding, and running the two in parallel would throw that away.
-# `extractor.py`'s own docstring has said so since it was written; this comment
-# said "parallel" and was simply wrong, which matters because the two readings
-# imply different latency budgets.
+# point of grounding. (On `jev` searches a Jev sort / doc-type call runs
+# alongside the extractor as a shadow; see loop._merge_jev_extraction.)
 
 # DERIVED from ENTITY_TYPE_REGISTRY -- do not hand-edit this list, and do not
 # reintroduce a literal one. Add the type to the registry in

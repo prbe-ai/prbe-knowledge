@@ -9,7 +9,10 @@ Flow:
 2. Pre-fan-out: harness calls `execute_search([query])` once before the
    LLM. The 4-channel fan-out result lands in the LLM's first user
    message as `<channel_results>`.
-3. Agent loop on Fireworks gpt-oss-120B with `tool_choice="required"`:
+2b. Selector (`_resolve_selector`): `gatherer` runs step 3; `floor` and `jev`
+   skip it entirely -- see the diagram above `_resolve_selector`. On `jev`,
+   a Jev sort / doc-type shadow also runs alongside step 1's extractor.
+3. (`gatherer` only) Agent loop on gpt-oss-120B with `tool_choice="required"`:
    the model MUST call something — either a retrieval tool (search,
    subgraph, fetch_doc), the budget extension (need_deeper), or the
    terminal (emit_gatherer_output). No prose path. Loop ends when
@@ -29,6 +32,7 @@ import math
 import random
 import re
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from functools import lru_cache
@@ -83,8 +87,10 @@ from engine.retrieval.router import (
 )
 from engine.shared.constants import (
     DEFAULT_RECENCY_HALF_LIFE_DAYS,
+    JEV_EXTRACTION_GRACE_SECONDS,
     JEV_MODEL,
     JEV_SELECTION_TIMEOUT_SECONDS,
+    LOG_ERROR_MAX_CHARS,
     SEARCH_AGENT_EXTENSION_GRANT,
     SEARCH_AGENT_FALLBACK_INFERENCE_MODEL,
     SEARCH_AGENT_FALLBACK_TIMEOUT_SECONDS,
@@ -112,12 +118,16 @@ from engine.shared.constants import (
     SEARCH_EXTRACTION_JEV_CLASS_MIN_CONFIDENCE,
     SEARCH_REWRITE_BELOW_SCORE,
     SEARCH_REWRITE_ENABLED,
+    SEARCH_REWRITE_MAX_QUERY_CHARS,
     SEARCH_REWRITE_MAX_TOKENS,
-    SEARCH_REWRITE_OVERLAP_STOP,
+    SEARCH_REWRITE_MIN_BUDGET_SECONDS,
     SEARCH_REWRITE_TIMEOUT_SECONDS,
+    SEARCH_REWRITE_TITLE_SAMPLE,
     SEARCH_SELECTOR_DEFAULT,
+    SEARCH_SELECTOR_JEV_ALLOWED,
     SEARCH_SELECTOR_JEV_CUSTOMERS,
     SEARCH_SELECTOR_VALUES,
+    TRACE_TERMINAL_RAW_MAX_CHARS,
     SourceSystem,
 )
 from engine.shared.db import with_tenant
@@ -2653,11 +2663,9 @@ def _parse_terminal_args(
         return None
     if state is not None:
         # Capped: the emit echoes chunk content verbatim, and the pool it came
-        # from is already in the blob. 256 KB keeps every realistic emission
-        # (observed max ~4.7k completion tokens) without letting one runaway
-        # generation bloat every trace.
+        # from is already in the blob. See TRACE_TERMINAL_RAW_MAX_CHARS.
         _raw = raw_args if isinstance(raw_args, str) else json.dumps(raw_args, default=str)
-        state.terminal_raw = _raw[:262_144]
+        state.terminal_raw = _raw[:TRACE_TERMINAL_RAW_MAX_CHARS]
     try:
         if isinstance(raw_args, str):
             try:
@@ -2766,14 +2774,16 @@ def _finalize_agent_timing(
 #          |                                                             |
 #          +-- selector=floor ----> (nothing picked) --------------------+--> recall
 #          |                                                             |    floor
-#          +-- selector=jev ------> Jev scores EVERY chunk --> top 10 ---+    tops up
-#                                     |        docs by best chunk            / answers
-#                                     |                                       alone
-#                                     +-- best < 0.4 or pool empty, and the
-#                                         rewrite not yet spent:
+#          +-- selector=jev ------> Jev scores EVERY chunk --> top N ----+    tops up
+#                                     |   docs by best chunk (N = 10, or    / answers
+#                                     |   its scored share if partial)        alone
+#                                     |
+#                                     +-- best < SEARCH_REWRITE_BELOW_SCORE, or
+#                                         pool empty, rewrite not yet spent,
+#                                         and >= SEARCH_REWRITE_MIN_BUDGET left:
 #                                           gpt-oss rewrites the query ONCE
 #                                           -> skip if near-copy
-#                                           -> re-fan-out; stop if >= 80% old
+#                                           -> re-fan-out; stop if no NEW chunk
 #                                           -> score only the new chunks
 #                                           -> re-rank the merged pool
 #
@@ -2781,20 +2791,43 @@ def _finalize_agent_timing(
 # gatherer, `jev` beats both 2-3x on precision. See docs/plans/.
 
 
-def _resolve_selector(req: QueryRequest, customer_id: str) -> str:
-    """The selector for this request: explicit > per-tenant rollout > default.
+def _jev_allowed(customer_id: str) -> bool:
+    return "*" in SEARCH_SELECTOR_JEV_ALLOWED or customer_id in SEARCH_SELECTOR_JEV_ALLOWED
 
-    An explicit `QueryRequest.selector` always wins so the same query can be
-    compared across selectors (the dress rehearsal does exactly this). Every
-    value is safe to honour -- they differ in cost and quality, never in what a
-    caller is allowed to see: scope is applied to the pool before any of them
-    runs.
+
+def _resolve_selector(req: QueryRequest, customer_id: str) -> str:
+    """The selector for this request: explicit > per-tenant rollout > default,
+    with `jev` confined to allowed tenants on every path.
+
+    An explicit `QueryRequest.selector` wins so the same query can be compared
+    across selectors (the dress rehearsal does exactly this). `gatherer` and
+    `floor` are always safe to honour -- they differ in cost and quality, never
+    in what a caller may see, because scope is applied to the pool first. `jev`
+    is different in one way that matters: it sends the query and retrieved
+    passages to an outside company. So it runs only for a tenant on
+    `SEARCH_SELECTOR_JEV_ALLOWED`, whichever path asked for it; anyone else
+    falls back to the non-Jev default.
     """
+    default = SEARCH_SELECTOR_DEFAULT if SEARCH_SELECTOR_DEFAULT in SEARCH_SELECTOR_VALUES else "gatherer"
     if req.selector in SEARCH_SELECTOR_VALUES:
-        return req.selector
-    if customer_id in SEARCH_SELECTOR_JEV_CUSTOMERS:
-        return "jev"
-    return SEARCH_SELECTOR_DEFAULT if SEARCH_SELECTOR_DEFAULT in SEARCH_SELECTOR_VALUES else "gatherer"
+        chosen = req.selector
+    elif customer_id in SEARCH_SELECTOR_JEV_CUSTOMERS:
+        chosen = "jev"
+    else:
+        chosen = default
+    if chosen == "jev" and not _jev_allowed(customer_id):
+        log.info("agent.selector_jev_not_allowed", customer_id=customer_id)
+        chosen = default if default != "jev" else "floor"
+    if chosen == "jev":
+        from engine.shared.config import get_settings as _get_settings
+
+        if not _get_settings().typesafe_api_key:
+            # A plane with no key is a CONFIGURATION, not an outage: serve the
+            # floor as a healthy answer rather than a degraded one that tells
+            # agents to retry a request that will fail the same way forever.
+            log.info("agent.selector_jev_unconfigured", customer_id=customer_id)
+            chosen = "floor"
+    return chosen
 
 
 _REWRITE_SYSTEM_PROMPT = (
@@ -2808,8 +2841,10 @@ _REWRITE_SYSTEM_PROMPT = (
 )
 
 
-async def _rewrite_query(state: LoopState, query: str) -> str | None:
-    """One gpt-oss call that proposes a better-worded query, or None.
+async def _rewrite_query(
+    state: LoopState, query: str, pool: dict[str, dict[str, Any]]
+) -> tuple[str | None, str | None]:
+    """One gpt-oss call that proposes a better-worded query: (query, error).
 
     The only text generation left on the `jev` path, and it never touches the
     output list -- it only changes what is RETRIEVED. Shown the titles of what
@@ -2817,10 +2852,12 @@ async def _rewrite_query(state: LoopState, query: str) -> str | None:
     them.
     """
     titles: list[str] = []
-    for hit in list(jev.pool_chunks(state.prefanout).values())[:8]:
+    for hit in pool.values():
         t = (hit.get("title") or "").strip()
         if t and t not in titles:
             titles.append(t[:120])
+        if len(titles) >= SEARCH_REWRITE_TITLE_SAMPLE:
+            break
     results = "\n".join(f"- {t}" for t in titles) or "(no results)"
     call: dict[str, Any] = {
         "model": SEARCH_AGENT_INFERENCE_MODEL,
@@ -2840,29 +2877,36 @@ async def _rewrite_query(state: LoopState, query: str) -> str | None:
         "max_tokens": SEARCH_REWRITE_MAX_TOKENS,
         "timeout": SEARCH_REWRITE_TIMEOUT_SECONDS,
         "seed": state.seed,
+        # One attempt, always: the rewrite rides a search that is already
+        # struggling, and SDK retries would multiply the timeout above.
+        "max_retries": 0,
     }
-    if gateway_url():
-        call["max_retries"] = 0
     try:
         resp = await acompletion(**call)
     except LLMError as exc:
-        state.selection["rewrite_error"] = f"{type(exc).__name__}: {str(exc)[:120] or '<empty>'}"
-        return None
+        return None, f"{type(exc).__name__}: {str(exc)[:LOG_ERROR_MAX_CHARS] or '<empty>'}"
     choices = getattr(resp, "choices", None) or []
     msg = getattr(choices[0], "message", None) if choices else None
     text = (getattr(msg, "content", None) or "").strip()
     line = text.splitlines()[0].strip().strip('"').strip("'") if text else ""
-    return line[:300] or None
+    return (line[:SEARCH_REWRITE_MAX_QUERY_CHARS] or None), None
 
 
-def _doc_ids_of(prefanout: dict[str, Any] | None) -> set[str]:
-    return {h.get("doc_id") or c for c, h in jev.pool_chunks(prefanout).items()}
+def _scoreable_doc_ids(pool: dict[str, dict[str, Any]]) -> set[str]:
+    """Documents in a SCOREABLE pool (hits with a chunk id and a content body).
+
+    Deliberately narrower than `_all_prefanout_doc_ids`, which counts every
+    doc_id in every channel: Jev can only read, and the harness can only
+    deliver, a hit with content. Used for the jev path's rewrite overlap and
+    for what it reports as examined.
+    """
+    return {h.get("doc_id") or c for c, h in pool.items()}
 
 
-async def _rewrite_once(
-    state: LoopState,
-    refanout: Any,
-) -> bool:
+RefanOut = Callable[[str], Awaitable[dict[str, Any]]]
+
+
+async def _rewrite_once(state: LoopState, refanout: RefanOut) -> bool:
     """Spend the single rewrite. Returns True when the pool grew.
 
     Every exit records WHY in `state.selection["rewrite"]`, so "the rewrite
@@ -2874,51 +2918,74 @@ async def _rewrite_once(
     t0 = time.perf_counter()
     rec: dict[str, Any] = {"fired": True}
     state.selection["rewrite"] = rec
-    new_query = await _rewrite_query(state, state.query)
-    rec["query"] = new_query
-    if not new_query:
-        rec["outcome"] = "no_rewrite"
-        rec["ms"] = round((time.perf_counter() - t0) * 1000, 1)
-        return False
-    if jev.near_copy(new_query, state.query):
-        # Same question, same pool: a second search would cost ~2s and change
-        # nothing.
-        rec["outcome"] = "near_copy"
-        rec["ms"] = round((time.perf_counter() - t0) * 1000, 1)
-        return False
     try:
-        extra = await refanout(new_query)
-    except Exception as exc:  # the rewrite is best-effort; never fail the search
-        rec["outcome"] = f"refanout_error:{type(exc).__name__}"
-        rec["ms"] = round((time.perf_counter() - t0) * 1000, 1)
+        before_pool = jev.pool_chunks(state.prefanout)
+        new_query, error = await _rewrite_query(state, state.query, before_pool)
+        rec["query"] = new_query
+        if error:
+            rec["error"] = error
+        if not new_query:
+            rec["outcome"] = "no_rewrite"
+            return False
+        if jev.near_copy(new_query, state.query):
+            # Same question, same pool: a second search would cost ~2s and
+            # change nothing.
+            rec["outcome"] = "near_copy"
+            return False
+        try:
+            extra = await refanout(new_query)
+        except Exception as exc:  # best-effort: never fail the search
+            rec["outcome"] = f"refanout_error:{type(exc).__name__}"
+            return False
+        found = jev.pool_chunks(extra)
+        new_chunks = set(found) - set(before_pool)
+        rec["found_chunks"] = len(found)
+        rec["new_chunks"] = len(new_chunks)
+        rec["new_docs"] = len(_scoreable_doc_ids(found) - _scoreable_doc_ids(before_pool))
+        rec["overlap"] = round((len(found) - len(new_chunks)) / len(found), 3) if found else 1.0
+        if not new_chunks:
+            # Nothing we do not already hold: the data has no more on this
+            # topic, so stop rather than rescore it. Novelty is counted by
+            # PASSAGE, not document -- a new answering chunk inside an
+            # already-seen document is exactly what a rewrite exists to find,
+            # and only the new chunks are ever rescored, so keeping them is
+            # cheap.
+            rec["outcome"] = "repeat_results"
+            return False
+        subs = [sq for sq in (extra.get("sub_queries") or []) if isinstance(sq, dict)]
+        if not isinstance(state.prefanout.get("sub_queries"), list):
+            state.prefanout["sub_queries"] = []
+        state.prefanout["sub_queries"].extend(subs)
+        for sub in subs:
+            for ch in state.prefanout_hit_counts:
+                state.prefanout_hit_counts[ch] += len(sub.get(ch) or [])
+        rec["outcome"] = "merged"
+        return True
+    except Exception as exc:  # the rewrite is best-effort: never fail the search
+        rec["outcome"] = f"error:{type(exc).__name__}"
         return False
-    before = _doc_ids_of(state.prefanout)
-    found = _doc_ids_of(extra)
-    new_docs = found - before
-    rec["found_docs"] = len(found)
-    rec["new_docs"] = len(new_docs)
-    overlap = (len(found & before) / len(found)) if found else 1.0
-    rec["overlap"] = round(overlap, 3)
-    if not new_docs or overlap >= SEARCH_REWRITE_OVERLAP_STOP:
-        # The data has nothing more on this topic -- stop rather than rescore
-        # what we already hold.
-        rec["outcome"] = "repeat_results"
+    finally:
         rec["ms"] = round((time.perf_counter() - t0) * 1000, 1)
+
+
+async def _rewrite_within(state: LoopState, refanout: RefanOut, deadline: float) -> bool:
+    """`_rewrite_once`, bounded by the stage deadline, keeping a rescore's worth
+    of time in hand. On timeout the first pass stands -- the search returns
+    what it already scored rather than nothing."""
+    time_left = deadline - time.perf_counter() - JEV_SELECTION_TIMEOUT_SECONDS
+    try:
+        return await asyncio.wait_for(_rewrite_once(state, refanout), timeout=max(0.1, time_left))
+    except TimeoutError:
+        state.selection.setdefault("rewrite", {})["outcome"] = "timeout"
         return False
-    state.prefanout.setdefault("sub_queries", []).extend(extra.get("sub_queries") or [])
-    for sub in extra.get("sub_queries") or []:
-        for ch in state.prefanout_hit_counts:
-            state.prefanout_hit_counts[ch] += len(sub.get(ch) or [])
-    rec["outcome"] = "merged"
-    rec["ms"] = round((time.perf_counter() - t0) * 1000, 1)
-    return True
 
 
 async def _select_without_gatherer(
     state: LoopState,
     *,
     selector: str,
-    refanout: Any,
+    refanout: RefanOut,
+    deadline: float,
 ) -> tuple[GathererOutput, GathererStatus]:
     """Pick the documents without the gatherer LLM. Never raises.
 
@@ -2926,7 +2993,9 @@ async def _select_without_gatherer(
     `jev`: score the pool, emit the top documents' best chunks. Any Jev failure
     degrades to the floor with status `jev_unavailable` -- the answer a `floor`
     request would have got -- so a vendor outage costs quality, never the
-    search.
+    search. `deadline` is the agent stage's `perf_counter` deadline: the rewrite
+    is skipped when too little of it is left, and the caller bounds the whole
+    call by it.
     """
     sel = state.selection
     sel["selector"] = selector
@@ -2954,6 +3023,7 @@ async def _select_without_gatherer(
         sel["jev_ms"] = round(sel.get("jev_ms", 0.0) + res.elapsed_ms, 1)
         if res.errors:
             sel.setdefault("jev_errors", []).extend(res.errors[:3])
+            sel["partial"] = True
 
     try:
         await _score(pool)
@@ -2975,7 +3045,10 @@ async def _select_without_gatherer(
 
     # Phase 2: ONE rewrite when the best document is weak.
     weak = not ranked or ranked[0].score < SEARCH_REWRITE_BELOW_SCORE
-    if weak and await _rewrite_once(state, refanout):
+    time_left = deadline - time.perf_counter()
+    if weak and time_left < SEARCH_REWRITE_MIN_BUDGET_SECONDS and not state.rewrite_used:
+        sel["rewrite"] = {"fired": False, "outcome": "no_budget", "time_left_s": round(time_left, 2)}
+    elif weak and await _rewrite_within(state, refanout, deadline):
         grown = jev.pool_chunks(state.prefanout)
         fresh = {c: h for c, h in grown.items() if c not in scores}
         try:
@@ -2991,6 +3064,21 @@ async def _select_without_gatherer(
             and (sel["best_before_rewrite"] is None or ranked[0].score > sel["best_before_rewrite"])
         )
 
+    status: GathererStatus = "ok"
+    if len(scores) < len(pool):
+        # Answers missing for part of the pool -- from a failed batch or a 200
+        # that simply skipped some ids -- are the same problem.
+        sel["partial"] = True
+        sel["unscored"] = len(pool) - len(scores)
+    if sel.get("partial"):
+        # Part of the pool was never scored, so Jev's top ten are the top ten
+        # of what it SAW. Give it only its share of the slots and let the floor
+        # fill the rest from retrieval's own order -- and say so: this is a
+        # degraded answer, not an `ok` one.
+        share = len(scores) / max(1, len(pool))
+        ranked = ranked[: max(1, int(_RECALL_FLOOR_DOCS * share))]
+        status = "jev_partial"
+
     channels = jev.channels_by_chunk(state.prefanout)
     chunks = [
         _chunk_from_hit(
@@ -3003,7 +3091,7 @@ async def _select_without_gatherer(
     ]
     # What Jev actually read -- the whole pool -- for the recall-floor
     # accounting that separates "rejected" from "never examined".
-    state.rendered_doc_ids = _doc_ids_of(state.prefanout)
+    state.rendered_doc_ids = _scoreable_doc_ids(pool)
     best = ranked[0].score if ranked else None
     sel["scored"] = len(scores)
     sel["pool"] = len(pool)
@@ -3017,7 +3105,7 @@ async def _select_without_gatherer(
         tools_called=[],
         confidence=jev.confidence_for(best),
     )
-    return GathererOutput(entities=[], chunks=chunks, gatherer_notes=notes), "ok"
+    return GathererOutput(entities=[], chunks=chunks, gatherer_notes=notes), status
 
 
 async def _jev_extraction_or_none(query: str) -> jev.ExtractionChoice | None:
@@ -3087,7 +3175,10 @@ def _merge_jev_extraction(
     options = extracted.search_options.model_copy(
         update={
             "sort": choice.sort,
-            "doc_types": (choice.doc_types if confident_class else None),
+            # Unsure -> keep what gpt-oss decided rather than silently drop it.
+            "doc_types": (
+                choice.doc_types if confident_class else extracted.search_options.doc_types
+            ),
         }
     )
     return extracted.model_copy(update={"search_options": options}), rec
@@ -3235,6 +3326,9 @@ async def run_gatherer(
         is None
     )
 
+    # Resolved ONCE: extraction and selection must agree on what this request
+    # is, and the downgrade log line should fire once.
+    selector = _resolve_selector(req, customer_id)
     t_extraction = time.perf_counter()
     _jev_extraction_rec: dict[str, Any] | None = None
     if pure_lookup:
@@ -3250,15 +3344,20 @@ async def run_gatherer(
         # changes the prefanout anchors and the variance attribution in the
         # trace gets misassigned to the (now-seeded) gatherer loop.
         extraction_seed = _seed_for_query(customer_id, req.query)
-        if _resolve_selector(req, customer_id) == "jev":
-            # Jev's sort / doc-type answer runs ALONGSIDE the real extractor,
-            # so it costs no wait; see `_merge_jev_extraction`.
-            extracted, _jev_choice = await asyncio.gather(
-                extract_entities_with_llm(
-                    customer_id, req.query, bundle, seed=extraction_seed
-                ),
-                _jev_extraction_or_none(req.query),
+        if selector == "jev":
+            # Jev's sort / doc-type answer runs ALONGSIDE the real extractor
+            # and gets only a short grace after it: a shadow must never make a
+            # search wait, least of all on a slow or down vendor.
+            jev_task = asyncio.create_task(_jev_extraction_or_none(req.query))
+            extracted = await extract_entities_with_llm(
+                customer_id, req.query, bundle, seed=extraction_seed
             )
+            try:
+                _jev_choice = await asyncio.wait_for(
+                    jev_task, timeout=JEV_EXTRACTION_GRACE_SECONDS
+                )
+            except TimeoutError:
+                _jev_choice = None
             extracted, _jev_extraction_rec = _merge_jev_extraction(
                 extracted, _jev_choice, customer_id=customer_id, trace_id=trace_id
             )
@@ -3539,19 +3638,27 @@ async def run_gatherer(
     # Filled by the render below with exactly the doc_ids the gatherer is
     # shown, then carried on LoopState for the recall-floor accounting.
     rendered_doc_ids: set[str] = set()
-    user_msg = _build_user_message(
-        req.query,
-        bundle,
-        prefanout_result,
-        options=search_options,
-        author_ids=author_ids,
-        source_keys=request_source_keys,
-        doc_types=request_doc_types,
-        id_pins=id_pins,
-        project_id=request_project_id,
-        rendered_doc_ids=rendered_doc_ids,
-    )
-    system_prompt = build_system_prompt(datetime.now(UTC))
+    if selector == "gatherer":
+        user_msg = _build_user_message(
+            req.query,
+            bundle,
+            prefanout_result,
+            options=search_options,
+            author_ids=author_ids,
+            source_keys=request_source_keys,
+            doc_types=request_doc_types,
+            id_pins=id_pins,
+            project_id=request_project_id,
+            rendered_doc_ids=rendered_doc_ids,
+        )
+        system_prompt = build_system_prompt(datetime.now(UTC))
+    else:
+        # `floor` / `jev` never send a prompt: rendering one tokenises the whole
+        # pool on the event loop and ~80KB of text nobody reads would land in
+        # the trace blob. It also leaves `rendered_doc_ids` empty, so the floor
+        # does not count pool docs as "rejected" by a gatherer that never ran.
+        user_msg = ""
+        system_prompt = ""
 
     state = LoopState(
         customer_id=customer_id,
@@ -3566,7 +3673,7 @@ async def run_gatherer(
         request_project_id=request_project_id,
         request_recall_floor_mode=request_recall_floor_mode,
         rendered_doc_ids=rendered_doc_ids,
-        selector=_resolve_selector(req, customer_id),
+        selector=selector,
         grounding_json=_grounding_json,
         extraction_json=_extraction_json,
         request_temporal=request_temporal,
@@ -3576,19 +3683,23 @@ async def run_gatherer(
         request_discovery=request_discovery,
         request_source_keys_include_keyless=request_source_keys_include_keyless,
         request_per_source_top_k=request_per_source_top_k,
-        messages=[
-            {
-                "role": "system",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": system_prompt,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ],
-            },
-            {"role": "user", "content": user_msg},
-        ],
+        messages=(
+            [
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": system_prompt,
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                },
+                {"role": "user", "content": user_msg},
+            ]
+            if selector == "gatherer"
+            else []
+        ),
     )
 
     t_agent = time.perf_counter()
@@ -3705,10 +3816,22 @@ async def run_gatherer(
     # under `jev` it gets the single rewrite before giving up. Nothing to score
     # yet, so this costs only the rewrite call and one fan-out. If the rewrite
     # also finds nothing, the short-circuit below returns empty as before.
+    stage_deadline = t_stage_start + SEARCH_AGENT_LOOP_TIMEOUT_SECONDS
     if prefanout_total == 0 and state.selector == "jev":
         state.selection["selector"] = "jev"
-        if await _rewrite_once(state, _refanout):
-            prefanout_total = sum(state.prefanout_hit_counts.values())
+        time_left = stage_deadline - time.perf_counter()
+        if time_left < SEARCH_REWRITE_MIN_BUDGET_SECONDS:
+            state.selection["rewrite"] = {"fired": False, "outcome": "no_budget"}
+        else:
+            try:
+                grew = await asyncio.wait_for(
+                    _rewrite_once(state, _refanout), timeout=time_left
+                )
+            except TimeoutError:
+                grew = False
+                state.selection.setdefault("rewrite", {})["outcome"] = "timeout"
+            if grew:
+                prefanout_total = sum(state.prefanout_hit_counts.values())
 
     if prefanout_total == 0:
         log.info(
@@ -3771,7 +3894,10 @@ async def run_gatherer(
             top_k=req.top_k,
         )
 
-    if _no_llm_configured():
+    # Only the gatherer needs an LLM to pick results. `floor` needs nothing and
+    # `jev` needs only its own key (its rewrite degrades on its own when the
+    # LLM is absent), so neither may be short-circuited to an empty answer here.
+    if state.selector == "gatherer" and _no_llm_configured():
         log.info(
             "agent.no_llm_configured_short_circuit",
             customer_id=customer_id,
@@ -3835,9 +3961,23 @@ async def run_gatherer(
         # `floor` / `jev`: no LLM turn. The recall floor below still runs and
         # tops the response up exactly as it does after the gatherer.
         t_select = time.perf_counter()
-        gathered, status = await _select_without_gatherer(
-            state, selector=state.selector, refanout=_refanout
-        )
+        # The same stage cap the gatherer lives under. Each Jev call has its own
+        # timeout, but the rewrite adds an LLM call, a fan-out and a rescore;
+        # without this bound they could stack past the budget on a slow night.
+        try:
+            gathered, status = await asyncio.wait_for(
+                _select_without_gatherer(
+                    state,
+                    selector=state.selector,
+                    refanout=_refanout,
+                    deadline=stage_deadline,
+                ),
+                timeout=max(0.5, stage_deadline - time.perf_counter()),
+            )
+        except TimeoutError:
+            state.selection["fallback"] = "stage_budget"
+            status = "jev_unavailable" if state.selector == "jev" else "ok"
+            gathered = _empty_passthrough(status, state)
         timing["selector_ms"] = (time.perf_counter() - t_select) * 1000
     else:
         # What is LEFT of the stage budget after setup. Floored at a small positive
@@ -4036,6 +4176,11 @@ async def run_gatherer(
         # `ranked` rides the trace blob, not a log line; `selector` is passed
         # explicitly below and would otherwise collide as a duplicate kwarg.
         _sel = {k: v for k, v in state.selection.items() if k not in ("ranked", "selector")}
+        if isinstance(_sel.get("rewrite"), dict):
+            # The rewritten query paraphrases the tenant's query and document
+            # titles. Pod logs never carried query text; keep it that way --
+            # the trace blob (tenant-keyed) has it.
+            _sel["rewrite"] = {k: v for k, v in _sel["rewrite"].items() if k != "query"}
         log.info(
             "agent.selector",
             customer_id=customer_id,
@@ -4097,11 +4242,15 @@ async def run_gatherer(
         request.state.intents_count = 1
         # `query_traces.router_model` names what picked the results, so a
         # rollout can be split by it without joining to logs.
-        request.state.router_model = {
-            "gatherer": SEARCH_AGENT_INFERENCE_MODEL,
-            "floor": "recall_floor",
-            "jev": JEV_MODEL,
-        }.get(state.selector, SEARCH_AGENT_INFERENCE_MODEL)
+        if state.selector == "jev" and status == "jev_unavailable":
+            # The floor answered; crediting Jev would mislabel the rollout data.
+            request.state.router_model = "recall_floor"
+        else:
+            request.state.router_model = {
+                "gatherer": SEARCH_AGENT_INFERENCE_MODEL,
+                "floor": "recall_floor",
+                "jev": JEV_MODEL,
+            }.get(state.selector, SEARCH_AGENT_INFERENCE_MODEL)
         request.state.failure_recovered = is_degraded(status)
 
     _stash_for_trace_persist(

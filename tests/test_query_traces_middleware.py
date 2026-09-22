@@ -550,8 +550,8 @@ def _stub_router_pipeline(monkeypatch) -> None:
 
     async def fake_run_retrieval(req, customer_id, request=None):
         if request is not None:
-            from engine.retrieval.pipeline import _bundle_to_jsonable
-            request.state.grounding_bundle = _bundle_to_jsonable(_bundle)
+            from engine.retrieval.grounding import bundle_to_jsonable
+            request.state.grounding_bundle = bundle_to_jsonable(_bundle)
             request.state.router_raw = {"intents": [{"query_text": "hello world", "mode": "search"}]}
             request.state.intents_count = 1
             request.state.router_model = HAIKU_MODEL

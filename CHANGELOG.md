@@ -18,8 +18,14 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   rather than failing the search.
 - On `jev` searches whose best result is weak (score below 0.4, or nothing found), the
   query is rewritten once and searched again under the same scope. At most one rewrite per
-  search; it is skipped when the rewrite is a near-copy and stops when it finds the same
-  documents. Results that are still weak return with `confidence: low`.
+  search; it is skipped when the rewrite is a near-copy or too little of the search's time
+  budget is left, and it stops when it finds nothing new. Results that are still weak return
+  with `confidence: low`.
+- Jev is only ever used for tenants on an allow-list (`SEARCH_SELECTOR_JEV_ALLOWED`), because
+  it sends the query and retrieved passages to an outside service. An explicit
+  `selector="jev"` from any other tenant is served by the non-Jev default instead. When Jev
+  answers for only part of the candidates the search reports `jev_partial` and the floor
+  fills the rest; after repeated Jev failures it is skipped for 30 seconds.
 - On `jev` searches, Jev also decides the result ordering and document-type filter
   alongside the existing extractor, and every disagreement is logged (`agent.extract_jev`).
   Nothing changes until the sampled apply rate is raised.
