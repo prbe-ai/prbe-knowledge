@@ -38,8 +38,9 @@ Per node, one transaction:
     whose edge count moved.
   * it does NOT exist yet: relabel the node in place. Its node_id, edges,
     provenance and degree all stay correct; only its name changes.
-`pending_edges` parked on the old label are rewritten the same way, so an edge
-waiting for an experiment node materialises when the project node lands.
+`pending_edges` parked on the old label are rewritten the same way and their
+leases cleared; any whose Project node has ALREADY landed are drained on the
+spot, because that node's post-write pass is over and nothing else would.
 
 Idempotent: a second run finds no `Experiment` node and changes nothing.
 """
@@ -51,6 +52,9 @@ import asyncio
 import sys
 from dataclasses import dataclass, field
 
+import asyncpg
+
+from engine.ingest.graph_writer import drain_pending_edges
 from engine.shared.config import get_settings
 from engine.shared.constants import RETIRED_NODE_LABELS
 from engine.shared.db import close_pool, init_pool, raw_conn, with_tenant
@@ -80,6 +84,7 @@ class RetireStats:
     edges_repointed: int = 0
     duplicate_edges_dropped: int = 0
     pending_rewritten: int = 0
+    pending_drained: int = 0
     skipped_ids: list[str] = field(default_factory=list)
     label_keyed_rows: dict[str, int] = field(default_factory=dict)
 
@@ -146,33 +151,43 @@ UPDATE graph_nodes n
 """
 
 # Parked edges waiting on an experiment node, or asserted FROM/TO one. Each
-# column pair is rewritten only where it still names the retired label.
+# column pair is rewritten only where IT names the retired label with the
+# mapped id shape -- guarded per pair, or a row selected for one pair would
+# rewrite another pair's odd id into `project:` plus a truncated tail.
+#
+# `locked_until = NULL` clears a lease a drain left behind: a drain that hit an
+# `Experiment` endpoint after the label left NodeLabel raised past its claim,
+# and a leased row is never claimed again. The caller then DRAINS every
+# rewritten row whose Project node already exists -- that node has landed and
+# its post-write pass is over, so nothing else would ever materialise them.
+_PENDING_PAIR = "{label} = '" + RETIRED_LABEL + "' AND {cid} LIKE '" + _OLD_PREFIX + "%'"
+
+
+def _rewrite(label: str, cid: str) -> str:
+    guard = _PENDING_PAIR.format(label=label, cid=cid)
+    return (
+        f"{label} = CASE WHEN {guard} THEN '{_NEW_LABEL}' ELSE {label} END, "
+        f"{cid} = CASE WHEN {guard} "
+        f"THEN '{_NEW_PREFIX}' || substr({cid}, {len(_OLD_PREFIX) + 1}) ELSE {cid} END"
+    )
+
+
+_PENDING_WHERE = " OR ".join(
+    "(" + _PENDING_PAIR.format(label=f"{side}_label", cid=f"{side}_canonical_id") + ")"
+    for side in ("missing", "from", "to")
+)
+
 _REWRITE_PENDING_SQL = f"""
 UPDATE pending_edges
-   SET missing_label = CASE WHEN missing_label = '{RETIRED_LABEL}' THEN '{_NEW_LABEL}' ELSE missing_label END,
-       missing_canonical_id = CASE WHEN missing_label = '{RETIRED_LABEL}'
-            THEN '{_NEW_PREFIX}' || substr(missing_canonical_id, {len(_OLD_PREFIX) + 1})
-            ELSE missing_canonical_id END,
-       from_label = CASE WHEN from_label = '{RETIRED_LABEL}' THEN '{_NEW_LABEL}' ELSE from_label END,
-       from_canonical_id = CASE WHEN from_label = '{RETIRED_LABEL}'
-            THEN '{_NEW_PREFIX}' || substr(from_canonical_id, {len(_OLD_PREFIX) + 1})
-            ELSE from_canonical_id END,
-       to_label = CASE WHEN to_label = '{RETIRED_LABEL}' THEN '{_NEW_LABEL}' ELSE to_label END,
-       to_canonical_id = CASE WHEN to_label = '{RETIRED_LABEL}'
-            THEN '{_NEW_PREFIX}' || substr(to_canonical_id, {len(_OLD_PREFIX) + 1})
-            ELSE to_canonical_id END
- WHERE customer_id = $1
-   AND (   (missing_label = '{RETIRED_LABEL}' AND missing_canonical_id LIKE '{_OLD_PREFIX}%')
-        OR (from_label    = '{RETIRED_LABEL}' AND from_canonical_id    LIKE '{_OLD_PREFIX}%')
-        OR (to_label      = '{RETIRED_LABEL}' AND to_canonical_id      LIKE '{_OLD_PREFIX}%'))
+   SET {_rewrite("missing_label", "missing_canonical_id")},
+       {_rewrite("from_label", "from_canonical_id")},
+       {_rewrite("to_label", "to_canonical_id")},
+       locked_until = NULL
+ WHERE customer_id = $1 AND ({_PENDING_WHERE})
+RETURNING missing_label, missing_canonical_id
 """
 
-_COUNT_PENDING_SQL = f"""
-SELECT count(*) FROM pending_edges
- WHERE customer_id = $1
-   AND (missing_label = '{RETIRED_LABEL}' OR from_label = '{RETIRED_LABEL}'
-        OR to_label = '{RETIRED_LABEL}')
-"""
+_COUNT_PENDING_SQL = f"SELECT count(*) FROM pending_edges WHERE customer_id = $1 AND ({_PENDING_WHERE})"
 
 
 async def _retire_one(conn, customer_id: str, node_id: int, target_id: str, stats: RetireStats) -> None:
@@ -219,8 +234,8 @@ async def _retire_one(conn, customer_id: str, node_id: int, target_id: str, stat
 
 async def retire_customer(customer_id: str, *, dry_run: bool = False) -> RetireStats:
     """Retire every Experiment node of one tenant. One transaction per node, so
-    a failure (say, ingest racing a relabel onto the same project id) costs
-    that node only; re-running picks it up."""
+    ingest racing a relabel onto the same project id costs that node only (it
+    is reported in `skipped_ids`); re-running picks it up."""
     stats = RetireStats(customer_id=customer_id)
     async with with_tenant(customer_id) as conn:
         nodes = await conn.fetch(
@@ -270,11 +285,39 @@ async def retire_customer(customer_id: str, *, dry_run: bool = False) -> RetireS
         if target is None:
             stats.skipped_ids.append(node["canonical_id"])
             continue
-        async with with_tenant(customer_id) as conn:
-            await _retire_one(conn, customer_id, node["node_id"], target, stats)
+        try:
+            async with with_tenant(customer_id) as conn:
+                await _retire_one(conn, customer_id, node["node_id"], target, stats)
+        except asyncpg.UniqueViolationError:
+            # Live ingest created the Project node between the lookup and the
+            # relabel. This node's transaction rolled back; a re-run folds it.
+            log.warning(
+                "retire_experiment_nodes.node_raced_ingest",
+                customer_id=customer_id,
+                canonical_id=node["canonical_id"],
+            )
+            stats.skipped_ids.append(node["canonical_id"])
     async with with_tenant(customer_id) as conn:
-        result = await conn.execute(_REWRITE_PENDING_SQL, customer_id)
-    stats.pending_rewritten = int(result.rsplit(" ", 1)[-1])
+        rewritten = await conn.fetch(_REWRITE_PENDING_SQL, customer_id)
+    stats.pending_rewritten = len(rewritten)
+    waiting_on = {
+        (r["missing_label"], r["missing_canonical_id"])
+        for r in rewritten
+        if r["missing_label"] == _NEW_LABEL
+    }
+    for label, canonical_id in sorted(waiting_on):
+        async with with_tenant(customer_id) as conn:
+            landed = await conn.fetchval(
+                "SELECT 1 FROM graph_nodes WHERE customer_id = $1 AND label = $2 "
+                "AND canonical_id = $3",
+                customer_id,
+                label,
+                canonical_id,
+            )
+            if landed:
+                stats.pending_drained += await drain_pending_edges(
+                    conn, customer_id, label, canonical_id
+                )
     log.info("retire_experiment_nodes.done", **_log_fields(stats))
     return stats
 
@@ -288,6 +331,7 @@ def _log_fields(stats: RetireStats) -> dict:
         "edges_repointed": stats.edges_repointed,
         "duplicate_edges_dropped": stats.duplicate_edges_dropped,
         "pending_rewritten": stats.pending_rewritten,
+        "pending_drained": stats.pending_drained,
         "skipped": len(stats.skipped_ids),
         "label_keyed_rows": stats.label_keyed_rows,
     }
