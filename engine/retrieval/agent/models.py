@@ -372,15 +372,22 @@ class GathererOutput(BaseModel):
 
 
 # ============================================================
-# LLM-based entity extraction (parallel with deterministic grounding)
+# LLM-based entity extraction (SEQUENTIAL, after deterministic grounding)
 # ============================================================
 # The Haiku router used to do LLM-based entity extraction before the
 # cutover. Grounding's pg_trgm fuzzy + tsvector match recovers most
 # bare-ID and prefix cases, but it misses paraphrased entities ("the
 # new login flow" when the graph node is named "Authentication Phase 2").
-# This shape is the recovery path: a tiny LLM call (same Fireworks model
-# as the agent loop, parallel with grounding) reads the query and proposes
-# entities. Results merge with grounding before pre-fan-out.
+# This shape is the recovery path: a tiny LLM call (same model as the agent
+# loop) reads the query and proposes entities. Results merge with grounding
+# before pre-fan-out.
+#
+# It runs AFTER grounding, not alongside it -- grounding's candidates are
+# rendered into the extractor's prompt as `<candidates>`, which is the entire
+# point of grounding, and running the two in parallel would throw that away.
+# `extractor.py`'s own docstring has said so since it was written; this comment
+# said "parallel" and was simply wrong, which matters because the two readings
+# imply different latency budgets.
 
 # DERIVED from ENTITY_TYPE_REGISTRY -- do not hand-edit this list, and do not
 # reintroduce a literal one. Add the type to the registry in

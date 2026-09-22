@@ -65,7 +65,7 @@ from engine.retrieval.agent.tools import (
 )
 from engine.retrieval.channel_health import begin_request, lost_channels
 from engine.retrieval.dedup import dedupe_gathered
-from engine.retrieval.grounding import GroundingBundle
+from engine.retrieval.grounding import GroundingBundle, bundle_to_jsonable
 from engine.retrieval.helpers import expand_to_author_id_set
 from engine.retrieval.retrievers.bm25 import residualize_for_bm25
 from engine.retrieval.retrievers.id_lookup import (
@@ -287,6 +287,26 @@ class LoopState:
     # `_source_weight` for this request only.
     request_recency_half_life_days: float | None = None
     request_per_source_top_k: int | None = None
+    # ---- capture-only fields (trace blob v3) -------------------------------
+    # None of these change a decision; they exist because the blob could not
+    # answer three questions an offline study has to ask.
+    #
+    # `terminal_raw` is the emit_gatherer_output arguments AS THE MODEL SENT
+    # THEM. The parsed GathererOutput is already in the blob, but the parse is
+    # lossy in exactly the interesting direction: `_coerce_lenient` drops a
+    # chunk whose citation could not be recovered, so a blob shows the survivors
+    # and never the casualties. Without the raw string, "the model fumbled" and
+    # "the parser rejected it" are indistinguishable after the fact.
+    terminal_raw: str | None = None
+    # The grounding bundle as a structure. It reaches the model today only as
+    # rendered `<grounding>` text lines inside `messages[1]`, which cannot be
+    # read back as candidates, and `query_traces.grounding_bundle` is NULL on
+    # every gatherer row -- only the list pipeline ever sets it.
+    grounding_json: dict[str, Any] | None = None
+    # What the extractor returned: the entity picks, the sort directive, the
+    # doc_type filter and the sub-queries. Today this survives only in the
+    # `agent.entity_extract_complete` log line, which ages out with the pod.
+    extraction_json: dict[str, Any] | None = None
 
 
 # Floor for the remaining-loop budget. Setup (grounding + extraction +
@@ -2574,6 +2594,12 @@ def _parse_terminal_args(
     via `_coerce_lenient` + the lenient `extra="ignore"` model config —
     no fallback parse needed.
 
+    Also stashes the raw arguments on `state` for the trace blob. Done HERE
+    rather than at the call sites deliberately: there are two (the normal
+    terminal return and the forced-termination path), and instrumenting the
+    obvious one would silently lose every forced emission -- which is exactly
+    the population a study of under-emission cares about.
+
     `state` is used to fill harness-authoritative fields (`turns_used`,
     `tools_called`) regardless of what the model emitted. Pre-#306
     (temperature=0) the model sometimes populated these; post-#306 it
@@ -2582,6 +2608,13 @@ def _parse_terminal_args(
     """
     if raw_args is None:
         return None
+    if state is not None:
+        # Capped: the emit echoes chunk content verbatim, and the pool it came
+        # from is already in the blob. 256 KB keeps every realistic emission
+        # (observed max ~4.7k completion tokens) without letting one runaway
+        # generation bloat every trace.
+        _raw = raw_args if isinstance(raw_args, str) else json.dumps(raw_args, default=str)
+        state.terminal_raw = _raw[:262_144]
     try:
         if isinstance(raw_args, str):
             try:
@@ -2843,6 +2876,17 @@ async def run_gatherer(
     extracted_entities = extracted.entities
     search_options = extracted.search_options
 
+    # Capture, not control: nothing below reads these. `state` does not exist
+    # yet at this point in the flow, so they ride locals until it is built.
+    try:
+        _grounding_json = bundle_to_jsonable(bundle)
+    except Exception:  # a capture field must never break a search
+        _grounding_json = None
+    try:
+        _extraction_json = extracted.model_dump(mode="json")
+    except Exception:  # a capture field must never break a search
+        _extraction_json = None
+
     # Reconcile LLM-proposed entities against the bundle (safety net).
     if extracted_entities:
         synthetic_intent = Intent(
@@ -3103,6 +3147,8 @@ async def run_gatherer(
         request_project_id=request_project_id,
         request_recall_floor_mode=request_recall_floor_mode,
         rendered_doc_ids=rendered_doc_ids,
+        grounding_json=_grounding_json,
+        extraction_json=_extraction_json,
         request_temporal=request_temporal,
         request_recency_half_life_days=request_recency_half_life_days,
         request_doc_types=request_doc_types,

@@ -48,7 +48,13 @@ log = logging.getLogger(__name__)
 # readable indefinitely; the analyzer filters by version when needed.
 # v2 adds finish_reasons_per_turn + completion_tokens_per_turn (per-turn,
 # same cardinality contract as the other per-turn arrays).
-TRACE_BLOB_SCHEMA_VERSION = 2
+# v3 adds the three things an offline study of curation could not ask v2:
+# `terminal_raw` (the emit arguments before the lossy coercion), `grounding`
+# (the bundle as a structure, not rendered prose) and `extraction` (what the
+# extractor returned), plus the two inputs a faithful replay of the recall
+# floor needs -- `rendered_doc_ids` and the request's recency/floor settings.
+# Old blobs stay readable: the analyzer reads with `.get`.
+TRACE_BLOB_SCHEMA_VERSION = 3
 
 
 def build_trace_blob(
@@ -124,6 +130,27 @@ def build_trace_blob(
         # finish_reason=="length" on any turn means a cap truncated the answer.
         blob["finish_reasons_per_turn"] = list(state.finish_reasons_per_turn)
         blob["completion_tokens_per_turn"] = list(state.completion_tokens_per_turn)
+        # ---- v3 capture ----------------------------------------------------
+        # The emit arguments AS SENT. `gathered` below is the parsed result,
+        # and the parse is lossy in the direction that matters: a chunk whose
+        # citation could not be recovered is dropped, so the blob shows the
+        # survivors and never the casualties. Without this, "the model fumbled"
+        # and "the parser rejected it" cannot be told apart afterwards.
+        blob["terminal_raw"] = state.terminal_raw
+        # The grounding bundle as a structure. It reaches the model only as
+        # rendered `<grounding>` lines inside `messages[1]`, which cannot be
+        # read back as candidates.
+        blob["grounding"] = state.grounding_json
+        # What the extractor returned -- entities, sort, doc_types, sub-queries.
+        # Otherwise this lives only in a pod log line that ages out.
+        blob["extraction"] = state.extraction_json
+        # The two inputs a faithful replay of the recall floor needs. The floor
+        # decays each hit by its age against `now` with a PER-SOURCE half-life,
+        # so a replay run later reorders the pool rather than shifting it; and
+        # which docs were actually rendered is otherwise unrecoverable.
+        blob["rendered_doc_ids"] = sorted(state.rendered_doc_ids)
+        blob["request_recency_half_life_days"] = state.request_recency_half_life_days
+        blob["request_recall_floor_mode"] = state.request_recall_floor_mode
     else:
         # Pre-loop failure (e.g. grounding raised before state was constructed
         # in a future refactor). Keep the keys present so analyzer schema
@@ -151,6 +178,12 @@ def build_trace_blob(
         blob["system_fingerprints_per_turn"] = []
         blob["finish_reasons_per_turn"] = []
         blob["completion_tokens_per_turn"] = []
+        blob["terminal_raw"] = None
+        blob["grounding"] = None
+        blob["extraction"] = None
+        blob["rendered_doc_ids"] = []
+        blob["request_recency_half_life_days"] = None
+        blob["request_recall_floor_mode"] = None
 
     if gathered is not None:
         blob["gathered"] = gathered.model_dump(mode="json")
