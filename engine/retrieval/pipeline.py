@@ -38,7 +38,10 @@ from uuid import uuid4
 from pydantic import TypeAdapter
 
 from engine.retrieval.agent.loop import run_gatherer
-from engine.retrieval.grounding import GroundingBundle, GroundingCandidate
+from engine.retrieval.grounding import (
+    GroundingBundle,
+    bundle_to_jsonable,
+)
 from engine.retrieval.paging import load_page, store_page
 from engine.retrieval.router import (
     Intent,
@@ -59,30 +62,6 @@ from engine.shared.models import (
 from engine.shared.telemetry import new_trace_id
 
 log = get_logger(__name__)
-
-
-def _bundle_to_jsonable(b: GroundingBundle) -> dict:
-    """Convert a GroundingBundle to a JSON-serializable dict.
-
-    Used by the query_traces middleware to persist the grounding bundle
-    into Postgres JSONB. Kept compatible with the pre-cutover shape so
-    the middleware needs no changes.
-    """
-    def _candidate(c: GroundingCandidate) -> dict:
-        return {
-            "entity_type": c.entity_type,
-            "canonical_id": c.canonical_id,
-            "display_name": c.display_name,
-            "last_seen_at": c.last_seen_at.isoformat() if c.last_seen_at else None,
-            "match_source": c.match_source,
-        }
-
-    return {
-        "candidates": [_candidate(c) for c in b.candidates],
-        "bare_id_matches": [_candidate(c) for c in b.bare_id_matches],
-        "connected_sources": list(b.connected_sources),
-        "timing_ms": b.timing_ms,
-    }
 
 
 @dataclass(slots=True)
@@ -189,7 +168,7 @@ async def run_router_phase(
 
     if request is not None:
         try:
-            request.state.grounding_bundle = _bundle_to_jsonable(bundle)
+            request.state.grounding_bundle = bundle_to_jsonable(bundle)
         except Exception:
             log.warning("pipeline.grounding_bundle_serialize_failed")
             request.state.grounding_bundle = None

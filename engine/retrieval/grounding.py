@@ -861,3 +861,30 @@ async def build_bundle(customer_id: str, query: str) -> GroundingBundle:
         bare_id_matches=bare_id_matches,
         timing_ms=(time.perf_counter() - t0) * 1000,
     )
+
+
+def bundle_to_jsonable(b: GroundingBundle) -> dict:
+    """Convert a GroundingBundle to a JSON-serializable dict.
+
+    Lives here, with the bundle, because two callers need it and they cannot
+    share it anywhere else: `retrieval/pipeline.py` imports `agent/loop.py`, so
+    the gatherer cannot import back from the pipeline. Shape is unchanged from
+    the copy that used to live in pipeline.py -- the query_traces middleware
+    writes it into JSONB and predates this move.
+    """
+
+    def _candidate(c: GroundingCandidate) -> dict:
+        return {
+            "entity_type": c.entity_type,
+            "canonical_id": c.canonical_id,
+            "display_name": c.display_name,
+            "last_seen_at": c.last_seen_at.isoformat() if c.last_seen_at else None,
+            "match_source": c.match_source,
+        }
+
+    return {
+        "candidates": [_candidate(c) for c in b.candidates],
+        "bare_id_matches": [_candidate(c) for c in b.bare_id_matches],
+        "connected_sources": list(b.connected_sources),
+        "timing_ms": b.timing_ms,
+    }

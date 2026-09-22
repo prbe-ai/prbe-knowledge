@@ -62,6 +62,15 @@ GathererStatus = Literal[
     # `timing_ms.loop_budget_ms` now rides every trace so the next occurrence
     # is one query away instead of an archaeology project.
     "loop_budget_starved",
+    # The `jev` selector could not score the pool (no key, timeout, provider
+    # error, every batch failed) and the recall floor answered alone. Degraded:
+    # the caller got floor-quality results -- the same as the `floor` selector
+    # -- instead of what it asked for.
+    "jev_unavailable",
+    # Jev scored only PART of the pool (some batches failed). It keeps its
+    # share of the ten slots and the recall floor fills the rest. Degraded:
+    # the best documents may have been in the batches that were never scored.
+    "jev_partial",
     "schema_violation",
     # The response gate could not re-verify the emitted chunks against the
     # live documents rows (DB error) on an UNSCOPED request. The chunks are
@@ -372,15 +381,20 @@ class GathererOutput(BaseModel):
 
 
 # ============================================================
-# LLM-based entity extraction (parallel with deterministic grounding)
+# LLM-based entity extraction (SEQUENTIAL, after deterministic grounding)
 # ============================================================
 # The Haiku router used to do LLM-based entity extraction before the
 # cutover. Grounding's pg_trgm fuzzy + tsvector match recovers most
 # bare-ID and prefix cases, but it misses paraphrased entities ("the
 # new login flow" when the graph node is named "Authentication Phase 2").
-# This shape is the recovery path: a tiny LLM call (same Fireworks model
-# as the agent loop, parallel with grounding) reads the query and proposes
-# entities. Results merge with grounding before pre-fan-out.
+# This shape is the recovery path: a tiny LLM call (same model as the agent
+# loop) reads the query and proposes entities. Results merge with grounding
+# before pre-fan-out.
+#
+# It runs AFTER grounding, not alongside it: grounding's candidates are
+# rendered into the extractor's prompt as `<candidates>`, which is the entire
+# point of grounding. (On `jev` searches a Jev sort / doc-type call runs
+# alongside the extractor as a shadow; see loop._merge_jev_extraction.)
 
 # DERIVED from ENTITY_TYPE_REGISTRY -- do not hand-edit this list, and do not
 # reintroduce a literal one. Add the type to the registry in

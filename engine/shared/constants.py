@@ -1887,3 +1887,121 @@ WFMEM_STRUCTURING_MODEL = os.getenv(
 DB_INIT_RETRY_ATTEMPTS = 4
 DB_INIT_RETRY_BASE_SECONDS = 0.5
 DB_INIT_RETRY_BACKOFF_CAP_SECONDS = 5.0
+
+
+# ---- Result selector (gatherer / floor / jev) --------------------------------
+# Which step picks the documents a search returns. Phase 0 (3,048 replayed
+# searches, docs/plans/jev-phase0-report.md) measured three:
+#
+#   gatherer  gpt-oss-120b reads the top ~35 pool docs and re-types the chunks
+#             it wants. ~$0.024 and ~1.9s a search. No better than `floor`.
+#   floor     the recall floor alone: top 10 fused documents, no model. $0.
+#   jev       Jev scores every pool chunk yes/no; the top 10 documents by best
+#             chunk ship, the floor tops up. ~$0.0016 and ~0.3s. 2-3x the
+#             precision of either, under graders from two model families.
+#
+# The DEFAULT is set here in code, not in a chart value, on purpose: a
+# `kubectl set env` rollout is reverted by the next deploy of either plane
+# (see the env-flags memory), and the two planes are deployed by different
+# pipelines. A code default moves both planes together, on merge.
+SEARCH_SELECTOR_VALUES = ("gatherer", "floor", "jev")
+SEARCH_SELECTOR_DEFAULT = os.getenv("SEARCH_SELECTOR_DEFAULT", "gatherer")
+# Tenants whose searches may use `jev` AT ALL -- by default, by rollout, or by
+# asking for it with `QueryRequest.selector`. `jev` sends the query and the
+# retrieved passages to an outside company (TypeSafe), so a tenant is only ever
+# scored there once it is on this list: an explicit `selector="jev"` from anyone
+# else is downgraded, not honoured. `*` allows every tenant. `probe` is our own.
+SEARCH_SELECTOR_JEV_ALLOWED = frozenset(
+    c.strip()
+    for c in os.getenv("SEARCH_SELECTOR_JEV_ALLOWED", "probe").split(",")
+    if c.strip()
+)
+# Tenants that run `jev` whatever the default is -- the one-tenant step of the
+# rollout. Comma-separated customer ids; each must also be allowed above.
+SEARCH_SELECTOR_JEV_CUSTOMERS = frozenset(
+    c.strip()
+    for c in os.getenv("SEARCH_SELECTOR_JEV_CUSTOMERS", "").split(",")
+    if c.strip()
+)
+
+# ---- Jev (TypeSafe typed-decision model) --------------------------------------
+# Every number below was MEASURED against the live API on 2026-09-22; the
+# published docs are looser (docs/jev-contract.md).
+JEV_BASE_URL = os.getenv("JEV_BASE_URL", "https://api.typesafe.ai").rstrip("/")
+# Pinned, not `jev-latest`: Phase 0 measured 1.13.0, and an unannounced model
+# bump behind a floating alias would change which documents every search
+# returns without a line changing here.
+JEV_MODEL = os.getenv("JEV_MODEL", "jev-1.13.0")
+# 0.75 of the ~32k whole-request cap. Batches split on the server's own
+# `max_tokens_exceeded` when a dense pool overruns anyway.
+JEV_TOKEN_BUDGET = max(4_000, _env_int("JEV_TOKEN_BUDGET", 24_000))
+JEV_CHARS_PER_TOKEN = 3.77
+JEV_TOKENS_PER_QUESTION = 35
+# One chunk may not exceed ~0.9 of a request on its own.
+JEV_MAX_CHUNK_CHARS = int(JEV_TOKEN_BUDGET * JEV_CHARS_PER_TOKEN * 0.9)
+# Measured 88-309 ms across every request shape. 2.5s per HTTP call is ~8x the
+# worst observation; the whole selection gets JEV_SELECTION_TIMEOUT_SECONDS,
+# after which the recall floor answers alone.
+JEV_REQUEST_TIMEOUT_SECONDS = float(os.getenv("JEV_REQUEST_TIMEOUT_SECONDS", "2.5"))
+JEV_SELECTION_TIMEOUT_SECONDS = float(os.getenv("JEV_SELECTION_TIMEOUT_SECONDS", "4.0"))
+
+# ---- One query rewrite when the pool is weak (Phase 2) ------------------------
+# Fires when the best document's Jev score is below this rung, or when the pool
+# is empty. Chosen from Phase 0 answerability (gpt-4.1-mini grader, 368 traces):
+# best < 0.4 -> the delivered set answered the query 0.8% of the time (33% of
+# searches); >= 0.4 -> 37.7%. At most ONE rewrite per search, by decision:
+# the scores cannot tell "badly worded" from "not in the data", so the cap is
+# what stops a search chasing an answer that does not exist.
+SEARCH_REWRITE_BELOW_SCORE = float(os.getenv("SEARCH_REWRITE_BELOW_SCORE", "0.4"))
+SEARCH_REWRITE_ENABLED = os.getenv("SEARCH_REWRITE_ENABLED", "1") not in ("0", "false", "False")
+# Bounds gpt-oss reasoning AND the one-line answer together; too tight and the
+# reasoning eats it and the rewrite comes back empty (outcome `no_rewrite`).
+SEARCH_REWRITE_MAX_TOKENS = 1500
+SEARCH_REWRITE_TIMEOUT_SECONDS = float(os.getenv("SEARCH_REWRITE_TIMEOUT_SECONDS", "4.0"))
+
+# ---- Extraction on Jev: shadow first, then a sampled A/B ---------------------
+# On `jev` searches, Jev decides `sort` and the doc-type class IN PARALLEL with
+# the gpt-oss extractor (Jev ~0.2s < extractor p50 0.8s, so no added wait) and
+# every disagreement is logged (`agent.extract_jev`). This share of those
+# searches USES Jev's answer instead; 0.0 = pure shadow. Raise it only after the
+# shadow log shows where they disagree and who was right: a wrong doc-type class
+# hides every other result.
+SEARCH_EXTRACTION_JEV_APPLY_RATE = float(os.getenv("SEARCH_EXTRACTION_JEV_APPLY_RATE", "0.0"))
+# Even when sampled in, a Jev doc-type class is applied only at this confidence
+# or above; below it the filter is left off rather than guessed.
+SEARCH_EXTRACTION_JEV_CLASS_MIN_CONFIDENCE = float(
+    os.getenv("SEARCH_EXTRACTION_JEV_CLASS_MIN_CONFIDENCE", "0.8")
+)
+
+# ---- Jev: confidence bands, outage breaker, pool, trace caps ------------------
+# The response's `confidence` from the best document's Jev score. The low band
+# is the same Phase 0 cut as the rewrite trigger (0.8% answerable below it), so
+# it follows SEARCH_REWRITE_BELOW_SCORE rather than holding its own copy.
+JEV_CONFIDENCE_HIGH_AT = 0.7
+# After this many CONSECUTIVE Jev failures, stop calling Jev for this long. An
+# outage then costs a few searches their ranking instead of charging every
+# search a full timeout (twice: extraction shadow + scoring).
+JEV_BREAKER_FAILURES = max(1, _env_int("JEV_BREAKER_FAILURES", 5))
+JEV_BREAKER_SECONDS = float(os.getenv("JEV_BREAKER_SECONDS", "30"))
+# Connections shared by every concurrent search on one worker (1 extraction +
+# 1-3 scoring batches per search). Waiting for a free slot is bounded
+# separately so local queueing is not reported as vendor latency.
+JEV_MAX_CONNECTIONS = max(8, _env_int("JEV_MAX_CONNECTIONS", 96))
+JEV_POOL_WAIT_SECONDS = 0.5
+# Stop halving an over-cap batch after this many levels (2^4 = 16 requests).
+JEV_MAX_SPLIT_DEPTH = 4
+# How long the shadow Jev extraction may run PAST the real extractor before it
+# is abandoned. It is a shadow: it must never make a search wait.
+JEV_EXTRACTION_GRACE_SECONDS = 0.25
+# The rewrite is skipped when less than this is left of the agent stage budget:
+# it costs an LLM call, a fan-out and a rescore (~2-3s typical).
+SEARCH_REWRITE_MIN_BUDGET_SECONDS = float(os.getenv("SEARCH_REWRITE_MIN_BUDGET_SECONDS", "8.0"))
+# Titles of the first pool shown to the rewrite, and caps on what it returns.
+SEARCH_REWRITE_TITLE_SAMPLE = 8
+SEARCH_REWRITE_MAX_QUERY_CHARS = 300
+# The gatherer's raw emit in the trace blob. Observed max ~4.7k completion
+# tokens (~20KB); 64KB keeps every realistic emit without letting a runaway
+# generation bloat every blob.
+TRACE_TERMINAL_RAW_MAX_CHARS = 65_536
+# Error strings carried into logs and traces.
+LOG_ERROR_MAX_CHARS = 160

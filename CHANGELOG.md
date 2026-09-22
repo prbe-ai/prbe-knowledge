@@ -8,6 +8,31 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Added
 
+- Choose what picks a search's results with the new `selector` option: `gatherer` (today's
+  LLM), `floor` (the top documents by fused retrieval score, no model), or `jev` (a
+  typed-decision model scores every candidate and the best ten documents ship, topped up
+  from the floor). Omit it to get the deployment default, which stays `gatherer` until the
+  staged rollout moves it. Measured on 3,048 replayed searches, `jev` returned 2-3x more
+  useful documents than either alternative, for ~$0.0016 and ~0.3s a search instead of
+  ~$0.024 and ~1.9s. Any Jev failure falls back to the floor with status `jev_unavailable`
+  rather than failing the search.
+- On `jev` searches whose best result is weak (score below 0.4, or nothing found), the
+  query is rewritten once and searched again under the same scope. At most one rewrite per
+  search; it is skipped when the rewrite is a near-copy or too little of the search's time
+  budget is left, and it stops when it finds nothing new. Results that are still weak return
+  with `confidence: low`.
+- Jev is only ever used for tenants on an allow-list (`SEARCH_SELECTOR_JEV_ALLOWED`), because
+  it sends the query and retrieved passages to an outside service. An explicit
+  `selector="jev"` from any other tenant is served by the non-Jev default instead. When Jev
+  answers for only part of the candidates the search reports `jev_partial` and the floor
+  fills the rest; after repeated Jev failures it is skipped for 30 seconds.
+- On `jev` searches, Jev also decides the result ordering and document-type filter
+  alongside the existing extractor, and every disagreement is logged (`agent.extract_jev`).
+  Nothing changes until the sampled apply rate is raised.
+- Search traces now record the gatherer's raw emitted arguments, the grounding candidates,
+  the extractor's output, and the selector's full record, so an offline study can tell a
+  model that picked nothing from a parser that dropped what it picked.
+
 - Add authenticated `/retrieve/direct` for interactive search: one query embedding,
   parallel vector/BM25 lookup, document rank fusion and a final live-version/scope
   check. Each channel is bounded and failures are reported explicitly; this path

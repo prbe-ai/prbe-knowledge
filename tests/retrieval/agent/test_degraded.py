@@ -69,6 +69,13 @@ _DEGRADED = {
     # finished perfectly -- that is the whole point, since a channel dies
     # several frames below it and its handler returns [].
     "channel_degraded",
+    # Degraded, deliberately: the `jev` selector could not score the pool and
+    # the recall floor answered alone. The caller holds floor-quality results
+    # -- the same as asking for `floor` -- not what it asked for.
+    "jev_unavailable",
+    # Degraded, deliberately: Jev scored only part of the pool, so the best
+    # documents may sit in the batches that never came back.
+    "jev_partial",
 }
 
 

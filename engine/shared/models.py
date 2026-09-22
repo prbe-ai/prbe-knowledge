@@ -420,6 +420,18 @@ class QueryRequest(BaseModel):
             "is wanted."
         ),
     )
+    selector: Literal["gatherer", "floor", "jev"] | None = Field(
+        default=None,
+        description=(
+            "Which step picks the documents this search returns. Omit it to "
+            "get the deployment's default. `gatherer`: an LLM reads the top of "
+            "the candidate pool and picks. `floor`: the top documents by fused "
+            "retrieval score, no model. `jev`: a typed-decision model scores "
+            "every candidate and the best-scoring documents ship, topped up "
+            "from the floor. Useful for comparing selectors on the same query; "
+            "every value returns the same response shape."
+        ),
+    )
     recall_floor_mode: Literal["always", "conditional"] = Field(
         default="always",
         description=(

@@ -184,6 +184,12 @@ class Settings(BaseSettings):
     #: query, which is the paired comparison that settles it.
     recall_floor_conditional_enabled: bool = Field(default=True)
 
+    # TypeSafe Jev, the result selector (engine/retrieval/agent/jev.py). Empty
+    # means Jev is unavailable and every `jev` request falls back to the recall
+    # floor -- logged, never raised. The key lives in `engine-secrets`
+    # (research) and `managed-data-plane-secrets` (managed).
+    typesafe_api_key: str = Field(default="")
+
     # --- LLM gateway (managed-shared / self-host: route LLM + embedding
     #     calls through a central LiteLLM proxy instead of direct provider
     #     SDKs — plan D1, `shared/llm.py`) ------------------------------------
