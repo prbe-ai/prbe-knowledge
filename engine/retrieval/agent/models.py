@@ -279,7 +279,18 @@ class GatheredChunk(BaseModel):
     # rationale. Persisted in the trace blob so "retrieved but never examined"
     # and "examined and rejected" stop looking alike.
     harness_appended: bool = Field(default=False)
-    content: str
+    # NOT re-typed by the model. The harness fills the stored passage text for
+    # every chunk it retrieved; only a chunk reached through a later tool, whose
+    # text is not in the pre-fan-out pool, needs the model to supply it. Making
+    # the model copy text it was already shown was slow (output tokens), and
+    # lossy: a fumbled re-type used to get the whole chunk dropped.
+    content: str = Field(
+        default="",
+        description=(
+            "Leave empty for any chunk from <channel_results>: the harness fills "
+            "the stored text. Only fill it for a chunk you fetched with a tool."
+        ),
+    )
     matched_via: list[MatchedViaChannel] = Field(
         default_factory=list,
         description="Channels that surfaced this chunk during the loop.",

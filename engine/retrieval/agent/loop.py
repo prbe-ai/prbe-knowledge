@@ -2373,6 +2373,10 @@ def _coerce_lenient(raw: dict[str, Any], state: LoopState | None = None) -> dict
     prefanout_meta: dict[str, dict[str, Any]] = (
         _build_prefanout_doc_meta(state.prefanout) if state is not None else {}
     )
+    # Chunk-level stored text, for filling `content` without a model retype.
+    stored_chunks: dict[str, dict[str, Any]] = (
+        jev.pool_chunks(state.prefanout) if state is not None else {}
+    )
     # Entities: filter non-dict items + alias `id` → `canonical_id`.
     # Cerebras gpt-oss-120b occasionally emits malformed JSON fragments as
     # bare strings inside arrays (e.g. `entities=[{...valid...}, '{',
@@ -2430,15 +2434,28 @@ def _coerce_lenient(raw: dict[str, Any], state: LoopState | None = None) -> dict
             ch_out["chunk_id"] = ch_out["doc_id"]
         if not ch_out.get("doc_id") or not ch_out.get("chunk_id"):
             continue  # Can't recover citation
-        # Content — try aliases when missing
-        if not ch_out.get("content"):
+        # Content: the STORED text wins whenever the harness retrieved this
+        # chunk. The model is not asked to re-type it (GatheredChunk.content),
+        # and even when it does, its copy is a transcription of text we already
+        # hold verbatim. This is what retires the old failure where a chunk
+        # the model named correctly was DROPPED because it fumbled the retype.
+        # A non-strict provider can emit a list or object as `chunk_id`; a
+        # dict lookup on that raises TypeError OUTSIDE the validation handler
+        # and would fail the whole search instead of degrading it.
+        cid = ch_out["chunk_id"]
+        stored = stored_chunks.get(cid) if isinstance(cid, str) else None
+        if stored is not None:
+            ch_out["content"] = stored.get("content") or ""
+        elif not ch_out.get("content"):
+            # Not in the pool (reached through fetch_doc / a follow-up search):
+            # the model's text is the only source, including under an alias.
             for alias in _CHUNK_CONTENT_ALIASES:
                 v = ch_out.get(alias)
                 if isinstance(v, str) and v.strip():
                     ch_out["content"] = v
                     break
         if not ch_out.get("content"):
-            continue  # No body to cite
+            continue  # Not retrieved by us and no body given: nothing to cite
         # STRIP THE RULER. The labels are a coordinate system the harness prints
         # into the text the model reads; the prompt says never to copy one, and
         # a prompt is advice. If one is copied anyway it becomes `[@200]` litter

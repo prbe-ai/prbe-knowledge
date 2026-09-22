@@ -19,16 +19,17 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Added
 
+- The gatherer no longer re-types the passages it picks. It names each chunk and the engine
+  fills in the stored text, so a correctly named passage is never dropped because the model
+  garbled its copy, and the gatherer's answers are shorter and faster to produce.
 - Searches now pick their results with the recall floor by default instead of the gatherer's
   LLM turn, which measured no better on 3,048 replayed searches and cost ~$293/month and ~1.9s
   a search. Our own tenant (`probe`) runs Jev. Ask for `selector="gatherer"` to get the old
   behaviour on any request.
-
 - Choose what picks a search's results with the new `selector` option: `gatherer` (today's
   LLM), `floor` (the top documents by fused retrieval score, no model), or `jev` (a
   typed-decision model scores every candidate and the best ten documents ship, topped up
-  from the floor). Omit it to get the deployment default, which stays `gatherer` until the
-  staged rollout moves it. Measured on 3,048 replayed searches, `jev` returned 2-3x more
+  from the floor). Omit it to get the deployment default (now `floor`; see above). Measured on 3,048 replayed searches, `jev` returned 2-3x more
   useful documents than either alternative, for ~$0.0016 and ~0.3s a search instead of
   ~$0.024 and ~1.9s. Any Jev failure falls back to the floor with status `jev_unavailable`
   rather than failing the search.
