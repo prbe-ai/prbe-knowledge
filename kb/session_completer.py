@@ -22,16 +22,19 @@ batch is still the newest key, or when the sweep's own marker is. The marker
 never touches `session_streams`: it is a server observation, not a client claim.
 
 "Ended" is not "mined". A session whose last complete pass was partial
-(`ingestion_queue.extraction_outcome.authoritative` false: a segment failed,
-the cap hit, the model declined the tool, or extraction was switched off) is
-re-queued once it is idle, up to MAX_EXTRACTION_RETRIES times -- unlimited
-while the reason is `disabled`, since a switched-off pass spends no model call.
+(`ingestion_queue.extraction_outcome.authoritative` false: a segment failed or
+the model declined the tool) is re-queued once it is idle, up to
+MAX_EXTRACTION_RETRIES times. A pass skipped because extraction was switched
+off is re-queued up to MAX_DISABLED_RETRIES times (daily), and not at all while
+this sweep's own settings say extraction is off. A session that only hit the
+segment cap is final: the same transcript hits the same cap every time.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
 
+from engine.shared.config import get_settings
 from engine.shared.constants import SourceSystem
 from engine.shared.db import get_pool
 from engine.shared.logging import get_logger
@@ -55,6 +58,10 @@ AGENT_SOURCES = (SourceSystem.CLAUDE_CODE, SourceSystem.CODEX, SourceSystem.PI)
 #: How many times the sweep re-queues a session whose last pass was partial.
 #: A segment that always fails must not become a new daily loop.
 MAX_EXTRACTION_RETRIES = 3
+
+#: A switched-off pass spends no model call, only a re-read; a week of daily
+#: retries covers an emergency stop without re-reading forever.
+MAX_DISABLED_RETRIES = 7
 
 
 #: Idle, not already ended by a key-visible signal, not being processed right
@@ -124,14 +131,16 @@ RETURNING queue_id
 #: A done row whose last complete pass was partial, and which has not changed
 #: since that pass (keys only ever get appended, so an equal count means the
 #: pass's end signal is still the newest key). `$3` is the retry bound.
-_RETRYABLE = """
+_RETRYABLE = f"""
        source_system = $1
    AND status = 'done'
    AND enqueued_at < NOW() - make_interval(mins => $2)
    AND (extraction_outcome ->> 'authoritative') = 'false'
    AND (extraction_outcome ->> 'keys')::int = cardinality(payload_s3_keys)
-   AND (extraction_outcome ->> 'reason' = 'disabled'
-        OR COALESCE((extraction_outcome ->> 'retries')::int, 0) < $3)
+   AND extraction_outcome ->> 'reason' <> 'capped'
+   AND COALESCE((extraction_outcome ->> 'retries')::int, 0) < CASE
+         WHEN extraction_outcome ->> 'reason' = 'disabled' THEN {MAX_DISABLED_RETRIES}
+         ELSE $3 END
 """
 
 _RETRY_FIND_SQL = f"""
@@ -142,7 +151,6 @@ SELECT queue_id FROM ingestion_queue
 """
 
 #: Hand it back to the worker as it is: its end signal is already on top.
-#: A switched-off pass spent nothing, so it does not count against the bound.
 _RETRY_SQL = f"""
 UPDATE ingestion_queue
    SET status = 'pending',
@@ -150,11 +158,8 @@ UPDATE ingestion_queue
        completed_at = NULL,
        error = NULL,
        enqueued_at = NOW(),
-       extraction_outcome = CASE
-         WHEN extraction_outcome ->> 'reason' = 'disabled' THEN extraction_outcome
-         ELSE jsonb_set(extraction_outcome, '{{retries}}',
+       extraction_outcome = jsonb_set(extraction_outcome, '{{retries}}',
                         to_jsonb(COALESCE((extraction_outcome ->> 'retries')::int, 0) + 1))
-       END
  WHERE queue_id = $4
    AND {_RETRYABLE}
 RETURNING queue_id
@@ -296,9 +301,13 @@ async def _v2_client_already_ended(conn, queue_id: int, customer_id: str, source
 
 async def _retry_partial_passes(conn, idle_minutes: int, *, limit: int, dry_run: bool) -> int:
     """Re-queue ended sessions whose last complete pass was partial."""
+    if not get_settings().claude_code_extraction_enabled:
+        # Re-queueing now would only produce more switched-off passes.
+        log.info("session_completer.retry_skipped", reason="extraction disabled")
+        return 0
     if not await conn.fetchval(
-        "SELECT 1 FROM information_schema.columns "
-        "WHERE table_name = 'ingestion_queue' AND column_name = 'extraction_outcome'"
+        "SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() "
+        "AND table_name = 'ingestion_queue' AND column_name = 'extraction_outcome'"
     ):
         # Research applies kb migrations on its own deploy, which can trail the
         # worker's image. Ending sessions does not depend on this; retrying does.

@@ -171,6 +171,7 @@ jobs:
           tests/test_session_completer.py
           tests/test_session_signals.py
           tests/test_backfill_finalize_markers.py
+          tests/test_session_end_report.py
           tests/test_session_coalescing.py
           tests/test_claude_code_finalize_e2e.py
           tests/test_claude_code_extraction.py

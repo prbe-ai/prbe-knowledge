@@ -696,9 +696,15 @@ async def test_a_partial_pass_is_retried_up_to_the_bound(live_db: None) -> None:
         (None, False),  # no pass recorded since the column existed
         ('{"authoritative": true, "reason": "ok", "keys": 2, "retries": 0}', False),
         ('{"authoritative": false, "reason": "segment_failed", "keys": 1, "retries": 0}', False),
-        ('{"authoritative": false, "reason": "disabled", "keys": 2, "retries": 9}', True),
+        # The same transcript hits the same segment cap every time.
+        ('{"authoritative": false, "reason": "capped", "keys": 2, "retries": 0}', False),
+        ('{"authoritative": false, "reason": "capped,segment_failed", "keys": 2, "retries": 0}', True),
+        # A switched-off pass: a week of daily retries, then it stops.
+        ('{"authoritative": false, "reason": "disabled", "keys": 2, "retries": 6}', True),
+        ('{"authoritative": false, "reason": "disabled", "keys": 2, "retries": 7}', False),
     ],
-    ids=["no_record", "authoritative", "row_changed_since", "disabled_is_unbounded"],
+    ids=["no_record", "authoritative", "row_changed_since", "capped_is_final",
+         "capped_plus_failure_retries", "disabled_within_a_week", "disabled_after_a_week"],
 )
 @pytest.mark.asyncio
 async def test_only_an_unchanged_partial_pass_is_retried(live_db: None, outcome, retried) -> None:
@@ -712,8 +718,8 @@ async def test_only_an_unchanged_partial_pass_is_retried(live_db: None, outcome,
             "SELECT extraction_outcome->>'retries' FROM ingestion_queue WHERE customer_id=$1", customer
         )
         await conn.execute("DELETE FROM ingestion_queue WHERE customer_id = $1", customer)
-    if outcome and '"disabled"' in outcome:
-        assert after == "9", "a switched-off pass spends nothing and does not count"
+    if retried:
+        assert int(after) == __import__("json").loads(outcome)["retries"] + 1
 
 
 @pytest.mark.asyncio
@@ -786,3 +792,59 @@ async def test_the_worker_records_each_complete_pass(live_db: None, monkeypatch)
     assert (full["authoritative"], full["reason"], full["retries"]) == (True, "ok", 0)
     async with get_pool().acquire() as conn:
         await conn.execute("DELETE FROM ingestion_queue WHERE customer_id = $1", customer)
+
+
+
+@pytest.mark.asyncio
+async def test_no_retries_while_extraction_is_switched_off(live_db: None, monkeypatch) -> None:
+    """Re-queueing during an emergency stop only produces more switched-off
+    passes: every one re-reads the whole transcript for nothing."""
+    from engine.shared.config import get_settings
+
+    customer, sid = "completer-killswitch-cust", "sess-killswitch"
+    async with get_pool().acquire() as conn:
+        await conn.execute("DELETE FROM ingestion_queue WHERE customer_id = $1", customer)
+        await _seed_mined(conn, customer, sid, _outcome_json(reason="disabled"))
+    monkeypatch.setenv("CLAUDE_CODE_EXTRACTION_ENABLED", "false")
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+    try:
+        assert await enqueue_idle_session_finalizers(idle_minutes=1440) == 0
+    finally:
+        monkeypatch.delenv("CLAUDE_CODE_EXTRACTION_ENABLED", raising=False)
+        get_settings.cache_clear()  # type: ignore[attr-defined]
+    assert await enqueue_idle_session_finalizers(idle_minutes=1440) == 1, "back on: retried"
+    async with get_pool().acquire() as conn:
+        await conn.execute("DELETE FROM ingestion_queue WHERE customer_id = $1", customer)
+
+
+@pytest.mark.asyncio
+async def test_a_missing_outcome_column_never_fails_a_pass(monkeypatch) -> None:
+    """Research applies kb migrations on its own deploy, which can trail the
+    worker image: recording an outcome into a column that is not there yet is
+    logged and skipped, never raised into the row."""
+    import asyncpg
+    import structlog
+
+    from engine.ingest import normalizer as norm_mod
+    from engine.ingest.handlers.base import make_default_context
+
+    class _Conn:
+        async def execute(self, *a, **k):
+            raise asyncpg.exceptions.UndefinedColumnError('column "extraction_outcome" does not exist')
+
+    class _Acquire:
+        async def __aenter__(self):
+            return _Conn()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Pool:
+        def acquire(self):
+            return _Acquire()
+
+    monkeypatch.setattr(norm_mod, "get_pool", lambda: _Pool())
+    normalizer = norm_mod.Normalizer(make_default_context(), store=object(), embedder=object())
+    with structlog.testing.capture_logs() as logs:
+        await normalizer._record_extraction_outcome(1, {"authoritative": True, "reason": "ok"})
+    assert [e["event"] for e in logs] == ["normalizer.extraction_outcome_failed"]

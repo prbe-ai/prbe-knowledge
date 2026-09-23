@@ -31,7 +31,7 @@ import json
 
 from engine.shared.db import get_pool, init_pool
 from engine.shared.session_signals import CRON_MARKER_SUFFIX, V2_KEY_SEGMENT
-from kb.session_completer import AGENT_SOURCES, MAX_EXTRACTION_RETRIES
+from kb.session_completer import AGENT_SOURCES, MAX_DISABLED_RETRIES, MAX_EXTRACTION_RETRIES
 
 _V2_ENDINGS_SQL = f"""
 WITH v2 AS (
@@ -68,8 +68,9 @@ _OUTCOMES_SQL = """
 SELECT COALESCE(extraction_outcome ->> 'reason', '<none recorded>') AS reason,
        COALESCE(extraction_outcome ->> 'authoritative', '') AS authoritative,
        count(*) AS rows,
-       count(*) FILTER (WHERE COALESCE((extraction_outcome ->> 'retries')::int, 0) >= $2
-                          AND extraction_outcome ->> 'reason' <> 'disabled') AS retries_exhausted
+       count(*) FILTER (WHERE COALESCE((extraction_outcome ->> 'retries')::int, 0) >= CASE
+                                 WHEN extraction_outcome ->> 'reason' = 'disabled' THEN $3::int ELSE $2::int END
+                          AND extraction_outcome ->> 'authoritative' = 'false') AS retries_exhausted
   FROM ingestion_queue
  WHERE source_system = $1
  GROUP BY 1, 2
@@ -99,7 +100,9 @@ async def report(*, days: int, grace_days: int) -> dict:
             out["v2_endings"][source.value] = totals
             if has_outcome:
                 out["outcomes"][source.value] = [
-                    dict(r) for r in await conn.fetch(_OUTCOMES_SQL, source.value, MAX_EXTRACTION_RETRIES)
+                    dict(r) for r in await conn.fetch(
+                        _OUTCOMES_SQL, source.value, MAX_EXTRACTION_RETRIES, MAX_DISABLED_RETRIES
+                    )
                 ]
     return out
 

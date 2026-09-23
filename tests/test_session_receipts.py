@@ -610,11 +610,21 @@ async def test_finalized_v2_sessions_do_not_starve_the_sweep(database, as_app_ro
         "UPDATE ingestion_queue SET enqueued_at=NOW()-INTERVAL '2 days' WHERE source_event_id=$1",
         silent["session_id"],
     )
-    assert await enqueue_idle_session_finalizers(idle_minutes=1440, limit=1) == 1
+    import structlog
+
+    with structlog.testing.capture_logs() as logs:
+        assert await enqueue_idle_session_finalizers(idle_minutes=1440, limit=1) == 1
     keys = await admin.fetchval(
         "SELECT payload_s3_keys FROM ingestion_queue WHERE source_event_id=$1", silent["session_id"]
     )
     assert keys[-1].endswith("/finalize.marker")
+    run = next(e for e in logs if e["event"] == "session_completer.run")
+    # Excluded IN the query (as the RLS-bound role), not found and then
+    # skipped one by one: that is what keeps them out of the LIMIT.
+    assert (run["candidates"], run["skipped"]) == (1, 0)
+    # This database has no extraction_outcome column: ending still works and
+    # the retry step says why it did nothing.
+    assert any(e["event"] == "session_completer.retry_skipped" for e in logs)
 
 
 @pytest.mark.asyncio
