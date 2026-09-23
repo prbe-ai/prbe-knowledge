@@ -39,6 +39,7 @@ import contextlib
 import json
 import os
 import socket
+import time
 import uuid
 from datetime import datetime
 
@@ -66,6 +67,39 @@ _DEFAULT_CONCURRENCY = int(os.getenv("POST_WRITE_CONCURRENCY", "16"))
 _POLL_INTERVAL_SECONDS = 2.0
 _LOCK_DURATION = "5 minutes"
 
+# The claim is two index-friendly legs instead of one `locked_until IS NULL OR
+# locked_until < NOW()` scan: that OR cannot use the partial index
+# idx_node_post_write_queue_pending (enqueued_at WHERE locked_until IS NULL),
+# so every claim sorted the whole queue -- nothing on managed, where the queue
+# is near empty, but ~2 cores of Postgres at 2 rows/s against research's 220k
+# backlog (2026-09-23).
+_CLAIM_FRESH = """
+    SELECT customer_id, node_id, analyzer_status, enqueued_at
+    FROM node_post_write_queue
+    WHERE locked_until IS NULL
+      AND COALESCE((analyzer_status->'auto_merge'->>'attempts')::int, 0) < $1
+    ORDER BY enqueued_at ASC
+    FOR UPDATE SKIP LOCKED
+    LIMIT 1
+"""
+# A lease that expired (a worker died mid-process) or a deferral whose delay
+# has passed. No index serves it, so it runs when there is no fresh row, and
+# first on every _DUE_EVERY-th claim so a long backlog cannot starve retries.
+_CLAIM_DUE = """
+    SELECT customer_id, node_id, analyzer_status, enqueued_at
+    FROM node_post_write_queue
+    WHERE locked_until < NOW()
+      AND COALESCE((analyzer_status->'auto_merge'->>'attempts')::int, 0) < $1
+    ORDER BY enqueued_at ASC
+    FOR UPDATE SKIP LOCKED
+    LIMIT 1
+"""
+_DUE_EVERY = 20
+# The drain path reaps a tenant's expired pending edges at most this often
+# (per process): the sweep is tenant-wide, so once per row was pure repetition.
+_REAP_INTERVAL_SECONDS = 600.0
+_last_reap: dict[str, float] = {}
+
 
 class PostWriteWorker:
     """Drain loop for node_post_write_queue."""
@@ -89,6 +123,7 @@ class PostWriteWorker:
             f"post-write-{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
         )
         self._shutdown = asyncio.Event()
+        self._claims = 0
         self._analyzer = AutoMergeAnalyzer(execute_high_confidence=execute_high_confidence)
 
     async def run(self) -> None:
@@ -131,21 +166,14 @@ class PostWriteWorker:
         couldn't run the success-DELETE or failure-clear, and would
         otherwise never get picked back up.
         """
+        self._claims += 1
+        legs = (_CLAIM_DUE, _CLAIM_FRESH) if self._claims % _DUE_EVERY == 0 else (_CLAIM_FRESH, _CLAIM_DUE)
         async with raw_conn() as conn, conn.transaction():
-            row = await conn.fetchrow(
-                """
-                SELECT customer_id, node_id, analyzer_status, enqueued_at
-                FROM node_post_write_queue
-                WHERE (locked_until IS NULL OR locked_until < NOW())
-                  AND COALESCE(
-                      (analyzer_status->'auto_merge'->>'attempts')::int, 0
-                  ) < $1
-                ORDER BY enqueued_at ASC
-                FOR UPDATE SKIP LOCKED
-                LIMIT 1
-                """,
-                _MAX_ATTEMPTS,
-            )
+            row = None
+            for sql in legs:
+                row = await conn.fetchrow(sql, _MAX_ATTEMPTS)
+                if row is not None:
+                    break
             if row is None:
                 return None
             await conn.execute(
@@ -248,8 +276,12 @@ class PostWriteWorker:
                 await drain_pending_edges(
                     conn, customer_id, row["label"], row["canonical_id"]
                 )
-                # Opportunistic TTL sweep for this tenant -- no separate cron.
-                await reap_expired_pending_edges(conn, customer_id)
+                # Opportunistic TTL sweep for this tenant -- no separate cron --
+                # at most once per _REAP_INTERVAL_SECONDS per process.
+                now = time.monotonic()
+                if now - _last_reap.get(customer_id, float("-inf")) >= _REAP_INTERVAL_SECONDS:
+                    await reap_expired_pending_edges(conn, customer_id)
+                    _last_reap[customer_id] = now
         except Exception as exc:
             log.warning(
                 "post_write_worker.drain_pending_edges_failed",

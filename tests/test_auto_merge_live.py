@@ -19,6 +19,7 @@ import asyncio
 import json
 import types
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
@@ -559,3 +560,64 @@ async def test_edge_linking_only_mode_links_a_parked_edge_and_judges_nothing(wor
     assert world.fake.requests == []
     assert await fetch("SELECT 1 FROM graph_nodes WHERE properties ? 'embedded'") == []
     assert await fetch("SELECT 1 FROM node_post_write_queue") == []
+
+
+async def test_a_claim_takes_fresh_rows_first_and_due_rows_when_none_are_left(world):
+    await ingest(make_person("ada@example.com", {"name": "Ada Lovelace"}), make_person("bob@example.com", {"name": "Bob"}))
+    async with raw_conn() as conn:
+        # ada's row is a deferral whose delay has passed; bob's is fresh.
+        await conn.execute(
+            "UPDATE node_post_write_queue q SET locked_until = NOW() - interval '1 minute' "
+            "FROM graph_nodes g WHERE g.node_id = q.node_id AND g.canonical_id = 'ada@example.com'"
+        )
+    first = await world.worker._claim_one()
+    second = await world.worker._claim_one()
+    names = [(await fetch("SELECT canonical_id FROM graph_nodes WHERE node_id = $1", r["node_id"]))[0]["canonical_id"]
+             for r in (first, second)]
+    assert names == ["bob@example.com", "ada@example.com"]
+    assert await world.worker._claim_one() is None
+
+
+async def test_a_long_fresh_backlog_cannot_starve_a_due_retry(world):
+    await ingest(*[make_person(f"p{i}@example.com", {"name": f"P{i}"}) for i in range(worker_module._DUE_EVERY + 2)])
+    async with raw_conn() as conn:
+        await conn.execute(
+            "UPDATE node_post_write_queue q SET locked_until = NOW() - interval '1 minute' "
+            "FROM graph_nodes g WHERE g.node_id = q.node_id AND g.canonical_id = 'p0@example.com'"
+        )
+    claimed = []
+    for _ in range(worker_module._DUE_EVERY):
+        row = await world.worker._claim_one()
+        claimed.append((await fetch("SELECT canonical_id FROM graph_nodes WHERE node_id = $1", row["node_id"]))[0]["canonical_id"])
+    assert "p0@example.com" in claimed  # reached by the every-Nth due-first claim
+
+
+async def test_the_pending_edge_sweep_runs_once_per_tenant_per_interval(world, monkeypatch):
+    calls = []
+
+    async def counting_reap(conn, customer_id):
+        calls.append(customer_id)
+        return 0
+
+    monkeypatch.setattr(worker_module, "reap_expired_pending_edges", counting_reap)
+    monkeypatch.setattr(worker_module, "_last_reap", {})
+    await ingest(*[make_person(f"p{i}@example.com", {"name": f"P{i}"}) for i in range(5)])
+    await drain(world.worker)
+    assert calls == [CUSTOMER]
+
+
+async def test_the_sweep_leaves_leased_pending_edges_alone(world):
+    from engine.ingest.graph_writer import reap_expired_pending_edges
+
+    async with raw_conn() as conn:
+        for leased in (False, True):
+            await conn.execute(
+                "INSERT INTO pending_edges (customer_id, missing_label, missing_canonical_id, edge_type, from_label, "
+                "from_canonical_id, to_label, to_canonical_id, source_system, created_at, locked_until) "
+                "VALUES ($1, 'Document', 'x', 'AUTHORED', 'Person', 'a', 'Document', 'x', 'github', "
+                "NOW() - interval '30 days', $2)",
+                CUSTOMER, datetime.now(UTC) + timedelta(seconds=30) if leased else None,
+            )
+    async with with_tenant(CUSTOMER) as conn:
+        assert await reap_expired_pending_edges(conn, CUSTOMER) == 1
+    assert len(await fetch("SELECT 1 FROM pending_edges")) == 1
