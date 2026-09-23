@@ -970,7 +970,6 @@ def test_doc_kind_and_tier_from_the_id():
     assert jev.doc_kind(PAPER) == "paper" and jev.doc_tier(PAPER) == 0
     assert jev.doc_tier("custom_ingest:t:team_notes:team_note:t") == 0
     assert jev.doc_kind(PR) == "gh_pr" and jev.doc_tier(PR) == 1
-    assert jev.doc_tier("github:o/r:pull_request:4") == 1
     assert jev.doc_kind(FILE) == "file" and jev.doc_tier(FILE) == 2
     assert jev.doc_kind(COMMIT) == "gh_commit" and jev.doc_tier(COMMIT) == 2
     assert jev.doc_kind("code_graph:r:f.py") == "code" and jev.doc_tier("code_graph:r:f.py") == 2
@@ -1007,7 +1006,159 @@ def test_zero_penalties_are_the_plain_jev_order():
     assert [r.doc_id for r in jev.rank_documents(pool, scores, limit=10, penalties=(0, 0, 0, 0))] == [SESSION, COMMIT, RUN]
 
 
-def test_default_penalties_come_from_config():
-    from engine.shared.constants import JEV_TIER_PENALTIES
-    assert len(JEV_TIER_PENALTIES) == 4 and JEV_TIER_PENALTIES[0] == 0.0
-    assert list(JEV_TIER_PENALTIES) == sorted(JEV_TIER_PENALTIES)
+def test_default_penalties_are_the_shipped_scale(monkeypatch):
+    """The literal in constants.py is the sized default, not whatever the env holds."""
+    import importlib
+
+    from engine.shared import constants as C
+
+    monkeypatch.delenv("JEV_TIER_PENALTIES", raising=False)
+    try:
+        importlib.reload(C)
+        assert C.JEV_TIER_PENALTIES == (0.0, 0.03, 0.08, 0.12)
+    finally:
+        importlib.reload(C)
+
+
+def test_the_default_penalties_reach_rank_documents():
+    """Production never passes `penalties=`; the default must be the config value."""
+    pool = _tiered_pool(SESSION, RUN)
+    ranked = jev.rank_documents(pool, {f"{SESSION}#0": 0.60, f"{RUN}#0": 0.58}, limit=10)
+    assert [r.doc_id for r in ranked] == [RUN, SESSION]
+
+
+def test_a_penalised_tie_keeps_retrieval_order():
+    """0.66 - 0.08 and 0.58 are a tie on paper; floats must not decide it."""
+    P = (0, 0.03, 0.08, 0.12)
+    scores = {f"{COMMIT}#0": 0.66, f"{RUN}#0": 0.58}
+    assert [r.doc_id for r in jev.rank_documents(_tiered_pool(COMMIT, RUN), scores, limit=10, penalties=P)] == [COMMIT, RUN]
+    assert [r.doc_id for r in jev.rank_documents(_tiered_pool(RUN, COMMIT), scores, limit=10, penalties=P)] == [RUN, COMMIT]
+
+
+def test_a_short_penalties_tuple_is_a_programming_error():
+    with pytest.raises(ValueError):
+        jev.rank_documents(_tiered_pool(RUN), {f"{RUN}#0": 0.5}, limit=10, penalties=(0, 0.03))
+
+
+def test_source_system_from_any_chunk_of_the_document():
+    """The first chunk may not carry source_system; a later one does."""
+    pool = {
+        "x#0": {**_hit("x", chunk="x#0"), "source_system": ""},
+        "x#1": {**_hit("x", chunk="x#1"), "source_system": "codex"},
+        f"{RUN}#0": {**_hit(RUN, chunk=f"{RUN}#0"), "source_system": "custom_ingest"},
+    }
+    ranked = jev.rank_documents(pool, {"x#0": 0.60, "x#1": 0.61, f"{RUN}#0": 0.58}, limit=10,
+                                penalties=(0, 0.03, 0.08, 0.12))
+    assert [r.doc_id for r in ranked] == [RUN, "x"]  # x is a transcript (0.61 - 0.12 < 0.58)
+
+
+@pytest.mark.parametrize("doc_id,kind,tier", [
+    ("custom_ingest:t:experiments:project:1", "project", 0),
+    ("custom_ingest:t:experiments:trial:1", "trial", 0),
+    ("custom_ingest:t:experiments:group:1", "group", 0),
+    ("custom_ingest:t:experiments:experiment:1", "experiment", 0),
+    ("github:o/r:issue:7", "gh_issue", 1),
+    ("github:o/r:review:7", "gh_review", 1),
+    ("github:o/r:release:7", "gh_release", 1),
+    ("github:o/r:feature_rationale:7", "gh_feature_rationale", 1),
+    ("github:o/r:codeowners:7", "gh_codeowners", 1),
+    ("github:o/r:commit_comment:7", "gh_commit_comment", 1),
+    ("custom_ingest:t:workspace%3Aabc:doc1", "file", 2),
+    ("custom_ingest:t:shared:probe:doc1", "file", 2),
+    ("custom_ingest:t:x", "custom_ingest", 2),
+    ("custom_ingest:t:other_key:thing:1", "custom_other", 2),
+    ("github:o/r", "gh_unknown", 2),
+    ("custom_ingest:t:experiments:8f3e", "8f3e", 2),
+    ("", "", 2),
+    ("pi:t:1", "transcript", 3),
+    ("codex:t:1", "transcript", 3),
+    ("linear:t:ISSUE-1", "linear", 1),
+    ("notion:t:page-1", "notion", 1),
+    ("slack:t:C1:ts", "slack", 1),
+    ("manual_upload:t:f", "manual_upload", 1),
+])
+def test_doc_kind_table(doc_id, kind, tier):
+    assert jev.doc_kind(doc_id) == kind
+    assert jev.doc_tier(doc_id) == tier
+
+
+@pytest.mark.parametrize("raw", ["nan,0,0,0", "0,inf,0,0", "0,-0.1,0,0", "0,abc,0,0", "0,0.03,0.08", "0,0.03,0.08,0.12,x", "0,0.03,0.08,0.12,0.5", "0,0,0,5", "0,0.12,0.03,0"])
+def test_env_floats_rejects_non_finite_negative_or_malformed_and_falls_back(monkeypatch, raw, capsys):
+    from engine.shared import constants as C
+
+    monkeypatch.setenv("JEV_TIER_PENALTIES_TEST", raw)
+    assert C._env_floats("JEV_TIER_PENALTIES_TEST", "0,0.03,0.08,0.12", count=4) == (0.0, 0.03, 0.08, 0.12)
+    assert "JEV_TIER_PENALTIES_TEST" in capsys.readouterr().err
+
+
+def test_env_floats_accepts_a_valid_list(monkeypatch):
+    from engine.shared import constants as C
+
+    monkeypatch.setenv("JEV_TIER_PENALTIES_TEST", "0, 0.05,0.1 ,0.2")
+    assert C._env_floats("JEV_TIER_PENALTIES_TEST", "0,0,0,0", count=4) == (0.0, 0.05, 0.1, 0.2)
+
+
+def test_env_floats_empty_means_the_default_quietly(monkeypatch, capsys):
+    from engine.shared import constants as C
+
+    monkeypatch.setenv("JEV_TIER_PENALTIES_TEST", "  ")
+    assert C._env_floats("JEV_TIER_PENALTIES_TEST", "0,0.03,0.08,0.12", count=4) == (0.0, 0.03, 0.08, 0.12)
+    assert capsys.readouterr().err == ""
+
+
+def test_best_probability_is_independent_of_the_penalised_order():
+    pool = _tiered_pool(SESSION, RUN)
+    scores = {f"{SESSION}#0": 0.50, f"{RUN}#0": 0.39}
+    ranked = jev.rank_documents(pool, scores, limit=10, penalties=(0, 0.03, 0.08, 0.12))
+    # the run is delivered first (0.39 vs 0.50 - 0.12) but Jev's best is still 0.50:
+    # the rewrite trigger and confidence band must see 0.50, not 0.39
+    assert [r.doc_id for r in ranked] == [RUN, SESSION]
+    assert jev.best_probability(scores) == 0.50
+    assert jev.best_probability({}) is None
+
+
+@pytest.mark.asyncio
+async def test_rewrite_and_confidence_follow_jevs_best_not_the_penalised_winner(monkeypatch):
+    """A run delivered first under the tier penalty must not make a 0.42 pool look
+    weak (rewrite) or medium (confidence): those read Jev's best probability."""
+    fr = _state()
+    tiered = _pf(vector=[
+        {**_hit(SESSION, chunk=f"{SESSION}#0"), "source_system": "claude_code"},
+        {**_hit(RUN, chunk=f"{RUN}#0"), "source_system": "custom_ingest"},
+    ])
+    monkeypatch.setattr(L, "execute_search", AsyncMock(return_value=json.loads(json.dumps(tiered))))
+    scores = {f"{SESSION}#0": 0.72, f"{RUN}#0": 0.66}
+    from structlog.testing import capture_logs
+
+    with patch.object(L, "acompletion", new=AsyncMock()) as llm, \
+         patch.object(jev, "score_pool", new=_scored(scores)), capture_logs() as logs:
+        resp = await L.run_gatherer(_req(selector="jev"), customer_id="c1", request=fr)
+    llm.assert_not_called()
+    # the run wins the near-tie (0.66 vs 0.72 - 0.12), but the pool's best is 0.72
+    assert [r.doc_id for r in resp.results[:2]] == [RUN, SESSION]
+    # confidence follows the 0.72 (high band), not the delivered winner's 0.66 (medium)
+    summary = [e for e in logs if e.get("event") == "agent.query_summary"]
+    assert summary and summary[-1]["confidence"] == "high"
+    assert fr.state.gatherer_status == "ok"
+
+
+@pytest.mark.asyncio
+async def test_confidence_describes_the_delivered_set_not_the_pool(monkeypatch):
+    """Jev's best doc can be penalised past the ten-slot cut; confidence then
+    reads the best DELIVERED probability, while the rewrite still sees the pool."""
+    fr = _state()
+    runs = [f"custom_ingest:t:experiments:run:{i}" for i in range(10)]
+    hits = [{**_hit(SESSION, chunk=f"{SESSION}#0"), "source_system": "claude_code"}]
+    hits += [{**_hit(r, chunk=f"{r}#0"), "source_system": "custom_ingest"} for r in runs]
+    monkeypatch.setattr(L, "execute_search", AsyncMock(return_value=json.loads(json.dumps(_pf(vector=hits)))))
+    scores = {f"{SESSION}#0": 0.72, **{f"{r}#0": 0.61 + i * 0.004 for i, r in enumerate(runs)}}
+    from structlog.testing import capture_logs
+
+    with patch.object(L, "acompletion", new=AsyncMock()) as llm, \
+         patch.object(jev, "score_pool", new=_scored(scores)), capture_logs() as logs:
+        resp = await L.run_gatherer(_req(selector="jev"), customer_id="c1", request=fr)
+    llm.assert_not_called()  # pool best 0.72 >= 0.4: no rewrite
+    delivered = [r.doc_id for r in resp.results]
+    assert SESSION not in delivered and len(delivered) == 10
+    summary = [e for e in logs if e.get("event") == "agent.query_summary"]
+    assert summary and summary[-1]["confidence"] == "medium"  # best delivered 0.646

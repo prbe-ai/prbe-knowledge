@@ -53,6 +53,7 @@ from typing import Any
 import httpx
 
 from engine.shared.constants import (
+    AGENT_SESSION_SOURCES,
     JEV_BASE_URL,
     JEV_BREAKER_FAILURES,
     JEV_BREAKER_SECONDS,
@@ -64,6 +65,7 @@ from engine.shared.constants import (
     JEV_MODEL,
     JEV_POOL_WAIT_SECONDS,
     JEV_REQUEST_TIMEOUT_SECONDS,
+    JEV_TIER_COUNT,
     JEV_TIER_PENALTIES,
     JEV_TOKEN_BUDGET,
     JEV_TOKENS_PER_QUESTION,
@@ -507,23 +509,40 @@ class RankedDoc:
 
 #: Kind -> tier (see JEV_TIER_PENALTIES). The kind is read off the doc id, the
 #: one field every pool hit carries: connector docs by source
-#: (`github:<repo>:<kind>:<id>`, `claude_code:<tenant>:<session>`), custom-ingest
-#: docs by the client id research-os projects
-#: (`custom_ingest:<tenant>:<source_key>:<kind>:<id>`). Anything unrecognised
-#: lands in tier 2 with the other high-volume kinds, never on top.
-_AGENT_SOURCES = ("claude_code", "codex", "pi")
+#: (`github:<repo>:<kind>:<id>`, kb/handlers/github.py; `<agent>:<tenant>:<session>`),
+#: custom-ingest docs by the client id research-os projects, whose first
+#: segment is the kind (`custom_ingest:<tenant>:<source_key>:<kind>:<id>`;
+#: research-os app/indexing/projections.py: EXPERIMENTS_SOURCE_KEY,
+#: DIGESTS_SOURCE_KEY, TEAM_NOTES_SOURCE_KEY, ARTIFACTS_SOURCE_KEY,
+#: `run_doc_id`/`project_doc_id`/... -- a rename there drops every custom doc
+#: to tier 2, so it is a cross-repo contract, named in custom_ingest_doc_id's
+#: docstring too). Anything unrecognised lands in tier 2 with the other
+#: high-volume kinds, never on top. The parse is a TENANT-LOCAL hint: a tenant
+#: can only shape ids inside its own RLS-scoped pool, and the most a crafted
+#: id can buy is the tier-3-to-tier-0 gap, 0.12 probability points.
+_AGENT_SOURCES = frozenset(str(x) for x in AGENT_SESSION_SOURCES)
 _TIER_OF_KIND: dict[str, int] = {
     # 0: the records Probe owns
     "run": 0, "trial": 0, "project": 0, "group": 0, "paper": 0, "team_note": 0, "experiment": 0,
-    # 1: authored GitHub records
-    "gh_pull_request": 1, "gh_pr": 1, "gh_issue": 1, "gh_review": 1, "gh_release": 1,
+    # 1: authored records: GitHub (kb/handlers/github.py spells a PR `pr`) and
+    #    the other connectors whose documents a person wrote (tickets, pages,
+    #    messages, meeting notes, uploads). `doc_kind` returns the bare source
+    #    for those, so their SourceSystem values are the keys.
+    "gh_pr": 1, "gh_issue": 1, "gh_review": 1, "gh_release": 1,
     "gh_feature_rationale": 1, "gh_codeowners": 1, "gh_commit_comment": 1,
+    "linear": 1, "notion": 1, "slack": 1, "granola": 1, "sentry": 1,
+    "manual_upload": 1, "incident_io": 1, "pagerduty": 1,
     # 2: high volume
     "gh_commit": 2, "file": 2, "code": 2,
     # 3: coding-agent session derivatives
     "transcript": 3, "digest": 3,
 }
 _DEFAULT_TIER = 2
+_TIER_COUNT = max(_TIER_OF_KIND.values()) + 1
+assert _TIER_COUNT == JEV_TIER_COUNT, (
+    f"_TIER_OF_KIND spans {_TIER_COUNT} tiers but JEV_TIER_COUNT is {JEV_TIER_COUNT}: "
+    "a new tier needs a penalty slot in constants.py"
+)
 
 
 def doc_kind(doc_id: str, source_system: str | None = None) -> str:
@@ -574,25 +593,44 @@ def rank_documents(
     trigger read. Ties break on pool order, which is retrieval order --
     deterministic, and a sensible prior when Jev cannot tell two chunks apart.
     """
+    if len(penalties) < _TIER_COUNT:
+        # A short tuple would give the highest tiers no penalty and invert the
+        # order; the env path is validated to four values (`_env_floats`), so
+        # this is a programming error, not a config one.
+        raise ValueError(f"penalties needs {_TIER_COUNT} values, got {len(penalties)}")
     best: dict[str, RankedDoc] = {}
     order: dict[str, int] = {}
-    source: dict[str, str | None] = {}
+    source: dict[str, str] = {}
     for i, (cid, hit) in enumerate(pool.items()):
         s = scores.get(cid)
         if s is None:
             continue
         doc = hit.get("doc_id") or cid
         order.setdefault(doc, i)
-        source.setdefault(doc, hit.get("source_system") or None)
+        # Any chunk that names the source will do; the first one may not.
+        if hit.get("source_system"):
+            source.setdefault(doc, str(hit["source_system"]))
         if doc not in best or s > best[doc].score:
             best[doc] = RankedDoc(doc_id=doc, chunk_id=cid, score=s)
 
-    def penalty(doc: str) -> float:
-        tier = doc_tier(doc, source.get(doc))
-        return penalties[tier] if tier < len(penalties) else 0.0
+    def penalised(r: RankedDoc) -> float:
+        # Rounded so that a tie ON PAPER (0.66 - 0.08 vs 0.58) is a tie in
+        # floats too, and pool order breaks it as documented.
+        return round(r.score - penalties[doc_tier(r.doc_id, source.get(r.doc_id))], 9)
 
-    ranked = sorted(best.values(), key=lambda r: (-(r.score - penalty(r.doc_id)), order[r.doc_id]))
+    ranked = sorted(best.values(), key=lambda r: (-penalised(r), order[r.doc_id]))
     return ranked[:limit]
+
+
+def best_probability(scores: dict[str, float]) -> float | None:
+    """Jev's highest probability in the pool, independent of the delivered ORDER.
+
+    `rank_documents` subtracts a tier penalty before ordering, so its first
+    document is not always the best-rated one. The rewrite trigger and the
+    confidence band are about Jev's judgment, not the presentation order, and
+    read this instead of `ranked[0].score`.
+    """
+    return max(scores.values()) if scores else None
 
 
 def confidence_for(best_score: float | None) -> str:
