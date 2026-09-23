@@ -283,3 +283,21 @@ async def test_refusals_write_nothing(collapsed, case, monkeypatch):
         assert doc["missing_keys"] == 2
     async with db_module.raw_conn() as conn:
         assert await _live_content(conn) == {_chunk_hash(rechunk.PLACEHOLDER)}
+
+
+def test_importing_the_script_registers_the_session_connectors() -> None:
+    """In a FRESH interpreter: this suite's conftest imports `kb.handlers`
+    for every test, which is exactly how the script shipped without it."""
+    import subprocess
+    import sys
+
+    code = (
+        "import scripts.rechunk_collapsed_sessions\n"
+        "from engine.ingest.handlers.registry import list_registered\n"
+        "print(sorted(str(s) for s in list_registered()))\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=120
+    )
+    for source in ("claude_code", "codex", "pi"):
+        assert source in out.stdout, out.stdout

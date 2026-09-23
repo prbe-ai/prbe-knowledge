@@ -90,6 +90,13 @@ from engine.shared.exceptions import StorageNotFound
 from engine.shared.models import Document, WebhookEvent
 from engine.shared.session_signals import is_cron_marker_key
 
+# THE CONNECTORS REGISTER ON IMPORT (engine/ingest/handlers/registry.py), and
+# only the ingestion app and the worker import them at startup. Without this the
+# re-render finds no connector for any session source: the first prod dry run
+# raised HandlerNotFound for all 27 documents, while the tests passed because
+# tests/conftest.py imports the package for them.
+import kb.handlers  # noqa: F401  # isort: skip
+
 PLACEHOLDER = "<redacted>"
 #: Live content chunks holding under this fraction of the body is "collapsed".
 COVERAGE_CEILING = 0.1
