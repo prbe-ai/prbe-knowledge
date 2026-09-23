@@ -1011,14 +1011,14 @@ class ClaudeCodeConnector(Connector):
     ) -> Document:
         rendered_body = _events_to_text(events)
         body_bytes = rendered_body.encode("utf-8")
-        # Completion is part of the document's identity, not just its metadata.
-        # The normalizer skips a write whose hash is unchanged, and a completing
-        # pass usually adds no text (the end signal carries no events), so with
-        # a body-only hash `session_complete` stayed false on the document
-        # forever: 2,258 of 2,483 "incomplete" v2 session docs had units.
-        content_hash = hashlib.sha256(
-            body_bytes + (b"\x00session_complete" if complete else b"")
-        ).hexdigest()
+        # Body only. A completing pass that adds no text is therefore skipped
+        # as unchanged, so `session_complete` / `completed_by` on the stored
+        # document can lag (2,258 of 2,483 "incomplete" v2 session docs on
+        # research had units). Folding completion into the hash would fix the
+        # flag but make every completion enqueue the inferred-edges extraction
+        # (_inferred_edge_doc_ids), a paid call that does not run today; the
+        # queue row's `extraction_outcome` is the record of a pass instead.
+        content_hash = hashlib.sha256(body_bytes).hexdigest()
         doc_id = f"{self._doc_id_prefix}:{event.customer_id}:{session_id}"
         first_content = ""
         if events:

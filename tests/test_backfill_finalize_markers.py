@@ -210,12 +210,17 @@ async def test_one_failing_row_is_counted_not_fatal(rows, monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_legacy_partial_passes_are_handed_to_the_retry(rows) -> None:
-    """Rows the OLD worker left ending in an end signal were partial passes;
-    rows mined after the cutoff (the new worker keeps end signals by design)
-    and rows with a recorded outcome are left alone."""
+    """Only rows the report named BEFORE the relink run: a row the relink just
+    proved mined also ends in an end signal with no outcome, and stamping it
+    would pay to mine it again. Rows mined after the cutoff are left alone."""
     from datetime import UTC, datetime
 
     from scripts.backfill_finalize_markers import stamp_legacy_retry
+
+    before_relink = await backfill(dry_run=True, customers=[C])
+    captured = before_relink.already_ended_queue_ids
+    assert captured == [rows["already"]]
+    await backfill(dry_run=False, customers=[C])  # relinks "mined" and "multi_mined"
 
     cutoff = datetime(2026, 5, 3, tzinfo=UTC)
     async with get_pool().acquire() as conn:
@@ -224,9 +229,9 @@ async def test_legacy_partial_passes_are_handed_to_the_retry(rows) -> None:
             [_batch("s-new-worker", "2026/05/04"), cron_marker_key("claude_code", C, "s-new-worker")],
             enqueued="2026-05-04 07:00Z", completed="2026-05-04 07:05Z",
         )
-    assert await stamp_legacy_retry(completed_before=cutoff, customers=[C], dry_run=True) == 1
-    assert await stamp_legacy_retry(completed_before=cutoff, customers=[C], dry_run=False) == 1
-    assert await stamp_legacy_retry(completed_before=cutoff, customers=[C], dry_run=False) == 0
+    ids = [*captured, after_cutoff]  # the cutoff still guards a row mined since
+    assert await stamp_legacy_retry(queue_ids=ids, completed_before=cutoff, dry_run=True) == 1
+    assert await stamp_legacy_retry(queue_ids=ids, completed_before=cutoff, dry_run=False) == 1
     async with get_pool().acquire() as conn:
         import json
 
@@ -236,7 +241,12 @@ async def test_legacy_partial_passes_are_handed_to_the_retry(rows) -> None:
         untouched = await conn.fetchval(
             "SELECT extraction_outcome FROM ingestion_queue WHERE queue_id=$1", after_cutoff
         )
+        relinked = await conn.fetchval(
+            "SELECT extraction_outcome FROM ingestion_queue WHERE queue_id=$1", rows["mined"]
+        )
     assert (stamped["authoritative"], stamped["reason"], stamped["keys"], stamped["retries"]) == (
         False, "legacy_unconsumed", 2, 0
     )
     assert untouched is None
+    assert relinked is None, "a row the relink proved mined is never handed to the retry"
+    assert await stamp_legacy_retry(queue_ids=ids, completed_before=cutoff, dry_run=False) == 0

@@ -859,10 +859,10 @@ async def test_a_switched_off_pass_is_recorded_as_disabled(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_completing_a_session_changes_its_document_hash(monkeypatch) -> None:
-    """The normalizer skips a write whose hash is unchanged, and a completing
-    pass adds no text, so with a body-only hash `session_complete` never
-    reached the stored document."""
+async def test_a_completed_session_document_says_what_ended_it(monkeypatch) -> None:
+    """The hash stays body-only on purpose (a completion-aware hash would make
+    every completion enqueue a paid inferred-edges extraction); the document
+    still carries `completed_by` whenever it is written."""
     import kb.handlers.claude_code as cc_mod
 
     async def empty(**kwargs):
@@ -876,6 +876,6 @@ async def test_completing_a_session_changes_its_document_hash(monkeypatch) -> No
         _event(session_id="s-hash"),
         {**hydrated, "session_complete": True, "completed_by": "cron_marker"},
     )
-    assert live.documents[0].content_hash != done.documents[0].content_hash
+    assert live.documents[0].content_hash == done.documents[0].content_hash
     assert done.documents[0].metadata["completed_by"] == "cron_marker"
     assert "completed_by" not in live.documents[0].metadata

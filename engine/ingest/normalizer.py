@@ -890,7 +890,20 @@ class Normalizer:
 
         # ---- Post-commit per-item enqueues (best-effort, mirrors _persist) -
         outcomes: list[NormalizeOutcome] = []
-        for item_idx, (result, _queue_id) in enumerate(items):
+        for item_idx, (result, queue_id) in enumerate(items):
+            # The coding-agent post-commit steps `_persist` runs, which this
+            # path used to skip: without them a coalesced claim would neither
+            # retire a session's orphaned units nor record how its pass went
+            # (and a stale `disabled` record would be retried forever).
+            if result.extraction_outcome is not None and queue_id is not None:
+                await self._record_extraction_outcome(queue_id, result.extraction_outcome)
+            if result.retire_children_of:
+                await self._retire_orphaned_children(
+                    customer_id,
+                    result.retire_children_of,
+                    {doc.doc_id for doc in result.documents}
+                    | {pre.document.doc_id for pre in result.documents_with_chunks},
+                )
             doc_ids = per_item_doc_ids[item_idx]
             if doc_ids:
                 edge_doc_ids = _inferred_edge_doc_ids(
