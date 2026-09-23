@@ -848,3 +848,32 @@ async def test_a_missing_outcome_column_never_fails_a_pass(monkeypatch) -> None:
     with structlog.testing.capture_logs() as logs:
         await normalizer._record_extraction_outcome(1, {"authoritative": True, "reason": "ok"})
     assert [e["event"] for e in logs] == ["normalizer.extraction_outcome_failed"]
+
+
+
+@pytest.mark.asyncio
+async def test_switched_off_retries_do_not_spend_the_failure_budget(live_db: None) -> None:
+    """Seven daily switched-off passes, then extraction is back and a segment
+    fails: that real failure still gets its three retries."""
+    import json
+
+    from engine.ingest.handlers.base import make_default_context
+    from engine.ingest.normalizer import Normalizer
+
+    customer, sid = "completer-budget-cust", "sess-budget"
+    async with get_pool().acquire() as conn:
+        await conn.execute("DELETE FROM ingestion_queue WHERE customer_id = $1", customer)
+        await _seed_mined(conn, customer, sid, _outcome_json(reason="disabled", retries=6))
+        qid = (await _row(conn, customer, sid))["queue_id"]
+    normalizer = Normalizer(make_default_context(), store=object(), embedder=object())
+    await normalizer._record_extraction_outcome(qid, {"authoritative": False, "reason": "segment_failed", "keys": 2})
+    async with get_pool().acquire() as conn:
+        out = json.loads(await conn.fetchval("SELECT extraction_outcome FROM ingestion_queue WHERE queue_id=$1", qid))
+    assert (out["reason"], out["retries"]) == ("segment_failed", 0)
+    # ...while a second switched-off pass keeps counting its own budget.
+    await normalizer._record_extraction_outcome(qid, {"authoritative": False, "reason": "disabled", "keys": 2})
+    await normalizer._record_extraction_outcome(qid, {"authoritative": False, "reason": "disabled", "keys": 2})
+    async with get_pool().acquire() as conn:
+        out = json.loads(await conn.fetchval("SELECT extraction_outcome FROM ingestion_queue WHERE queue_id=$1", qid))
+        await conn.execute("DELETE FROM ingestion_queue WHERE customer_id = $1", customer)
+    assert out["retries"] == 0, "a partial pass followed by switched-off ones keeps the partial's count"

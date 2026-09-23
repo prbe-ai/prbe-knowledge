@@ -83,8 +83,8 @@ async def report(*, days: int, grace_days: int) -> dict:
     async with get_pool().acquire() as conn:
         tenants = [r["customer_id"] for r in await conn.fetch("SELECT customer_id FROM customers")]
         has_outcome = await conn.fetchval(
-            "SELECT 1 FROM information_schema.columns "
-            "WHERE table_name = 'ingestion_queue' AND column_name = 'extraction_outcome'"
+            "SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() "
+            "AND table_name = 'ingestion_queue' AND column_name = 'extraction_outcome'"
         )
         for source in AGENT_SOURCES:
             totals = {"client_finalized": 0, "late_client": 0, "sweep_only": 0, "open": 0}

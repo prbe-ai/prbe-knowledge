@@ -252,8 +252,9 @@ class Normalizer:
         """Record how a coding-agent session's last complete pass went.
 
         `retries` belongs to the idle sweep, which bumps it when it re-queues a
-        partial pass: an authoritative pass resets it, any other pass keeps it,
-        so the bound holds across the retries themselves.
+        partial pass: an authoritative pass resets it, and so does the first
+        real attempt after switched-off ones (their budget is separate); any
+        other pass keeps it, so the bound holds across the retries themselves.
 
         Best-effort: the documents are already committed, and a missing record
         only costs a retry the sweep would otherwise have made. It also has to
@@ -269,6 +270,10 @@ class Normalizer:
                        SET extraction_outcome = $2::jsonb || jsonb_build_object(
                              'retries',
                              CASE WHEN ($2::jsonb ->> 'authoritative')::boolean THEN 0
+                                  -- Retries spent while extraction was switched
+                                  -- off do not count against a real failure.
+                                  WHEN extraction_outcome ->> 'reason' = 'disabled'
+                                   AND $2::jsonb ->> 'reason' <> 'disabled' THEN 0
                                   ELSE COALESCE((extraction_outcome ->> 'retries')::int, 0)
                              END)
                      WHERE queue_id = $1
