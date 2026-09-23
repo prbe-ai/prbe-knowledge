@@ -1,21 +1,22 @@
 """Periodic finalizer for agent-session sources (Claude Code, Codex, pi) that go idle.
 
-For each (customer, session) where the most recent ingestion_queue activity is
-older than `idle_minutes`, write a finalize.marker placeholder to R2 and
-UPSERT it into the live session row's `payload_s3_keys` array. The worker,
-on next claim, sees the marker key and triggers `session_complete=True`
-extraction (qa, code_change, decision, file_ref unit docs).
+A session is mined only once it has ENDED (engine.shared.session_signals: the
+newest key on its queue row is an end signal). Clients end their own sessions;
+this sweep ends the ones nobody did -- a hard-killed terminal, a laptop that
+never came back -- by appending a `finalize.marker` key to the live row once it
+has been idle for `idle_minutes`. The worker then mines it once.
 
-Post-migration 0026 the live session row is keyed on bare session_id (no
-`:batch_seq` suffix), and finalize is no longer a separate row — it
-coalesces into the same row as live batches via the same UPSERT path.
+A session whose newest key is ALREADY an end signal is left alone. That one
+check is the whole cost bound: the previous version asked instead whether a
+marker key was still present anywhere, while the worker deleted that key after
+mining, so every idle session was re-ended and fully re-mined once a day.
 
-Codex and pi sessions need the same finalizer treatment as Claude Code —
-all three ingest in coalescing mode where idle sessions otherwise stay
-`pending` forever. We loop over every agent-session source and write the
-marker under the source-prefixed R2 path (raw/claude_code/... vs
-raw/codex/... vs raw/pi/...) so each source's marker collides correctly
-with that source's live batches and nothing else.
+Rows are only ever UPDATED. A session with no live row has nothing to mine: the
+old INSERT path created marker-only rows that dead-lettered on "missing
+employee_id" (288 of them on research).
+
+Protocol-2 sessions are skipped here: the client journal finalizes them, and
+covering the ones it misses is a separate change.
 """
 
 from __future__ import annotations
@@ -25,11 +26,55 @@ import orjson
 from engine.shared.constants import SourceSystem
 from engine.shared.db import get_pool
 from engine.shared.logging import get_logger
-from engine.shared.source_registry import ingestion_priority_for
+from engine.shared.session_signals import (
+    cron_marker_key,
+    has_v2_key_sql,
+    last_key_ends_v1_session_sql,
+)
 from engine.shared.storage import get_store
 from kb.session_receipts import _lock
 
 log = get_logger(__name__)
+
+#: Every agent-session source ingests in coalescing mode and needs ending when
+#: idle. Each is swept on its own so the marker lands under its own R2 prefix.
+AGENT_SOURCES = (SourceSystem.CLAUDE_CODE, SourceSystem.CODEX, SourceSystem.PI)
+
+#: Idle, not already ended, protocol 1, not being processed right now. The same
+#: predicate is re-checked in the UPDATE under the per-session lock, because a
+#: batch can land between this read and that write.
+_ELIGIBLE = f"""
+       status IS DISTINCT FROM 'processing'
+   AND enqueued_at < NOW() - make_interval(mins => $2)
+   AND cardinality(payload_s3_keys) > 0
+   AND NOT {last_key_ends_v1_session_sql()}
+   AND NOT {has_v2_key_sql()}
+"""
+
+_FIND_SQL = f"""
+SELECT queue_id, customer_id, source_event_id AS session_id
+  FROM ingestion_queue
+ WHERE source_system = $1
+   AND {_ELIGIBLE}
+ ORDER BY enqueued_at
+ LIMIT $3
+"""
+
+#: Append the marker, return the row to the worker. Conditioned on the same
+#: eligibility, so a row that changed since it was found is skipped, not ended.
+_END_SQL = f"""
+UPDATE ingestion_queue
+   SET payload_s3_keys = payload_s3_keys || ARRAY[$3]::text[],
+       status = 'pending',
+       version = version + 1,
+       completed_at = NULL,
+       error = NULL,
+       enqueued_at = NOW()
+ WHERE queue_id = $4
+   AND source_system = $1
+   AND {_ELIGIBLE}
+RETURNING queue_id
+"""
 
 
 async def enqueue_idle_session_finalizers(
@@ -38,103 +83,27 @@ async def enqueue_idle_session_finalizers(
     limit: int = 1000,
     dry_run: bool = False,
 ) -> int:
-    """Mark idle, unfinalized sessions complete so the worker mines them.
+    """End idle sessions that nobody ended, so the worker mines them once.
 
     `limit` is per source, and it is a COST bound rather than a correctness one:
-    every session this enqueues buys a full multi-segment extraction, so an
-    unbounded first run against a corpus that has never been swept is a bill
-    nobody sized. Anything not reached tonight is reached tomorrow.
+    every session this ends buys one multi-segment extraction. Anything not
+    reached this run is reached on the next.
 
-    `dry_run` counts what would be enqueued and writes nothing — the only
-    honest way to size that first run before paying for it.
-    """
-    # Find sessions where the most recent activity (across both new-format
-    # rows with bare session_id and any in-flight legacy `:batch_seq`/
-    # `:finalize` rows) is older than the idle window. The split_part
-    # collapses both shapes onto the session_id key.
-    #
-    # We additionally filter out sessions whose live row already has a
-    # finalize.marker in payload_s3_keys — that's the post-coalescing
-    # signal that the cron has already finalized this session.
-    find_sql = """
-    WITH idle_sessions AS (
-        SELECT customer_id,
-               split_part(source_event_id, ':', 1) AS session_id,
-               MAX(enqueued_at) AS last_seen
-          FROM ingestion_queue
-         WHERE source_system = $1
-         GROUP BY customer_id, session_id
-        HAVING MAX(enqueued_at) < NOW() - make_interval(mins => $2)
-    )
-    SELECT i.customer_id, i.session_id
-      FROM idle_sessions i
-      LEFT JOIN ingestion_queue q
-        ON q.customer_id = i.customer_id
-       AND q.source_system = $1
-       AND q.source_event_id = i.session_id
-     WHERE (q.queue_id IS NULL
-        OR NOT EXISTS (
-            SELECT 1 FROM unnest(q.payload_s3_keys) AS k
-            -- Already finalized, by EITHER route. Matching only the cron's own
-            -- marker was the bug: the tap's client finalize is keyed like any
-            -- other payload except that it carries no `:batch_seq` suffix
-            -- (a finalize parse_hint has no batch_seq to append), so a cleanly
-            -- ended session looked unfinished to this query forever. Every one
-            -- of them would be swept and fully re-extracted on each run, and
-            -- the first production run would do it to the entire historical
-            -- corpus at once.
-            WHERE k LIKE '%/finalize.marker'
-               OR k LIKE '%/' || i.session_id || '.json'
-        ))
-       AND NOT EXISTS (
-           SELECT 1 FROM unnest(q.payload_s3_keys) AS k
-           WHERE k LIKE '%/sessions-v2/%'
-       )
-     LIMIT $3
-    """
+    `dry_run` counts what would be ended and writes nothing.
 
-    # UPSERT the finalize.marker into the live session row. Same shape as
-    # services/ingestion/main.py:_enqueue's CC path: append marker key,
-    # bump version, refresh status, bump enqueued_at. If no live row
-    # exists for this session_id (cleanly archived sessions, or sessions
-    # that only ever had legacy `:batch_seq` rows that all completed),
-    # this INSERTs a fresh row whose payload_s3_keys contains only the
-    # marker — the worker will process it once and emit complete=True
-    # with an empty event list (no unit docs, no harm).
-    #
-    # Intentionally NOT gated by engine.ingest.connectedness:
-    # finalize markers only fire for CLAUDE_CODE / CODEX / PI, which don't
-    # have integration_tokens rows (agent sessions, no OAuth lifecycle).
-    upsert_sql = """
-    INSERT INTO ingestion_queue
-        (customer_id, source_system, source_event_id,
-         payload_s3_key, payload_s3_keys, status, priority,
-         version, enqueued_at)
-    VALUES ($1, $2, $3, $4, ARRAY[$4], 'pending', $5, 1, NOW())
-    ON CONFLICT (customer_id, source_system, source_event_id) DO UPDATE
-        SET payload_s3_keys = ingestion_queue.payload_s3_keys
-                              || EXCLUDED.payload_s3_keys,
-            status = 'pending',
-            version = ingestion_queue.version + 1,
-            completed_at = NULL,
-            error = NULL,
-            enqueued_at = NOW()
+    Returns how many sessions were ended (or would be, on a dry run).
     """
-
-    # All agent-session sources ingest in coalescing mode and need
-    # finalize markers when idle. We finalize each source independently so
-    # the R2 marker key lives under the source-prefixed namespace and
-    # collides with the right live batches.
-    AGENT_SOURCES = (SourceSystem.CLAUDE_CODE, SourceSystem.CODEX, SourceSystem.PI)
     store = get_store()
     enqueued = 0
-    total_candidates = 0
+    candidates = 0
+    skipped = 0
+    capped = False
     async with get_pool().acquire() as conn:
         seen_buckets: set[str] = set()
         for source in AGENT_SOURCES:
-            priority = ingestion_priority_for(source.value)
-            rows = await conn.fetch(find_sql, source.value, idle_minutes, limit)
-            total_candidates += len(rows)
+            rows = await conn.fetch(_FIND_SQL, source.value, idle_minutes, limit)
+            candidates += len(rows)
+            capped = capped or len(rows) >= limit
             for r in rows:
                 customer_id = r["customer_id"]
                 session_id = r["session_id"]
@@ -143,54 +112,60 @@ async def enqueue_idle_session_finalizers(
                         "SELECT set_config('app.current_customer_id', $1, true)", customer_id
                     )
                     await _lock(conn, customer_id, source.value, session_id)
+                    # A protocol-2 stream owns this session even when no key on
+                    # the row says so (session_streams is the authority).
                     if await conn.fetchval(
                         "SELECT 1 FROM session_streams WHERE customer_id=$1 AND source_system=$2 AND session_id=$3",
                         customer_id,
                         source.value,
                         session_id,
                     ):
+                        skipped += 1
                         continue
                     if dry_run:
                         enqueued += 1
                         continue
+                    key = cron_marker_key(source.value, customer_id, session_id)
+                    # The object must exist before any row references it: a
+                    # claim that cannot fetch a key fails the whole row. One
+                    # object per session, rewritten identically, so a write
+                    # whose UPDATE is then skipped leaves nothing dangling.
                     bucket = await store.bucket_for(customer_id)
                     if bucket not in seen_buckets:
                         await store.ensure_bucket(bucket)
                         seen_buckets.add(bucket)
-                    placeholder_key = (
-                        f"raw/{source.value}/{customer_id}/{session_id}/finalize.marker"
+                    await store.put(bucket, key, _marker_body(session_id))
+                    ended = await conn.fetchval(
+                        _END_SQL, source.value, idle_minutes, key, r["queue_id"]
                     )
-                    placeholder_body = orjson.dumps(
-                        {
-                            "device_id": "cron-finalize",
-                            "session_id": session_id,
-                            "batch_seq": -1,
-                            "cwd": None,
-                            "events": [],
-                            "finalize": True,
-                        }
-                    )
-                    await store.put(bucket, placeholder_key, placeholder_body)
-                    await conn.execute(
-                        upsert_sql,
-                        customer_id,
-                        source.value,
-                        session_id,  # bare session_id — coalescing key
-                        placeholder_key,
-                        priority,
-                    )
+                    if ended is None:
+                        skipped += 1
+                        continue
                     enqueued += 1
     log.info(
         "session_completer.run",
-        extra={
-            "idle_minutes": idle_minutes,
-            "enqueued": enqueued,
-            "candidates": total_candidates,
-            "limit": limit,
-            "dry_run": dry_run,
-            # A run that hits the cap left work behind. Silent truncation here
-            # would read as "the corpus is fully swept".
-            "capped": total_candidates >= limit,
-        },
+        idle_minutes=idle_minutes,
+        enqueued=enqueued,
+        candidates=candidates,
+        skipped=skipped,
+        limit=limit,
+        dry_run=dry_run,
+        # A run that hits the cap left work behind. Silent truncation here
+        # would read as "the corpus is fully swept".
+        capped=capped,
     )
     return enqueued
+
+
+def _marker_body(session_id: str) -> bytes:
+    """The placeholder the worker reads for a marker key: no events."""
+    return orjson.dumps(
+        {
+            "device_id": "cron-finalize",
+            "session_id": session_id,
+            "batch_seq": -1,
+            "cwd": None,
+            "events": [],
+            "finalize": True,
+        }
+    )

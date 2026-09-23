@@ -6,6 +6,33 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Fixed
+
+- Idle coding-agent sessions are no longer re-mined every day. The hourly idle sweep treated
+  a session as finished only while its end-of-session marker was still on the queue row, and
+  the worker deleted that marker after mining it, so every idle protocol-1 session was ended
+  and fully re-extracted once a day: on research, about 5,000 re-mines a day and nearly all
+  of a $2,800/month extraction bill. A session now counts as ended exactly when the newest
+  thing on its row is an end signal (a client finalize or the sweep's marker); nothing is
+  deleted, and the sweep and the worker share that one rule. A session that resumes is live
+  again and is mined once more when it next ends.
+- The idle sweep only ends sessions that already have a queue row, re-checks under the
+  session lock that no batch landed since it looked, and skips rows being processed. It no
+  longer creates marker-only rows, which dead-lettered on "missing employee_id".
+- A mining pass whose model call answered in prose instead of the tool now logs
+  `claude_code_extraction.tool_declined`; it was the one partial-extraction path that left
+  no trace.
+
+### Added
+
+- `claude_code_extraction.pass`: one log line per mining pass with what ended the session,
+  segments, model calls, whether the pass was complete, what went wrong, units, and a short
+  hash of each segment (repeats across passes show what a per-segment cache would save).
+- `scripts/backfill_finalize_markers.py`: one-time repair that puts the end marker back on
+  sessions already mined under the old rule, only where the queue row proves a complete
+  mine, so the first sweep after this deploy does not mine them all again. Dry-run first,
+  `--customer` for a one-tenant canary.
+
 ### Changed
 
 - A pull request's, GitHub issue's or Linear issue's document now absorbs its bare mention

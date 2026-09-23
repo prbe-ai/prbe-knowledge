@@ -644,7 +644,7 @@ async def test_extraction_can_be_disabled_without_stopping_capture(monkeypatch) 
                 "session_id": "s-off",
                 "events": [{"line_no": 0, "raw": {}}],
                 "session_complete": True,
-                "finalize_keys": ["raw/claude_code/c/2026/08/15/s-off.json"],
+                "completed_by": "v1_client_finalize",
                 "cwd": "/tmp/p",
             },
         )
@@ -658,7 +658,126 @@ async def test_extraction_can_be_disabled_without_stopping_capture(monkeypatch) 
                getattr(d.doc_type, "value", d.doc_type) == "claude_code.session"
                for d in result.documents)
     assert len(result.documents) == 1, "no unit docs when mining is off"
-    # And the session is NOT recorded as done — re-enabling must re-mine it
-    # rather than leave a hole no later sweep would revisit.
-    assert result.consume_payload_keys == []
+    # And nothing the session already has is retired: a skip is not an empty mine.
     assert result.retire_children_of == []
+
+
+@pytest.mark.asyncio
+async def test_a_non_authoritative_pass_retires_nothing(monkeypatch) -> None:
+    """A pass that lost a segment, hit the cap, or had the tool declined holds
+    fewer units than the session really has. Declaring it a wholesale
+    replacement would turn one transient failure into deletion of a better
+    extraction's units."""
+    import kb.handlers.claude_code as cc_mod
+
+    ext_mod = cc_mod._ext
+
+    async def partial(**kwargs):
+        return ext_mod.UnitBundle(
+            authoritative=False,
+            problems=["segment_failed"],
+            qa=[ext_mod.QA(prompt="p", outcome="o")],
+        )
+
+    monkeypatch.setattr(cc_mod._ext, "extract_units_from_session", partial)
+    result = await ClaudeCodeConnector(make_default_context()).normalize(
+        _event(session_id="s-partial"),
+        {"session_id": "s-partial", "events": [{"line_no": 0, "raw": {}}], "session_complete": True},
+    )
+    assert len(result.documents) == 2, "the units it did get are still written"
+    assert result.retire_children_of == []
+
+
+@pytest.mark.asyncio
+async def test_an_authoritative_pass_claims_its_children(monkeypatch) -> None:
+    import kb.handlers.claude_code as cc_mod
+
+    ext_mod = cc_mod._ext
+
+    async def full(**kwargs):
+        return ext_mod.UnitBundle(qa=[ext_mod.QA(prompt="p", outcome="o")])
+
+    monkeypatch.setattr(cc_mod._ext, "extract_units_from_session", full)
+    result = await ClaudeCodeConnector(make_default_context()).normalize(
+        _event(session_id="s-full"),
+        {"session_id": "s-full", "events": [{"line_no": 0, "raw": {}}], "session_complete": True},
+    )
+    assert result.retire_children_of == [result.documents[0].doc_id]
+
+
+@pytest.mark.asyncio
+async def test_a_row_with_no_events_and_no_identity_writes_nothing() -> None:
+    """The old sweep INSERTed marker-only rows; each raised "missing
+    employee_id" and dead-lettered (288 on research). Nothing to write is not
+    an error."""
+    from datetime import UTC, datetime
+
+    ev = WebhookEvent(
+        customer_id="cust-1",
+        source_system=SourceSystem.CLAUDE_CODE,
+        source_event_id="s-empty",
+        received_at=datetime.now(UTC),
+        payload_s3_key="raw/claude_code/cust-1/s-empty/finalize.marker",
+        raw_payload={"device_id": "cron-finalize", "session_id": "s-empty", "events": [], "finalize": True},
+        headers={},
+    )
+    result = await ClaudeCodeConnector(make_default_context()).normalize(
+        ev, {"session_id": "s-empty", "events": [], "session_complete": True}
+    )
+    assert result.documents == [] and result.graph_nodes == []
+
+
+@pytest.mark.asyncio
+async def test_every_mining_pass_logs_what_it_cost(monkeypatch) -> None:
+    import structlog
+
+    import kb.handlers.claude_code as cc_mod
+
+    ext_mod = cc_mod._ext
+
+    async def mined(**kwargs):
+        return ext_mod.UnitBundle(
+            segments=2,
+            calls=3,
+            segment_hashes=["aaaa", "bbbb"],
+            qa=[ext_mod.QA(prompt="p", outcome="o")],
+        )
+
+    monkeypatch.setattr(cc_mod._ext, "extract_units_from_session", mined)
+    with structlog.testing.capture_logs() as logs:
+        await ClaudeCodeConnector(make_default_context()).normalize(
+            _event(session_id="s-log"),
+            {
+                "session_id": "s-log",
+                "events": [{"line_no": 0, "raw": {}}],
+                "session_complete": True,
+                "completed_by": "cron_marker",
+            },
+        )
+    passes = [e for e in logs if e["event"] == "claude_code_extraction.pass"]
+    assert len(passes) == 1
+    line = passes[0]
+    assert (line["completed_by"], line["segments"], line["calls"], line["units"]) == (
+        "cron_marker", 2, 3, 1
+    )
+    assert line["segment_hashes"] == ["aaaa", "bbbb"] and line["authoritative"] is True
+    assert line["protocol_version"] == 1 and line["source"] == "claude_code"
+
+
+@pytest.mark.asyncio
+async def test_an_open_session_is_not_mined_and_logs_no_pass(monkeypatch) -> None:
+    import structlog
+
+    import kb.handlers.claude_code as cc_mod
+
+    async def never(**kwargs):
+        raise AssertionError("an open session must not be mined")
+
+    monkeypatch.setattr(cc_mod._ext, "extract_units_from_session", never)
+    with structlog.testing.capture_logs() as logs:
+        result = await ClaudeCodeConnector(make_default_context()).normalize(
+            _event(session_id="s-open"),
+            {"session_id": "s-open", "events": [{"line_no": 0, "raw": {}}], "session_complete": False},
+        )
+    assert len(result.documents) == 1
+    assert not [e for e in logs if e["event"] == "claude_code_extraction.pass"]

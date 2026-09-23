@@ -468,9 +468,7 @@ async def test_v2_completion_survives_extraction_idle_sweep_and_reprocessing(dat
         "tenant-a", SourceSystem.CLAUDE_CODE, row["payload_s3_keys"]
     )
     assert first.documents[0].metadata["session_complete"] and len(first.documents) > 1
-    assert first.consume_payload_keys == []
-    # Execute the real key-consumption method, then the real idle selector.
-    await normalizer._consume_payload_keys(row["queue_id"], first.consume_payload_keys)
+    # Nothing is consumed; run the real idle selector against the row as mined.
     await admin.execute("UPDATE ingestion_queue SET enqueued_at=NOW()-INTERVAL '1 hour'")
     assert await enqueue_idle_session_finalizers(idle_minutes=5) == 0
     keys = await admin.fetchval("SELECT payload_s3_keys FROM ingestion_queue")

@@ -30,6 +30,7 @@ import orjson
 from engine.ingest.handlers.base import Connector
 from engine.ingest.handlers.registry import register_connector
 from engine.shared import claude_code_extraction as _ext
+from engine.shared import session_signals as _signals
 from engine.shared.config import get_settings
 from engine.shared.constants import (
     PRIORITY_AGENT_CAPTURE,
@@ -142,13 +143,9 @@ class ClaudeCodeConnector(Connector):
         # source_event_id is the bare session_id for both live batches AND
         # finalize events. _enqueue (services/ingestion/main.py) UPSERTs on
         # this key for claude_code, so every batch + the cron finalize all
-        # coalesce into one queue row per session. The worker detects
-        # finalize via the presence of a `finalize.marker` key in
-        # payload_s3_keys, not via a source_event_id suffix.
-        #
-        # Legacy `<session>:<batch>` and `<session>:finalize` source_event_ids
-        # may still exist on in-flight queue rows from before migration 0026;
-        # they continue to drain through the worker's old single-payload path.
+        # coalesce into one queue row per session. The worker decides whether
+        # the session has ended from the NEWEST key on that row
+        # (engine.shared.session_signals), never from a source_event_id suffix.
         if raw_payload.get("finalize") is True:
             session_id = raw_payload.get("session_id")
             if not isinstance(session_id, str) or not session_id:
@@ -213,18 +210,11 @@ class ClaudeCodeConnector(Connector):
         webhook envelope's `payload.events`, and merges them into a single
         line_no-ordered event list.
 
-        Session-complete detection has two paths:
-        1. Live: any merged event with raw.type == 'session_end'.
-        2. Cron-finalize: any payload_s3_keys entry ending in
-           `finalize.marker` (written by session_completer.py when a
-           session goes idle past the threshold).
-
-        Legacy in-flight rows from before migration 0026 still flow
-        through here naturally: their `payload_s3_keys` was backfilled
-        to ARRAY[payload_s3_key], so the array is single-element. The
-        legacy `<session>:<batch>` and `<session>:finalize` source_event_ids
-        on those rows still trigger complete=True via the suffix check
-        below — they'll drain through one last time under old semantics.
+        Session-complete detection is ONE rule, `engine.shared.session_signals`:
+        the session has ended when the newest key on the row is an end signal
+        (a protocol-2 finalize, a protocol-1 client finalize, or the sweep's
+        `finalize.marker`). Nothing is consumed, so a resumed session is live
+        again simply because its end signal is no longer on top.
         """
         session_id = event.raw_payload.get("session_id") or event.source_event_id.split(":", 1)[0]
         if not session_id:
@@ -304,18 +294,16 @@ class ClaudeCodeConnector(Connector):
         # for the merge — we re-sort by line_no after.
         fetched: list[tuple[str, bytes]] = await asyncio.gather(*(_fetch(k) for k in keys))
 
-        finalize_marker_seen = False
-        client_finalize_seen = False
         last_v2_batch = -1
         last_v2_finalized = False
-        # Legacy completion keys are consumed after extraction. Protocol 2
-        # finalize keys are immutable evidence of the accepted prefix; retain
-        # them, and let the highest sequence determine completion on every pass.
-        finalize_keys: list[str] = []
+        # What the NEWEST key on the row says, in arrival order. Set on every
+        # key, so after the loop it describes the last one only.
+        last_signal: _signals.CompletedBy | None = None
         for key, body in fetched:
-            if key.endswith("/finalize.marker"):
-                finalize_marker_seen = True
-                finalize_keys.append(key)
+            # The sweep's marker is recognised by its key, before its body: the
+            # placeholder it writes also carries `finalize: true`.
+            signal = _signals.CompletedBy.CRON_MARKER if _signals.is_cron_marker_key(key) else None
+            last_signal = signal
             try:
                 envelope = orjson.loads(body)
             except orjson.JSONDecodeError:
@@ -330,22 +318,16 @@ class ClaudeCodeConnector(Connector):
             ):
                 last_v2_batch = payload["batch_seq"]
                 last_v2_finalized = payload.get("finalize") is True
-            # An explicit client finalize (the tap's SessionEnd hook, via the
-            # gateway's SessionFinalizeRequest route) lands here as an ordinary
-            # coalesced payload carrying `finalize: true` and NO events. It is
-            # NOT the cron's marker: the cron writes a dedicated
-            # `.../finalize.marker` R2 object, while this one is keyed like any
-            # other batch (`raw/<source>/<cust>/<date>/<session_id>.json`,
-            # since a finalize parse_hint carries no batch_seq to suffix with).
-            #
-            # Without this branch the gateway route was a no-op with a 202: it
-            # authenticated, forwarded and stored the payload, and nothing ever
-            # marked the session complete — so the unit extraction that only
-            # runs on completion never fired for a cleanly-ended session.
-            if payload.get("finalize") is True:
-                client_finalize_seen = True
-                if payload.get("protocol_version") != 2:
-                    finalize_keys.append(key)
+            # An explicit protocol-1 client finalize (the tap's SessionEnd hook,
+            # via the gateway's SessionFinalizeRequest route) is an ordinary
+            # coalesced payload carrying `finalize: true` and NO events, keyed
+            # `raw/<source>/<cust>/<date>/<session_id>.json`.
+            if signal is None and payload.get("finalize") is True:
+                last_signal = (
+                    _signals.CompletedBy.V2_FINALIZE
+                    if payload.get("protocol_version") == 2
+                    else _signals.CompletedBy.V1_CLIENT_FINALIZE
+                )
             _remember_payload_identity(payload)
             for obj in payload.get("events") or []:
                 if isinstance(obj, dict):
@@ -353,36 +335,30 @@ class ClaudeCodeConnector(Connector):
 
         merged_events.sort(key=lambda e: (e.get("line_no") is None, e.get("line_no") or 0))
 
-        # Session-complete detection, four ways in:
-        #   1. a live `session_end` event in the merged stream
-        #   2. an explicit client finalize payload (the tap's SessionEnd hook)
-        #   3. the cron sweep's injected finalize.marker
-        #   4. a legacy `:finalize` source_event_id on a pre-0026 in-flight row
+        # One rule (engine.shared.session_signals): the session has ended when
+        # the NEWEST key is an end signal. Nothing is consumed; a batch that
+        # lands after an end signal makes the session live again.
         #
-        # (2) and (3) are deliberately separate signals rather than one. They
-        # come from different actors with different failure modes — the client
-        # says "this session ended cleanly", the sweep says "nobody ever said
-        # anything and it has been quiet for hours" — and collapsing them would
-        # make it impossible to tell a working finish hook from a silent one.
-        complete = any((e.get("raw") or {}).get("type") == "session_end" for e in merged_events)
-        if last_v2_batch >= 0:
-            client_finalize_seen = last_v2_finalized
-        if client_finalize_seen:
-            complete = True
-        if finalize_marker_seen:
-            complete = True
-        if event.source_event_id.endswith(":finalize"):
-            complete = True
-        if last_v2_batch >= 0:
-            # A historical session_end or a cron marker cannot certify a newer
-            # protocol stream. Only its last accepted, pinned finalize can.
-            complete = last_v2_finalized
+        # Protocol 2 orders by accepted batch_seq rather than array position:
+        # the server admits v2 batches strictly in sequence, so the highest
+        # sequence IS the newest, and consumers may read keys in any order.
+        # The sweep's marker is not a client claim; it ends a v2 session only
+        # while it is the last key on the row.
+        completed_by: _signals.CompletedBy | None
+        if last_signal == _signals.CompletedBy.CRON_MARKER:
+            completed_by = last_signal
+        elif last_v2_batch >= 0:
+            completed_by = _signals.CompletedBy.V2_FINALIZE if last_v2_finalized else None
+        elif last_signal == _signals.CompletedBy.V1_CLIENT_FINALIZE:
+            completed_by = last_signal
+        else:
+            completed_by = None
 
         return {
             "session_id": session_id,
             "events": merged_events,
-            "session_complete": complete,
-            "finalize_keys": finalize_keys,
+            "session_complete": completed_by is not None,
+            "completed_by": completed_by.value if completed_by else None,
             "cwd": event.raw_payload.get("cwd"),
             **session_identity,
         }
@@ -396,6 +372,24 @@ class ClaudeCodeConnector(Connector):
         events = hydrated.get("events") or []
         cwd = hydrated.get("cwd")
         complete = bool(hydrated.get("session_complete"))
+        # A row holding only end signals has nothing to write and no one to
+        # attribute it to. That shape used to exist -- the sweep INSERTed a
+        # marker-only row for a session with no live row -- and every one of
+        # them raised "missing employee_id" and dead-lettered. The sweep no
+        # longer creates them; this keeps any that remain from failing. Only
+        # that shape: a live batch without an employee_id still raises.
+        if (
+            complete
+            and not events
+            and not _nonempty_str(hydrated.get("employee_id"))
+            and not _nonempty_str(event.raw_payload.get("employee_id"))
+        ):
+            log.info(
+                "claude_code.session_without_events",
+                customer=event.customer_id,
+                session_id=session_id,
+            )
+            return NormalizationResult()
         # Authentication proves who uploaded supplied bytes, not who authored
         # the historical conversation. There is no verified-author v2 claim.
         unverified_author = hydrated.get("protocol_version") == 2
@@ -532,9 +526,9 @@ class ClaudeCodeConnector(Connector):
             )
 
         # Emergency stop, independent of capture. Skipping mining must not look
-        # like "this session had nothing to mine": leave the session
-        # un-finalized so re-enabling re-mines it, rather than recording a
-        # silent hole that no later sweep would ever revisit.
+        # like "this session had nothing to mine": no units are written and
+        # nothing is retired, so the session's existing units stay live and a
+        # skip is logged as its own outcome, never as an empty mine.
         if not get_settings().claude_code_extraction_enabled:
             log.info(
                 "claude_code.extraction_disabled",
@@ -553,6 +547,25 @@ class ClaudeCodeConnector(Connector):
             events=events,
             cwd=cwd,
             agent=self._agent_label,
+        )
+        # One line per mining pass: the only record of what a pass cost and
+        # why it ran. `segment_hashes` repeat across passes of one session
+        # exactly when a per-segment cache would have hit, which sizes that
+        # cache before anyone builds it.
+        log.info(
+            "claude_code_extraction.pass",
+            customer=event.customer_id,
+            source=self.source_system.value,
+            session_id=session_id,
+            protocol_version=2 if hydrated.get("protocol_version") == 2 else 1,
+            completed_by=hydrated.get("completed_by"),
+            events=len(events),
+            segments=bundle.segments,
+            calls=bundle.calls,
+            authoritative=bundle.authoritative,
+            problems=sorted(set(bundle.problems)),
+            units=len(_ext.all_units(bundle)),
+            segment_hashes=bundle.segment_hashes,
         )
 
         for idx, qa in enumerate(bundle.qa):
@@ -724,17 +737,6 @@ class ClaudeCodeConnector(Connector):
             # they are stale, and the next successful pass retires them.
             retire_children_of=(
                 [session_doc.doc_id] if bundle.authoritative and len(documents) > 1 else []
-            ),
-            # Legacy completion is an event. Having acted on it, drop
-            # its keys: payload_s3_keys is append-only, so
-            # leaving them makes every later batch of a resumed session look
-            # complete again and buy another full re-extraction of the whole
-            # transcript. Only consumed when the extraction was authoritative —
-            # a degraded pass has not really acted on the signal, and dropping
-            # it would strand the session unmined until the next sweep. V2
-            # completion evidence is retained and superseded by sequence.
-            consume_payload_keys=(
-                list(hydrated.get("finalize_keys") or []) if bundle.authoritative else []
             ),
         )
 

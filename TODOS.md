@@ -5,6 +5,66 @@ why it matters, and roughly what it takes.
 
 ---
 
+## Transcript extraction — from the 2026-09-23 spend review (docs/plans/extraction-spend-plan.md)
+
+### Per-segment extraction cache (Phase 1 of the spend plan)
+**Where:** `engine/shared/claude_code_extraction.py` (`extract_units_from_session`, `_extract_one`).
+
+**What:** cache each segment's grounded `UnitBundle` in R2 keyed on
+`(customer, session, sha256(rendered segment text), agent, prompt+schema version)`; skip the
+model call on a hit. **Why:** a re-completed session re-reads every unchanged segment.
+**Context:** measured 2026-09-23, re-completions are 73 of 5,251 v2 sessions (30 d) and 461 of
+5,712 passes, so this is worth under $20/month once the sweep loop is fixed. The `(part i of n)`
+prompt text must stay out of the key; the cap keeps the LAST 16 segments so a capped session's
+earliest segments change identity (misses, not corruption); never cache a non-authoritative
+result. `claude_code_extraction.pass` logs per-segment hashes, which gives the hit rate before
+anything is built. **Effort:** M. **Priority:** P3.
+**Depends on:** the sweep-loop fix shipped and 1 week of pass logs showing repeated segment
+hashes >= 25 % of segment calls.
+
+### Jev tail screen (Phase 2 of the spend plan), shadow first
+**Where:** `engine/shared/claude_code_extraction.py`, `engine/retrieval/agent/jev.py`.
+
+**What:** before mining a re-completed session's newest segment, ask Jev (yes/no + probability)
+whether the tail holds a decision, directive, Q&A or code change; shadow-only until the miss
+rate is measured. **Why:** the residual call after the cache is the changed tail, and many tails
+hold nothing. **Context:** ~32k-token request cap (`docs/jev-contract.md`), so screen the tail
+truncated to its last 100k chars and log the truncation; run extraction anyway in shadow and log
+Jev's probability next to `units`; nothing is skipped until >= 500 tails show the miss rate; a
+skip is its own outcome, never "mined, found nothing" (`kb/handlers/claude_code.py:534-549` is
+the model). The key is hand-patched into `engine-secrets`; `sync-secrets` full-replaces a
+Secret. **Effort:** M. **Priority:** P3. **Depends on:** the per-segment cache, and its
+measurement showing tails that produce nothing dominate the residual.
+
+### Finalize `reason` on the wire
+**Where:** prbe-backend gateway (`SessionFinalizeRequest`, two-field model), research-os tap
+`build_finalize_body`, `kb/session_receipts.py:validate_payload`.
+
+**What:** carry why a session ended (`session_end_hook`, `process_exit`, `daemon_reconcile`)
+on the finalize. **Why:** today the server cannot tell a clean `/exit` from an orphan-detected
+exit, so the reliability of each client signal is unmeasurable. **Context:** the gateway
+validates a two-field model and rebuilds the forwarded body, so this is three repos.
+**Effort:** S per repo. **Priority:** P3. **Depends on:** PR 2 of the spend plan (`completed_by`).
+
+### pi daemon: verify process-death finalize
+**Where:** research-os `agent/plugins/probe-research-pi/src/daemon.ts`.
+
+**What:** confirm the pi daemon enqueues a finalize when the pi process exits without a hook,
+as the Claude Code tap does (`tap/main.py:629-650`). **Why:** otherwise pi sessions rely on the
+server idle sweep alone. **Effort:** S. **Priority:** P3. **Depends on:** None.
+
+### 177 done v1 rows still carrying a finalize.marker
+**Where:** `ingestion_queue` (research kb), `engine/shared/claude_code_extraction.py`.
+
+**What:** identify why their last pass did not consume the marker (non-authoritative: segment
+failed, capped, or the model declined the tool; the last case logs nothing today). **Why:** they
+are the population PR 2's bounded retry will re-end; knowing the cause sizes that retry.
+**Context:** `select ... where source_system='claude_code' and status='done' and exists
+(unnest(payload_s3_keys) like '%/finalize.marker')` (465 rows incl. 288 dlq marker-only rows).
+**Effort:** S. **Priority:** P3. **Depends on:** the `claude_code_extraction.pass` log line.
+
+---
+
 ## P0 — do before first real webhook lands in prod
 
 ### Notion signature bypass
@@ -242,6 +302,9 @@ reclaim, would make it O(new batches).
 
 **Depends on:** re-measuring after the worker is off half a core.
 **Cost:** a day, mostly cache-invalidation care.
+**Re-prioritized 2026-09-23:** the session-completer sweep was re-mining every idle v1 session
+daily (docs/plans/extraction-spend-plan.md); once that fix lands, transcript runs drop ~98 %,
+so re-measure the parse cost before building this.
 
 ---
 
