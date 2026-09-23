@@ -544,6 +544,10 @@ async def reap_expired_pending_edges(
 ) -> int:
     """Delete pending edges older than the TTL for this tenant.
 
+    Leased rows (a drain in progress) are left alone -- which also lets the
+    DELETE use idx_pending_edges_created (created_at WHERE locked_until IS
+    NULL) instead of scanning the table.
+
     Runs opportunistically from the drain path -- no separate cron. A tenant
     with no ingestion parks nothing, so there is nothing to reap there;
     wherever edges ARE parking, the drain fires and sweeps the stale tail.
@@ -554,6 +558,7 @@ async def reap_expired_pending_edges(
         WITH deleted AS (
             DELETE FROM pending_edges
             WHERE customer_id = $1
+              AND locked_until IS NULL
               AND created_at < NOW() - make_interval(days => $2)
             RETURNING id
         )

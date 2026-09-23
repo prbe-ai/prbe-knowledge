@@ -8,6 +8,10 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Changed
 
+- The post-write worker no longer makes Postgres sort its whole queue to claim one row, and
+  sweeps a workspace's expired parked edges at most every 10 minutes (it used to on every
+  row, with a query that could not use its index). Harmless on managed's near-empty queue,
+  this cost about 2 cores on research's 220k-row backlog while clearing 2 rows a second.
 - A pull request's, GitHub issue's or Linear issue's document now absorbs its bare mention
   (`owner/repo#12`, or the issue's id), so links to the mention lead to the document. This
   is the right-way-round version of the merge auto-merge used to make backwards. No model
