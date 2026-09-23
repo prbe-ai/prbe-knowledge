@@ -1,35 +1,96 @@
 """Periodic finalizer for agent-session sources (Claude Code, Codex, pi) that go idle.
 
-For each (customer, session) where the most recent ingestion_queue activity is
-older than `idle_minutes`, write a finalize.marker placeholder to R2 and
-UPSERT it into the live session row's `payload_s3_keys` array. The worker,
-on next claim, sees the marker key and triggers `session_complete=True`
-extraction (qa, code_change, decision, file_ref unit docs).
+A session is mined only once it has ENDED (engine.shared.session_signals: the
+newest key on its queue row is an end signal). Clients end their own sessions;
+this sweep ends the ones nobody did -- a hard-killed terminal, a laptop that
+never came back -- by appending a `finalize.marker` key to the live row once it
+has been idle for `idle_minutes`. The worker then mines it once.
 
-Post-migration 0026 the live session row is keyed on bare session_id (no
-`:batch_seq` suffix), and finalize is no longer a separate row — it
-coalesces into the same row as live batches via the same UPSERT path.
+A session whose newest key is ALREADY an end signal is left alone. That one
+check is the whole cost bound: the previous version asked instead whether a
+marker key was still present anywhere, while the worker deleted that key after
+mining, so every idle session was re-ended and fully re-mined once a day.
 
-Codex and pi sessions need the same finalizer treatment as Claude Code —
-all three ingest in coalescing mode where idle sessions otherwise stay
-`pending` forever. We loop over every agent-session source and write the
-marker under the source-prefixed R2 path (raw/claude_code/... vs
-raw/codex/... vs raw/pi/...) so each source's marker collides correctly
-with that source's live batches and nothing else.
+Rows are only ever UPDATED. A session with no live row has nothing to mine: the
+old INSERT path created marker-only rows that dead-lettered on "missing
+employee_id" (288 of them on research).
+
+Protocol-2 sessions are skipped here: the client journal finalizes them, and
+covering the ones it misses is a separate change.
 """
 
 from __future__ import annotations
 
-import orjson
+from datetime import UTC, datetime
 
 from engine.shared.constants import SourceSystem
 from engine.shared.db import get_pool
 from engine.shared.logging import get_logger
-from engine.shared.source_registry import ingestion_priority_for
+from engine.shared.session_signals import (
+    cron_marker_body,
+    cron_marker_key,
+    ends_v1_session_sql,
+    has_v2_key_sql,
+    last_key_sql,
+)
 from engine.shared.storage import get_store
 from kb.session_receipts import _lock
 
 log = get_logger(__name__)
+
+#: Every agent-session source ingests in coalescing mode and needs ending when
+#: idle. Each is swept on its own so the marker lands under its own R2 prefix.
+AGENT_SOURCES = (SourceSystem.CLAUDE_CODE, SourceSystem.CODEX, SourceSystem.PI)
+
+#: Idle, not already ended, protocol 1, not being processed right now. The same
+#: predicate is re-checked in the UPDATE under the per-session lock, because a
+#: batch can land between this read and that write.
+def _eligible(last_key: str) -> str:
+    return f"""
+       status IS DISTINCT FROM 'processing'
+   AND enqueued_at < NOW() - make_interval(mins => $2)
+   AND cardinality(payload_s3_keys) > 0
+   -- A pre-0026 legacy identity (`<session>:<batch>`) is not a session.
+   AND strpos(source_event_id, ':') = 0
+   AND NOT {ends_v1_session_sql(last_key)}
+   AND NOT {has_v2_key_sql()}
+"""
+
+
+#: The last key is read once per row: repeating the array subscript makes
+#: Postgres de-TOAST the whole array per reference (rows hold up to ~2,700 keys).
+_FIND_SQL = f"""
+SELECT q.queue_id, q.customer_id, q.source_event_id AS session_id, q.enqueued_at
+  FROM ingestion_queue q
+  CROSS JOIN LATERAL (SELECT {last_key_sql("q.payload_s3_keys")} AS last_key OFFSET 0) lk
+ WHERE q.source_system = $1
+   AND {_eligible("lk.last_key")}
+   AND (q.enqueued_at, q.queue_id) > ($4::timestamptz, $5::bigint)
+ ORDER BY q.enqueued_at, q.queue_id
+ LIMIT $3
+"""
+
+#: Rows that fail keep their place (oldest first), so a run pages past them
+#: until it has ENDED `limit` sessions or run out of candidates. The keyset
+#: cursor only moves forward through a finite set, so this always terminates;
+#: a page cap would let enough persistent failures starve every row behind
+#: them, run after run.
+
+#: Append the marker, return the row to the worker. Conditioned on the same
+#: eligibility, so a row that changed since it was found is skipped, not ended.
+_END_SQL = f"""
+UPDATE ingestion_queue
+   SET payload_s3_keys = payload_s3_keys || ARRAY[$3]::text[],
+       status = 'pending',
+       version = version + 1,
+       completed_at = NULL,
+       error = NULL,
+       enqueued_at = NOW()
+ WHERE queue_id = $4
+   AND source_system = $1
+   AND {_eligible(last_key_sql())}
+RETURNING queue_id
+"""
 
 
 async def enqueue_idle_session_finalizers(
@@ -38,159 +99,109 @@ async def enqueue_idle_session_finalizers(
     limit: int = 1000,
     dry_run: bool = False,
 ) -> int:
-    """Mark idle, unfinalized sessions complete so the worker mines them.
+    """End idle sessions that nobody ended, so the worker mines them once.
 
     `limit` is per source, and it is a COST bound rather than a correctness one:
-    every session this enqueues buys a full multi-segment extraction, so an
-    unbounded first run against a corpus that has never been swept is a bill
-    nobody sized. Anything not reached tonight is reached tomorrow.
+    every session this ends buys one multi-segment extraction. Anything not
+    reached this run is reached on the next.
 
-    `dry_run` counts what would be enqueued and writes nothing — the only
-    honest way to size that first run before paying for it.
-    """
-    # Find sessions where the most recent activity (across both new-format
-    # rows with bare session_id and any in-flight legacy `:batch_seq`/
-    # `:finalize` rows) is older than the idle window. The split_part
-    # collapses both shapes onto the session_id key.
-    #
-    # We additionally filter out sessions whose live row already has a
-    # finalize.marker in payload_s3_keys — that's the post-coalescing
-    # signal that the cron has already finalized this session.
-    find_sql = """
-    WITH idle_sessions AS (
-        SELECT customer_id,
-               split_part(source_event_id, ':', 1) AS session_id,
-               MAX(enqueued_at) AS last_seen
-          FROM ingestion_queue
-         WHERE source_system = $1
-         GROUP BY customer_id, session_id
-        HAVING MAX(enqueued_at) < NOW() - make_interval(mins => $2)
-    )
-    SELECT i.customer_id, i.session_id
-      FROM idle_sessions i
-      LEFT JOIN ingestion_queue q
-        ON q.customer_id = i.customer_id
-       AND q.source_system = $1
-       AND q.source_event_id = i.session_id
-     WHERE (q.queue_id IS NULL
-        OR NOT EXISTS (
-            SELECT 1 FROM unnest(q.payload_s3_keys) AS k
-            -- Already finalized, by EITHER route. Matching only the cron's own
-            -- marker was the bug: the tap's client finalize is keyed like any
-            -- other payload except that it carries no `:batch_seq` suffix
-            -- (a finalize parse_hint has no batch_seq to append), so a cleanly
-            -- ended session looked unfinished to this query forever. Every one
-            -- of them would be swept and fully re-extracted on each run, and
-            -- the first production run would do it to the entire historical
-            -- corpus at once.
-            WHERE k LIKE '%/finalize.marker'
-               OR k LIKE '%/' || i.session_id || '.json'
-        ))
-       AND NOT EXISTS (
-           SELECT 1 FROM unnest(q.payload_s3_keys) AS k
-           WHERE k LIKE '%/sessions-v2/%'
-       )
-     LIMIT $3
-    """
+    `dry_run` counts what would be ended and writes nothing.
 
-    # UPSERT the finalize.marker into the live session row. Same shape as
-    # services/ingestion/main.py:_enqueue's CC path: append marker key,
-    # bump version, refresh status, bump enqueued_at. If no live row
-    # exists for this session_id (cleanly archived sessions, or sessions
-    # that only ever had legacy `:batch_seq` rows that all completed),
-    # this INSERTs a fresh row whose payload_s3_keys contains only the
-    # marker — the worker will process it once and emit complete=True
-    # with an empty event list (no unit docs, no harm).
-    #
-    # Intentionally NOT gated by engine.ingest.connectedness:
-    # finalize markers only fire for CLAUDE_CODE / CODEX / PI, which don't
-    # have integration_tokens rows (agent sessions, no OAuth lifecycle).
-    upsert_sql = """
-    INSERT INTO ingestion_queue
-        (customer_id, source_system, source_event_id,
-         payload_s3_key, payload_s3_keys, status, priority,
-         version, enqueued_at)
-    VALUES ($1, $2, $3, $4, ARRAY[$4], 'pending', $5, 1, NOW())
-    ON CONFLICT (customer_id, source_system, source_event_id) DO UPDATE
-        SET payload_s3_keys = ingestion_queue.payload_s3_keys
-                              || EXCLUDED.payload_s3_keys,
-            status = 'pending',
-            version = ingestion_queue.version + 1,
-            completed_at = NULL,
-            error = NULL,
-            enqueued_at = NOW()
+    Returns how many sessions were ended (or would be, on a dry run).
     """
-
-    # All agent-session sources ingest in coalescing mode and need
-    # finalize markers when idle. We finalize each source independently so
-    # the R2 marker key lives under the source-prefixed namespace and
-    # collides with the right live batches.
-    AGENT_SOURCES = (SourceSystem.CLAUDE_CODE, SourceSystem.CODEX, SourceSystem.PI)
     store = get_store()
     enqueued = 0
-    total_candidates = 0
+    candidates = 0
+    skipped = 0
+    failed = 0
+    capped = False
     async with get_pool().acquire() as conn:
         seen_buckets: set[str] = set()
         for source in AGENT_SOURCES:
-            priority = ingestion_priority_for(source.value)
-            rows = await conn.fetch(find_sql, source.value, idle_minutes, limit)
-            total_candidates += len(rows)
-            for r in rows:
-                customer_id = r["customer_id"]
-                session_id = r["session_id"]
-                async with conn.transaction():
-                    await conn.execute(
-                        "SELECT set_config('app.current_customer_id', $1, true)", customer_id
-                    )
-                    await _lock(conn, customer_id, source.value, session_id)
-                    if await conn.fetchval(
-                        "SELECT 1 FROM session_streams WHERE customer_id=$1 AND source_system=$2 AND session_id=$3",
-                        customer_id,
-                        source.value,
-                        session_id,
-                    ):
+            ended_here = 0
+            after = (datetime(1970, 1, 1, tzinfo=UTC), 0)
+            while True:
+                rows = await conn.fetch(
+                    _FIND_SQL, source.value, idle_minutes, limit - ended_here, *after
+                )
+                if not rows:
+                    break
+                candidates += len(rows)
+                after = (rows[-1]["enqueued_at"], rows[-1]["queue_id"])
+                for r in rows:
+                    try:
+                        outcome = await _end_one(
+                            conn, store, seen_buckets, source, r, idle_minutes, dry_run=dry_run
+                        )
+                    except Exception as exc:
+                        # One bad row (a tenant with no bucket, an R2 error)
+                        # must not end the run, nor hold its slot: the next
+                        # page goes past it.
+                        log.warning(
+                            "session_completer.row_failed",
+                            queue_id=r["queue_id"],
+                            error=f"{type(exc).__name__}: {str(exc)[:200]}",
+                        )
+                        failed += 1
                         continue
-                    if dry_run:
+                    if outcome:
                         enqueued += 1
-                        continue
-                    bucket = await store.bucket_for(customer_id)
-                    if bucket not in seen_buckets:
-                        await store.ensure_bucket(bucket)
-                        seen_buckets.add(bucket)
-                    placeholder_key = (
-                        f"raw/{source.value}/{customer_id}/{session_id}/finalize.marker"
-                    )
-                    placeholder_body = orjson.dumps(
-                        {
-                            "device_id": "cron-finalize",
-                            "session_id": session_id,
-                            "batch_seq": -1,
-                            "cwd": None,
-                            "events": [],
-                            "finalize": True,
-                        }
-                    )
-                    await store.put(bucket, placeholder_key, placeholder_body)
-                    await conn.execute(
-                        upsert_sql,
-                        customer_id,
-                        source.value,
-                        session_id,  # bare session_id — coalescing key
-                        placeholder_key,
-                        priority,
-                    )
-                    enqueued += 1
+                        ended_here += 1
+                    else:
+                        skipped += 1
+                if ended_here >= limit:
+                    capped = True
+                    break
     log.info(
         "session_completer.run",
-        extra={
-            "idle_minutes": idle_minutes,
-            "enqueued": enqueued,
-            "candidates": total_candidates,
-            "limit": limit,
-            "dry_run": dry_run,
-            # A run that hits the cap left work behind. Silent truncation here
-            # would read as "the corpus is fully swept".
-            "capped": total_candidates >= limit,
-        },
+        idle_minutes=idle_minutes,
+        enqueued=enqueued,
+        candidates=candidates,
+        skipped=skipped,
+        failed=failed,
+        limit=limit,
+        dry_run=dry_run,
+        # A run that hits the cap left work behind. Silent truncation here
+        # would read as "the corpus is fully swept".
+        capped=capped,
     )
     return enqueued
+
+
+async def _end_one(conn, store, seen_buckets: set[str], source, r, idle_minutes: int, *, dry_run: bool) -> bool:
+    """End one idle session under its lock. False when it turned out not to
+    need ending (a v2 stream owns it, or a batch landed since it was found)."""
+    customer_id, session_id = r["customer_id"], r["session_id"]
+    async with conn.transaction():
+        await conn.execute("SELECT set_config('app.current_customer_id', $1, true)", customer_id)
+        await _lock(conn, customer_id, source.value, session_id)
+        if await has_v2_stream(conn, customer_id, source.value, session_id):
+            return False
+        if dry_run:
+            return True
+        key = cron_marker_key(source.value, customer_id, session_id)
+        # The object must exist before any row references it. One object per
+        # session, rewritten identically, so a write whose UPDATE is then
+        # skipped leaves nothing dangling.
+        bucket = await store.bucket_for(customer_id)
+        if bucket not in seen_buckets:
+            await store.ensure_bucket(bucket)
+            seen_buckets.add(bucket)
+        await store.put(bucket, key, cron_marker_body(session_id))
+        return await conn.fetchval(_END_SQL, source.value, idle_minutes, key, r["queue_id"]) is not None
+
+
+async def has_v2_stream(conn, customer_id: str, source: str, session_id: str) -> bool:
+    """A protocol-2 stream owns this session, whatever its keys look like.
+
+    `session_streams` is the authority and is FORCE RLS: the caller must hold
+    a transaction with `app.current_customer_id` set to `customer_id`.
+    """
+    return bool(
+        await conn.fetchval(
+            "SELECT 1 FROM session_streams WHERE customer_id=$1 AND source_system=$2 AND session_id=$3",
+            customer_id,
+            source,
+            session_id,
+        )
+    )

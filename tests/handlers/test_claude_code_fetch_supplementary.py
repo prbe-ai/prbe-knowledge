@@ -342,3 +342,259 @@ async def test_batches_without_any_finalize_stay_incomplete(
     hydrated = await c.fetch_supplementary(_make_event(customer, session, [key]), None)
 
     assert hydrated["session_complete"] is False
+
+
+# ---- one completion rule: the NEWEST key decides (engine.shared.session_signals)
+#
+# The session has ended when the newest key on the row is an end signal.
+# Nothing is ever consumed, so these pin both directions: an end signal on top
+# ends the session, and anything landing after it makes the session live again.
+# The second half is what stops a resumed session from re-mining per batch now
+# that the worker no longer deletes finalize keys.
+
+
+async def _put_batch(store, bucket, customer, session, seq, text="work", *, day="2026/04/29"):
+    key = f"raw/claude_code/{customer}/{day}/{session}:{seq}.json"
+    await store.put(bucket, key, _envelope(
+        session_id=session,
+        batch_seq=seq,
+        events=[{"line_no": seq, "raw": {"type": "user", "content": text}}],
+    ))
+    return key
+
+
+async def _put_client_finalize(store, bucket, customer, session, *, day="2026/04/29"):
+    key = f"raw/claude_code/{customer}/{day}/{session}.json"
+    await store.put(bucket, key, orjson.dumps({
+        "_headers": {},
+        "payload": {"finalize": True, "session_id": session, "device_id": "dev-1"},
+    }))
+    return key
+
+
+async def _put_marker(store, bucket, customer, session):
+    from engine.shared.session_signals import cron_marker_body
+
+    key = f"raw/claude_code/{customer}/{session}/finalize.marker"
+    await store.put(bucket, key, cron_marker_body(session))
+    return key
+
+
+async def _hydrate(customer, session, keys):
+    c = ClaudeCodeConnector(make_default_context())
+    return await c.fetch_supplementary(_make_event(customer, session, keys), None)
+
+
+@pytest.mark.asyncio
+async def test_a_batch_after_a_client_finalize_reopens_the_session(stub_store: _StubStore) -> None:
+    customer, session = "fs-reopen-cust", "sess-reopen"
+    bucket = await stub_store.bucket_for(customer)
+    b0 = await _put_batch(stub_store, bucket, customer, session, 0)
+    fin = await _put_client_finalize(stub_store, bucket, customer, session)
+    b1 = await _put_batch(stub_store, bucket, customer, session, 1, "resumed")
+
+    ended = await _hydrate(customer, session, [b0, fin])
+    assert ended["session_complete"] is True
+    assert ended["completed_by"] == "v1_client_finalize"
+
+    resumed = await _hydrate(customer, session, [b0, fin, b1])
+    assert resumed["session_complete"] is False
+    assert resumed["completed_by"] is None
+    # The events of every batch still reach the live document.
+    assert [e["line_no"] for e in resumed["events"]] == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_a_marker_on_top_ends_the_session_and_a_later_batch_reopens_it(
+    stub_store: _StubStore,
+) -> None:
+    customer, session = "fs-marker-cust", "sess-marker"
+    bucket = await stub_store.bucket_for(customer)
+    b0 = await _put_batch(stub_store, bucket, customer, session, 0)
+    marker = await _put_marker(stub_store, bucket, customer, session)
+    b1 = await _put_batch(stub_store, bucket, customer, session, 1, "back again")
+
+    ended = await _hydrate(customer, session, [b0, marker])
+    assert (ended["session_complete"], ended["completed_by"]) == (True, "cron_marker")
+
+    resumed = await _hydrate(customer, session, [b0, marker, b1])
+    assert resumed["session_complete"] is False
+
+    re_ended = await _hydrate(customer, session, [b0, marker, b1, marker])
+    assert (re_ended["session_complete"], re_ended["completed_by"]) == (True, "cron_marker")
+
+
+@pytest.mark.asyncio
+async def test_a_session_end_event_no_longer_ends_a_session(stub_store: _StubStore) -> None:
+    """No producer emits `session_end`, and a sticky in-stream event used to
+    certify every later pass as complete. Only end signals on top count."""
+    customer, session = "fs-sessend-cust", "sess-sessend"
+    bucket = await stub_store.bucket_for(customer)
+    key = f"raw/claude_code/{customer}/2026/04/29/{session}:0.json"
+    await stub_store.put(bucket, key, _envelope(
+        session_id=session,
+        batch_seq=0,
+        events=[
+            {"line_no": 0, "raw": {"type": "user", "content": "hi"}},
+            {"line_no": 1, "raw": {"type": "session_end"}},
+        ],
+    ))
+    hydrated = await _hydrate(customer, session, [key])
+    assert hydrated["session_complete"] is False
+
+
+def _v2_payload(session, seq, *, finalize=False, events=None):
+    body = {
+        "protocol_version": 2,
+        "session_id": session,
+        "batch_seq": seq,
+        "device_id": "dev-1",
+        "employee_id": "emp-1",
+    }
+    if finalize:
+        body["finalize"] = True
+    else:
+        body["events"] = events or [{"line_no": seq, "raw": {"type": "user", "content": f"v2 {seq}"}}]
+    return orjson.dumps({"_headers": {}, "payload": body})
+
+
+@pytest.mark.asyncio
+async def test_protocol_2_ends_on_its_sequence_and_on_a_trailing_marker_only(
+    stub_store: _StubStore,
+) -> None:
+    customer, session = "fs-v2-cust", "sess-v2"
+    bucket = await stub_store.bucket_for(customer)
+    keys = []
+    for seq, fin in ((0, False), (1, False)):
+        key = f"raw/claude_code/{customer}/sessions-v2/{session}/{seq}-d{seq}.json"
+        await stub_store.put(bucket, key, _v2_payload(session, seq, finalize=fin))
+        keys.append(key)
+    marker = await _put_marker(stub_store, bucket, customer, session)
+    fin_key = f"raw/claude_code/{customer}/sessions-v2/{session}/2-d2.json"
+    await stub_store.put(bucket, fin_key, _v2_payload(session, 2, finalize=True))
+
+    assert (await _hydrate(customer, session, keys))["session_complete"] is False
+    # The sweep's marker ends an idle v2 session while it is the newest key...
+    ended = await _hydrate(customer, session, [*keys, marker])
+    assert (ended["session_complete"], ended["completed_by"]) == (True, "cron_marker")
+    # ...and the client's own finalize ends it by sequence, in any key order.
+    finalized = await _hydrate(customer, session, [fin_key, *reversed(keys)])
+    assert (finalized["session_complete"], finalized["completed_by"]) == (True, "v2_finalize")
+    # A marker that a later v2 batch landed on top of no longer counts.
+    late = f"raw/claude_code/{customer}/sessions-v2/{session}/2-late.json"
+    await stub_store.put(bucket, late, _v2_payload(session, 2))
+    assert (await _hydrate(customer, session, [*keys, marker, late]))["session_complete"] is False
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_newest_key_does_not_end_the_session(stub_store: _StubStore) -> None:
+    customer, session = "fs-garbage-cust", "sess-garbage"
+    bucket = await stub_store.bucket_for(customer)
+    fin = await _put_client_finalize(stub_store, bucket, customer, session)
+    junk = f"raw/claude_code/{customer}/2026/04/29/{session}:9.json"
+    await stub_store.put(bucket, junk, b"not json")
+    assert (await _hydrate(customer, session, [fin, junk]))["session_complete"] is False
+
+
+# ---- late delivery vs resume after a protocol-1 client finalize -------------
+#
+# The tap retries a failed batch with backoff while the finalize queued behind
+# it goes out first. A batch WRITTEN before the goodbye that ARRIVES after it
+# is late delivery, and the session has still ended. A batch written after it
+# is a resume. The transcript lines' own timestamps tell the two apart.
+
+
+async def _put_timed_batch(store, bucket, customer, session, seq, written_at):
+    key = f"raw/claude_code/{customer}/2026/04/29/{session}:{seq}.json"
+    await store.put(bucket, key, _envelope(
+        session_id=session,
+        batch_seq=seq,
+        events=[{"line_no": seq, "raw": {"type": "user", "content": "x", "timestamp": written_at}}],
+    ))
+    return key
+
+
+async def _put_timed_finalize(store, bucket, customer, session, received_at):
+    key = f"raw/claude_code/{customer}/2026/04/29/{session}.json"
+    await store.put(bucket, key, orjson.dumps({
+        "_headers": {},
+        "payload": {"finalize": True, "session_id": session, "device_id": "dev-1"},
+        "received_at": received_at,
+    }))
+    return key
+
+
+@pytest.mark.asyncio
+async def test_a_batch_written_before_the_goodbye_but_delivered_after_it_still_ends(
+    stub_store: _StubStore,
+) -> None:
+    customer, session = "fs-late-cust", "sess-late"
+    bucket = await stub_store.bucket_for(customer)
+    b0 = await _put_timed_batch(stub_store, bucket, customer, session, 0, "2026-04-29T10:00:00Z")
+    fin = await _put_timed_finalize(stub_store, bucket, customer, session, "2026-04-29T10:05:00+00:00")
+    late = await _put_timed_batch(stub_store, bucket, customer, session, 1, "2026-04-29T10:04:30Z")
+    hydrated = await _hydrate(customer, session, [b0, fin, late])
+    assert (hydrated["session_complete"], hydrated["completed_by"]) == (True, "v1_client_finalize")
+    assert [e["line_no"] for e in hydrated["events"]] == [0, 1], "the late tail is mined too"
+
+
+@pytest.mark.asyncio
+async def test_a_quick_resume_is_not_mistaken_for_late_delivery(stub_store: _StubStore) -> None:
+    """A resume writes lines AFTER the goodbye. Treating it as late delivery
+    would re-mine the session on every batch of the resume."""
+    customer, session = "fs-resume-cust", "sess-quick-resume"
+    bucket = await stub_store.bucket_for(customer)
+    b0 = await _put_timed_batch(stub_store, bucket, customer, session, 0, "2026-04-29T10:00:00Z")
+    fin = await _put_timed_finalize(stub_store, bucket, customer, session, "2026-04-29T10:05:00+00:00")
+    resumed = await _put_timed_batch(stub_store, bucket, customer, session, 1, "2026-04-29T10:08:00Z")
+    assert (await _hydrate(customer, session, [b0, fin, resumed]))["session_complete"] is False
+
+
+@pytest.mark.asyncio
+async def test_undated_lines_are_ignored_and_a_fast_client_clock_is_allowed(stub_store: _StubStore) -> None:
+    """Claude Code writes some undated lines; one must not turn a retry into a
+    'resume' (on a plane with no idle sweep, that session would never be
+    mined). A client clock a minute or so fast is within the allowance."""
+    customer, session = "fs-undated-ok-cust", "sess-undated-ok"
+    bucket = await stub_store.bucket_for(customer)
+    b0 = await _put_timed_batch(stub_store, bucket, customer, session, 0, "2026-04-29T10:00:00Z")
+    fin = await _put_timed_finalize(stub_store, bucket, customer, session, "2026-04-29T10:05:00+00:00")
+    key = f"raw/claude_code/{customer}/2026/04/29/{session}:1.json"
+    await stub_store.put(bucket, key, _envelope(session_id=session, batch_seq=1, events=[
+        {"line_no": 1, "raw": {"type": "summary", "summary": "no timestamp on this kind of line"}},
+        {"line_no": 2, "raw": {"type": "user", "content": "x", "timestamp": "2026-04-29T10:06:30Z"}},
+    ]))
+    hydrated = await _hydrate(customer, session, [b0, fin, key])
+    assert (hydrated["session_complete"], hydrated["completed_by"]) == (True, "v1_client_finalize")
+
+
+@pytest.mark.asyncio
+async def test_a_late_batch_with_no_dated_line_is_judged_by_when_it_arrived(stub_store: _StubStore) -> None:
+    customer, session = "fs-arrival-cust", "sess-arrival"
+    bucket = await stub_store.bucket_for(customer)
+    b0 = await _put_timed_batch(stub_store, bucket, customer, session, 0, "2026-04-29T10:00:00Z")
+    fin = await _put_timed_finalize(stub_store, bucket, customer, session, "2026-04-29T10:05:00+00:00")
+
+    async def undated(seq, arrived):
+        key = f"raw/claude_code/{customer}/2026/04/29/{session}:{seq}.json"
+        await stub_store.put(bucket, key, orjson.dumps({
+            "_headers": {}, "received_at": arrived,
+            "payload": {"session_id": session, "batch_seq": seq,
+                        "events": [{"line_no": seq, "raw": {"type": "summary"}}]},
+        }))
+        return key
+
+    soon = await undated(1, "2026-04-29T10:12:00+00:00")
+    assert (await _hydrate(customer, session, [b0, fin, soon]))["session_complete"] is True
+    later = await undated(2, "2026-04-29T11:00:00+00:00")
+    assert (await _hydrate(customer, session, [b0, fin, later]))["session_complete"] is False
+
+
+@pytest.mark.asyncio
+async def test_an_undatable_late_batch_counts_as_a_resume(stub_store: _StubStore) -> None:
+    customer, session = "fs-undated-cust", "sess-undated"
+    bucket = await stub_store.bucket_for(customer)
+    b0 = await _put_timed_batch(stub_store, bucket, customer, session, 0, "2026-04-29T10:00:00Z")
+    fin = await _put_timed_finalize(stub_store, bucket, customer, session, "2026-04-29T10:05:00+00:00")
+    undated = await _put_batch(stub_store, bucket, customer, session, 1, "no timestamp")
+    assert (await _hydrate(customer, session, [b0, fin, undated]))["session_complete"] is False

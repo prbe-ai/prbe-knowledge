@@ -6,6 +6,39 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Fixed
+
+- Idle coding-agent sessions are no longer re-mined every day. The hourly idle sweep treated
+  a session as finished only while its end-of-session marker was still on the queue row, and
+  the worker deleted that marker after mining it, so every idle protocol-1 session was ended
+  and fully re-extracted once a day: on research, about 5,000 re-mines a day and nearly all
+  of a $2,800/month extraction bill. A session now counts as ended exactly when the newest
+  thing on its row is an end signal (a client finalize or the sweep's marker); nothing is
+  deleted, and the sweep and the worker share that one rule. A session that resumes is live
+  again and is mined once more when it next ends.
+- The idle sweep only ends sessions that already have a queue row, re-checks under the
+  session lock that no batch landed since it looked, and skips rows being processed. It no
+  longer creates marker-only rows, which dead-lettered on "missing employee_id".
+- A protocol-1 batch written before the client's finalize but delivered after it (the tap
+  retries a failed batch while the finalize behind it goes out first) no longer reopens the
+  session; the transcript lines' own timestamps tell a late delivery from a resume.
+- New batches for a session that is being processed no longer free its queue row for a
+  second worker, which mined the same session twice.
+- One failing row no longer stops the idle sweep; it is counted and the run pages past it.
+- A mining pass whose model call answered in prose instead of the tool now logs
+  `claude_code_extraction.tool_declined`; it was the one partial-extraction path that left
+  no trace.
+
+### Added
+
+- `claude_code_extraction.pass`: one log line per mining pass with what ended the session,
+  segments, model calls, whether the pass was complete, what went wrong, units, and a short
+  hash of each segment (repeats across passes show what a per-segment cache would save).
+- `scripts/backfill_finalize_markers.py`: one-time repair that puts the end marker back on
+  sessions already mined under the old rule, only where the queue row proves a complete
+  mine, so the first sweep after this deploy does not mine them all again. Dry-run first,
+  `--customer` for a one-tenant canary.
+
 ### Changed
 
 - The post-write worker no longer makes Postgres sort its whole queue to claim one row, and

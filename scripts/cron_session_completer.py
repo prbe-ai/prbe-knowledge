@@ -1,31 +1,23 @@
-"""Finalize agent sessions (Claude Code, Codex) whose client never said goodbye.
+"""End agent sessions (Claude Code, Codex, pi) whose client never said goodbye.
 
-Writes a finalize.marker into each idle session's live queue row. The worker,
-on next claim, sees the marker and runs the `session_complete=True` path —
-which is the ONLY thing that produces the qa / code_change / decision /
-file_ref unit docs. A session that is never finalized is captured but never
-mined.
+Appends a finalize.marker key to each idle session's live queue row. The worker,
+on next claim, sees an end signal on top of the row and mines the session once
+-- which is the ONLY thing that produces the qa / code_change / decision /
+file_ref / directive unit docs. A session that is never ended is captured but
+never mined.
 
-TWO SCHEDULES, ONE SCRIPT
--------------------------
-The tap sends an explicit finalize when a session ends cleanly, so the common
-case needs nothing here. This script is the backstop for the cases that leave
-no goodbye at all: a hard-killed terminal, a laptop that slept and never woke,
-a crashed daemon, a machine that lost the network before its last drain.
+The tap ends a session itself when it ends cleanly or when Claude Code dies
+under it, so the common case needs nothing here. This is the backstop for the
+cases that leave no goodbye at all: a laptop that slept and never woke, a
+machine that lost the network before its last drain.
 
-* NIGHTLY SWEEP (`--idle-minutes 360`, knowledge-cron.yml) — the safety net.
-  Six hours is deliberately far above any think-time gap: a session a
-  researcher is still using between meetings must not be finalized out from
-  under them, because a session that re-activates after finalize re-runs the
-  extraction LLM on every subsequent batch (the marker key is sticky, so
-  `complete` stays true forever after).
-* FAST CADENCE (no flag → `claude_code_session_idle_minutes`, default 5) —
-  what a per-minute runner would use if one is ever added. Left as the default
-  so the flagless invocation keeps its historical meaning.
-
-Idempotent: sessions whose live row already carries a finalize.marker are
-filtered out by the finder query, so re-running is free and a nightly sweep
-cannot double-charge the extractor.
+Two schedules run it: research hourly with `--idle-minutes 1440` (a CronJob in
+research-os), and the managed plane nightly with 360 (session-finalizer-nightly.yml,
+opt-in via SESSION_FINALIZER_ENABLED). A session that resumes after
+being ended is simply live again (the end signal is no longer the newest key),
+and is re-ended and re-mined once when it next goes idle. Sessions whose newest
+key is already an end signal are skipped, so re-running is free: the sweep ends
+each idle session once, not once per run.
 """
 from __future__ import annotations
 
@@ -35,6 +27,9 @@ import asyncio
 from engine.shared.config import get_settings
 from engine.shared.db import init_pool
 from kb.session_completer import enqueue_idle_session_finalizers
+
+#: Same floor as session-finalizer-nightly.yml.
+MIN_IDLE_MINUTES = 60
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -55,7 +50,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Cap on sessions finalized per source per run. Every one buys a "
             "full multi-segment extraction, so this is a cost bound. Work not "
-            "reached tonight is reached tomorrow."
+            "reached this run is reached on the next."
         ),
     )
     parser.add_argument(
@@ -76,7 +71,7 @@ def resolve_idle_minutes(explicit: int | None) -> int:
 
     Split out so the precedence is testable without a live pool — getting this
     backwards would silently finalize live sessions at the 5-minute default
-    during a nightly run.
+    during a scheduled run.
     """
     if explicit is not None:
         return explicit
@@ -88,6 +83,14 @@ async def _main(argv: list[str] | None = None) -> None:
     await init_pool()
     try:
         idle_minutes = resolve_idle_minutes(args.idle_minutes)
+        if idle_minutes < MIN_IDLE_MINUTES:
+            # Ending a session mines it. A short window ends sessions people
+            # have only paused, and every pause then costs a full re-mine.
+            raise SystemExit(
+                f"refusing --idle-minutes {idle_minutes}: below {MIN_IDLE_MINUTES}. "
+                "The settings default (claude_code_session_idle_minutes) is for "
+                "tests; production passes the window explicitly."
+            )
         n = await enqueue_idle_session_finalizers(
             idle_minutes, limit=args.limit, dry_run=args.dry_run
         )

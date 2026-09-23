@@ -409,11 +409,13 @@ async def test_a_shrinking_re_extraction_retires_its_orphans(
 async def test_a_resumed_session_does_not_re_extract(
     live_db: None, settings: Settings, monkeypatch
 ) -> None:
-    """`payload_s3_keys` is append-only, which is right for batches and wrong
-    for a signal. Leaving the finalize key in the array made every later batch
-    of a RESUMED session look complete again and buy another full
-    multi-segment extraction — ~4.6 model calls and ~219k input tokens a time,
-    bounded only by how fast batches arrive.
+    """A session has ended only while an end signal is the NEWEST key on its
+    row (engine.shared.session_signals). When the session resumes, the old
+    finalize is buried under the new batch and stops counting -- without
+    anything being deleted. Counting a finalize ANYWHERE in the row made every
+    later batch of a resumed session buy another full multi-segment extraction
+    (~4.6 model calls and ~219k input tokens a time); deleting it instead is
+    what let the idle sweep re-end and re-mine every session daily.
     """
     customer = "resume-e2e-cust"
     session_id = f"sess-resume-{uuid.uuid4()}"
@@ -445,7 +447,10 @@ async def test_a_resumed_session_does_not_re_extract(
     hdr = {"X-Internal-Knowledge-Key": "test-internal-key", "X-Prbe-Customer": customer}
     internal = {"X-Internal-Knowledge-Key": "test-internal-key"}
 
-    async def post_batch(seq: int) -> None:
+    async def post_batch(seq: int, written_at: str | None = None) -> None:
+        raw = {"type": "user", "message": {"content": f"turn {seq}"}}
+        if written_at:
+            raw["timestamp"] = written_at
         async with (
             httpx.AsyncClient(transport=transport, base_url="http://t") as client,
             app.router.lifespan_context(app),
@@ -453,8 +458,7 @@ async def test_a_resumed_session_does_not_re_extract(
             await client.post("/webhooks/claude_code", json={
                 "device_id": device_id, "session_id": session_id, "batch_seq": seq,
                 "cwd": "/tmp", "employee_id": "emp",
-                "events": [{"line_no": seq, "raw": {"type": "user", "message":
-                            {"content": f"turn {seq}"}}}],
+                "events": [{"line_no": seq, "raw": raw}],
             }, headers=hdr)
 
     async def post_finalize() -> None:
@@ -505,13 +509,32 @@ async def test_a_resumed_session_does_not_re_extract(
     await drain()
     assert calls["n"] == 1, "the finalize should mine the session once"
 
-    # The session RESUMES: same id, a new batch. It must not be mined again
-    # just because a finalize key from last time is still lying around.
+    # The session RESUMES: same id, a new batch, lines written after the
+    # goodbye. It must not be mined again just because a finalize key from last
+    # time is still lying around.
+    from datetime import timedelta
+
     await close_pool()
-    await post_batch(1)
+    await post_batch(1, (datetime.now(UTC) + timedelta(minutes=10)).isoformat())
     await init_pool(settings)
     await drain()
     assert calls["n"] == 1, (
         f"a resumed session re-extracted ({calls['n']} passes) — the finalize "
         "key was replayed"
     )
+
+    # The finalize is still on the row: nothing was consumed.
+    async with raw_conn() as conn:
+        keys = await conn.fetchval(
+            "SELECT payload_s3_keys FROM ingestion_queue "
+            "WHERE customer_id = $1 AND source_event_id = $2",
+            customer, session_id,
+        )
+    assert sum(1 for k in keys if k.endswith(f"/{session_id}.json")) == 1
+
+    # And when the resumed session ends again, it is mined exactly once more.
+    await close_pool()
+    await post_finalize()
+    await init_pool(settings)
+    await drain()
+    assert calls["n"] == 2, f"the second ending should mine once more, got {calls['n']}"

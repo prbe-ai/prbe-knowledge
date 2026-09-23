@@ -736,3 +736,120 @@ async def test_pi_agent_label_reaches_the_extraction_system_prompt(monkeypatch) 
     system_message = fake.await_args.kwargs["messages"][0]["content"]
     assert "one pi session" in system_message
     assert "coding agent" not in system_message
+
+
+# ---- what makes a bundle non-authoritative, and what a pass reports ---------
+#
+# `authoritative` decides whether a pass may retire a session's existing units
+# (kb/handlers/claude_code.py). Each way of losing part of a session must flip
+# it, and must say why: the per-pass log line reads `problems`.
+
+
+def _declined_response() -> SimpleNamespace:
+    """The model answered in prose instead of calling the tool."""
+    message = SimpleNamespace(content="I'd rather not.", tool_calls=[])
+    choice = SimpleNamespace(message=message, finish_reason="stop")
+    return SimpleNamespace(choices=[choice], usage=None)
+
+
+def _units(**overrides) -> dict:
+    return {"qa": [], "code_change": [], "decision": [], "file_ref": [], **overrides}
+
+
+@pytest.mark.asyncio
+async def test_a_declined_tool_call_is_non_authoritative_and_logged(monkeypatch) -> None:
+    import structlog
+
+    from engine.shared import claude_code_extraction as ext_mod
+
+    async def decline(**kwargs):
+        return _declined_response()
+
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", decline)
+    with structlog.testing.capture_logs() as logs:
+        bundle = await ext_mod.extract_units_from_session(
+            session_id="s-declined", events=[_user("hello", 0)]
+        )
+    assert bundle.authoritative is False
+    assert bundle.problems == ["tool_declined"]
+    assert bundle.calls == 1 and bundle.segments == 1 and len(bundle.segment_hashes) == 1
+    warned = [e for e in logs if e["event"] == "claude_code_extraction.tool_declined"]
+    assert len(warned) == 1 and warned[0]["session_id"] == "s-declined"
+    assert warned[0]["log_level"] == "warning"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_segment_makes_the_bundle_non_authoritative(monkeypatch) -> None:
+    from engine.shared import claude_code_extraction as ext_mod
+
+    calls = {"n": 0}
+
+    async def flaky(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("gateway timeout")
+        return _litellm_tool_response("emit_units", _units(qa=[{"prompt": "ok", "outcome": "o"}]))
+
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", flaky)
+    bundle = await ext_mod.extract_units_from_session(
+        session_id="s", events=[_user("first", 0), _boundary(1), _user("second", 2)]
+    )
+    assert bundle.authoritative is False
+    assert bundle.problems == ["segment_failed"]
+    assert bundle.segments == 2 and bundle.calls == 2
+
+
+def test_the_cap_keeps_the_latest_segments() -> None:
+    """A pathological session keeps its LAST _MAX_SEGMENTS parts: the
+    conclusion matters most."""
+    from engine.shared import claude_code_extraction as ext_mod
+
+    events = []
+    for i in range(ext_mod._MAX_SEGMENTS + 3):
+        events += [_boundary(2 * i), _user(f"part {i}", 2 * i + 1)]
+    segments, capped = ext_mod._segment_session(events)
+    assert capped is True
+    assert len(segments) == ext_mod._MAX_SEGMENTS
+    assert segments[-1][0][-1] is events[-1]
+    assert all(seg[0][0]["line_no"] >= 6 for seg in segments), "the earliest parts are the ones dropped"
+
+
+@pytest.mark.asyncio
+async def test_a_capped_session_is_non_authoritative(monkeypatch) -> None:
+    from engine.shared import claude_code_extraction as ext_mod
+
+    async def ok(**kwargs):
+        return _litellm_tool_response("emit_units", _units())
+
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", ok)
+    monkeypatch.setattr(ext_mod, "_MAX_SEGMENTS", 2)
+    events = [_user("a", 0), _boundary(1), _user("b", 2), _boundary(3), _user("c", 4)]
+    bundle = await ext_mod.extract_units_from_session(session_id="s", events=events)
+    assert bundle.authoritative is False and bundle.problems == ["capped"]
+    assert bundle.segments == 2 and bundle.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_a_pass_reports_its_calls_and_stable_segment_hashes(monkeypatch) -> None:
+    """Hashes repeat across passes for an unchanged segment, and only there:
+    that is what sizes a per-segment cache from logs alone. The supersession
+    call counts as a call when it is made."""
+    from engine.shared import claude_code_extraction as ext_mod
+
+    async def fake(**kwargs):
+        if kwargs["tool_choice"]["function"]["name"] == "emit_supersessions":
+            return _litellm_tool_response("emit_supersessions", {"links": []})
+        return _litellm_tool_response("emit_units", _units(decision=[
+            {"question": "q", "options_considered": ["a"], "chosen": "a", "rationale": "r"},
+        ]))
+
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake)
+    first = [_user("stable start", 0), _boundary(1), _user("tail v1", 2)]
+    grown = [_user("stable start", 0), _boundary(1), _user("tail v1", 2), _user("tail v2", 3)]
+    a = await ext_mod.extract_units_from_session(session_id="s", events=first)
+    b = await ext_mod.extract_units_from_session(session_id="s", events=grown)
+    assert a.authoritative and a.problems == []
+    assert a.segments == 2 and a.calls == 3, "two segments plus one supersession pass"
+    assert a.segment_hashes[0] == b.segment_hashes[0], "an unchanged segment hashes the same"
+    assert a.segment_hashes[1] != b.segment_hashes[1], "a grown tail does not"
+    assert all(len(h) == 16 for h in a.segment_hashes + b.segment_hashes)

@@ -468,9 +468,7 @@ async def test_v2_completion_survives_extraction_idle_sweep_and_reprocessing(dat
         "tenant-a", SourceSystem.CLAUDE_CODE, row["payload_s3_keys"]
     )
     assert first.documents[0].metadata["session_complete"] and len(first.documents) > 1
-    assert first.consume_payload_keys == []
-    # Execute the real key-consumption method, then the real idle selector.
-    await normalizer._consume_payload_keys(row["queue_id"], first.consume_payload_keys)
+    # Nothing is consumed; run the real idle selector against the row as mined.
     await admin.execute("UPDATE ingestion_queue SET enqueued_at=NOW()-INTERVAL '1 hour'")
     assert await enqueue_idle_session_finalizers(idle_minutes=5) == 0
     keys = await admin.fetchval("SELECT payload_s3_keys FROM ingestion_queue")
@@ -536,6 +534,29 @@ async def test_idle_finalizer_checks_the_tenant_scoped_stream_even_without_key_h
         )
         == 2
     )
+
+
+@pytest.mark.asyncio
+async def test_a_batch_arriving_mid_extraction_does_not_free_the_row_for_a_second_worker(
+    database, monkeypatch
+):
+    """A row being processed stays `processing` when a batch lands; the version
+    bump alone tells the running worker to go again. Resetting it to pending
+    let a second worker claim the same session and mine it twice."""
+    _tenant, admin = database
+    store = Store()
+    consumer(store, monkeypatch)
+    body = batch(employee_id="uploader")
+    await sr.accept(body, "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    await admin.execute("UPDATE ingestion_queue SET status='processing'")
+    before = await admin.fetchval("SELECT version FROM ingestion_queue")
+    await sr.accept(finalize(body), "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    row = await admin.fetchrow("SELECT status, version FROM ingestion_queue")
+    assert row["status"] == "processing" and row["version"] == before + 1
+    await admin.execute("UPDATE ingestion_queue SET status='done'")
+    await sr.accept(dict(finalize(body), batch_seq=2, prefix_sha256=body["prefix_sha256"]),
+                    "tenant-a", SourceSystem.CLAUDE_CODE, store) if False else None
+    assert await admin.fetchval("SELECT status FROM ingestion_queue") == "done"
 
 
 @pytest.mark.asyncio

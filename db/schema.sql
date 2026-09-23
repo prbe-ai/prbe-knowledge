@@ -681,7 +681,7 @@ CREATE TABLE ingestion_queue (
     version              INT NOT NULL DEFAULT 0,
     enqueued_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     -- When the work ARRIVED. `enqueued_at` is bumped by every transcript
-    -- batch (session_completer reads MAX(enqueued_at) as an idle signal), so
+    -- batch (session_completer reads it as an idle signal), so
     -- an active session looks permanently young and a queue that is not
     -- draining reads as a queue with nothing old in it. Set once, on insert.
     first_enqueued_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),

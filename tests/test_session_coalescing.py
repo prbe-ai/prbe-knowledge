@@ -8,7 +8,7 @@ Pins the four launch-readiness invariants:
    is bumped to N. Other connectors keep one-row-per-event semantics.
 
 2. **Priority deprioritization**: claude_code rows are inserted at
-   priority=75 (vs 100 for live webhooks); the worker's claim ORDER
+   priority=PRIORITY_AGENT_CAPTURE (60, below live integrations at 75); the worker's claim ORDER
    BY puts a github row ahead of a CC row when both are pending.
 
 3. **Resurrection**: a session that completed (status='done') gets
@@ -34,7 +34,12 @@ from engine.shared import claude_code_extraction as _ext
 from engine.shared import db as db_module
 from engine.shared.claude_code_extraction import UnitBundle
 from engine.shared.config import Settings
-from engine.shared.constants import EMBEDDING_V2_DIM, SourceSystem
+from engine.shared.constants import (
+    EMBEDDING_V2_DIM,
+    PRIORITY_AGENT_CAPTURE,
+    PRIORITY_LIVE_INTEGRATION,
+    SourceSystem,
+)
 from engine.shared.customer_mapping import record_mapping
 from engine.shared.embeddings import EmbeddedChunk, EmbedResult
 from engine.shared.encryption import encrypt_token
@@ -187,7 +192,7 @@ async def test_three_batches_coalesce_to_one_row(live_db) -> None:
         f"expected exact key array {keys}, got {list(row['payload_s3_keys'])}"
     )
     assert row["version"] == 3, f"expected version=3 after 3 UPSERTs, got {row['version']}"
-    assert row["priority"] == 75, "claude_code priority must be 75"
+    assert row["priority"] == PRIORITY_AGENT_CAPTURE, "claude_code is an agent capture"
 
 
 # ---- 2. priority ordering ---------------------------------------------------
@@ -228,7 +233,7 @@ async def test_github_claims_before_cc_at_same_pending_state(live_db) -> None:
     claimed = await worker._claim_one()
     assert claimed is not None
     assert claimed["source_system"] == "github", (
-        f"github (priority=100) must claim before CC (priority=75); "
+        f"github (a live integration) must claim before CC (an agent capture); "
         f"got source={claimed['source_system']}"
     )
 
@@ -418,7 +423,7 @@ async def test_slack_still_uses_one_row_per_event(live_db) -> None:
 
     assert len(rows) == 3, f"slack must keep one row per event, got {len(rows)}"
     for r in rows:
-        assert r["priority"] == 100, "slack priority stays at 100"
+        assert r["priority"] == PRIORITY_LIVE_INTEGRATION, "slack is a live integration"
         assert r["version"] == 0, "slack rows don't bump version (no UPSERT)"
         assert len(r["payload_s3_keys"]) == 1, "slack payload_s3_keys is single-element"
 

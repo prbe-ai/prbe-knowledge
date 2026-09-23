@@ -1018,8 +1018,8 @@ async def _enqueue(
                         completed_at = NULL,
                         error = NULL,
                         -- Bump enqueued_at to reflect most-recent activity so
-                        -- session_completer's MAX(enqueued_at) tracks idle
-                        -- correctly. Side effect: chatty sessions get pushed
+                        -- session_completer's idle check (the row's
+                        -- enqueued_at) tracks idle correctly. Side effect: chatty sessions get pushed
                         -- to the back of the priority tier within CC, which
                         -- is intentional — quieter sessions drain first.
                         enqueued_at = NOW()

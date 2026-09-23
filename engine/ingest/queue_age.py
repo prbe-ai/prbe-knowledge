@@ -11,8 +11,8 @@ its normal rate is exactly as alive as one that is keeping up.
 
 WHY NOT `enqueued_at`
 ---------------------
-Every transcript batch bumps `enqueued_at` (session_completer reads
-MAX(enqueued_at) as an idle signal), so an actively-batching session looks
+Every transcript batch bumps `enqueued_at` (session_completer reads it as an
+idle signal), so an actively-batching session looks
 permanently young. Age measured that way reports zero on precisely the workload
 that is filling the queue. `first_enqueued_at` is stamped once on insert.
 

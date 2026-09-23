@@ -149,8 +149,10 @@ class Settings(BaseSettings):
     #: at all, losing data to save money.
     #:
     #: Turning this off keeps capture and indexing fully intact and skips only
-    #: the mining. Sessions are left un-finalized rather than marked done, so
-    #: turning it back on re-mines them instead of leaving a silent hole.
+    #: the mining: no units are written and none are retired. A session that
+    #: ends while it is off keeps its end signal on top of its queue row
+    #: (engine/shared/session_signals.py), so turning it back on does NOT
+    #: re-mine it by itself -- that session is mined again when it next ends.
     claude_code_extraction_enabled: bool = Field(default=True)
 
     #: Honour `QueryRequest.recall_floor_mode="conditional"`. OFF by default.
