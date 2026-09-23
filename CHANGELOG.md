@@ -35,8 +35,10 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   the source view served nothing for them. The body and pre-chunked pieces are now scrubbed as
   free text: a value that would collapse is scrubbed line by line (the tap scanner still sees
   the whole text first), so a finding costs its own line. Values that do not collapse are
-  scrubbed exactly as before. Already-collapsed documents need a forced re-chunk; the
-  unchanged content hash makes a plain re-queue a no-op.
+  scrubbed exactly as before. Already-collapsed documents need a forced re-chunk (the
+  unchanged content hash makes a plain re-queue a no-op): `scripts/rechunk_collapsed_sessions.py`
+  re-renders each from R2, re-chunks it through the fixed scrub without mining, and writes
+  nothing but chunks. Dry run by default; `--write` applies.
 - A coding-agent session whose last mining pass was partial (a segment failed, the segment
   cap hit, the model declined the tool, or extraction was switched off) is no longer treated
   as mined for good. The worker records how every complete pass went on the session's queue
