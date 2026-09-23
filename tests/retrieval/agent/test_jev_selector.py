@@ -991,6 +991,8 @@ def test_penalty_decides_near_ties_only():
     assert [r.doc_id for r in ranked] == [SESSION, RUN, COMMIT]
     # the carried score is still Jev's raw probability, not the penalised one
     assert [r.score for r in ranked] == [0.91, 0.53, 0.55]
+    # and each row carries the tier the order used
+    assert [r.tier for r in ranked] == [3, 0, 2]
 
 
 def test_a_transcript_barely_ahead_of_a_run_drops_behind_it():
@@ -1076,6 +1078,8 @@ def test_source_system_from_any_chunk_of_the_document():
     ("notion:t:page-1", "notion", 1),
     ("slack:t:C1:ts", "slack", 1),
     ("manual_upload:t:f", "manual_upload", 1),
+    ("sentry:t:issue-1", "sentry", 2),
+    ("pagerduty:t:inc-1", "pagerduty", 2),
 ])
 def test_doc_kind_table(doc_id, kind, tier):
     assert jev.doc_kind(doc_id) == kind
@@ -1114,7 +1118,8 @@ def test_best_probability_is_independent_of_the_penalised_order():
     # the rewrite trigger and confidence band must see 0.50, not 0.39
     assert [r.doc_id for r in ranked] == [RUN, SESSION]
     assert jev.best_probability(scores) == 0.50
-    assert jev.best_probability({}) is None
+    assert jev.delivered_best(ranked) == 0.50
+    assert jev.best_probability({}) is None and jev.delivered_best([]) is None
 
 
 @pytest.mark.asyncio
@@ -1162,3 +1167,11 @@ async def test_confidence_describes_the_delivered_set_not_the_pool(monkeypatch):
     assert SESSION not in delivered and len(delivered) == 10
     summary = [e for e in logs if e.get("event") == "agent.query_summary"]
     assert summary and summary[-1]["confidence"] == "medium"  # best delivered 0.646
+
+
+def test_the_agent_source_list_is_shared_with_ingest():
+    from engine.ingest import normalizer
+    from engine.shared.constants import AGENT_SESSION_SOURCES
+
+    assert normalizer._AGENT_SESSION_SOURCES is AGENT_SESSION_SOURCES
+    assert frozenset(str(x) for x in AGENT_SESSION_SOURCES) == jev._AGENT_SOURCES

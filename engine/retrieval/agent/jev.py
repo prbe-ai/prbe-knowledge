@@ -505,6 +505,9 @@ class RankedDoc:
     doc_id: str
     chunk_id: str
     score: float
+    #: The tier the ORDER used (JEV_TIER_PENALTIES index); recorded in the
+    #: trace so the penalised order can be read back without re-deriving it.
+    tier: int = 2
 
 
 #: Kind -> tier (see JEV_TIER_PENALTIES). The kind is read off the doc id, the
@@ -522,7 +525,9 @@ class RankedDoc:
 #: id can buy is the tier-3-to-tier-0 gap, 0.12 probability points.
 _AGENT_SOURCES = frozenset(str(x) for x in AGENT_SESSION_SOURCES)
 _TIER_OF_KIND: dict[str, int] = {
-    # 0: the records Probe owns
+    # 0: the records Probe owns. `paper` is here by product ruling (Richard,
+    #    2026-09-23: "run/proj/paper" first) although the sizing study judged
+    #    papers useful only 44% of the time when they reached the top ten.
     "run": 0, "trial": 0, "project": 0, "group": 0, "paper": 0, "team_note": 0, "experiment": 0,
     # 1: authored records: GitHub (kb/handlers/github.py spells a PR `pr`) and
     #    the other connectors whose documents a person wrote (tickets, pages,
@@ -530,8 +535,11 @@ _TIER_OF_KIND: dict[str, int] = {
     #    for those, so their SourceSystem values are the keys.
     "gh_pr": 1, "gh_issue": 1, "gh_review": 1, "gh_release": 1,
     "gh_feature_rationale": 1, "gh_codeowners": 1, "gh_commit_comment": 1,
-    "linear": 1, "notion": 1, "slack": 1, "granola": 1, "sentry": 1,
-    "manual_upload": 1, "incident_io": 1, "pagerduty": 1,
+    #    Not in Probe's corpora and unsized (docs/plans/jev-postsort-tiers-sizing.md
+    #    covers the research-plane kinds only): tickets, pages, messages,
+    #    meeting notes and uploads a person wrote. Machine-generated sources
+    #    (sentry, pagerduty, incident_io) stay at the tier-2 default.
+    "linear": 1, "notion": 1, "slack": 1, "granola": 1, "manual_upload": 1,
     # 2: high volume
     "gh_commit": 2, "file": 2, "code": 2,
     # 3: coding-agent session derivatives
@@ -613,24 +621,37 @@ def rank_documents(
         if doc not in best or s > best[doc].score:
             best[doc] = RankedDoc(doc_id=doc, chunk_id=cid, score=s)
 
+    for r in best.values():
+        r.tier = doc_tier(r.doc_id, source.get(r.doc_id))
+
     def penalised(r: RankedDoc) -> float:
         # Rounded so that a tie ON PAPER (0.66 - 0.08 vs 0.58) is a tie in
         # floats too, and pool order breaks it as documented.
-        return round(r.score - penalties[doc_tier(r.doc_id, source.get(r.doc_id))], 9)
+        return round(r.score - penalties[r.tier], 9)
 
     ranked = sorted(best.values(), key=lambda r: (-penalised(r), order[r.doc_id]))
     return ranked[:limit]
 
 
 def best_probability(scores: dict[str, float]) -> float | None:
-    """Jev's highest probability in the pool, independent of the delivered ORDER.
+    """Jev's highest probability in the POOL, independent of the delivered order.
 
-    `rank_documents` subtracts a tier penalty before ordering, so its first
-    document is not always the best-rated one. The rewrite trigger and the
-    confidence band are about Jev's judgment, not the presentation order, and
-    read this instead of `ranked[0].score`.
+    Recorded in the trace (`selection.pool_best`) so a reader can see when the
+    tier penalty pushed the pool's best document past the cut. The rewrite
+    trigger and the confidence band read the DELIVERED set instead
+    (`delivered_best`): both are about the answer the reader gets.
     """
     return max(scores.values()) if scores else None
+
+
+def delivered_best(ranked: Sequence[RankedDoc]) -> float | None:
+    """The highest raw probability among the documents actually delivered.
+
+    Not `ranked[0].score`: the order subtracts a tier penalty, so the first
+    document is not always the best-rated one. The rewrite trigger and the
+    confidence band both read this, so they move together.
+    """
+    return max((r.score for r in ranked), default=None)
 
 
 def confidence_for(best_score: float | None) -> str:
@@ -639,7 +660,7 @@ def confidence_for(best_score: float | None) -> str:
     Cut from Phase 0's answerability data (gpt-4.1-mini grader, 368 traces):
     with the best doc below 0.4 the delivered set answered the query 0.8% of
     the time, against 37.7% above it -- the same cut that triggers the rewrite,
-    so the two move together.
+    and both read `delivered_best`, so the two move together.
     """
     if best_score is None or best_score < SEARCH_REWRITE_BELOW_SCORE:
         return "low"
