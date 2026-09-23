@@ -413,45 +413,62 @@ def _parse_yes_no(txt: str) -> bool | None:
     return found[-1].upper() == "YES"
 
 
+#: On a `refusal` stop, the same prompt is re-asked on these, in order. Opus 5.5's
+#: `bio` classifier refused ~20% of judge calls in the first run and 85% of those
+#: were transcripts (biology tenants' sessions), so excluding refused documents
+#: would bias exactly the transcript-vs-record comparison this study makes.
+#: Which model answered is recorded on every row (`answered_by`).
+REFUSAL_FALLBACKS = ("claude-opus-5",)
+
+
 def ask_anthropic(
     client: Any, model: str, effort: str, prompt: str, usage: Usage
-) -> tuple[bool | None, str, str | None]:
-    """(verdict, raw text tail, stop_reason)."""
+) -> tuple[bool | None, str, str | None, str]:
+    """(verdict, raw text tail, stop_reason, answered_by)."""
     import anthropic
 
-    max_tokens = 1024
     raw = ""
     stop = None
-    for attempt in range(3):
-        try:
-            r = client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                output_config={"effort": effort},
-                messages=[{"role": "user", "content": prompt}],
-            )
-        except anthropic.APIStatusError as exc:
-            if exc.status_code in (429, 500, 502, 503, 529):
+    answered_by = model
+    for candidate in (model, *REFUSAL_FALLBACKS):
+        max_tokens = 1024
+        refused = False
+        for attempt in range(3):
+            try:
+                r = client.messages.create(
+                    model=candidate,
+                    max_tokens=max_tokens,
+                    output_config={"effort": effort},
+                    messages=[{"role": "user", "content": prompt}],
+                )
+            except anthropic.APIStatusError as exc:
+                if exc.status_code in (429, 500, 502, 503, 529):
+                    time.sleep(2.0 * (attempt + 1))
+                    continue
+                return None, f"http {exc.status_code}", None, candidate
+            except anthropic.APIConnectionError:
                 time.sleep(2.0 * (attempt + 1))
                 continue
-            return None, f"http {exc.status_code}", None
-        except anthropic.APIConnectionError:
-            time.sleep(2.0 * (attempt + 1))
-            continue
-        usage.add(model, r.usage.input_tokens, r.usage.output_tokens)
-        stop = r.stop_reason
-        if r.stop_reason == "max_tokens":
-            max_tokens = 4096
-            continue
-        if r.stop_reason == "refusal":
-            return None, "refusal", stop
-        txt = "".join(b.text for b in r.content if b.type == "text")
-        raw = txt[-160:]
-        v = _parse_yes_no(txt)
-        if v is not None:
-            return v, raw, stop
-        # No verdict token at all: one more try before giving up on this document.
-    return None, raw, stop
+            usage.add(candidate, r.usage.input_tokens, r.usage.output_tokens)
+            stop = r.stop_reason
+            answered_by = candidate
+            if r.stop_reason == "max_tokens":
+                max_tokens = 4096
+                continue
+            if r.stop_reason == "refusal":
+                sd = getattr(r, "stop_details", None)
+                raw = f"refusal:{getattr(sd, 'category', None)}"
+                refused = True
+                break
+            txt = "".join(b.text for b in r.content if b.type == "text")
+            raw = txt[-160:]
+            v = _parse_yes_no(txt)
+            if v is not None:
+                return v, raw, stop, candidate
+            # No verdict token at all: one more try before giving up on this document.
+        if not refused:
+            break
+    return None, raw, stop, answered_by
 
 
 def ask_openai(client: Any, key: str, model: str, prompt: str, usage: Usage) -> tuple[bool | None, str, str | None]:
@@ -549,12 +566,14 @@ def cmd_judge(args: argparse.Namespace) -> int:
     def work(t: dict[str, Any]) -> dict[str, Any]:
         if t["model"] == args.openai_model:
             v, raw, stop = ask_openai(http, openai_key, t["model"], t["prompt"], usage)
+            answered_by = t["model"]
         else:
-            v, raw, stop = ask_anthropic(anthropic_client, t["model"], args.effort, t["prompt"], usage)
+            v, raw, stop, answered_by = ask_anthropic(anthropic_client, t["model"], args.effort, t["prompt"], usage)
         row = {k: v_ for k, v_ in t.items() if k != "prompt"}
         row["verdict"] = v
         row["raw"] = raw
         row["stop"] = stop
+        row["answered_by"] = answered_by
         return row
 
     n = 0
@@ -649,6 +668,8 @@ def cmd_report(args: argparse.Namespace) -> int:
     verdicts: dict[tuple[str, str, str, int], bool | None] = {}
     sets: dict[tuple[str, str, int], bool | None] = {}
     same_set: dict[tuple[str, int], bool] = {}
+    answered_by: collections.Counter = collections.Counter()
+    refused_by_source: collections.Counter = collections.Counter()
     for line in open(args.verdicts):
         row = json.loads(line)
         # A re-asked row follows its unanswered predecessor; never let a None overwrite an answer.
@@ -656,6 +677,12 @@ def cmd_report(args: argparse.Namespace) -> int:
             key = (row["trace_id"], row["doc"], row["model"], row["pass"])
             if row["verdict"] is not None or key not in verdicts:
                 verdicts[key] = row["verdict"]
+            if row["verdict"] is not None and row["model"] == args.model and row["pass"] == 1:
+                answered_by[row.get("answered_by") or row["model"]] += 1
+            if str(row.get("raw", "")).startswith("refusal") or row.get("stop") == "refusal":
+                rec_ = records.get(row["trace_id"])
+                if rec_:
+                    refused_by_source[rec_["sources"].get(row["doc"], "?")] += 1
         else:
             key2 = (row["trace_id"], row["arm"], row["k"])
             if row["verdict"] is not None or key2 not in sets:
@@ -796,6 +823,10 @@ def cmd_report(args: argparse.Namespace) -> int:
         out.append(f"- {model} vs {', '.join(other_models)}: raw {a2:.3f}, kappa {kp2:.3f}, n={len(cross_pairs)}")
     yes_rate = sum(1 for (_, _, m, p), v in verdicts.items() if m == model and p == 1 and v) / max(1, sum(1 for (_, _, m, p), v in verdicts.items() if m == model and p == 1 and v is not None))
     out.append(f"- {model} YES rate over judged documents: {100 * yes_rate:.1f}%")
+    n_ans = sum(answered_by.values())
+    out.append(f"- Answered by: " + ", ".join(f"{m} {n} ({100 * n / max(1, n_ans):.1f}%)" for m, n in answered_by.most_common()))
+    if refused_by_source:
+        out.append(f"- `{model}` refusals seen (stop_reason=refusal, re-asked on the fallback), by document source: {dict(refused_by_source)}")
     out.append("- Human calibration (40-query slice): NOT DONE unless `calibrate --human` was scored; see below.")
 
     out.append("\n## Per-origin and per-tenant NDCG@10 diff (B − A)\n")
