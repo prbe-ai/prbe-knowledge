@@ -8,6 +8,27 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Fixed
 
+- A coding-agent session whose last mining pass was partial (a segment failed, the segment
+  cap hit, the model declined the tool, or extraction was switched off) is no longer treated
+  as mined for good. The worker records how every complete pass went on the session's queue
+  row (`ingestion_queue.extraction_outcome`, migration 0138), and the idle sweep re-queues a
+  partial one once it has been quiet for the sweep's window: up to 3 times, or every day
+  while the reason is that extraction was off.
+- Protocol-2 sessions whose client never sent a finalize are now ended by the idle sweep
+  like protocol-1 ones. A session its client did finalize is excluded in the sweep's query,
+  so the many finished sessions cannot use up a run's limit.
+
+### Added
+
+- `scripts/session_end_report.py`: how protocol-2 sessions end (the client's finalize, a
+  late one, only the sweep, or still open) and the resulting client miss rate, plus how the
+  recorded mining passes went.
+- `scripts/backfill_finalize_markers.py --stamp-legacy-retry --from-report ...`: hands the
+  old worker's partial passes, named by a report captured before the relink run, to the
+  sweep's retry.
+
+### Fixed
+
 - Idle coding-agent sessions are no longer re-mined every day. The hourly idle sweep treated
   a session as finished only while its end-of-session marker was still on the queue row, and
   the worker deleted that marker after mining it, so every idle protocol-1 session was ended
