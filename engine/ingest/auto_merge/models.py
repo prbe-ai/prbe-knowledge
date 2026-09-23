@@ -1,8 +1,9 @@
-"""Pydantic schemas for the AutoMergeAnalyzer's Cerebras judge call.
+"""The verdict contract every auto-merge judge returns.
 
-`response_format=AutoMergeVerdict` is constrained-decoded by Cerebras
-gpt-oss-120b via the LiteLLM proxy — same pattern as
-services/retrieval/agent/models.py:EntityExtraction.
+Jev (the default, `jev_judge.py`) builds an `AutoMergeVerdict` from one Choice
+answer. The gpt-oss rollback path (`AUTO_MERGE_JUDGE = "gptoss"`) still asks
+Cerebras gpt-oss-120b for it as `response_format`, constrained-decoded via the
+LiteLLM proxy.
 """
 
 from __future__ import annotations

@@ -1,20 +1,34 @@
-"""Unit tests for the AutoMergeAnalyzer's pure logic.
+"""Unit tests for the AutoMergeAnalyzer.
 
-LLM judge + DB integration are exercised via a mocked acompletion + an
-asyncpg test fixture in a separate integration suite (not in this file).
-This file covers the deterministic pieces: path-canonical detection,
-property-key conflict filtering, and prompt construction shape.
+The deterministic pieces (path-canonical detection, property-key conflict
+filtering, the gpt-oss prompt) plus the analyze() flow with its DB edges and
+judge stubbed. tests/test_auto_merge_live.py runs the flow on real Postgres.
 """
 
 from __future__ import annotations
 
+import json
+import types
+import uuid
+
+import pytest
+
+from engine.ingest.auto_merge import analyzer as az
 from engine.ingest.auto_merge.analyzer import (
     Candidate,
     _build_prompt,
     _is_path_canonical,
     _properties_conflict,
 )
+from engine.ingest.auto_merge.jev_judge import Judgment
 from engine.ingest.auto_merge.models import AutoMergeVerdict
+from engine.retrieval.agent.jev import JevBreakerOpen, JevError, JevRequestTooLarge
+from engine.shared.constants import (
+    AUTO_MERGE_RETRY_SECONDS,
+    JEV_BREAKER_SECONDS,
+    SEARCH_AGENT_INFERENCE_MODEL,
+)
+from engine.shared.llm import LLMError
 
 # --------------------------------------------------------------------------- #
 # _is_path_canonical
@@ -184,3 +198,259 @@ def test_verdict_rejects_extra_fields() -> None:
         AutoMergeVerdict.model_validate_json(
             '{"verdict": "unique", "rationale": "x", "extra_field": 1}'
         )
+
+
+# --------------------------------------------------------------------------- #
+# analyze() flow: judge outcome -> merge / suggestion / nothing / defer
+#
+# The DB edges (_load_node, _find_candidates, merge_cluster) are stubbed here;
+# tests/test_auto_merge_live.py runs the same flow against real Postgres.
+# --------------------------------------------------------------------------- #
+
+PR_NODE = {
+    "node_id": 7,
+    "label": "Document",
+    "canonical_id": "github:acme/widgets:pr:12",
+    "properties": {"name": "Add widgets"},
+    "degree": 1,
+    "has_embedding": True,
+}
+PR_CANDS = [
+    Candidate("acme/widgets#12", {"name": "Add widgets"}, 3, 0.78, 0.02),
+    Candidate("acme/widgets#13", {"name": "Remove widgets"}, 2, 0.70, 0.09),
+]
+PERSON_NODE = {
+    "node_id": 8,
+    "label": "Person",
+    "canonical_id": "ada-gh",
+    "properties": {"name": "Ada Lovelace", "login": "ada-gh"},
+    "degree": 1,
+    "has_embedding": True,
+}
+
+# Both judges, so the verdict-to-action contract is pinned for the rollback too.
+JUDGES = [
+    pytest.param("jev-1.13.0", 0.99, id="jev"),
+    pytest.param(SEARCH_AGENT_INFERENCE_MODEL, None, id="gptoss"),
+]
+
+
+class FakeConn:
+    def __init__(self) -> None:
+        self.suggestions: list[tuple] = []
+
+    async def fetchrow(self, sql: str, *args):
+        assert "INSERT INTO entity_merge_suggestions" in sql, sql
+        self.suggestions.append(args)
+        return {"suggestion_id": uuid.uuid4()}
+
+
+def _verdict(primary: str | None, confidence: str | None) -> AutoMergeVerdict:
+    if primary is None:
+        return AutoMergeVerdict(verdict="unique", rationale="none of them")
+    return AutoMergeVerdict(
+        verdict="duplicate", primary_canonical_id=primary, confidence=confidence, rationale="same repo and number"
+    )
+
+
+def _analyzer(monkeypatch, node, cands, *, judgment=None, raises=None, execute=True):
+    a = az.AutoMergeAnalyzer(execute_high_confidence=execute)
+
+    async def load(conn, node_id):
+        return node
+
+    async def find(conn, n):
+        return list(cands)
+
+    async def judge(n, c):
+        if raises is not None:
+            raise raises
+        return judgment
+
+    merges: list = []
+
+    async def fake_merge(body):
+        merges.append(body)
+        return types.SimpleNamespace(merge_id=uuid.uuid4())
+
+    monkeypatch.setattr(a, "_load_node", load)
+    monkeypatch.setattr(a, "_find_candidates", find)
+    monkeypatch.setattr(a, "_judge", judge)
+    monkeypatch.setattr(az, "merge_cluster", fake_merge)
+    return a, merges
+
+
+@pytest.mark.parametrize(("model", "p"), JUDGES)
+async def test_high_merges_and_the_audit_reason_names_the_judge(monkeypatch, model, p):
+    j = Judgment(verdict=_verdict("acme/widgets#12", "high"), model=model, p=p)
+    a, merges = _analyzer(monkeypatch, PR_NODE, PR_CANDS, judgment=j)
+    conn = FakeConn()
+    result = await a.analyze(conn, "acme-test", 7)
+    assert result.action == "merged"
+    assert (result.judge_model, result.p) == (model, p)
+    (body,) = merges
+    assert body.primary_canonical_id == "acme/widgets#12"
+    assert body.alias_canonical_ids == ["github:acme/widgets:pr:12"]
+    expected_p = " p=0.99" if p is not None else ""
+    assert body.reason == f"auto: model={model} confidence=high{expected_p} rationale=same repo and number"
+    assert conn.suggestions == []
+
+
+@pytest.mark.parametrize(("model", "p"), JUDGES)
+async def test_high_without_execute_writes_a_suggestion_stamped_with_the_judge(monkeypatch, model, p):
+    j = Judgment(verdict=_verdict("acme/widgets#12", "high"), model=model, p=p)
+    a, merges = _analyzer(monkeypatch, PR_NODE, PR_CANDS, judgment=j, execute=False)
+    conn = FakeConn()
+    result = await a.analyze(conn, "acme-test", 7)
+    assert result.action == "suggested"
+    assert merges == []
+    (row,) = conn.suggestions
+    # customer, label, primary, candidate(new node), confidence, rationale, llm_model
+    assert row == ("acme-test", "Document", "acme/widgets#12", "github:acme/widgets:pr:12", "high",
+                   "same repo and number", model)
+
+
+@pytest.mark.parametrize(("model", "p"), JUDGES)
+async def test_medium_writes_a_suggestion(monkeypatch, model, p):
+    j = Judgment(verdict=_verdict("acme/widgets#12", "medium"), model=model, p=p)
+    a, merges = _analyzer(monkeypatch, PR_NODE, PR_CANDS, judgment=j)
+    conn = FakeConn()
+    result = await a.analyze(conn, "acme-test", 7)
+    assert result.action == "suggested" and merges == []
+    assert conn.suggestions[0][4] == "medium"
+
+
+@pytest.mark.parametrize(("model", "p"), JUDGES)
+async def test_unique_writes_nothing(monkeypatch, model, p):
+    j = Judgment(verdict=_verdict(None, None), model=model, p=p)
+    a, merges = _analyzer(monkeypatch, PR_NODE, PR_CANDS, judgment=j)
+    conn = FakeConn()
+    result = await a.analyze(conn, "acme-test", 7)
+    assert result.action == "unique"
+    assert merges == [] and conn.suggestions == []
+
+
+@pytest.mark.parametrize(("model", "p"), JUDGES)
+async def test_primary_outside_the_candidates_is_an_error(monkeypatch, model, p):
+    j = Judgment(verdict=_verdict("acme/widgets#99", "high"), model=model, p=p)
+    a, merges = _analyzer(monkeypatch, PR_NODE, PR_CANDS, judgment=j)
+    result = await a.analyze(FakeConn(), "acme-test", 7)
+    assert result.action == "error" and merges == []
+
+
+@pytest.mark.parametrize(("model", "p"), JUDGES)
+async def test_person_on_a_name_alone_is_a_suggestion_not_a_merge(monkeypatch, model, p):
+    cands = [Candidate("U123", {"name": "Ada Lovelace", "display_name": "Ada Lovelace"}, 4, 1.0, 0.05)]
+    j = Judgment(verdict=_verdict("U123", "high"), model=model, p=p)
+    a, merges = _analyzer(monkeypatch, PERSON_NODE, cands, judgment=j)
+    conn = FakeConn()
+    result = await a.analyze(conn, "acme-test", 8)
+    assert result.action == "suggested"
+    assert merges == []
+    assert conn.suggestions[0][4] == "medium"
+
+
+@pytest.mark.parametrize(("model", "p"), JUDGES)
+async def test_person_with_a_shared_login_merges(monkeypatch, model, p):
+    cands = [Candidate("ada@example.com", {"name": "Ada Lovelace", "login": "ADA-GH"}, 4, 0.4, 0.05)]
+    j = Judgment(verdict=_verdict("ada@example.com", "high"), model=model, p=p)
+    a, merges = _analyzer(monkeypatch, PERSON_NODE, cands, judgment=j)
+    result = await a.analyze(FakeConn(), "acme-test", 8)
+    assert result.action == "merged"
+    assert merges[0].primary_canonical_id == "ada@example.com"
+
+
+async def test_open_breaker_defers_without_spending_an_attempt(monkeypatch):
+    a, merges = _analyzer(monkeypatch, PR_NODE, PR_CANDS, raises=JevBreakerOpen("breaker_open"))
+    result = await a.analyze(FakeConn(), "acme-test", 7)
+    assert result.action == "deferred"
+    assert result.spend_attempt is False
+    assert result.retry_after_seconds == int(JEV_BREAKER_SECONDS * 2)
+    assert merges == []
+
+
+async def test_jev_outage_defers_and_spends_an_attempt(monkeypatch):
+    a, merges = _analyzer(monkeypatch, PR_NODE, PR_CANDS, raises=JevError("ReadTimeout: <empty>"))
+    result = await a.analyze(FakeConn(), "acme-test", 7)
+    assert result.action == "deferred"
+    assert result.spend_attempt is True
+    assert result.retry_after_seconds == AUTO_MERGE_RETRY_SECONDS
+    assert merges == []
+
+
+async def test_oversize_request_is_an_error_not_a_retry(monkeypatch):
+    a, _ = _analyzer(monkeypatch, PR_NODE, PR_CANDS, raises=JevRequestTooLarge("http_400:max_tokens_exceeded"))
+    result = await a.analyze(FakeConn(), "acme-test", 7)
+    assert result.action == "error"
+
+
+async def test_gptoss_llm_error_keeps_todays_behaviour(monkeypatch):
+    a, _ = _analyzer(monkeypatch, PR_NODE, PR_CANDS, raises=LLMError("boom", provider="cerebras"))
+    result = await a.analyze(FakeConn(), "acme-test", 7)
+    assert result.action == "error"
+
+
+# --------------------------------------------------------------------------- #
+# _judge dispatch: Jev by default, gpt-oss on rollback or without a key
+# --------------------------------------------------------------------------- #
+
+
+def _gptoss_response(verdict: dict) -> dict:
+    return {"choices": [{"message": {"content": json.dumps(verdict)}}]}
+
+
+async def test_rollback_switch_runs_the_gptoss_path_unchanged(monkeypatch):
+    calls: list[dict] = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        return _gptoss_response({"verdict": "duplicate", "primary_canonical_id": "acme/widgets#12",
+                                 "confidence": "high", "rationale": "same PR"})
+
+    monkeypatch.setattr(az, "AUTO_MERGE_JUDGE", "gptoss")
+    monkeypatch.setattr(az, "acompletion", fake_acompletion)
+    monkeypatch.setattr(az.jev_judge, "judge", lambda *a, **k: pytest.fail("Jev must not be called"))
+    judgment = await az.AutoMergeAnalyzer()._judge(PR_NODE, PR_CANDS)
+    assert judgment.model == SEARCH_AGENT_INFERENCE_MODEL and judgment.p is None
+    assert judgment.verdict.primary_canonical_id == "acme/widgets#12"
+    (kw,) = calls
+    # Today's request, verbatim.
+    assert kw["model"] == SEARCH_AGENT_INFERENCE_MODEL
+    assert kw["messages"] == [
+        {"role": "system", "content": az._SYSTEM_PROMPT},
+        {"role": "user", "content": _build_prompt(PR_NODE, PR_CANDS)},
+    ]
+    assert kw["response_format"] is az._VERDICT_RESPONSE_FORMAT
+    assert (kw["temperature"], kw["max_tokens"], kw["custom_llm_provider"]) == (0.1, 512, "openai")
+
+
+async def test_jev_is_the_default_judge(monkeypatch):
+    seen: dict = {}
+
+    async def fake_judge(node, candidates, *, api_key):
+        seen.update(node=node, n=len(candidates), api_key=api_key)
+        return Judgment(verdict=_verdict(None, None), model="jev-1.13.0", p=0.9)
+
+    monkeypatch.setattr(az, "AUTO_MERGE_JUDGE", "jev")
+    monkeypatch.setattr(az, "get_settings", lambda: types.SimpleNamespace(typesafe_api_key="k-test"))
+    monkeypatch.setattr(az.jev_judge, "judge", fake_judge)
+    monkeypatch.setattr(az, "acompletion", lambda **k: pytest.fail("gpt-oss must not be called"))
+    judgment = await az.AutoMergeAnalyzer()._judge(PR_NODE, PR_CANDS)
+    assert judgment.model == "jev-1.13.0"
+    assert seen == {"node": PR_NODE, "n": 2, "api_key": "k-test"}
+
+
+async def test_missing_key_falls_back_to_gptoss_and_warns_once(monkeypatch):
+    async def fake_acompletion(**kwargs):
+        return _gptoss_response({"verdict": "unique", "rationale": "no"})
+
+    warnings: list = []
+    monkeypatch.setattr(az, "AUTO_MERGE_JUDGE", "jev")
+    monkeypatch.setattr(az, "get_settings", lambda: types.SimpleNamespace(typesafe_api_key=""))
+    monkeypatch.setattr(az, "acompletion", fake_acompletion)
+    monkeypatch.setattr(az, "_jev_unconfigured_logged", False)
+    monkeypatch.setattr(az.log, "warning", lambda event, **kw: warnings.append(event))
+    for _ in range(3):
+        judgment = await az.AutoMergeAnalyzer()._judge(PR_NODE, PR_CANDS)
+        assert judgment.model == SEARCH_AGENT_INFERENCE_MODEL
+    assert warnings == ["auto_merge.jev_unconfigured"]

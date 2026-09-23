@@ -22,6 +22,10 @@ Lifecycle of a queued row::
   On success: DELETE FROM node_post_write_queue WHERE (customer_id, node_id) = (...)
   On failure: clear locked_until, bump attempts in analyzer_status JSONB; if
               attempts hit 3 the WHERE clause stops picking it back up.
+  On deferral (the judge was unreachable, action="deferred"): KEEP the row and
+              push locked_until into the future; the claim query reclaims it
+              once that passes. A failed call bumps attempts; an open breaker
+              (nothing sent) does not.
 
 Concurrency: 16 tasks per process (POST_WRITE_CONCURRENCY env var).
 Runs alongside InferredEdgesWorker — both pull from independent queues
@@ -151,9 +155,15 @@ class PostWriteWorker:
         )
 
         try:
+            # Two transactions, on purpose. Writing the embedding locks this
+            # node's row, and a high-confidence verdict runs merge_cluster on
+            # its OWN connection, which must lock the same row: sharing one
+            # transaction made the merge wait on its caller until the statement
+            # timed out (5 min), so a brand-new node's first merge always failed.
             async with with_tenant(customer_id) as conn:
                 await self._ensure_embedding(conn, node_id)
                 await self._drain_pending_edges(conn, customer_id, node_id)
+            async with with_tenant(customer_id) as conn:
                 result = await self._analyzer.analyze(conn, customer_id, node_id)
 
             counter(
@@ -169,7 +179,21 @@ class PostWriteWorker:
                 action=result.action,
                 primary=result.primary_canonical_id,
                 confidence=result.confidence,
+                judge_model=result.judge_model,
+                p=result.p,
             )
+            if result.action == "deferred":
+                attempts = int(status.get("auto_merge", {}).get("attempts", 0))
+                if result.spend_attempt:
+                    attempts += 1
+                await self._defer(
+                    customer_id,
+                    node_id,
+                    attempts,
+                    result.error or "judge unavailable",
+                    delay_seconds=(result.retry_after_seconds or 60) * max(1, attempts),
+                )
+                return
             await self._delete_queue_row(customer_id, node_id)
 
         except Exception as exc:
@@ -262,6 +286,39 @@ class PostWriteWorker:
                 "DELETE FROM node_post_write_queue WHERE customer_id = $1 AND node_id = $2",
                 customer_id,
                 node_id,
+            )
+
+    async def _defer(
+        self,
+        customer_id: str,
+        node_id: int,
+        attempts: int,
+        error: str,
+        *,
+        delay_seconds: int,
+    ) -> None:
+        """Keep the row; make it claimable again only after `delay_seconds`.
+
+        The claim query reclaims rows whose `locked_until` has passed, so a
+        future lock IS the retry schedule. `attempts` still caps it: a node
+        whose judge call keeps failing parks after _MAX_ATTEMPTS, visible in
+        the queue with its last error, instead of retrying forever.
+        """
+        new_status = json.dumps(
+            {"auto_merge": {"status": "deferred", "attempts": attempts, "last_error": error[:240]}}
+        )
+        async with raw_conn() as conn:
+            await conn.execute(
+                """
+                UPDATE node_post_write_queue
+                SET locked_until = NOW() + make_interval(secs => $3),
+                    analyzer_status = $4::jsonb
+                WHERE customer_id = $1 AND node_id = $2
+                """,
+                customer_id,
+                node_id,
+                float(delay_seconds),
+                new_status,
             )
 
     async def _record_failure(

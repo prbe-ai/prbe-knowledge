@@ -8,6 +8,21 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Changed
 
+- Entity auto-merge now asks Jev, not gpt-oss, whether a new entity duplicates one already
+  in the graph. Jev picks one candidate or none; at 0.95 or above the pair is merged, from
+  0.70 a suggestion is written for review, below that nothing happens. The suggestion's
+  explanation is built from the evidence the analyzer already has (shared email, same PR
+  number, name similarity). Replayed on 477 past decisions, Jev agreed with gpt-oss on the
+  same entity 94.8% of the time and every auto-merge it made checked out against hard
+  identity evidence, for about a tenth of the cost. Setting `AUTO_MERGE_JUDGE = "gptoss"`
+  restores the old judge.
+- A person is only merged automatically when the two records share an exact email or
+  login. A matching name alone now becomes a suggestion instead, whichever model judged it.
+- When the auto-merge judge is unreachable, the entity stays queued and is retried a few
+  minutes later instead of being skipped until it next changes.
+- Merge audit rows and suggestions now record the model that actually made the call, and
+  its probability, instead of always naming gpt-oss.
+
 - Every tenant's searches now pick their results with Jev. If Jev fails or is slow, that
   search is served by the recall floor instead.
 - Retire the `Experiment` graph node label and the `experiment` entity type:

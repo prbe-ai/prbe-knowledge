@@ -112,3 +112,52 @@ SET — that is why selection uses Noul-per-chunk.
   request_id is what a vendor ticket needs.
 - `RetryPolicy(max_retries=...)` is built in; set it to 0 when probing a limit,
   or a retried 400 just slows the answer down.
+
+## Entity auto-merge (Choice + `none_of_these`), measured 2026-09-23
+
+`engine/ingest/auto_merge/jev_judge.py` asks ONE Choice per judgment: the
+analyzer's ≤10 filtered candidates as `c0..cN`, plus `none_of_these`. The
+replay (`scripts/jev_automerge/`) rebuilt 477 managed-plane decisions with the
+analyzer's own candidate SQL and asked Jev and the production gpt-oss prompt the
+same questions on identical inputs.
+
+| | Jev | gpt-oss |
+|---|---|---|
+| same real-world entity as gpt-oss (all / everyday traffic) | 94.8% / 98.8% | — |
+| agrees with the STORED past gpt-oss decision (same entity) | 89.5% | 84.8% (its own re-run) |
+| failed calls | 0 / 954 | 33 / 477 (reasoning ate `max_tokens=512`) |
+| latency p50 / p90 | 145 / 197 ms | 383 / 625 ms |
+| input tokens p50 / max | 1,773 / 3,154 | — |
+| cost per decision | $0.000078 | $0.000703 |
+
+**Precision, not agreement.** Every auto-merge each gate would make was checked
+against hard identity evidence (same repo + PR/issue number, shared UUID, shared
+email or login, a human-approved merge):
+
+| gate | auto-merges | verified | known false | name-only (needs a human) |
+|---|---|---|---|---|
+| gpt-oss `high` | 107 | 106 | 0 | 1 |
+| Jev Choice p ≥ 0.95 | 84 | 83 | 0 | 1 |
+| Jev Choice p ≥ 0.95 + Person shared-identifier guard | 83 | 83 | 0 | 0 |
+| Jev pairwise Noul (one per candidate) ≥ 0.95 | 58 | 58 | 0 | 0 |
+
+Pairwise Noul looks safer but found 58 of the 107 verified duplicates against
+83 for the Choice, and its score cannot separate the one risky pair (0.80, while
+verified pairs go as low as 0.78). So the Choice stays, and the name-only class
+is handled by a deterministic rule instead.
+
+**Two properties of the Choice probability to design around:**
+
+- **It splits across copies of the same entity.** When the graph holds the
+  same repo three ways (`org/x`, `x`, `wiki:repo:x`), the mass divides between
+  them: in 98 of 215 picks another candidate that is the same entity held ≥ 0.05.
+  That lowers p, which errs toward a suggestion, never toward a wrong merge.
+- **It drifts ±0.02–0.03 between identical calls** (20 repeats on three
+  near-threshold pairs: 0.87–0.92, 0.89–0.92, 0.91–0.95). Every upsert re-queues
+  its node, so a pair is judged many times, and under that churn a 0.95 cut
+  behaves like "averages ~0.92". The fix for that is not re-judging unchanged
+  nodes (TODOS.md).
+
+`max_tokens_exceeded` is permanent for its input (same state, same answer), so
+`post_choice` raises `JevRequestTooLarge` and does not trip the breaker; string
+property values are trimmed at 500 characters before that can happen, keys never.
