@@ -504,6 +504,8 @@ async def test_v2_completion_survives_extraction_idle_sweep_and_reprocessing(dat
 async def test_idle_finalizer_checks_the_tenant_scoped_stream_even_without_key_hint(
     database, monkeypatch
 ):
+    """A client-finalized v2 session is left alone; the same session id in
+    another tenant is judged under ITS scope, not this one's."""
     from kb.session_completer import enqueue_idle_session_finalizers
 
     _tenant, admin = database
@@ -511,11 +513,8 @@ async def test_idle_finalizer_checks_the_tenant_scoped_stream_even_without_key_h
     consumer(store, monkeypatch)
     body = batch(employee_id="uploader")
     await sr.accept(body, "tenant-a", SourceSystem.CLAUDE_CODE, store)
-    # Simulate legacy-shaped queue references: the URI prefilter is only an
-    # optimization, not the authoritative source ownership check.
-    await admin.execute(
-        "UPDATE ingestion_queue SET payload_s3_keys=ARRAY['legacy-shaped-key'], enqueued_at=NOW()-INTERVAL '1 hour'"
-    )
+    await sr.accept(finalize(body), "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    await admin.execute("UPDATE ingestion_queue SET enqueued_at=NOW()-INTERVAL '1 hour'")
     # The same UUID in another tenant stays eligible under its own scope.
     await admin.execute(
         "INSERT INTO ingestion_queue(customer_id,source_system,source_event_id,payload_s3_key,payload_s3_keys,enqueued_at) VALUES('tenant-b','claude_code',$1,'legacy',ARRAY['legacy'],NOW()-INTERVAL '1 hour')",
@@ -526,7 +525,7 @@ async def test_idle_finalizer_checks_the_tenant_scoped_stream_even_without_key_h
         await admin.fetchval(
             "SELECT cardinality(payload_s3_keys) FROM ingestion_queue WHERE customer_id='tenant-a'"
         )
-        == 1
+        == 2
     )
     assert (
         await admin.fetchval(
@@ -534,6 +533,98 @@ async def test_idle_finalizer_checks_the_tenant_scoped_stream_even_without_key_h
         )
         == 2
     )
+
+
+@pytest.fixture
+async def as_app_role(database, monkeypatch):
+    """Run the sweep as a NON-superuser, so FORCE RLS on session_streams is
+    real: a missing tenant setting then hides every stream instead of passing."""
+    dsn = os.environ["PRBE_RECEIPT_TEST_DATABASE_URL"]
+
+    async def as_app(conn):
+        await conn.execute("SET ROLE receipt_app")
+
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=2, init=as_app)
+    monkeypatch.setattr("kb.session_completer.get_pool", lambda: pool)
+    yield
+    await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_an_idle_unfinalized_v2_session_is_ended_once_and_then_left_alone(
+    database, as_app_role, monkeypatch
+):
+    """The v2 loop guard. A client that never said goodbye gets the sweep's
+    marker; once that session is mined, the marker on top keeps the next sweep
+    away -- nothing about session_streams has to change for that."""
+    from kb.session_completer import enqueue_idle_session_finalizers
+
+    _tenant, admin = database
+    store = Store()
+    normalizer = consumer(store, monkeypatch)
+    body = batch(employee_id="uploader")
+    await sr.accept(body, "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    await admin.execute("UPDATE ingestion_queue SET enqueued_at=NOW()-INTERVAL '2 days'")
+
+    assert await enqueue_idle_session_finalizers(idle_minutes=1440) == 1
+    keys = await admin.fetchval("SELECT payload_s3_keys FROM ingestion_queue")
+    assert keys[-1].endswith("/finalize.marker")
+    assert await admin.fetchval("SELECT finalized FROM session_streams") is False, (
+        "the sweep's marker is not a client claim"
+    )
+    mined = await normalizer._normalize_only("tenant-a", SourceSystem.CLAUDE_CODE, keys)
+    assert mined.documents[0].metadata["session_complete"]
+    assert mined.documents[0].metadata["completed_by"] == "cron_marker"
+
+    await admin.execute(
+        "UPDATE ingestion_queue SET status='done', completed_at=NOW(), enqueued_at=NOW()-INTERVAL '2 days'"
+    )
+    assert await enqueue_idle_session_finalizers(idle_minutes=1440) == 0
+    assert await enqueue_idle_session_finalizers(idle_minutes=1440) == 0
+    assert await admin.fetchval("SELECT payload_s3_keys FROM ingestion_queue") == keys
+
+    # A late client finalize lands on top and is accepted; still left alone.
+    await sr.accept(finalize(body), "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    await admin.execute("UPDATE ingestion_queue SET status='done', enqueued_at=NOW()-INTERVAL '2 days'")
+    assert await enqueue_idle_session_finalizers(idle_minutes=1440) == 0
+
+
+@pytest.mark.asyncio
+async def test_finalized_v2_sessions_do_not_starve_the_sweep(database, as_app_role, monkeypatch):
+    """Most v2 rows are client-finalized. They are excluded in the query, not
+    skipped one by one inside a LIMIT, or the oldest finished rows would eat
+    every run and a real candidate behind them would never be reached."""
+    from kb.session_completer import enqueue_idle_session_finalizers
+
+    _tenant, admin = database
+    store = Store()
+    consumer(store, monkeypatch)
+    for _ in range(3):
+        done = batch(employee_id="uploader")
+        await sr.accept(done, "tenant-a", SourceSystem.CLAUDE_CODE, store)
+        await sr.accept(finalize(done), "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    await admin.execute("UPDATE ingestion_queue SET enqueued_at=NOW()-INTERVAL '5 days'")
+    silent = batch(employee_id="uploader")
+    await sr.accept(silent, "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    await admin.execute(
+        "UPDATE ingestion_queue SET enqueued_at=NOW()-INTERVAL '2 days' WHERE source_event_id=$1",
+        silent["session_id"],
+    )
+    import structlog
+
+    with structlog.testing.capture_logs() as logs:
+        assert await enqueue_idle_session_finalizers(idle_minutes=1440, limit=1) == 1
+    keys = await admin.fetchval(
+        "SELECT payload_s3_keys FROM ingestion_queue WHERE source_event_id=$1", silent["session_id"]
+    )
+    assert keys[-1].endswith("/finalize.marker")
+    run = next(e for e in logs if e["event"] == "session_completer.run")
+    # Excluded IN the query (as the RLS-bound role), not found and then
+    # skipped one by one: that is what keeps them out of the LIMIT.
+    assert (run["candidates"], run["skipped"]) == (1, 0)
+    # This database has no extraction_outcome column: ending still works and
+    # the retry step says why it did nothing.
+    assert any(e["event"] == "session_completer.retry_skipped" for e in logs)
 
 
 @pytest.mark.asyncio

@@ -688,6 +688,11 @@ CREATE TABLE ingestion_queue (
     started_at           TIMESTAMPTZ,
     heartbeat_at         TIMESTAMPTZ,
     completed_at         TIMESTAMPTZ,
+    -- Coding-agent sessions only: how the last COMPLETE mining pass went
+    -- ({authoritative, reason, keys, retries, ...}). The idle sweep re-queues
+    -- an ended session whose last pass was partial, a bounded number of times.
+    -- NULL = no pass recorded since the column existed (migration 0138).
+    extraction_outcome   JSONB,
     UNIQUE (customer_id, source_system, source_event_id)
 );
 CREATE INDEX idx_queue_pending_priority ON ingestion_queue (priority DESC, enqueued_at) WHERE status = 'pending';

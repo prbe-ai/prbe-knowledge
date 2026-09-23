@@ -48,6 +48,14 @@ Run it with the sweep SUSPENDED, dry-run first:
 signal. Run BEFORE the new worker has mined anything, that is the old worker's
 partial passes (it kept an end signal only then); afterwards it also includes
 sessions the new worker mined completely, which keep theirs by design.
+
+`--stamp-legacy-retry --from-report <that report> --completed-before <when the
+new worker went live>` hands those old partial passes to the sweep's bounded
+retry (kb/session_completer.py) by recording the outcome the old worker never
+recorded. Only rows named in a report captured BEFORE the relink run: afterwards
+a relinked row -- proven mined -- also ends in an end signal with no outcome,
+and stamping it would pay to mine it again. The cutoff keeps out anything the
+new worker has mined since.
 """
 
 from __future__ import annotations
@@ -57,6 +65,7 @@ import asyncio
 import json
 from collections import Counter
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
@@ -137,6 +146,31 @@ SELECT q.queue_id
    AND {_ENDED}
  ORDER BY q.queue_id
 """
+
+#: Record, once, the partial pass the old worker never recorded -- only for rows
+#: the pre-relink report named, only if still exactly in that state, and never
+#: over an outcome a real pass wrote.
+_STAMP_WHERE = f"""
+       q.queue_id = ANY($1::bigint[])
+   AND q.status = 'done'
+   AND q.completed_at < $2
+   AND q.extraction_outcome IS NULL
+   AND {ends_v1_session_sql(last_key_sql("q.payload_s3_keys"), "q.source_event_id")}
+"""
+
+_STAMP_LEGACY_SQL = f"""
+UPDATE ingestion_queue AS q
+   SET extraction_outcome = jsonb_build_object(
+         'at', to_jsonb(NOW()),
+         'authoritative', false,
+         'reason', 'legacy_unconsumed',
+         'keys', cardinality(q.payload_s3_keys),
+         'retries', 0)
+ WHERE {_STAMP_WHERE}
+RETURNING q.queue_id
+"""
+
+_STAMP_COUNT_SQL = f"SELECT count(*) FROM ingestion_queue q WHERE {_STAMP_WHERE}"
 
 #: Re-attach the marker only if the row is exactly as read.
 _RELINK_SQL = f"""
@@ -239,6 +273,19 @@ async def backfill(
     return report
 
 
+async def stamp_legacy_retry(
+    *, queue_ids: list[int], completed_before: datetime, dry_run: bool = True
+) -> int:
+    """Hand the pre-relink report's legacy partial passes to the sweep's retry."""
+    async with get_pool().acquire() as conn:
+        if dry_run:
+            total = await conn.fetchval(_STAMP_COUNT_SQL, queue_ids, completed_before)
+        else:
+            total = len(await conn.fetch(_STAMP_LEGACY_SQL, queue_ids, completed_before))
+    log.info("backfill_finalize_markers.stamp_legacy_retry", rows=total, dry_run=dry_run)
+    return total
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dry-run", action="store_true", help="Count and HEAD only; write nothing.")
@@ -249,7 +296,23 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--customer", action="append", default=None,
         help="Only this tenant (repeatable). Run one tenant first as a canary.",
     )
+    parser.add_argument(
+        "--stamp-legacy-retry", action="store_true",
+        help="Instead of re-linking: hand legacy partial passes to the sweep's retry.",
+    )
+    parser.add_argument(
+        "--from-report", default=None,
+        help="With --stamp-legacy-retry: a --report captured BEFORE the relink run.",
+    )
+    parser.add_argument(
+        "--completed-before", type=datetime.fromisoformat, default=None,
+        help="With --stamp-legacy-retry: when the new worker went live (ISO 8601, with zone).",
+    )
     args = parser.parse_args(argv)
+    if args.stamp_legacy_retry and (args.completed_before is None or args.completed_before.tzinfo is None):
+        parser.error("--stamp-legacy-retry needs --completed-before with a time zone")
+    if args.stamp_legacy_retry and not args.from_report:
+        parser.error("--stamp-legacy-retry needs --from-report (captured before the relink run)")
     if args.concurrency < 1:
         parser.error("--concurrency must be >= 1")
     return args
@@ -258,6 +321,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 async def _main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
     await init_pool()
+    if args.stamp_legacy_retry:
+        try:
+            with open(args.from_report) as fh:
+                queue_ids = [int(q) for q in json.load(fh)["already_ended_queue_ids"]]
+            n = await stamp_legacy_retry(
+                queue_ids=queue_ids, completed_before=args.completed_before, dry_run=args.dry_run
+            )
+        finally:
+            from engine.shared.db import close_pool
+
+            await close_pool()
+        print(json.dumps({"stamp_legacy_retry": n, "dry_run": args.dry_run}))
+        return
     try:
         report = await backfill(
             dry_run=args.dry_run,

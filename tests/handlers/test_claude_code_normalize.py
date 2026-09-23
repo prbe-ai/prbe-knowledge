@@ -797,3 +797,85 @@ async def test_an_open_session_is_not_mined_and_logs_no_pass(monkeypatch) -> Non
         )
     assert len(result.documents) == 1
     assert not [e for e in logs if e["event"] == "claude_code_extraction.pass"]
+
+
+# ---- PR 2: what a complete pass records ---------------------------------------
+
+
+def _event_with_keys(session_id: str, keys: list[str]) -> WebhookEvent:
+    ev = _event(session_id=session_id)
+    ev.payload_s3_keys = keys
+    return ev
+
+
+@pytest.mark.asyncio
+async def test_a_complete_pass_records_its_outcome(monkeypatch) -> None:
+    import kb.handlers.claude_code as cc_mod
+
+    ext_mod = cc_mod._ext
+
+    async def partial(**kwargs):
+        return ext_mod.UnitBundle(
+            authoritative=False, problems=["tool_declined", "segment_failed", "tool_declined"],
+            calls=4, qa=[ext_mod.QA(prompt="p", outcome="o")],
+        )
+
+    monkeypatch.setattr(cc_mod._ext, "extract_units_from_session", partial)
+    result = await ClaudeCodeConnector(make_default_context()).normalize(
+        _event_with_keys("s-out", ["a", "b", "c"]),
+        {"session_id": "s-out", "events": [{"line_no": 0, "raw": {}}],
+         "session_complete": True, "completed_by": "v1_client_finalize"},
+    )
+    out = result.extraction_outcome
+    assert (out["authoritative"], out["reason"], out["keys"]) == (False, "segment_failed,tool_declined", 3)
+    assert (out["completed_by"], out["units"], out["calls"]) == ("v1_client_finalize", 1, 4)
+
+
+@pytest.mark.asyncio
+async def test_a_live_pass_records_no_outcome(monkeypatch) -> None:
+    result = await ClaudeCodeConnector(make_default_context()).normalize(
+        _event_with_keys("s-live", ["a"]),
+        {"session_id": "s-live", "events": [{"line_no": 0, "raw": {}}], "session_complete": False},
+    )
+    assert result.extraction_outcome is None
+
+
+@pytest.mark.asyncio
+async def test_a_switched_off_pass_is_recorded_as_disabled(monkeypatch) -> None:
+    from engine.shared.config import get_settings
+
+    monkeypatch.setenv("CLAUDE_CODE_EXTRACTION_ENABLED", "false")
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+    try:
+        result = await ClaudeCodeConnector(make_default_context()).normalize(
+            _event_with_keys("s-off2", ["a", "b"]),
+            {"session_id": "s-off2", "events": [{"line_no": 0, "raw": {}}], "session_complete": True},
+        )
+    finally:
+        monkeypatch.delenv("CLAUDE_CODE_EXTRACTION_ENABLED", raising=False)
+        get_settings.cache_clear()  # type: ignore[attr-defined]
+    assert result.extraction_outcome["reason"] == "disabled"
+    assert result.extraction_outcome["authoritative"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_completed_session_document_says_what_ended_it(monkeypatch) -> None:
+    """The hash stays body-only on purpose (a completion-aware hash would make
+    every completion enqueue a paid inferred-edges extraction); the document
+    still carries `completed_by` whenever it is written."""
+    import kb.handlers.claude_code as cc_mod
+
+    async def empty(**kwargs):
+        return cc_mod._ext.UnitBundle()
+
+    monkeypatch.setattr(cc_mod._ext, "extract_units_from_session", empty)
+    connector = ClaudeCodeConnector(make_default_context())
+    hydrated = {"session_id": "s-hash", "events": [{"line_no": 0, "raw": {"type": "user", "content": "x"}}]}
+    live = await connector.normalize(_event(session_id="s-hash"), {**hydrated, "session_complete": False})
+    done = await connector.normalize(
+        _event(session_id="s-hash"),
+        {**hydrated, "session_complete": True, "completed_by": "cron_marker"},
+    )
+    assert live.documents[0].content_hash == done.documents[0].content_hash
+    assert done.documents[0].metadata["completed_by"] == "cron_marker"
+    assert "completed_by" not in live.documents[0].metadata

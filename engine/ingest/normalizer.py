@@ -248,6 +248,46 @@ class Normalizer:
 
     # ---- persistence --------------------------------------------------------
 
+    async def _record_extraction_outcome(self, queue_id: int, outcome: dict[str, Any]) -> None:
+        """Record how a coding-agent session's last complete pass went.
+
+        `retries` belongs to the idle sweep, which bumps it when it re-queues a
+        partial pass: an authoritative pass resets it, and so does the first
+        real attempt after switched-off ones (their budget is separate); any
+        other pass keeps it, so the bound holds across the retries themselves.
+
+        Best-effort: the documents are already committed, and a missing record
+        only costs a retry the sweep would otherwise have made. It also has to
+        survive a plane whose schema is behind its code -- research applies kb
+        migrations on its own deploy, which can trail the worker's image -- so
+        a missing column is logged and skipped rather than failing the row.
+        """
+        try:
+            async with get_pool().acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE ingestion_queue
+                       SET extraction_outcome = $2::jsonb || jsonb_build_object(
+                             'retries',
+                             CASE WHEN ($2::jsonb ->> 'authoritative')::boolean THEN 0
+                                  -- Retries spent while extraction was switched
+                                  -- off do not count against a real failure.
+                                  WHEN extraction_outcome ->> 'reason' = 'disabled'
+                                   AND $2::jsonb ->> 'reason' <> 'disabled' THEN 0
+                                  ELSE COALESCE((extraction_outcome ->> 'retries')::int, 0)
+                             END)
+                     WHERE queue_id = $1
+                    """,
+                    queue_id,
+                    _json(outcome),
+                )
+        except Exception as exc:
+            log.warning(
+                "normalizer.extraction_outcome_failed",
+                queue_id=queue_id,
+                error=f"{type(exc).__name__}: {str(exc)[:200]}",
+            )
+
     async def _retire_orphaned_children(
         self,
         customer_id: str,
@@ -605,6 +645,9 @@ class Normalizer:
         #
         # Skip if no docs were persisted this cycle. Agent-session transcripts
         # are gated to their finalization pass (see _inferred_edge_doc_ids).
+        if result.extraction_outcome is not None and queue_id is not None:
+            await self._record_extraction_outcome(queue_id, result.extraction_outcome)
+
         if result.retire_children_of:
             # DECLARED, not written. `doc_ids` holds what this pass actually
             # persisted, and a child whose content is byte-identical to its live
@@ -852,7 +895,20 @@ class Normalizer:
 
         # ---- Post-commit per-item enqueues (best-effort, mirrors _persist) -
         outcomes: list[NormalizeOutcome] = []
-        for item_idx, (result, _queue_id) in enumerate(items):
+        for item_idx, (result, queue_id) in enumerate(items):
+            # The coding-agent post-commit steps `_persist` runs, which this
+            # path used to skip: without them a coalesced claim would neither
+            # retire a session's orphaned units nor record how its pass went
+            # (and a stale `disabled` record would be retried forever).
+            if result.extraction_outcome is not None and queue_id is not None:
+                await self._record_extraction_outcome(queue_id, result.extraction_outcome)
+            if result.retire_children_of:
+                await self._retire_orphaned_children(
+                    customer_id,
+                    result.retire_children_of,
+                    {doc.doc_id for doc in result.documents}
+                    | {pre.document.doc_id for pre in result.documents_with_chunks},
+                )
             doc_ids = per_item_doc_ids[item_idx]
             if doc_ids:
                 edge_doc_ids = _inferred_edge_doc_ids(
