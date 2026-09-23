@@ -46,6 +46,7 @@ import asyncio
 import math
 import time
 import weakref
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -63,6 +64,7 @@ from engine.shared.constants import (
     JEV_MODEL,
     JEV_POOL_WAIT_SECONDS,
     JEV_REQUEST_TIMEOUT_SECONDS,
+    JEV_TIER_PENALTIES,
     JEV_TOKEN_BUDGET,
     JEV_TOKENS_PER_QUESTION,
     LOG_ERROR_MAX_CHARS,
@@ -503,33 +505,93 @@ class RankedDoc:
     score: float
 
 
+#: Kind -> tier (see JEV_TIER_PENALTIES). The kind is read off the doc id, the
+#: one field every pool hit carries: connector docs by source
+#: (`github:<repo>:<kind>:<id>`, `claude_code:<tenant>:<session>`), custom-ingest
+#: docs by the client id research-os projects
+#: (`custom_ingest:<tenant>:<source_key>:<kind>:<id>`). Anything unrecognised
+#: lands in tier 2 with the other high-volume kinds, never on top.
+_AGENT_SOURCES = ("claude_code", "codex", "pi")
+_TIER_OF_KIND: dict[str, int] = {
+    # 0: the records Probe owns
+    "run": 0, "trial": 0, "project": 0, "group": 0, "paper": 0, "team_note": 0, "experiment": 0,
+    # 1: authored GitHub records
+    "gh_pull_request": 1, "gh_pr": 1, "gh_issue": 1, "gh_review": 1, "gh_release": 1,
+    "gh_feature_rationale": 1, "gh_codeowners": 1, "gh_commit_comment": 1,
+    # 2: high volume
+    "gh_commit": 2, "file": 2, "code": 2,
+    # 3: coding-agent session derivatives
+    "transcript": 3, "digest": 3,
+}
+_DEFAULT_TIER = 2
+
+
+def doc_kind(doc_id: str, source_system: str | None = None) -> str:
+    """The ranking kind of a document, from its id (and source_system when known)."""
+    parts = doc_id.split(":")
+    src = source_system or parts[0]
+    if src in _AGENT_SOURCES:
+        return "transcript"
+    if src == "custom_ingest" and len(parts) >= 4:
+        source_key, tail = parts[2], parts[3]
+        if source_key == "session_digests":
+            return "digest"
+        if source_key == "team_notes":
+            return "team_note"
+        if source_key == "artifacts" or source_key.startswith(("workspace", "shared")):
+            return "file"
+        if source_key == "experiments":
+            return tail
+        return "custom_other"
+    if src == "github":
+        return "gh_" + (parts[2] if len(parts) > 2 else "unknown")
+    if src == "code_graph":
+        return "code"
+    return src
+
+
+def doc_tier(doc_id: str, source_system: str | None = None) -> int:
+    return _TIER_OF_KIND.get(doc_kind(doc_id, source_system), _DEFAULT_TIER)
+
+
 def rank_documents(
     pool: dict[str, dict[str, Any]],
     scores: dict[str, float],
     *,
     limit: int,
+    penalties: Sequence[float] = JEV_TIER_PENALTIES,
 ) -> list[RankedDoc]:
-    """The top `limit` DOCUMENTS by their best-scoring chunk.
+    """The top `limit` DOCUMENTS by their best-scoring chunk, less a tier penalty.
 
     Units are documents because that is what the recall floor counts and what
     a reader receives -- ranking chunks would let one long document take every
     slot. A document scores as its best chunk: a long doc whose fourth chunk is
     the answer must not be ranked on its first.
 
-    Ties break on pool order, which is retrieval order -- deterministic, and a
-    sensible prior when Jev cannot tell two chunks apart.
+    The ORDER subtracts `penalties[doc_tier(doc)]` from the probability (see
+    JEV_TIER_PENALTIES); the `score` each RankedDoc carries stays Jev's raw
+    probability, which is what the trace, the confidence band and the rewrite
+    trigger read. Ties break on pool order, which is retrieval order --
+    deterministic, and a sensible prior when Jev cannot tell two chunks apart.
     """
     best: dict[str, RankedDoc] = {}
     order: dict[str, int] = {}
+    source: dict[str, str | None] = {}
     for i, (cid, hit) in enumerate(pool.items()):
         s = scores.get(cid)
         if s is None:
             continue
         doc = hit.get("doc_id") or cid
         order.setdefault(doc, i)
+        source.setdefault(doc, hit.get("source_system") or None)
         if doc not in best or s > best[doc].score:
             best[doc] = RankedDoc(doc_id=doc, chunk_id=cid, score=s)
-    ranked = sorted(best.values(), key=lambda r: (-r.score, order[r.doc_id]))
+
+    def penalty(doc: str) -> float:
+        tier = doc_tier(doc, source.get(doc))
+        return penalties[tier] if tier < len(penalties) else 0.0
+
+    ranked = sorted(best.values(), key=lambda r: (-(r.score - penalty(r.doc_id)), order[r.doc_id]))
     return ranked[:limit]
 
 

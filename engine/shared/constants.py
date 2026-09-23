@@ -2062,6 +2062,28 @@ JEV_MAX_SPLIT_DEPTH = 4
 # is abandoned. It is a shadow: it must never make a search wait.
 JEV_EXTRACTION_GRACE_SECONDS = 0.25
 
+
+def _env_floats(name: str, default: str) -> tuple[float, ...]:
+    raw = os.getenv(name, default)
+    try:
+        return tuple(float(x) for x in raw.split(",") if x.strip())
+    except ValueError:
+        return tuple(float(x) for x in default.split(","))
+
+
+# ---- Jev: tier penalties -- the source/kind preference, where Jev can see it --
+# The product order (Richard, 2026-09-23): the records Probe owns (run, project,
+# paper, ...) > authored GitHub records (PR, issue, review) > high-volume
+# commits, files and code > coding-agent session derivatives. One penalty per
+# tier is SUBTRACTED from Jev's probability before documents are ranked, so a
+# strong judgment still wins (a 0.91 session outranks a 0.55 commit) and the
+# tier decides near-ties only. research-os's old post-sort was this rule with an
+# infinite penalty on tier 3, and it cost 0.020 NDCG@10 on 400 labelled
+# searches; these values are quality-neutral against pure Jev order and set
+# only how the top of the list looks (docs/plans/jev-postsort-tiers-sizing.md).
+# Comma-separated, tiers 0..3; "0,0,0,0" turns the preference off.
+JEV_TIER_PENALTIES: tuple[float, ...] = _env_floats("JEV_TIER_PENALTIES", "0,0.03,0.08,0.12")
+
 # ---- Entity auto-merge on Jev (engine/ingest/auto_merge/jev_judge.py) ---------
 # Replay of 477 managed-plane decisions, 2026-09-23 (docs/jev-contract.md, "Entity auto-merge"):
 # at >=0.95 Jev auto-merged 84 pairs, 83 verified by hard identity evidence (same

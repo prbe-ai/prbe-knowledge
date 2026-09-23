@@ -952,3 +952,62 @@ def test_the_shipped_defaults_are_the_rollout_step():
     assert C.SEARCH_SELECTOR_DEFAULT == "jev"
     assert frozenset() == C.SEARCH_SELECTOR_JEV_CUSTOMERS
     assert frozenset({"*"}) == C.SEARCH_SELECTOR_JEV_ALLOWED
+
+
+# ---- tier penalties: the source/kind preference, applied inside the ranking ----
+
+RUN = "custom_ingest:t:experiments:run:1"
+PAPER = "custom_ingest:t:experiments:paper:2"
+FILE = "custom_ingest:t:artifacts:file:3"
+PR = "github:o/r:pr:4"
+COMMIT = "github:o/r:commit:5"
+SESSION = "claude_code:t:6"
+DIGEST = "custom_ingest:t:session_digests:session_digest:claude_code:6"
+
+
+def test_doc_kind_and_tier_from_the_id():
+    assert jev.doc_kind(RUN) == "run" and jev.doc_tier(RUN) == 0
+    assert jev.doc_kind(PAPER) == "paper" and jev.doc_tier(PAPER) == 0
+    assert jev.doc_tier("custom_ingest:t:team_notes:team_note:t") == 0
+    assert jev.doc_kind(PR) == "gh_pr" and jev.doc_tier(PR) == 1
+    assert jev.doc_tier("github:o/r:pull_request:4") == 1
+    assert jev.doc_kind(FILE) == "file" and jev.doc_tier(FILE) == 2
+    assert jev.doc_kind(COMMIT) == "gh_commit" and jev.doc_tier(COMMIT) == 2
+    assert jev.doc_kind("code_graph:r:f.py") == "code" and jev.doc_tier("code_graph:r:f.py") == 2
+    assert jev.doc_kind(SESSION) == "transcript" and jev.doc_tier(SESSION) == 3
+    assert jev.doc_tier("x", "codex") == 3  # source_system wins over the prefix
+    assert jev.doc_kind(DIGEST) == "digest" and jev.doc_tier(DIGEST) == 3
+    assert jev.doc_tier("something:new") == jev._DEFAULT_TIER
+
+
+def _tiered_pool(*docs: str) -> dict:
+    return {f"{d}#0": {**_hit(d, chunk=f"{d}#0"), "source_system": d.split(":")[0]} for d in docs}
+
+
+def test_penalty_decides_near_ties_only():
+    pool = _tiered_pool(SESSION, COMMIT, RUN)
+    scores = {f"{SESSION}#0": 0.91, f"{COMMIT}#0": 0.55, f"{RUN}#0": 0.53}
+    ranked = jev.rank_documents(pool, scores, limit=10, penalties=(0, 0.03, 0.08, 0.12))
+    # a strong judgment survives its tier; the commit/run near-tie flips to the run
+    assert [r.doc_id for r in ranked] == [SESSION, RUN, COMMIT]
+    # the carried score is still Jev's raw probability, not the penalised one
+    assert [r.score for r in ranked] == [0.91, 0.53, 0.55]
+
+
+def test_a_transcript_barely_ahead_of_a_run_drops_behind_it():
+    pool = _tiered_pool(SESSION, RUN)
+    ranked = jev.rank_documents(pool, {f"{SESSION}#0": 0.60, f"{RUN}#0": 0.58}, limit=10,
+                                penalties=(0, 0.03, 0.08, 0.12))
+    assert [r.doc_id for r in ranked] == [RUN, SESSION]
+
+
+def test_zero_penalties_are_the_plain_jev_order():
+    pool = _tiered_pool(SESSION, COMMIT, RUN)
+    scores = {f"{SESSION}#0": 0.60, f"{COMMIT}#0": 0.59, f"{RUN}#0": 0.58}
+    assert [r.doc_id for r in jev.rank_documents(pool, scores, limit=10, penalties=(0, 0, 0, 0))] == [SESSION, COMMIT, RUN]
+
+
+def test_default_penalties_come_from_config():
+    from engine.shared.constants import JEV_TIER_PENALTIES
+    assert len(JEV_TIER_PENALTIES) == 4 and JEV_TIER_PENALTIES[0] == 0.0
+    assert list(JEV_TIER_PENALTIES) == sorted(JEV_TIER_PENALTIES)
