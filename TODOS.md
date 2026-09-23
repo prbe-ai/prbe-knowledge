@@ -38,6 +38,49 @@ or retry loop that increments version on conflict. ~10 lines.
 
 ## P2 — operational hygiene
 
+### Queue post-write work only when a node is inserted or actually changes
+**Where:** `engine/ingest/graph_writer.py:149-165` (`upsert_nodes` enqueue).
+
+Every upsert re-queues the node with `ON CONFLICT DO UPDATE`, changed or not. On
+the managed plane (logs, 2026-09-23) 80 distinct nodes produced 500 auto-merge
+judge calls in 81 minutes; one Person node was judged 86 times. That is most of
+the judge spend, and repeated draws let a noisy judge ratchet a near-threshold
+pair into a merge (a Jev pair averaging 0.932 crossed 0.95 on 4 of 20 calls).
+All three post-write steps only need insert-or-change: embedding runs only when
+`embedding IS NULL`, pending edges drain on arrival, and a newly arriving twin
+is judged itself. **Fix:** have the upsert report inserted/changed node ids and
+enqueue only those.
+
+### Auto-merge keeps retrying a merge that 409s
+**Where:** `engine/ingest/auto_merge/analyzer.py` (`_fire_merge`).
+
+On the managed plane one Person node proposed the same merge 18 times in 81
+minutes; every attempt failed `merge_cluster` with "one or more aliases already
+belong to a cluster" because the node is already an alias in another cluster.
+The analyzer should resolve an already-clustered node or candidate to its
+primary before proposing a merge, or skip it. Judge-independent.
+
+### Auto-merge vector leg is an exact scan (~19.5 s CPU per Document)
+**Where:** `engine/ingest/auto_merge/analyzer.py` (`_find_candidates`, vector path).
+
+EXPLAIN ANALYZE on the managed plane: seq scan + sort over ~27.6k Document rows,
+19.5 s and ~230k buffer hits, on a Postgres limited to 1.5 cores. It runs for
+every judged Document. Try the HNSW index with `hnsw.iterative_scan` and measure
+top-10 recall against the exact result before switching.
+
+### Review two suspect gpt-oss auto-merges on the managed plane
+The 2026-09-23 replay found two executed gpt-oss merges that look wrong: two
+different Notion pages merged on the rationale "identical canonical_id" (false),
+and two Slack users merged on a shared display name alone. A human should
+decide; `entity_merge_audit` + node snapshots make both reversible via unmerge.
+The ids are in the replay notes, not here (public repo).
+
+### The research plane never runs entity auto-merge
+No side-worker deployment runs `services.ingestion.inferred_edges.worker` on the
+research cluster, so every kb node there sits in `node_post_write_queue`
+(221,210 rows on 2026-09-23) with no suggestions and no merges. **Decide:** run
+it there, or stop enqueueing on research so the table stops growing.
+
 ### neon_auth person enrichment is unwired on managed, not just unpermitted
 **Where:** `neon_auth."user"` on managed-shared; the query lives in prbe-backend
 (see `kb/handlers/claude_code.py:717` — "Gateway injects this from
