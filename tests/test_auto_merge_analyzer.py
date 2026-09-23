@@ -246,15 +246,26 @@ JUDGES = [
 
 
 class FakeConn:
-    def __init__(self, documents: tuple[str, ...] = ()) -> None:
+    def __init__(self, documents: tuple[str, ...] = (), aliases: tuple[str, ...] = (), nodes: tuple[str, ...] = ()) -> None:
         self.suggestions: list[tuple] = []
         self.documents = set(documents)
+        self.aliases = set(aliases)
+        self.nodes = set(nodes)
 
     async def fetchval(self, sql: str, *args):
+        if "FROM entity_aliases" in sql:
+            return args[2] in self.aliases
         assert "FROM documents" in sql, sql
         return args[1] in self.documents
 
     async def fetchrow(self, sql: str, *args):
+        if "AS aliased" in sql:  # the document-twin lookup
+            _, _, document_id, mention_id = args
+            return {
+                "document": document_id in self.nodes,
+                "mention": mention_id in self.nodes,
+                "aliased": bool({document_id, mention_id} & self.aliases),
+            }
         assert "INSERT INTO entity_merge_suggestions" in sql, sql
         self.suggestions.append(args)
         return {"suggestion_id": uuid.uuid4()}
@@ -348,6 +359,43 @@ async def test_a_document_node_is_never_judged_or_merged(monkeypatch, model, p):
     result = await a.analyze(conn, "acme-test", 7)
     assert (result.action, result.rationale) == ("skipped", "document node")
     assert merges == [] and conn.suggestions == []
+
+
+async def test_a_document_folds_its_bare_mention_into_itself_without_a_judge(monkeypatch):
+    a, merges = _analyzer(monkeypatch, PR_NODE, PR_CANDS, raises=AssertionError("the judge must not be asked"))
+    conn = FakeConn(documents=("github:acme/widgets:pr:12",), nodes=("github:acme/widgets:pr:12", "acme/widgets#12"))
+    result = await a.analyze(conn, "acme-test", 7)
+    assert (result.action, result.judge_model) == ("merged", az.TWIN_RULE)
+    (body,) = merges
+    assert (body.primary_canonical_id, body.alias_canonical_ids) == ("github:acme/widgets:pr:12", ["acme/widgets#12"])
+    assert (body.refuse_cluster_primaries, body.refuse_document_aliases) == (True, True)
+    assert body.reason.startswith("auto: rule:document-twin confidence=high")
+
+
+async def test_a_mention_arriving_after_its_document_folds_into_it(monkeypatch):
+    mention = dict(PR_NODE, canonical_id="acme/widgets#12", properties={"kind": "PR", "repo": "acme/widgets", "number": 12})
+    a, merges = _analyzer(monkeypatch, mention, PR_CANDS, raises=AssertionError("the judge must not be asked"))
+    conn = FakeConn(nodes=("github:acme/widgets:issue:12", "acme/widgets#12"))
+    result = await a.analyze(conn, "acme-test", 7)
+    assert result.action == "merged"
+    (body,) = merges
+    assert (body.primary_canonical_id, body.alias_canonical_ids) == ("github:acme/widgets:issue:12", ["acme/widgets#12"])
+
+
+async def test_no_twin_fold_when_the_mention_is_already_an_alias(monkeypatch):
+    a, merges = _analyzer(monkeypatch, PR_NODE, PR_CANDS)
+    conn = FakeConn(documents=("github:acme/widgets:pr:12",), nodes=("github:acme/widgets:pr:12", "acme/widgets#12"),
+                    aliases=("acme/widgets#12",))
+    result = await a.analyze(conn, "acme-test", 7)
+    assert (result.action, result.rationale) == ("skipped", "document node") and merges == []
+
+
+async def test_a_stray_alias_node_is_skipped_before_any_work(monkeypatch):
+    j = Judgment(verdict=_verdict("U123", "high"), model="jev-1.13.0", p=0.99)
+    a, merges = _analyzer(monkeypatch, PERSON_NODE, [Candidate("ada@example.com", {"name": "Ada"}, 1, 0.9, 0.1)], judgment=j)
+    result = await a.analyze(FakeConn(aliases=("ada-gh",)), "acme-test", 8)
+    assert (result.action, result.rationale) == ("skipped", "stray alias node")
+    assert merges == []
 
 
 async def test_a_document_stub_written_before_its_document_is_skipped_too(monkeypatch):
@@ -476,6 +524,7 @@ async def test_open_breaker_defers_before_the_candidate_search(monkeypatch):
     result = await a.analyze(FakeConn(), "acme-test", 7)
     assert result.action == "deferred"
     assert 1 <= result.retry_after_seconds <= breaker.seconds_until_closed() + 1 + AUTO_MERGE_BREAKER_JITTER_SECONDS
+    assert result.judge_called is False  # does not count toward the worker's cap
     assert merges == []
 
 

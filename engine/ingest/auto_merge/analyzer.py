@@ -27,6 +27,7 @@ from pydantic import ValidationError
 from engine.ingest.auto_merge import jev_judge
 from engine.ingest.auto_merge.jev_judge import Judgment, execution_evidence
 from engine.ingest.auto_merge.models import RATIONALE_MAX_CHARS, AutoMergeVerdict
+from engine.ingest.auto_merge.twins import documents_of, mention_of
 from engine.ingest.entity_clusters_routes import (
     MergeRequest,
     MergeResponse,
@@ -49,6 +50,7 @@ from engine.shared.constants import (
 )
 from engine.shared.llm import LLMError, acompletion
 from engine.shared.logging import get_logger
+from engine.shared.metrics import counter
 
 log = get_logger(__name__)
 
@@ -162,6 +164,14 @@ class AutoMergeResult:
     p: float | None = None
     #: For action="deferred": the base delay before the worker retries it.
     retry_after_seconds: int | None = None
+    #: For action="deferred": whether a request went to the judge. Only those
+    #: count toward the worker's deferral cap -- an open breaker sends nothing,
+    #: and a long outage must not park the whole backlog.
+    judge_called: bool = True
+
+
+#: `judge_model` of a merge made by the document-twin rule (no judge asked).
+TWIN_RULE = "rule:document-twin"
 
 
 @functools.cache
@@ -179,6 +189,9 @@ def _jev_api_key() -> str | None:
         key = get_settings().typesafe_api_key
         if key:
             return key
+        # Every judgment it happens on, so a dashboard can alert on it; the
+        # log line is once per process.
+        counter("auto_merge.jev_unconfigured", 1)
         _warn_jev_unconfigured()
     return None
 
@@ -279,7 +292,18 @@ class AutoMergeAnalyzer:
         properties = node["properties"] or {}
 
         if _is_path_canonical(label, canonical_id):
+            # A bare `owner/repo#n` mention is never judged, but when its PR or
+            # issue already has a document node, the mention folds INTO it.
+            for document_id in documents_of(canonical_id):
+                folded = await self._fold_into_document(conn, customer_id, label, document_id, canonical_id)
+                if folded is not None:
+                    return folded
             return AutoMergeResult(action="skipped", rationale="path-canonical label")
+
+        # A node that is itself an alias is a stray copy (an upsert that
+        # raced a merge, or an older one-hop route): every merge of it 409s.
+        if await self._is_alias(conn, customer_id, label, canonical_id):
+            return AutoMergeResult(action="skipped", rationale="stray alias node")
 
         # A node whose id is one of this tenant's documents IS that document's
         # graph node: retrieval reaches the document through it
@@ -291,6 +315,11 @@ class AutoMergeAnalyzer:
         # So a document node is never the alias; it can still be a primary. A
         # `doc_type` marks a stub written before its document row exists.
         if "doc_type" in properties or await self._is_document(conn, customer_id, canonical_id):
+            mention = mention_of(canonical_id)
+            if mention is not None:
+                folded = await self._fold_into_document(conn, customer_id, label, canonical_id, mention)
+                if folded is not None:
+                    return folded
             return AutoMergeResult(action="skipped", rationale="document node")
 
         # With the merge breaker open there is no judge to ask: defer BEFORE the
@@ -301,6 +330,7 @@ class AutoMergeAnalyzer:
                 action="deferred",
                 error="JevBreakerOpen('breaker_open')",
                 retry_after_seconds=_breaker_wait_seconds(),
+                judge_called=False,
             )
 
         candidates = await self._find_candidates(conn, node)
@@ -328,6 +358,7 @@ class AutoMergeAnalyzer:
                 candidate_count=len(filtered),
                 error=repr(exc),
                 retry_after_seconds=_breaker_wait_seconds(),
+                judge_called=False,
             )
         except (JevRequestTooLarge, JevRequestRejected, LLMError, ValidationError) as exc:
             # Permanent for this input (an oversize or refused request, an LLM
@@ -566,6 +597,88 @@ class AutoMergeAnalyzer:
             )
 
         return rank_candidates(merged)
+
+    async def _is_alias(self, conn: asyncpg.Connection, customer_id: str, label: str, canonical_id: str) -> bool:
+        return bool(
+            await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM entity_aliases "
+                "WHERE customer_id = $1 AND label = $2 AND alias_canonical_id = $3)",
+                customer_id,
+                label,
+                canonical_id,
+            )
+        )
+
+    async def _fold_into_document(
+        self,
+        conn: asyncpg.Connection,
+        customer_id: str,
+        label: str,
+        document_id: str,
+        mention_id: str,
+    ) -> AutoMergeResult | None:
+        """Merge a document's bare mention INTO the document's node (twins.py).
+
+        No judge: the two ids name one object by construction. None when there
+        is nothing to fold -- either node missing, or either already an alias.
+        merge_cluster re-checks, under its lock, that the mention is not a
+        document and not a cluster primary.
+        """
+        if not self._execute:
+            return None
+        row = await conn.fetchrow(
+            """
+            SELECT
+              EXISTS (SELECT 1 FROM graph_nodes WHERE customer_id = $1 AND label = $2 AND canonical_id = $3) AS document,
+              EXISTS (SELECT 1 FROM graph_nodes WHERE customer_id = $1 AND label = $2 AND canonical_id = $4) AS mention,
+              EXISTS (SELECT 1 FROM entity_aliases WHERE customer_id = $1 AND label = $2
+                        AND alias_canonical_id IN ($3, $4)) AS aliased
+            """,
+            customer_id,
+            label,
+            document_id,
+            mention_id,
+        )
+        if not (row["document"] and row["mention"]) or row["aliased"]:
+            return None
+        rationale = f"{mention_id} is the bare mention of document {document_id}"
+        body = MergeRequest(
+            customer_id=customer_id,
+            performed_by_user_id=SYSTEM_USER_ID,
+            label=label,
+            primary_canonical_id=document_id,
+            alias_canonical_ids=[mention_id],
+            reason=f"auto: {TWIN_RULE} confidence=high rationale={rationale[:120]}",
+            refuse_cluster_primaries=True,
+            refuse_document_aliases=True,
+        )
+        try:
+            resp: MergeResponse = await merge_cluster(body)
+        except HTTPException as exc:
+            log.warning(
+                "auto_merge.twin_merge_refused",
+                customer=customer_id,
+                document=document_id,
+                mention=mention_id,
+                error=repr(exc),
+            )
+            return AutoMergeResult(action="error", error=repr(exc), judge_model=TWIN_RULE)
+        log.info(
+            "auto_merge.merged",
+            customer=customer_id,
+            merge_id=str(resp.merge_id),
+            primary=document_id,
+            alias=mention_id,
+            judge_model=TWIN_RULE,
+        )
+        return AutoMergeResult(
+            action="merged",
+            primary_canonical_id=document_id,
+            confidence="high",
+            rationale=rationale,
+            merge_id=resp.merge_id,
+            judge_model=TWIN_RULE,
+        )
 
     async def _is_document(self, conn: asyncpg.Connection, customer_id: str, canonical_id: str) -> bool:
         return bool(

@@ -45,6 +45,7 @@ from datetime import datetime
 import asyncpg
 
 from engine.ingest.auto_merge import AutoMergeAnalyzer
+from engine.ingest.auto_merge.analyzer import AutoMergeResult
 from engine.ingest.graph_writer import drain_pending_edges, reap_expired_pending_edges
 from engine.ingest.normalizer import _pg_vector
 from engine.shared.constants import (
@@ -75,8 +76,15 @@ class PostWriteWorker:
         concurrency: int = _DEFAULT_CONCURRENCY,
         worker_id: str | None = None,
         execute_high_confidence: bool = False,
+        auto_merge_enabled: bool = True,
+        embeddings_enabled: bool = True,
     ) -> None:
         self._concurrency = max(1, concurrency)
+        # Both default on. A plane that only needs parked edges linked (the
+        # research plane) turns them off: node embeddings are read only by
+        # auto-merge's candidate search.
+        self._auto_merge_enabled = auto_merge_enabled
+        self._embeddings_enabled = embeddings_enabled
         self._worker_id = worker_id or (
             f"post-write-{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
         )
@@ -89,6 +97,8 @@ class PostWriteWorker:
             worker_id=self._worker_id,
             concurrency=self._concurrency,
             execute=self._analyzer._execute,
+            auto_merge=self._auto_merge_enabled,
+            embeddings=self._embeddings_enabled,
         )
         await asyncio.gather(
             *(self._claim_loop() for _ in range(self._concurrency))
@@ -173,10 +183,14 @@ class PostWriteWorker:
             # transaction made the merge wait on its caller until the statement
             # timed out (5 min), so a brand-new node's first merge always failed.
             async with with_tenant(customer_id) as conn:
-                await self._ensure_embedding(conn, node_id)
+                if self._embeddings_enabled:
+                    await self._ensure_embedding(conn, node_id)
                 await self._drain_pending_edges(conn, customer_id, node_id)
-            async with with_tenant(customer_id) as conn:
-                result = await self._analyzer.analyze(conn, customer_id, node_id)
+            if self._auto_merge_enabled:
+                async with with_tenant(customer_id) as conn:
+                    result = await self._analyzer.analyze(conn, customer_id, node_id)
+            else:
+                result = AutoMergeResult(action="skipped", rationale="auto-merge disabled")
 
             counter(
                 "post_write.processed",
@@ -310,26 +324,30 @@ class PostWriteWorker:
         future lock IS the retry schedule. Deferrals double from the
         analyzer's base delay up to AUTO_MERGE_RETRY_MAX_SECONDS and do not
         touch `attempts` -- an outage is not this node's fault. After
-        AUTO_MERGE_MAX_DEFERRALS in a row the row is parked (attempts set to
-        the cap, status "failed") so a judge that never recovers cannot keep a
-        node cycling forever. A new upsert of the node resets all of this.
+        AUTO_MERGE_MAX_DEFERRALS failed CALLS the row is parked (attempts set
+        to the cap, status "failed") so a judge that keeps failing cannot keep
+        a node cycling forever. A deferral with the breaker open sent nothing
+        and does not count: a long outage backs the queue off to the hourly
+        ceiling instead of parking all of it. A new upsert resets all of this.
         """
         prev = _auto_merge_status(status)
         deferrals = prev.get("deferrals", 0) + 1
+        failed_calls = prev.get("failed_calls", 0) + (1 if result.judge_called else 0)
         error = (result.error or "judge unavailable")[:240]
-        if deferrals > AUTO_MERGE_MAX_DEFERRALS:
+        if failed_calls > AUTO_MERGE_MAX_DEFERRALS:
             log.warning(
                 "post_write_worker.deferral_cap_reached",
                 customer=customer_id,
                 node_id=node_id,
-                deferrals=deferrals - 1,
+                failed_calls=failed_calls - 1,
                 error=error,
             )
             await self._write_status(
                 customer_id,
                 node_id,
                 claimed_at,
-                {"status": "failed", "attempts": _MAX_ATTEMPTS, "deferrals": deferrals - 1, "last_error": error},
+                {"status": "failed", "attempts": _MAX_ATTEMPTS, "deferrals": deferrals,
+                 "failed_calls": failed_calls - 1, "last_error": error},
                 delay_seconds=None,
             )
             return
@@ -339,7 +357,8 @@ class PostWriteWorker:
             customer_id,
             node_id,
             claimed_at,
-            {"status": "deferred", "attempts": prev.get("attempts", 0), "deferrals": deferrals, "last_error": error},
+            {"status": "deferred", "attempts": prev.get("attempts", 0), "deferrals": deferrals,
+             "failed_calls": failed_calls, "last_error": error},
             delay_seconds=delay,
         )
 
@@ -394,7 +413,12 @@ class PostWriteWorker:
 def _auto_merge_status(status: dict) -> dict:
     """analyzer_status["auto_merge"] with integer counters (0 when absent)."""
     raw = status.get("auto_merge") or {}
-    return {**raw, "attempts": int(raw.get("attempts", 0)), "deferrals": int(raw.get("deferrals", 0))}
+    return {
+        **raw,
+        "attempts": int(raw.get("attempts", 0)),
+        "deferrals": int(raw.get("deferrals", 0)),
+        "failed_calls": int(raw.get("failed_calls", 0)),
+    }
 
 
 # --------------------------------------------------------------------------- #

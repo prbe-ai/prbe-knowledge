@@ -282,5 +282,6 @@ jobs:
           tests/test_retire_experiment_nodes.py
           tests/test_auto_merge_analyzer.py
           tests/test_auto_merge_jev_judge.py
+          tests/test_auto_merge_twins.py
           tests/test_auto_merge_live.py
           tests/test_entity_clusters_routes.py

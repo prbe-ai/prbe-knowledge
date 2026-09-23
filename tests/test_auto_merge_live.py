@@ -27,7 +27,7 @@ from engine.ingest.auto_merge import analyzer as az
 from engine.ingest.auto_merge import jev_judge
 from engine.ingest.entity_clusters_routes import MergeRequest, merge_cluster
 from engine.ingest.entity_merge_suggestions_routes import ApproveAllRequest, approve_all_suggestions
-from engine.ingest.graph_writer import upsert_nodes
+from engine.ingest.graph_writer import upsert_edges, upsert_nodes
 from engine.ingest.post_write import worker as worker_module
 from engine.ingest.post_write.worker import PostWriteWorker
 from engine.retrieval.agent import jev
@@ -37,10 +37,11 @@ from engine.shared.constants import (
     AUTO_MERGE_RETRY_SECONDS,
     JEV_BREAKER_FAILURES,
     AutoMergeJudge,
+    EdgeType,
     NodeLabel,
 )
 from engine.shared.db import raw_conn, with_tenant
-from engine.shared.models import GraphNodeSpec, make_document, make_person
+from engine.shared.models import GraphEdgeSpec, GraphNodeSpec, make_document, make_person
 
 CUSTOMER = "acme-automerge-test"
 
@@ -214,7 +215,8 @@ async def seed_document(doc_id: str) -> None:
 async def test_a_prs_document_node_is_never_folded_into_its_mention(world):
     # The PR's document node (its id is the document's doc_id) and the bare
     # `owner/repo#N` mention name the same PR. Folding the document node away
-    # would cut the document out of graph retrieval, so it is not judged.
+    # would cut the document out of graph retrieval, so it is never judged --
+    # and never the alias: the mention folds into IT (the twin rule).
     await ingest(make_document("acme/widgets#12", properties={"name": "Add widgets"}))
     await drain(world.worker)
 
@@ -224,7 +226,10 @@ async def test_a_prs_document_node_is_never_folded_into_its_mention(world):
     await drain(world.worker)
 
     assert world.fake.requests == []  # skipped before the candidate search and the judge
-    assert await fetch("SELECT 1 FROM entity_merge_audit") == []
+    audit = await fetch("SELECT primary_canonical_id, merged_alias_canonical_ids FROM entity_merge_audit")
+    assert [(a["primary_canonical_id"], a["merged_alias_canonical_ids"]) for a in audit] == [
+        ("github:acme/widgets:pr:12", ["acme/widgets#12"])
+    ]
     assert await fetch("SELECT 1 FROM entity_merge_suggestions") == []
     assert await fetch("SELECT 1 FROM graph_nodes WHERE canonical_id = 'github:acme/widgets:pr:12'") != []
 
@@ -239,7 +244,8 @@ async def test_a_document_stub_written_before_its_document_is_not_folded(world):
                                properties={"doc_type": "github.pull_request"}))
     await drain(world.worker)
     assert world.fake.requests == []
-    assert await fetch("SELECT 1 FROM entity_merge_audit") == []
+    audit = await fetch("SELECT primary_canonical_id FROM entity_merge_audit")
+    assert [a["primary_canonical_id"] for a in audit] == ["github:acme/widgets:pr:12"]  # the stub is the primary
 
 
 async def test_approving_an_old_suggestion_never_folds_a_document(world):
@@ -334,7 +340,8 @@ async def test_a_judge_that_never_recovers_parks_the_node_after_the_cap(world):
     async with raw_conn() as conn:
         await conn.execute(
             "UPDATE node_post_write_queue SET analyzer_status = $1::jsonb",
-            json.dumps({"auto_merge": {"status": "deferred", "attempts": 0, "deferrals": AUTO_MERGE_MAX_DEFERRALS}}),
+            json.dumps({"auto_merge": {"status": "deferred", "attempts": 0, "deferrals": AUTO_MERGE_MAX_DEFERRALS,
+                                       "failed_calls": AUTO_MERGE_MAX_DEFERRALS}}),
         )
     await drain(world.worker)
     status = await status_of("ada-gh")
@@ -354,7 +361,25 @@ async def test_open_breaker_defers_without_calling_jev_or_spending_an_attempt(wo
 
     assert world.fake.requests == []  # nothing was sent
     status = await status_of("ada-gh")
-    assert (status["status"], status["attempts"]) == ("deferred", 0)
+    assert (status["status"], status["attempts"], status["failed_calls"]) == ("deferred", 0, 0)
+
+
+async def test_a_long_outage_with_the_breaker_open_never_parks_the_node(world):
+    # Far past the cap in deferrals, but none of them sent anything.
+    await ingest(make_person("ada@example.com", {"name": "Ada Lovelace", "email": "ada@example.com"}))
+    await drain(world.worker)
+    for _ in range(JEV_BREAKER_FAILURES):
+        world.breaker.failure()
+    await ingest(make_person("ada-gh", {"name": "Ada Lovelace", "login": "ada-gh", "email": "ada@example.com"}))
+    async with raw_conn() as conn:
+        await conn.execute(
+            "UPDATE node_post_write_queue SET analyzer_status = $1::jsonb",
+            json.dumps({"auto_merge": {"status": "deferred", "attempts": 0,
+                                       "deferrals": 3 * AUTO_MERGE_MAX_DEFERRALS, "failed_calls": 0}}),
+        )
+    await drain(world.worker)
+    status = await status_of("ada-gh")
+    assert (status["status"], status["failed_calls"]) == ("deferred", 0)
 
 
 async def test_a_failed_pending_edge_drain_keeps_the_embedding_and_still_judges(world, monkeypatch):
@@ -439,4 +464,98 @@ async def test_a_node_reupserted_mid_processing_stays_queued_for_another_pass(wo
     (queued,) = await fetch("SELECT analyzer_status, locked_until FROM node_post_write_queue")
     assert (json.loads(queued["analyzer_status"]), queued["locked_until"]) == ({}, None)
     assert await drain(world.worker) == 1
+    assert await fetch("SELECT 1 FROM node_post_write_queue") == []
+
+
+
+async def test_a_prs_document_folds_its_mention_into_itself(world):
+    # The connector writes the mention and the document together; the
+    # document's node absorbs the mention (and every edge pointing at it).
+    world.fake.decide = lambda state: (_ for _ in ()).throw(AssertionError("no judge for a twin"))
+    await ingest(make_document("acme/widgets#12", properties={"name": "Add widgets"}))
+    await drain(world.worker)
+    await seed_document("github:acme/widgets:pr:12")
+    await ingest(make_document("github:acme/widgets:pr:12", properties={"doc_type": "github.pull_request"}))
+    await drain(world.worker)
+
+    assert world.fake.requests == []
+    audit = await fetch("SELECT primary_canonical_id, merged_alias_canonical_ids, reason FROM entity_merge_audit")
+    assert [(a["primary_canonical_id"], a["merged_alias_canonical_ids"]) for a in audit] == [
+        ("github:acme/widgets:pr:12", ["acme/widgets#12"])
+    ]
+    assert audit[0]["reason"].startswith("auto: rule:document-twin confidence=high")
+    # Later writes of the mention now land on the document's node.
+    await ingest(make_document("acme/widgets#12", properties={"name": "Add widgets"}))
+    assert await fetch("SELECT 1 FROM graph_nodes WHERE canonical_id = 'acme/widgets#12'") == []
+
+
+async def test_a_mention_written_after_its_document_folds_into_it(world):
+    await seed_document("github:acme/widgets:issue:3")
+    await ingest(make_document("github:acme/widgets:issue:3", properties={"doc_type": "github.issue"}))
+    await drain(world.worker)
+    await ingest(make_document("acme/widgets#3", properties={"name": "A bug"}))
+    await drain(world.worker)
+    audit = await fetch("SELECT primary_canonical_id, merged_alias_canonical_ids FROM entity_merge_audit")
+    assert [(a["primary_canonical_id"], a["merged_alias_canonical_ids"]) for a in audit] == [
+        ("github:acme/widgets:issue:3", ["acme/widgets#3"])
+    ]
+
+
+async def test_a_mention_that_heads_a_cluster_is_not_folded(world):
+    # The old judge folded documents INTO mentions, so a mention can head a
+    # cluster; folding it would strand that cluster (the repair script
+    # unmerges first).
+    await ingest(make_document("acme/widgets#12", properties={"name": "Add widgets"}),
+                 make_document("acme/widgets#12-old", properties={"name": "Add widgets"}))
+    async with raw_conn() as conn:
+        await conn.execute("UPDATE graph_nodes SET properties = properties || '{}'::jsonb")
+    await merge_cluster(MergeRequest(customer_id=CUSTOMER, performed_by_user_id=az.SYSTEM_USER_ID, label="Document",
+                                     primary_canonical_id="acme/widgets#12", alias_canonical_ids=["acme/widgets#12-old"]))
+    await seed_document("github:acme/widgets:pr:12")
+    await ingest(make_document("github:acme/widgets:pr:12", properties={"doc_type": "github.pull_request"}))
+    await drain(world.worker)
+    audit = await fetch("SELECT merged_alias_canonical_ids FROM entity_merge_audit")
+    assert [a["merged_alias_canonical_ids"] for a in audit] == [["acme/widgets#12-old"]]
+
+
+async def test_a_stray_alias_node_is_not_judged(world):
+    await ingest(make_person("ada@example.com", {"name": "Ada Lovelace", "email": "ada@example.com"}))
+    await drain(world.worker)
+    world.fake.decide = pick("ada-gh", "ada@example.com", 0.99)
+    await ingest(make_person("ada-gh", {"name": "Ada Lovelace", "login": "ada-gh", "email": "ada@example.com"}))
+    await drain(world.worker)
+    # A copy of the alias appears anyway (e.g. written by an older route).
+    async with raw_conn() as conn:
+        await conn.execute(
+            "INSERT INTO graph_nodes (customer_id, label, canonical_id, properties) VALUES ($1, 'Person', 'ada-gh', '{}')",
+            CUSTOMER,
+        )
+        node_id = await conn.fetchval("SELECT node_id FROM graph_nodes WHERE canonical_id = 'ada-gh'")
+        await conn.execute("INSERT INTO node_post_write_queue (customer_id, node_id, analyzer_status) VALUES ($1, $2, '{}')",
+                           CUSTOMER, node_id)
+    world.fake.requests.clear()
+    await drain(world.worker)
+    assert world.fake.requests == []
+    assert len(await fetch("SELECT 1 FROM entity_merge_audit")) == 1
+
+
+async def test_edge_linking_only_mode_links_a_parked_edge_and_judges_nothing(world):
+    # What the research plane runs: auto-merge and node embeddings off.
+    worker = PostWriteWorker(concurrency=1, execute_high_confidence=False,
+                             auto_merge_enabled=False, embeddings_enabled=False)
+    await ingest(make_person("ada@example.com", {"name": "Ada Lovelace", "email": "ada@example.com"}))
+    async with with_tenant(CUSTOMER) as conn:
+        ids = {("Person", "ada@example.com"): await conn.fetchval(
+            "SELECT node_id FROM graph_nodes WHERE canonical_id = 'ada@example.com'")}
+        await upsert_edges(conn, CUSTOMER, [GraphEdgeSpec(
+            edge_type=EdgeType.AUTHORED, from_label=NodeLabel.PERSON, from_canonical_id="ada@example.com",
+            to_label=NodeLabel.DOCUMENT, to_canonical_id="github:acme/widgets:pr:12")], ids, "github")
+    assert len(await fetch("SELECT 1 FROM pending_edges")) == 1
+
+    await ingest(make_document("github:acme/widgets:pr:12", properties={"doc_type": "github.pull_request"}))
+    await drain(worker)
+    assert await fetch("SELECT 1 FROM pending_edges") == []
+    assert len(await fetch("SELECT 1 FROM graph_edges WHERE edge_type = 'AUTHORED'")) == 1
+    assert world.fake.requests == []
+    assert await fetch("SELECT 1 FROM graph_nodes WHERE properties ? 'embedded'") == []
     assert await fetch("SELECT 1 FROM node_post_write_queue") == []

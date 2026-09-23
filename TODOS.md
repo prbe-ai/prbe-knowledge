@@ -51,57 +51,27 @@ All three post-write steps only need insert-or-change: embedding runs only when
 is judged itself. **Fix:** have the upsert report inserted/changed node ids and
 enqueue only those.
 
-### Auto-merge keeps retrying a merge that 409s
-**Where:** `engine/ingest/auto_merge/analyzer.py` (`_fire_merge`).
-
-On the managed plane one Person node proposed the same merge 18 times in 81
-minutes; every attempt failed `merge_cluster` with "one or more aliases already
-belong to a cluster" because the node is already an alias in another cluster.
-The judge call is still repeated on every upsert. The analyzer should resolve an
-already-clustered node or candidate to its primary before proposing a merge, or
-skip it. Judge-independent.
-
 ### Repair the documents that past auto-merges detached from the graph
 **Where:** `entity_merge_audit`, `entity_aliases` (managed plane).
 
 Before the document-node guard, auto-merge folded a document's own graph node
-into its mention (a PR's `github:o/r:pr:N` into `o/r#N`): 661 of 704 auto-merges
-since 2026-05, leaving 875 live documents whose `doc_id` routes to another node
-(2026-09-23). Graph retrieval joins `documents.doc_id = graph_nodes.canonical_id`,
-so those documents are unreachable through the graph. **Fix:** unmerge them (the
-snapshots make it reversible), or merge the other way -- the mention INTO the
-document node, which is the merge worth having. Measure with a replay first.
+into its mention (a PR's `github:o/r:pr:N` into `o/r#N`): 661 live documents
+(638 PRs, 13 GitHub issues, 9 Linear issues, 1 Notion page) route to another
+node (2026-09-23; an earlier "875" counted document versions). Graph retrieval
+joins `documents.doc_id = graph_nodes.canonical_id`, so they are unreachable
+through the graph (text and vector search still find them). **Fix:** unmerge
+each, then let the twin rule fold the mention INTO the document.
 
-### Merge a mention into its document, not the reverse
-**Where:** `engine/ingest/auto_merge/analyzer.py`.
+### A `Co-authored-by` trailer can rename a real person
+**Where:** `kb/handlers/github.py` (co-author Person nodes), `engine/ingest/graph_writer.py`
+(`properties || EXCLUDED.properties`).
 
-The judged node is always the alias, so the document-node guard skips the
-useful case: a new PR document and its `o/r#N` mention (the mention is
-path-canonical and never judged itself). Folding the mention INTO the document
-node would connect every mention to the document. Needs a direction rule and a
-replay before it ships.
-
-### A commit's author email is trusted as identity
-**Where:** `engine/ingest/auto_merge/jev_judge.py` (`shared_identifier`),
-`kb/handlers/github.py` (commit author, `Co-authored-by`).
-
-The auto-merge gate accepts a shared exact email as proof two Person records
-are one person. A git author email and a `Co-authored-by` trailer are free text
-anyone can write, so a commit can claim someone else's email and be merged into
-their Person; later upserts then merge its name/login into that record
-(`properties || EXCLUDED.properties`). The gate is still far tighter than the
-gpt-oss path it replaced (which merged on the model's word alone). **Fix:**
-record where an email came from and let only verified sources (a connector's
-account email, not commit text) count as execution evidence.
-
-### Suggest when Jev's probability splits across copies of one entity
-**Where:** `engine/ingest/auto_merge/jev_judge.py` (`verdict_from_answer`).
-
-With three copies of one entity among the candidates the Choice mass divides
-(e.g. c0 0.48, c1 0.47): the top pick is below 0.70 and nothing is written,
-although Jev is sure the node is a duplicate. **Fix:** write a suggestion when
-`1 - p(none_of_these)` clears `AUTO_MERGE_JEV_SUGGEST_AT`; replay it first to
-size the extra suggestion volume.
+Checked 2026-09-23: an email IS sound identity for auto-merge -- GitHub fills a
+commit's `author.username` only when the email belongs to that account, so a
+login node's email is GitHub-linked, and a co-author node is keyed BY the email.
+What a stranger can still do is write any NAME in a trailer: the co-author node
+(and, once merged, the real person's node) takes that name on every upsert.
+**Fix:** don't let a trailer's name overwrite a name that came from an account.
 
 ### Measure auto-merge precision on the merges that still run
 **Where:** `scripts/jev_automerge/`.
@@ -111,31 +81,6 @@ verified independently, 11 people confirmed only by the email/login the gate
 itself requires. 0 known-false out of 14 still allows a false-merge rate of up
 to ~20% (95% bound). **Do:** a replay sampled over non-document nodes by label,
 and the day-one human review of live `jev-` audit rows, before relying on it.
-
-### Cap keys and depth in Jev's entity properties
-**Where:** `engine/ingest/auto_merge/jev_judge.py` (`trim_values`).
-
-`trim_values` trims long strings and lists but keeps every key, and custom-ingest
-properties have no size limit, so one tenant's huge property map can push every
-judgment it appears in over Jev's cap (the node is then dropped as an error; it
-no longer trips the shared breaker). Cap keys per map and nesting depth; replay
-first, since it changes the request.
-
-### A long Jev outage parks the whole auto-merge backlog
-**Where:** `engine/ingest/post_write/worker.py` (`_defer`).
-
-After 12 deferrals (about 9 hours) a queue row is parked as failed, and that
-counts deferrals where the breaker was open and nothing was sent. A node that
-is not upserted again is then never judged. **Fix:** do not count breaker-open
-deferrals toward the cap, or re-queue parked rows once the breaker closes.
-
-### Auto-merge shares Jev's base URL, timeout and quota with search
-`JEV_BASE_URL` and `JEV_REQUEST_TIMEOUT_SECONDS` (2.5 s) are search settings the
-merge judge also reads, and a backlog drain (16 tasks x 2 pods) spends the same
-key as live search. Whether that can 429 search is unmeasured. Separately, if
-`TYPESAFE_API_KEY` goes missing the judge falls back to gpt-oss with one
-warning per process; the execution gate still applies, but nothing alerts.
-**Fix:** measure the rate limit; alert on `auto_merge.jev_unconfigured`.
 
 ### Alias routing is one hop, so a merge chain strands its inner aliases
 **Where:** `engine/ingest/graph_writer.py` (`_fetch_aliases`),
@@ -148,26 +93,14 @@ still build the chain, and unmerge does not take the per-(tenant, label) merge
 lock. **Fix:** re-point a folded primary's aliases in the same transaction (or
 resolve routing transitively), and take the lock in unmerge too.
 
-### Auto-merge vector leg is an exact scan (~19.5 s CPU per Document)
-**Where:** `engine/ingest/auto_merge/analyzer.py` (`_find_candidates`, vector path).
-
-EXPLAIN ANALYZE on the managed plane: seq scan + sort over ~27.6k Document rows,
-19.5 s and ~230k buffer hits, on a Postgres limited to 1.5 cores. It runs for
-every judged Document. Try the HNSW index with `hnsw.iterative_scan` and measure
-top-10 recall against the exact result before switching.
-
-### Review two suspect gpt-oss auto-merges on the managed plane
-The 2026-09-23 replay found two executed gpt-oss merges that look wrong: two
-different Notion pages merged on the rationale "identical canonical_id" (false),
-and two Slack users merged on a shared display name alone. A human should
-decide; `entity_merge_audit` + node snapshots make both reversible via unmerge.
-The ids are in the replay notes, not here (public repo).
-
-### The research plane never runs entity auto-merge
-No side-worker deployment runs `services.ingestion.inferred_edges.worker` on the
-research cluster, so every kb node there sits in `node_post_write_queue`
-(221,210 rows on 2026-09-23) with no suggestions and no merges. **Decide:** run
-it there, or stop enqueueing on research so the table stops growing.
+### The research plane never runs the post-write worker
+No side-worker runs on research, so nothing links parked edges there: 1.84M
+`pending_edges` rows (268k distinct edges, 32k linkable today -- 29k of them
+document -> run links, for 2,500 of 5,158 runs) and 223k queue rows
+(2026-09-23). **Decided:** edge linking only (`AUTO_MERGE_ENABLED=false`,
+`POST_WRITE_EMBEDDINGS_ENABLED=false`, `INFERRED_EDGES_ENABLED=false`) via a
+research-os chart deployment. Link the resolvable edges BEFORE the worker
+starts: its drain reaps every parked edge older than 14 days.
 
 ### neon_auth person enrichment is unwired on managed, not just unpermitted
 **Where:** `neon_auth."user"` on managed-shared; the query lives in prbe-backend

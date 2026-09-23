@@ -46,6 +46,7 @@ import sys
 from pathlib import Path
 
 from engine.ingest.auto_merge.jev_judge import (
+    NONE_OF_THESE,
     NUMBERED_RE,
     REPO_SHAPED_RE,
     execution_evidence,
@@ -148,8 +149,12 @@ def main() -> int:
         """What production does with one answer."""
         if d["is_document"] or "doc_type" in (d["properties"] or {}):
             return "skipped (document node)"
-        if j.get("error") or j.get("primary") is None or j["p"] < AUTO_MERGE_JEV_SUGGEST_AT:
+        if j.get("error") or j.get("primary") is None:
             return "unique"
+        if j["p"] < AUTO_MERGE_JEV_SUGGEST_AT:
+            # jev_judge.verdict_from_answer: a split pick still suggests.
+            none = (j.get("probs") or {}).get(NONE_OF_THESE, 1.0 - j["p"])
+            return "suggest (split)" if 1.0 - none >= AUTO_MERGE_JEV_SUGGEST_AT else "unique"
         if j["p"] < AUTO_MERGE_JEV_HIGH_AT:
             return "suggest"
         if j.get("model") != AUTO_MERGE_JEV_MODEL:

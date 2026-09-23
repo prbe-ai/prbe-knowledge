@@ -517,6 +517,13 @@ async def unmerge_alias(
     customer_id = x_prbe_customer
 
     async with with_tenant(customer_id) as conn:
+        # 0. The same per-(tenant, label) lock merge_cluster takes, so an
+        #    unmerge cannot interleave with a merge touching the same cluster.
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock($1)",
+            advisory_lock_key("entity-merge", customer_id, label),
+        )
+
         # 1. Look up the merge_id; 404 if no routing row.
         existing = await conn.fetchrow(
             """
