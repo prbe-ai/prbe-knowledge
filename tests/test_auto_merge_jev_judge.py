@@ -46,8 +46,11 @@ CANDS = [
 
 
 def _answer(choice: str, p: float, model: str = "jev-1.13.0") -> ChoiceAnswer:
+    # A real answer sums to 1: the rest goes to "none" (or, when "none" is the
+    # pick, to a candidate).
     probs = {"c0": 0.0, "c1": 0.0, jj.NONE_OF_THESE: 0.0}
     probs[choice] = p
+    probs[jj.NONE_OF_THESE if choice != jj.NONE_OF_THESE else "c1"] += 1.0 - p
     return ChoiceAnswer(choice=choice, probabilities=probs, model=model, input_tokens=900, elapsed_ms=120.0)
 
 
@@ -109,6 +112,24 @@ def test_long_string_values_are_trimmed_but_every_key_survives():
     assert out["nested"]["note"].endswith("…")
 
 
+def test_a_huge_map_keeps_its_identity_keys_and_says_how_many_were_cut():
+    props = {f"k{i:03d}": i for i in range(jj.MAX_KEYS + 20)} | {"email": "ada@example.com", "login": "ada-gh"}
+    out = jj.trim_values(props)
+    assert out["email"] == "ada@example.com" and out["login"] == "ada-gh"
+    assert len(out) == jj.MAX_KEYS + 1  # the kept keys plus one marker
+    assert out["…"] == "22 more keys"
+
+
+def test_nesting_stops_at_the_depth_cap():
+    deep: dict = {"v": 1}
+    for _ in range(jj.MAX_DEPTH + 3):
+        deep = {"x": deep}
+    out = jj.trim_values(deep)
+    for _ in range(jj.MAX_DEPTH):
+        out = out["x"]
+    assert out == "… nested too deep"
+
+
 def test_long_lists_keep_a_bounded_prefix_and_say_how_many_were_cut():
     out = jj.trim_values({"members": [f"u{i}" for i in range(jj.MAX_LIST_ITEMS + 7)]})
     assert out["members"][: jj.MAX_LIST_ITEMS] == [f"u{i}" for i in range(jj.MAX_LIST_ITEMS)]
@@ -166,6 +187,27 @@ def test_an_answer_from_another_model_never_auto_merges():
     # with a different model gets a suggestion at most.
     j = jj.verdict_from_answer(_answer("c0", 0.99, model="jev-2.0.0"), KEYS, NODE)
     assert (j.verdict.verdict, j.verdict.confidence, j.model) == ("duplicate", "medium", "jev-2.0.0")
+
+
+def _split(c0: float, c1: float, none: float) -> ChoiceAnswer:
+    probs = {"c0": c0, "c1": c1, jj.NONE_OF_THESE: none}
+    choice = max(probs, key=probs.get)
+    return ChoiceAnswer(choice=choice, probabilities=probs, model="jev-1.13.0", input_tokens=900, elapsed_ms=120.0)
+
+
+def test_mass_split_across_two_copies_suggests_the_likelier_one():
+    # Two copies of one entity: no pick clears 0.70, but Jev is 95% sure the
+    # node is a duplicate of one of them.
+    j = jj.verdict_from_answer(_split(0.48, 0.47, 0.05), KEYS, NODE)
+    assert (j.verdict.verdict, j.verdict.confidence, j.verdict.primary_canonical_id) == (
+        "duplicate", "medium", "ada@example.com")
+    assert j.p == 0.48
+
+
+def test_a_split_never_auto_merges_and_needs_the_suggestion_bar():
+    assert jj.verdict_from_answer(_split(0.50, 0.49, 0.01), KEYS, NODE).verdict.confidence == "medium"
+    j = jj.verdict_from_answer(_split(0.35, 0.30, 0.35), KEYS, NODE)  # duplicate mass 0.65
+    assert j.verdict.verdict == "unique"
 
 
 def test_bands_are_the_reviewed_values():

@@ -156,8 +156,24 @@ the caller sets `refuse_document_aliases`, which auto-merge and both suggestion
 approve routes do.
 On the managed plane 661 of the 704 auto-merges made before 2026-08 folded a
 document's node into its mention (above all a PR's `github:o/r:pr:N` document
-into the bare `o/r#N`), and on the replay 68 of Jev's 82 would have too; 875
+into the bare `o/r#N`), and on the replay 68 of Jev's 82 would have too; 661
 live documents are detached that way today (TODOS.md).
+
+**The document-twin rule** (`auto_merge/twins.py`) makes the useful merge
+instead, with no judge: `github:o/r:pr|issue:N` and `o/r#N`, and
+`linear:ws:issue:U` and `U`, name one object by construction, so the MENTION
+folds into the document's node -- from whichever side arrives second (a
+GitHub mention is path-canonical and never judged, so it looks up its
+document; a bare Linear uuid is judged normally, and the judge already makes
+the document the primary). Audit rows say `rule:document-twin`.
+
+**A split pick suggests.** When the graph holds one entity several ways the
+Choice mass divides between the copies. If no single pick reaches 0.70 but
+`1 - p(none_of_these)` does, the most likely copy is written as a `medium`
+suggestion -- never a merge. On the replay set that adds 60 suggestions (50
+Documents, 10 people): 57 check out (33 the same repo spelled another way, 23
+already merged by a human, 1 the same id up to case) and 3 are same-name people,
+which is what a human review is for.
 
 **The shipped gate.** A `high` answer (p ≥ 0.95) executes only when
 `jev_judge.execution_evidence` finds identity evidence the pair shares: an exact
@@ -185,13 +201,14 @@ truth; the day-one review of live merges is the independent check.
   near-threshold pairs: 0.87–0.92, 0.89–0.92, 0.91–0.95). Every upsert re-queues
   its node, so a pair is judged many times, and under that churn a 0.95 cut
   behaves like "averages ~0.92". The fix for that is not re-judging unchanged
-  nodes (TODOS.md).
+  nodes.
 
 `max_tokens_exceeded` is permanent for its input (same state, same answer), so
-`post_choice` raises `JevRequestTooLarge` and does not trip the breaker; string
-property values are trimmed at 500 characters and lists at 50 items before that
-can happen, keys never (no replayed property held a list, so the list cap
-changes no measured request).
+`post_choice` raises `JevRequestTooLarge` and does not trip the breaker. Before
+that can happen, strings are trimmed at 500 characters, lists at 50 items, maps
+at 100 keys (identity keys kept first) and nesting at depth 6. On the replay
+set the largest map held 8 keys at depth 1 and no property held a list, so
+none of these caps changes a measured request.
 
 **Failure classes.** 400/413/422 are refusals of one request
 (`JevRequestRejected`): the node is dropped from the queue as an error. Only a
@@ -200,7 +217,18 @@ server that changed its schema opens it; other refusals do not, because the
 breaker is shared by every tenant. `400 api_usage_error` -- what an unknown or retired model
 gets (checked 2026-09-23) -- and every other non-200 -- 401/403 (a revoked
 key), 404 (a wrong URL), 408, 429, 5xx -- and any malformed answer count
-against the breaker and DEFER the node (5 min doubling to 1 h, parked after
-12). An answer naming a
-model other than `AUTO_MERGE_JEV_MODEL` may suggest but never auto-merges: the
-bands were measured on that model.
+against the breaker and DEFER the node (5 min doubling to 1 h). The node is
+parked after 12 FAILED CALLS; a deferral while the breaker is open sent nothing
+and does not count, so a long outage backs the queue off hourly instead of
+parking all of it. An answer naming a model other than `AUTO_MERGE_JEV_MODEL`
+(or none) may suggest but never auto-merges: the bands were measured on that
+model.
+
+**Load, measured 2026-09-23.** With document nodes skipped, the exact-scan
+vector leg no longer runs over the 28k-node Document label for new nodes (0 in
+the last 7 days; 47 older Document-label nodes can still reach it when
+re-written). New judgments are AgentSessions (69/week, 1,158 scanned) and
+people (2/week, 84 scanned). Search and auto-merge share one Jev key; 72 hours
+of `managed-retrieval` and `managed-side-worker` logs held 0 `http_429`. A
+missing key now counts `auto_merge.jev_unconfigured` on every judgment it
+affects, for alerting.

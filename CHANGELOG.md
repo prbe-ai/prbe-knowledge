@@ -8,6 +8,23 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Changed
 
+- A pull request's, GitHub issue's or Linear issue's document now absorbs its bare mention
+  (`owner/repo#12`, or the issue's id), so links to the mention lead to the document. This
+  is the right-way-round version of the merge auto-merge used to make backwards. No model
+  is asked: the two ids name the same thing by construction.
+- When the graph holds one thing several ways, Jev's confidence splits between the copies
+  and no single one reached the suggestion bar. If Jev is sure the entity is a duplicate
+  overall, the likeliest copy is now suggested for review (never merged automatically).
+- A long Jev outage no longer parks the auto-merge queue. Only failed calls count toward
+  the 12-try limit; waits while the breaker is open (nothing sent) do not.
+- Auto-merge skips a node that is itself a merged-away copy instead of retrying a merge
+  that always fails, and very large or deeply nested properties are trimmed before they
+  reach Jev.
+- The worker that links parked edges can now run without auto-merge, node embeddings or
+  the LLM edge extractor (`AUTO_MERGE_ENABLED`, `POST_WRITE_EMBEDDINGS_ENABLED`,
+  `INFERRED_EDGES_ENABLED`, all on by default), for a plane that only needs its edges
+  linked. Unmerging now waits for any merge in progress on the same kind of entity.
+
 - Entity auto-merge now asks Jev, not gpt-oss, whether a new entity duplicates one already
   in the graph. Jev picks one candidate or none; at 0.95 or above the pair is merged, from
   0.70 a suggestion is written for review, below that nothing happens. The suggestion's

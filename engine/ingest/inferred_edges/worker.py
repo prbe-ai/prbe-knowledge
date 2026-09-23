@@ -372,7 +372,14 @@ async def run_worker_forever() -> None:
         post_write_worker = PostWriteWorker(
             concurrency=int(os.environ.get("POST_WRITE_CONCURRENCY", "16")),
             execute_high_confidence=post_write_execute,
+            # A plane that only needs parked edges linked sets both off
+            # (node embeddings are read only by auto-merge).
+            auto_merge_enabled=os.environ.get("AUTO_MERGE_ENABLED", "true").lower() == "true",
+            embeddings_enabled=os.environ.get("POST_WRITE_EMBEDDINGS_ENABLED", "true").lower() == "true",
         )
+    # INFERRED_EDGES_ENABLED=false runs this process for the post-write queue
+    # alone: the LLM extractor is the one paid workload here.
+    inferred_edges_enabled = os.environ.get("INFERRED_EDGES_ENABLED", "true").lower() == "true"
 
     health_port = int(os.environ.get("INFERRED_EDGES_HEALTH_PORT", "8083"))
     health_config = uvicorn.Config(
@@ -416,7 +423,11 @@ async def run_worker_forever() -> None:
             loop.add_signal_handler(getattr(signal, signame), handle_signal, signame)
 
     try:
-        coros = [worker.run(), health_server.serve()]
+        coros = [health_server.serve()]
+        if inferred_edges_enabled:
+            coros.append(worker.run())
+        else:
+            log.info("inferred_edges_worker.disabled")
         if post_write_worker is not None:
             log.info("post_write_worker.enabled", execute=post_write_execute)
             coros.append(post_write_worker.run())

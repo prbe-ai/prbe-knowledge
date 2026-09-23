@@ -93,24 +93,41 @@ class Judgment:
 #: A list property keeps at most this many elements (a marker notes the rest),
 #: so one huge array cannot push every judgment it appears in over the cap.
 MAX_LIST_ITEMS = 50
+#: A map keeps at most this many keys (identity keys always first), and
+#: nesting stops at MAX_DEPTH: custom-ingest properties have no size limit,
+#: and one tenant's huge map must not push its judgments over the cap.
+MAX_KEYS = 100
+MAX_DEPTH = 6
+#: Kept ahead of every other key when a map is cut.
+_IDENTITY_KEYS = ("email", "login", "name", "display_name", "source_system", "doc_type", "kind")
 
 
-def trim_values(value: Any, limit: int = AUTO_MERGE_JEV_MAX_VALUE_CHARS) -> Any:
-    """Trim long STRING values and long lists; keep every KEY.
+def trim_values(value: Any, limit: int = AUTO_MERGE_JEV_MAX_VALUE_CHARS, _depth: int = 0) -> Any:
+    """Trim long strings, long lists, big maps and deep nesting.
 
     A blanket size cap could cut an identity field off while keeping a
-    matching name. Trimming only long free text keeps ids, emails and logins
-    intact -- they are never anywhere near `limit`.
+    matching name. So strings are cut only past `limit` (ids, emails and
+    logins are never near it), and a map that is cut keeps its identity keys
+    first. A marker records what was cut.
     """
     if isinstance(value, str):
         return value if len(value) <= limit else value[:limit] + "…"
+    if isinstance(value, dict | list) and _depth >= MAX_DEPTH:
+        return "… nested too deep"
     if isinstance(value, dict):
-        return {k: trim_values(v, limit) for k, v in value.items()}
-    if isinstance(value, list):
-        kept = [trim_values(v, limit) for v in value[:MAX_LIST_ITEMS]]
-        if len(value) > MAX_LIST_ITEMS:
-            kept.append(f"… {len(value) - MAX_LIST_ITEMS} more")
+        keys = list(value)
+        if len(keys) > MAX_KEYS:
+            identity = [k for k in _IDENTITY_KEYS if k in value]
+            keys = identity + [k for k in keys if k not in identity][: MAX_KEYS - len(identity)]
+        kept = {k: trim_values(value[k], limit, _depth + 1) for k in keys}
+        if len(value) > len(keys):
+            kept["…"] = f"{len(value) - len(keys)} more keys"
         return kept
+    if isinstance(value, list):
+        kept_list = [trim_values(v, limit, _depth + 1) for v in value[:MAX_LIST_ITEMS]]
+        if len(value) > MAX_LIST_ITEMS:
+            kept_list.append(f"… {len(value) - MAX_LIST_ITEMS} more")
+        return kept_list
     return value
 
 
@@ -165,6 +182,21 @@ def verdict_from_answer(
 ) -> Judgment:
     """Map Jev's choice + probability onto the analyzer's verdict contract."""
     p = answer.probabilities[answer.choice]
+    # When the graph holds one entity several ways, Jev's mass splits across
+    # the copies (c0 0.48, c1 0.47): no single pick clears the bar although it
+    # is sure the node is a duplicate. Then suggest the most likely copy.
+    duplicate_mass = 1.0 - answer.probabilities.get(NONE_OF_THESE, 0.0)
+    best = max((k for k in keys), key=lambda k: answer.probabilities.get(k, 0.0), default=None)
+    if best is not None and p < AUTO_MERGE_JEV_SUGGEST_AT and duplicate_mass >= AUTO_MERGE_JEV_SUGGEST_AT:
+        cand = keys[best]
+        best_p = answer.probabilities[best]
+        verdict = AutoMergeVerdict(
+            verdict="duplicate",
+            primary_canonical_id=cand.canonical_id,
+            confidence="medium",
+            rationale=template_rationale(node, cand, best_p),
+        )
+        return Judgment(verdict=verdict, model=answer.model, p=best_p)
     if answer.choice == NONE_OF_THESE:
         verdict = AutoMergeVerdict(
             verdict="unique",
