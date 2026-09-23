@@ -10,6 +10,7 @@ from datetime import datetime
 import asyncpg
 import orjson
 
+from engine.shared.alias_sql import RESOLVE_ALIASES_SQL
 from engine.shared.constants import EdgeType, NodeLabel
 from engine.shared.logging import get_logger
 from engine.shared.models import GraphEdgeSpec, GraphNodeSpec
@@ -26,26 +27,18 @@ async def _fetch_aliases(
 
     Returned dict only contains entries for keys that ARE aliases. Non-aliased
     keys are absent; callers should treat absence as "no rewrite needed."
+    The primary is the END of the alias chain (a -> b -> c resolves a to c):
+    see engine/shared/alias_sql.py.
 
     One bulk query per call regardless of input size — entity_aliases is
     typically O(100s) of rows per tenant; the (customer_id, label,
-    alias_canonical_id) PK answers this with an index-only scan.
+    alias_canonical_id) PK answers each hop with an index scan.
     """
     if not keys:
         return {}
     labels = [k[0] for k in keys]
     aliases = [k[1] for k in keys]
-    rows = await conn.fetch(
-        """
-        SELECT label, alias_canonical_id, primary_canonical_id
-        FROM entity_aliases
-        WHERE customer_id = $1
-          AND (label, alias_canonical_id) IN (
-                SELECT * FROM UNNEST($2::text[], $3::text[])
-              )
-        """,
-        customer_id, labels, aliases,
-    )
+    rows = await conn.fetch(RESOLVE_ALIASES_SQL, customer_id, labels, aliases)
     return {(r["label"], r["alias_canonical_id"]): r["primary_canonical_id"] for r in rows}
 
 
@@ -107,17 +100,39 @@ async def upsert_nodes(
         orjson.dumps(deduped[k]).decode("utf-8") for k in sorted_keys
     ]
 
+    # `old` reads the pre-statement snapshot (every part of one statement sees
+    # the same one), so comparing it with the RETURNING row tells which nodes
+    # were inserted or actually changed. A concurrent writer can only make
+    # this say "changed" when nothing did -- an extra enqueue, never a lost one.
     rows = await conn.fetch(
         """
-        INSERT INTO graph_nodes (customer_id, label, canonical_id, properties, updated_at)
-        SELECT $1, label, canonical_id, properties::jsonb, NOW()
-        FROM unnest($2::text[], $3::text[], $4::text[])
-            AS t(label, canonical_id, properties)
-        ON CONFLICT (customer_id, label, canonical_id)
-        DO UPDATE SET
-            properties = graph_nodes.properties || EXCLUDED.properties,
-            updated_at = NOW()
-        RETURNING node_id, label, canonical_id
+        WITH input AS (
+            SELECT label, canonical_id, properties::jsonb AS properties
+            FROM unnest($2::text[], $3::text[], $4::text[])
+                AS t(label, canonical_id, properties)
+        ),
+        old AS (
+            SELECT g.label, g.canonical_id, g.properties
+            FROM graph_nodes g
+            JOIN input i
+              ON g.customer_id = $1
+             AND g.label = i.label
+             AND g.canonical_id = i.canonical_id
+        ),
+        up AS (
+            INSERT INTO graph_nodes (customer_id, label, canonical_id, properties, updated_at)
+            SELECT $1, label, canonical_id, properties, NOW()
+            FROM input
+            ON CONFLICT (customer_id, label, canonical_id)
+            DO UPDATE SET
+                properties = graph_nodes.properties || EXCLUDED.properties,
+                updated_at = NOW()
+            RETURNING node_id, label, canonical_id, properties
+        )
+        SELECT up.node_id, up.label, up.canonical_id,
+               (old.label IS NULL OR old.properties IS DISTINCT FROM up.properties) AS changed
+        FROM up
+        LEFT JOIN old USING (label, canonical_id)
         """,
         customer_id,
         labels,
@@ -146,24 +161,48 @@ async def upsert_nodes(
         source_system,
     )
 
-    # Enqueue post-write processing (entity auto-merge, future analyzers).
-    # Same transaction as the upsert so queue rows track committed nodes
-    # exactly: a rollback drops both the node and the enqueue. ON CONFLICT
-    # resets analyzer_status to '{}' on re-write so an updated node gets
-    # re-analyzed against any new property values.
-    await conn.execute(
-        """
-        INSERT INTO node_post_write_queue (customer_id, node_id, analyzer_status)
-        SELECT $2, node_id, '{}'::jsonb
-        FROM unnest($1::bigint[]) AS t(node_id)
-        ON CONFLICT (customer_id, node_id) DO UPDATE
-            SET analyzer_status = '{}'::jsonb,
-                enqueued_at     = NOW(),
-                locked_until    = NULL
-        """,
-        provenance_node_ids,
-        customer_id,
-    )
+    # Enqueue post-write processing (embedding, pending-edge drain, entity
+    # auto-merge) only where it can matter: a node that was INSERTED, whose
+    # properties CHANGED, or that edges are parked waiting on (an edge can park
+    # concurrently with the node's insert and miss that insert's drain).
+    # Re-enqueueing every upsert made one node be judged 86 times in 81
+    # minutes on the managed plane for no new input. Same transaction as the
+    # upsert so queue rows track committed nodes exactly: a rollback drops
+    # both. ON CONFLICT resets analyzer_status so a changed node is
+    # re-analyzed against its new property values.
+    changed = {(r["label"], r["canonical_id"]) for r in rows if r["changed"]}
+    unchanged = [k for k in results if k not in changed]
+    if unchanged:
+        waited_on = await conn.fetch(
+            """
+            SELECT DISTINCT missing_label, missing_canonical_id
+            FROM pending_edges
+            WHERE customer_id = $1
+              AND locked_until IS NULL
+              AND (missing_label, missing_canonical_id) IN (
+                    SELECT * FROM unnest($2::text[], $3::text[])
+                  )
+            """,
+            customer_id,
+            [k[0] for k in unchanged],
+            [k[1] for k in unchanged],
+        )
+        changed |= {(r["missing_label"], r["missing_canonical_id"]) for r in waited_on}
+    enqueue_ids = sorted(results[k] for k in changed)
+    if enqueue_ids:
+        await conn.execute(
+            """
+            INSERT INTO node_post_write_queue (customer_id, node_id, analyzer_status)
+            SELECT $2, node_id, '{}'::jsonb
+            FROM unnest($1::bigint[]) AS t(node_id)
+            ON CONFLICT (customer_id, node_id) DO UPDATE
+                SET analyzer_status = '{}'::jsonb,
+                    enqueued_at     = NOW(),
+                    locked_until    = NULL
+            """,
+            enqueue_ids,
+            customer_id,
+        )
     return results
 
 

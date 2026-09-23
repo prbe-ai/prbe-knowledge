@@ -38,29 +38,17 @@ or retry loop that increments version on conflict. ~10 lines.
 
 ## P2 — operational hygiene
 
-### Queue post-write work only when a node is inserted or actually changes
-**Where:** `engine/ingest/graph_writer.py:149-165` (`upsert_nodes` enqueue).
+### 18 documents still route to their mention through a stray copy
+**Where:** `entity_aliases` (managed plane, probe-founders).
 
-Every upsert re-queues the node with `ON CONFLICT DO UPDATE`, changed or not. On
-the managed plane (logs, 2026-09-23) 80 distinct nodes produced 500 auto-merge
-judge calls in 81 minutes; one Person node was judged 86 times. That is most of
-the judge spend, and repeated draws let a noisy judge ratchet a near-threshold
-pair into a merge (a Jev pair averaging 0.932 crossed 0.95 on 4 of 20 calls).
-All three post-write steps only need insert-or-change: embedding runs only when
-`embedding IS NULL`, pending edges drain on arrival, and a newly arriving twin
-is judged itself. **Fix:** have the upsert report inserted/changed node ids and
-enqueue only those.
-
-### Repair the documents that past auto-merges detached from the graph
-**Where:** `entity_merge_audit`, `entity_aliases` (managed plane).
-
-Before the document-node guard, auto-merge folded a document's own graph node
-into its mention (a PR's `github:o/r:pr:N` into `o/r#N`): 661 live documents
-(638 PRs, 13 GitHub issues, 9 Linear issues, 1 Notion page) route to another
-node (2026-09-23; an earlier "875" counted document versions). Graph retrieval
-joins `documents.doc_id = graph_nodes.canonical_id`, so they are unreachable
-through the graph (text and vector search still find them). **Fix:** unmerge
-each, then let the twin rule fold the mention INTO the document.
+On 2026-09-23 the 660 documents that past auto-merges had folded into their
+mention were repaired: each was unmerged, then its mention folded INTO it (642
+`repair: rule:document-twin` audit rows). 18 were skipped because a stray node
+with the document's id already existed next to the alias row, so unmerge
+cannot re-create it. Those documents stay reachable through the stray node,
+but new edges written for them still route to the mention. **Fix:** move the
+alias-lane edges onto the existing node and drop the routing row (unmerge's
+steps 3-7 against an existing node), or delete the stray and unmerge.
 
 ### A `Co-authored-by` trailer can rename a real person
 **Where:** `kb/handlers/github.py` (co-author Person nodes), `engine/ingest/graph_writer.py`
@@ -72,35 +60,6 @@ login node's email is GitHub-linked, and a co-author node is keyed BY the email.
 What a stranger can still do is write any NAME in a trailer: the co-author node
 (and, once merged, the real person's node) takes that name on every upsert.
 **Fix:** don't let a trailer's name overwrite a name that came from an account.
-
-### Measure auto-merge precision on the merges that still run
-**Where:** `scripts/jev_automerge/`.
-
-With document nodes skipped, the 2026-09-23 replay leaves 14 auto-merges: 3
-verified independently, 11 people confirmed only by the email/login the gate
-itself requires. 0 known-false out of 14 still allows a false-merge rate of up
-to ~20% (95% bound). **Do:** a replay sampled over non-document nodes by label,
-and the day-one human review of live `jev-` audit rows, before relying on it.
-
-### Alias routing is one hop, so a merge chain strands its inner aliases
-**Where:** `engine/ingest/graph_writer.py` (`_fetch_aliases`),
-`engine/ingest/entity_clusters_routes.py` (`merge_cluster`, unmerge).
-
-Merging `b` (itself the primary of `a`) into `c` leaves `a → b` routing to a
-deleted node, so the next upsert of `a` recreates `b` as a stray copy.
-Auto-merge refuses this (`refuse_cluster_primaries`), but a human merge can
-still build the chain, and unmerge does not take the per-(tenant, label) merge
-lock. **Fix:** re-point a folded primary's aliases in the same transaction (or
-resolve routing transitively), and take the lock in unmerge too.
-
-### The research plane never runs the post-write worker
-No side-worker runs on research, so nothing links parked edges there: 1.84M
-`pending_edges` rows (268k distinct edges, 32k linkable today -- 29k of them
-document -> run links, for 2,500 of 5,158 runs) and 223k queue rows
-(2026-09-23). **Decided:** edge linking only (`AUTO_MERGE_ENABLED=false`,
-`POST_WRITE_EMBEDDINGS_ENABLED=false`, `INFERRED_EDGES_ENABLED=false`) via a
-research-os chart deployment. Link the resolvable edges BEFORE the worker
-starts: its drain reaps every parked edge older than 14 days.
 
 ### neon_auth person enrichment is unwired on managed, not just unpermitted
 **Where:** `neon_auth."user"` on managed-shared; the query lives in prbe-backend

@@ -24,7 +24,14 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   the LLM edge extractor (`AUTO_MERGE_ENABLED`, `POST_WRITE_EMBEDDINGS_ENABLED`,
   `INFERRED_EDGES_ENABLED`, all on by default), for a plane that only needs its edges
   linked. Unmerging now waits for any merge in progress on the same kind of entity.
-
+- Merged entities now route correctly through chains of merges. Before, merging `b` into
+  `c` after `a` had been merged into `b` sent `a`'s next update to `b`, whose record the
+  second merge had deleted, so `b` came back as a stray duplicate. Search now also treats
+  every link in such a chain as one entity.
+- A graph entity is only queued for post-write work (its embedding, linking its parked
+  edges, the auto-merge check) when it is new, when its properties actually change, or when
+  edges are waiting on it. Before, every re-save queued it again: on the managed plane one
+  person was judged 86 times in 81 minutes with nothing new to judge.
 - Entity auto-merge now asks Jev, not gpt-oss, whether a new entity duplicates one already
   in the graph. Jev picks one candidate or none; at 0.95 or above the pair is merged, from
   0.70 a suggestion is written for review, below that nothing happens. The suggestion's

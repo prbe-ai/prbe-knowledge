@@ -157,7 +157,7 @@ approve routes do.
 On the managed plane 661 of the 704 auto-merges made before 2026-08 folded a
 document's node into its mention (above all a PR's `github:o/r:pr:N` document
 into the bare `o/r#N`), and on the replay 68 of Jev's 82 would have too; 661
-live documents are detached that way today (TODOS.md).
+live documents were detached that way until the 2026-09-23 repair.
 
 **The document-twin rule** (`auto_merge/twins.py`) makes the useful merge
 instead, with no judge: `github:o/r:pr|issue:N` and `o/r#N`, and
@@ -166,6 +166,16 @@ folds into the document's node -- from whichever side arrives second (a
 GitHub mention is path-canonical and never judged, so it looks up its
 document; a bare Linear uuid is judged normally, and the judge already makes
 the document the primary). Audit rows say `rule:document-twin`.
+
+**Measured on live data, 2026-09-23.** A read-only sweep ran the deployed
+analyzer over every node it can still auto-merge on the managed plane (1,288:
+1,161 agent sessions, 80 people, 47 non-document Document nodes). It would
+merge 8 (4 pairs of people -- a GitHub login and its commit email, same name,
+same address -- each judged from both sides), all correct; suggest 10, 9 of
+them right (the tenth pairs a Slack channel with one message in it); and call
+1,240 unique. Separately, the 660 documents folded into their mention before
+the guard were repaired (unmerged, then the mention folded into the document):
+642 done, 18 left behind a stray copy (TODOS.md).
 
 **A split pick suggests.** When the graph holds one entity several ways the
 Choice mass divides between the copies. If no single pick reaches 0.70 but

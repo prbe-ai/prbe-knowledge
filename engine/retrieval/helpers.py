@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncpg
 
+from engine.shared.alias_sql import RESOLVE_ALIASES_SQL, cluster_members_cte, resolve_to_root_cte
 from engine.shared.constants import SourceSystem
 from engine.shared.db import with_tenant
 
@@ -96,27 +97,16 @@ async def resolve_aliases(
     absent from the dict — callers should treat absence as "no rewrite
     needed" and use the original canonical_id.
 
-    Mirrors ``services/ingestion/graph_writer.py:_fetch_aliases`` so the
-    write-path and read-path share batching semantics. One bulk SELECT per
-    call regardless of input size — ``entity_aliases`` is keyed on
-    ``(customer_id, label, alias_canonical_id)`` and answers via index-only
-    scan.
+    The primary is the END of the alias chain (a -> b -> c resolves a to c).
+    Shares its SQL with ``engine/ingest/graph_writer.py:_fetch_aliases`` so
+    the write path and the read path route identically. One bulk query per
+    call regardless of input size.
     """
     if not refs:
         return {}
     labels = [r[0] for r in refs]
     aliases = [r[1] for r in refs]
-    rows = await conn.fetch(
-        """
-        SELECT label, alias_canonical_id, primary_canonical_id
-        FROM entity_aliases
-        WHERE customer_id = $1
-          AND (label, alias_canonical_id) IN (
-                SELECT * FROM UNNEST($2::text[], $3::text[])
-              )
-        """,
-        customer_id, labels, aliases,
-    )
+    rows = await conn.fetch(RESOLVE_ALIASES_SQL, customer_id, labels, aliases)
     return {(r["label"], r["alias_canonical_id"]): r["primary_canonical_id"] for r in rows}
 
 
@@ -134,50 +124,37 @@ async def expand_to_cluster_members(
       * Alias id → ``[primary, alias_1, alias_2, ...]``.
       * Primary id → ``[primary, alias_1, alias_2, ...]``.
 
-    Implementation: one SELECT joins entity_aliases twice to find each
-    input's primary (or self if unmerged), then aggregates all aliases of
-    that primary. Membership is label-scoped — ids of different labels
-    don't collide.
+    Chains are followed both ways: the primary is the end of the input's
+    alias chain, and the members are every alias that routes to it through
+    any chain. Membership is label-scoped — ids of different labels don't
+    collide.
 
     Note: duplicate input ids are coalesced to a single output key.
     """
     if not canonical_ids:
         return {}
     rows = await conn.fetch(
-        """
-        WITH inputs AS (
-            SELECT canonical_id FROM UNNEST($3::text[]) AS t(canonical_id)
+        f"""
+        WITH RECURSIVE inputs AS (
+            SELECT DISTINCT canonical_id FROM UNNEST($3::text[]) AS t(canonical_id)
         ),
+        {resolve_to_root_cte(customer_param="$1", label_param="$2", inputs="inputs")},
         primaries AS (
-            -- For each input, find its primary. Three cases:
-            --   (a) input IS an alias    -> ea_alias.primary_canonical_id
-            --   (b) input IS a primary   -> input itself
-            --   (c) input is unmerged    -> input itself
-            SELECT
-                i.canonical_id AS input_id,
-                COALESCE(ea_alias.primary_canonical_id, i.canonical_id) AS primary_canonical_id
+            -- Each input's primary: the end of its alias chain, or itself
+            -- when it is a primary or unmerged.
+            SELECT i.canonical_id AS input_id,
+                   COALESCE(
+                       (SELECT u.cur FROM up u WHERE u.input_id = i.canonical_id
+                        ORDER BY u.depth DESC LIMIT 1),
+                       i.canonical_id
+                   ) AS root
             FROM inputs i
-            LEFT JOIN entity_aliases ea_alias
-              ON ea_alias.customer_id = $1
-             AND ea_alias.label = $2
-             AND ea_alias.alias_canonical_id = i.canonical_id
         ),
-        members AS (
-            -- For each (input, primary), gather all aliases of that primary.
-            SELECT
-                p.input_id,
-                p.primary_canonical_id,
-                ARRAY(
-                    SELECT alias_canonical_id
-                    FROM entity_aliases
-                    WHERE customer_id = $1
-                      AND label = $2
-                      AND primary_canonical_id = p.primary_canonical_id
-                ) AS alias_list
-            FROM primaries p
-        )
-        SELECT input_id, primary_canonical_id, alias_list
-        FROM members
+        roots AS (SELECT DISTINCT root FROM primaries),
+        {cluster_members_cte(customer_param="$1", label_param="$2", roots="roots")}
+        SELECT p.input_id, p.root AS primary_canonical_id,
+               ARRAY(SELECT DISTINCT m.member FROM members m WHERE m.root = p.root) AS alias_list
+        FROM primaries p
         """,
         customer_id, label, canonical_ids,
     )
@@ -229,30 +206,27 @@ async def expand_to_author_id_set(
     if not person_canonical_ids:
         return []
     rows = await conn.fetch(
-        """
-        WITH inputs AS (
-            SELECT canonical_id FROM UNNEST($2::text[]) AS t(canonical_id)
+        f"""
+        WITH RECURSIVE inputs AS (
+            SELECT DISTINCT canonical_id FROM UNNEST($2::text[]) AS t(canonical_id)
         ),
-        -- Resolve each input to its primary (self if unmerged).
+        {resolve_to_root_cte(customer_param="$1", label_param="'Person'", inputs="inputs")},
+        -- Resolve each input to the end of its alias chain (self if unmerged).
         primaries AS (
-            SELECT
-                COALESCE(ea.primary_canonical_id, i.canonical_id) AS primary_id
+            SELECT COALESCE(
+                       (SELECT u.cur FROM up u WHERE u.input_id = i.canonical_id
+                        ORDER BY u.depth DESC LIMIT 1),
+                       i.canonical_id
+                   ) AS root
             FROM inputs i
-            LEFT JOIN entity_aliases ea
-              ON ea.customer_id = $1
-             AND ea.label = 'Person'
-             AND ea.alias_canonical_id = i.canonical_id
         ),
-        -- Full cluster membership: primary itself + every alias of that primary.
+        roots AS (SELECT DISTINCT root FROM primaries),
+        {cluster_members_cte(customer_param="$1", label_param="'Person'", roots="roots")},
+        -- Full cluster membership: each root plus every alias routing to it.
         cluster_members AS (
-            SELECT primary_id AS member FROM primaries
+            SELECT root AS member FROM roots
             UNION
-            SELECT ea2.alias_canonical_id
-            FROM primaries p
-            JOIN entity_aliases ea2
-              ON ea2.customer_id = $1
-             AND ea2.label = 'Person'
-             AND ea2.primary_canonical_id = p.primary_id
+            SELECT member FROM members
         ),
         -- Lane E enrichment values: each member Person's enrichment properties
         -- become valid author_id matches.
