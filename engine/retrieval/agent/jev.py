@@ -98,6 +98,18 @@ class JevError(RuntimeError):
     """Jev did not produce scores. The caller falls back to the recall floor."""
 
 
+class JevBreakerOpen(JevError):
+    """The breaker is open: nothing was sent. Retrying later is the whole remedy."""
+
+
+class JevRequestTooLarge(JevError):
+    """The server refused the request as over its token cap (`max_tokens_exceeded`).
+
+    Permanent for THIS input -- retrying the same state gets the same answer --
+    so callers must not treat it like an outage.
+    """
+
+
 # --------------------------------------------------------------------------
 # the pool
 
@@ -287,8 +299,10 @@ class _Breaker:
 #: service with very different payloads (a full pool vs one query), and small
 #: extraction calls succeeding would otherwise keep resetting a breaker that
 #: full-pool scoring keeps tripping -- so a scoring outage never opens it.
+#: Entity auto-merge (ingest side) gets its own for the same reason.
 BREAKER = _Breaker()
 EXTRACT_BREAKER = _Breaker()
+MERGE_BREAKER = _Breaker()
 
 
 def _err(exc: BaseException) -> str:
@@ -302,11 +316,13 @@ async def _post(
     api_key: str,
     state: dict[str, Any],
     questions: dict[str, Any],
+    *,
+    model: str = JEV_MODEL,
 ) -> httpx.Response:
     return await client.post(
         f"{JEV_BASE_URL}/v1/systemone",
         headers={"Authorization": f"Bearer {api_key}"},
-        json={"model": JEV_MODEL, "state": state, "questions": questions},
+        json={"model": model, "state": state, "questions": questions},
         # Explicit Timeout, not a scalar: a scalar here would override the
         # client's own and silently drop the separate pool-wait bound.
         timeout=httpx.Timeout(JEV_REQUEST_TIMEOUT_SECONDS, pool=JEV_POOL_WAIT_SECONDS),
@@ -611,5 +627,101 @@ async def extract_options(
         doc_class=class_choice,
         doc_types=DOC_CLASSES[class_choice],
         class_confidence=class_conf,
+        elapsed_ms=(time.perf_counter() - t0) * 1000,
+    )
+
+
+# --------------------------------------------------------------------------
+# one Choice question (entity auto-merge, engine/ingest/auto_merge/jev_judge.py)
+# --------------------------------------------------------------------------
+
+
+#: The question id. Part of the request Jev reads, and the auto-merge replay
+#: measured "match" -- keep it.
+_CHOICE_ID = "match"
+
+
+@dataclass(slots=True)
+class ChoiceAnswer:
+    """Jev's answer to one Choice question, validated."""
+
+    choice: str
+    #: Probability per criteria key. They sum to ~1 across the option set.
+    probabilities: dict[str, float]
+    #: The model the server says answered -- what an audit row should record.
+    model: str
+    input_tokens: int
+    elapsed_ms: float
+
+
+def _probability(value: Any) -> float | None:
+    """A probability, or None. Same guard as `_score_batch`: NaN, bools and
+    out-of-range numbers are not answers."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        return None
+    return float(value)
+
+
+async def post_choice(
+    state: dict[str, Any],
+    question: dict[str, Any],
+    *,
+    api_key: str,
+    model: str,
+    breaker: _Breaker,
+    client: httpx.AsyncClient | None = None,
+) -> ChoiceAnswer:
+    """Ask ONE Choice question about `state` and return the validated answer.
+
+    `model` is explicit on purpose: `JEV_MODEL` is env-overridable for search,
+    and a search config change must not silently change another caller's judge.
+
+    Raises:
+      JevBreakerOpen      -- nothing sent; the breaker is cooling down.
+      JevRequestTooLarge  -- `max_tokens_exceeded`; permanent for this input.
+      JevError            -- transport, status or a malformed answer.
+    """
+    if not api_key:
+        raise JevError("TYPESAFE_API_KEY is not configured")
+    if breaker.is_open():
+        raise JevBreakerOpen("breaker_open")
+    criteria = question.get("criteria") or {}
+    t0 = time.perf_counter()
+    client = client or _shared_client()
+    try:
+        resp = await _post(client, api_key, state, {_CHOICE_ID: question}, model=model)
+    except httpx.HTTPError as exc:
+        breaker.failure()
+        raise JevError(_err(exc)) from exc
+    if resp.status_code == 400 and "max_tokens_exceeded" in resp.text:
+        # The input's fault, not an outage: do not trip the breaker.
+        raise JevRequestTooLarge("http_400:max_tokens_exceeded")
+    if resp.status_code != 200:
+        breaker.failure()
+        raise JevError(f"http_{resp.status_code}:{_error_type(resp)}")
+    try:
+        body = resp.json()
+        ans = (body.get("answers") or {})[_CHOICE_ID]
+        choice = ans["choice"]
+        raw = ans["probabilities"]
+        if not isinstance(raw, dict):
+            raise TypeError("probabilities is not an object")
+        tokens = int(((body.get("usage") or {}).get("input_tokens")) or 0)
+        answered_model = str(body.get("model") or model)
+    except (ValueError, KeyError, AttributeError, TypeError) as exc:
+        raise JevError(f"malformed answer: {type(exc).__name__}") from exc
+    if choice not in criteria:
+        raise JevError("malformed answer: choice outside the criteria")
+    probabilities = {k: p for k, p in ((k, _probability(v)) for k, v in raw.items()) if p is not None}
+    if choice not in probabilities:
+        raise JevError("malformed answer: no probability for the choice")
+    breaker.success()
+    return ChoiceAnswer(
+        choice=choice,
+        probabilities=probabilities,
+        model=answered_model,
+        input_tokens=tokens,
         elapsed_ms=(time.perf_counter() - t0) * 1000,
     )
