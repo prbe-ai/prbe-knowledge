@@ -46,6 +46,7 @@ from engine.shared.chunk_reconstruction import (
     strip_chunk_overlap_tokens,
 )
 from engine.shared.constants import (
+    AGENT_SESSION_SOURCES,
     CHUNKER_VERSION,
     EMBEDDING_V2_DIM,
     EMBEDDING_V2_MODEL,
@@ -107,7 +108,7 @@ class NormalizeOutcome:
 # with session_complete=True on the session doc and extracts the high-signal
 # unit docs (qa / decision / code_change / file_ref). We detect that pass at
 # the session level and enqueue then; every other source enqueues each doc.
-_AGENT_SESSION_SOURCES = (SourceSystem.CLAUDE_CODE, SourceSystem.CODEX, SourceSystem.PI)
+_AGENT_SESSION_SOURCES = AGENT_SESSION_SOURCES  # one list, shared with the Jev selector's tiers
 
 
 def _inferred_edge_doc_ids(

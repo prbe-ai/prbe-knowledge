@@ -1,6 +1,8 @@
 """Phase 0 canonical enums. Every string used as a type/label/edge/status lives here."""
 
+import math
 import os
+import sys
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -28,6 +30,16 @@ class SourceSystem(StrEnum):
     CODE_GRAPH = "code_graph"
     PAGERDUTY = "pagerduty"
     INCIDENT_IO = "incident_io"
+
+
+#: The coding-agent session sources. One list, read by the ingest normalizer's
+#: session coalescing and by the Jev selector's ranking tiers; a fourth agent
+#: goes here, not into either consumer.
+AGENT_SESSION_SOURCES: tuple[SourceSystem, ...] = (
+    SourceSystem.CLAUDE_CODE,
+    SourceSystem.CODEX,
+    SourceSystem.PI,
+)
 
 
 # Canonical display labels for each SourceSystem. Exposed to the
@@ -2061,6 +2073,59 @@ JEV_MAX_SPLIT_DEPTH = 4
 # How long the shadow Jev extraction may run PAST the real extractor before it
 # is abandoned. It is a shadow: it must never make a search wait.
 JEV_EXTRACTION_GRACE_SECONDS = 0.25
+
+
+def _env_floats(name: str, default: str, *, count: int) -> tuple[float, ...]:
+    """A comma-separated list of exactly `count` penalties in [0, 1], non-decreasing.
+
+    Same posture as `_env_int` (tolerant, incident-time knob): empty means the
+    default; anything else that is not exactly `count` finite floats in [0, 1]
+    in non-decreasing order (a typo, a short list, `nan`, `inf`, a negative, a
+    value above 1 that would recreate a hard partition, tiers out of order)
+    makes the WHOLE setting fall back to `default`, and says so on stderr
+    since logging is not up yet. `float()` accepts `nan` and `inf`, and a NaN
+    sort key orders a list by nothing at all, silently.
+    """
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        raw = default
+    try:
+        values = tuple(float(x) for x in raw.split(",") if x.strip())
+        if (
+            len(values) != count
+            or any(not math.isfinite(v) or v < 0 or v > 1 for v in values)
+            or list(values) != sorted(values)
+        ):
+            raise ValueError(raw)
+        return values
+    except ValueError:
+        print(
+            f"{name}={raw!r} is not {count} non-decreasing floats in [0, 1]; using {default!r}",
+            file=sys.stderr,
+        )
+        return tuple(float(x) for x in default.split(","))
+
+
+# ---- Jev: tier penalties -- the source/kind preference, where Jev can see it --
+# The product order (Richard, 2026-09-23): the records Probe owns (run, project,
+# paper, ...) > authored GitHub records (PR, issue, review) > high-volume
+# commits, files and code > coding-agent session derivatives. One penalty per
+# tier is SUBTRACTED from Jev's probability before documents are ranked, so a
+# strong judgment still wins (a 0.91 session outranks a 0.55 commit) and the
+# tier decides near-ties only. research-os's old post-sort was this rule with an
+# infinite penalty on tier 3, and it cost 0.020 NDCG@10 on 400 labelled
+# searches; these values are quality-neutral against pure Jev order and set
+# only how the top of the list looks (docs/plans/jev-postsort-tiers-sizing.md).
+# Comma-separated, one per tier 0..3; "0,0,0,0" turns the preference off. This
+# is the Jev-ranking stage; the RRF fuse that feeds the gatherer render and the
+# recall-floor top-up carries its own per-source `score_multiplier` (claude_code
+# 0.5, code graph 0.3; see `_source_weight` in engine/retrieval/agent/loop.py).
+#: Tiers 0..3 as `jev._TIER_OF_KIND` assigns them; jev.py asserts its table
+#: matches this count at import, so a fifth tier cannot arrive unpenalised.
+JEV_TIER_COUNT = 4
+JEV_TIER_PENALTIES: tuple[float, ...] = _env_floats(
+    "JEV_TIER_PENALTIES", "0,0.03,0.08,0.12", count=JEV_TIER_COUNT
+)
 
 # ---- Entity auto-merge on Jev (engine/ingest/auto_merge/jev_judge.py) ---------
 # Replay of 477 managed-plane decisions, 2026-09-23 (docs/jev-contract.md, "Entity auto-merge"):

@@ -297,6 +297,12 @@ def custom_ingest_doc_id(customer_id: str, source_key: str, document_id: str) ->
     where encoded_source_key = source_key with ':' -> '%3A' (see
     encode_source_key_for_doc_id). document_id is the caller's raw id and
     is the final segment, so it may itself contain ':'.
+
+    One reader looks INSIDE document_id: the Jev selector's `doc_kind`
+    (engine/retrieval/agent/jev.py) takes its first ':'-segment as the
+    document's kind (`run`, `project`, `paper`, `file`, ...) to pick a ranking
+    tier, keyed on the source_keys research-os projects. A change to either
+    side of that convention is a cross-repo ranking change.
     """
     encoded = encode_source_key_for_doc_id(source_key)
     return f"custom_ingest:{customer_id}:{encoded}:{document_id}"

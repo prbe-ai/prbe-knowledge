@@ -90,6 +90,7 @@ from engine.shared.constants import (
     JEV_EXTRACTION_GRACE_SECONDS,
     JEV_MODEL,
     JEV_SELECTION_TIMEOUT_SECONDS,
+    JEV_TIER_PENALTIES,
     LOG_ERROR_MAX_CHARS,
     SEARCH_AGENT_EXTENSION_GRANT,
     SEARCH_AGENT_FALLBACK_INFERENCE_MODEL,
@@ -1934,9 +1935,17 @@ def _source_weight(
     were the ONLY consumers of source_registry's `score_multiplier` and
     `half_life_days`, so when the agentic cutover removed fusion.py from the
     pipeline they stopped being applied at all -- silently. That regression
-    is why high-volume agent transcripts (claude_code / codex, both weighted
-    0.5) stopped being demoted below authored artifacts like PR descriptions
-    and Linear tickets.
+    is why high-volume agent transcripts stopped being demoted below authored
+    artifacts like PR descriptions and Linear tickets.
+
+    TWO stages weigh sources, and they are not the same knob. This weight
+    (`score_multiplier`: claude_code 0.5 in kb/handlers/claude_code.py, code
+    graph 0.3 in kb/handlers/codegraph.py, everything else 1.0, plus the
+    recency decay) shapes the FUSED order that the gatherer render and the
+    recall-floor top-up read. The `jev` selector ranks the pool by Jev's
+    probability instead and applies its own source-kind tier penalties there
+    (`jev.rank_documents`, JEV_TIER_PENALTIES); this weight reaches a Jev
+    search only through the floor's top-up of unscored slots.
 
     Multiplier BEFORE decay, deliberately: otherwise a brand-new transcript
     sits at age 0, contributes no decay, and bypasses its demotion entirely.
@@ -3068,10 +3077,18 @@ async def _select_without_gatherer(
         return _empty_passthrough("jev_unavailable", state), "jev_unavailable"
 
     ranked = jev.rank_documents(pool, scores, limit=_RECALL_FLOOR_DOCS)
-    sel["best_before_rewrite"] = round(ranked[0].score, 4) if ranked else None
+    # The best probability is read off the DELIVERED set, not off `ranked[0]`:
+    # the ranking subtracts a tier penalty (JEV_TIER_PENALTIES), so the first
+    # delivered document is not always the one Jev rated highest. The rewrite
+    # trigger and the confidence band both read this same number, so they move
+    # together; the pool's best is kept beside it for the trace.
+    best_before = jev.delivered_best(ranked)
+    sel["best_before_rewrite"] = round(best_before, 4) if best_before is not None else None
+    pool_best = jev.best_probability(scores)
+    sel["pool_best"] = round(pool_best, 4) if pool_best is not None else None
 
     # Phase 2: ONE rewrite when the best document is weak.
-    weak = not ranked or ranked[0].score < SEARCH_REWRITE_BELOW_SCORE
+    weak = best_before is None or best_before < SEARCH_REWRITE_BELOW_SCORE
     time_left = deadline - time.perf_counter()
     if weak and time_left < SEARCH_REWRITE_MIN_BUDGET_SECONDS and not state.rewrite_used:
         sel["rewrite"] = {"fired": False, "outcome": "no_budget", "time_left_s": round(time_left, 2)}
@@ -3085,10 +3102,11 @@ async def _select_without_gatherer(
             sel["rewrite"]["rescore_error"] = f"{type(exc).__name__}"
         pool = grown
         ranked = jev.rank_documents(pool, scores, limit=_RECALL_FLOOR_DOCS)
-        sel["rewrite"]["best_after"] = round(ranked[0].score, 4) if ranked else None
+        best_after = jev.delivered_best(ranked)
+        sel["rewrite"]["best_after"] = round(best_after, 4) if best_after is not None else None
         sel["rewrite"]["helped"] = bool(
-            ranked
-            and (sel["best_before_rewrite"] is None or ranked[0].score > sel["best_before_rewrite"])
+            best_after is not None
+            and (sel["best_before_rewrite"] is None or best_after > sel["best_before_rewrite"])
         )
 
     status: GathererStatus = "ok"
@@ -3123,7 +3141,10 @@ async def _select_without_gatherer(
     # "rejected" from "never examined": a doc in a batch that failed was not
     # examined, and must not be reported as Jev turning it down.
     state.rendered_doc_ids = _scoreable_doc_ids({c: h for c, h in pool.items() if c in scores})
-    best = ranked[0].score if ranked else None
+    # Confidence describes the DELIVERED set (the same number the rewrite
+    # trigger read): a tier penalty can push the pool's best past the cut, and
+    # the band must describe the answer the reader gets.
+    best = jev.delivered_best(ranked)
     sel["scored"] = len(scores)
     sel["pool"] = len(pool)
     sel["best"] = round(best, 4) if best is not None else None
@@ -3131,6 +3152,11 @@ async def _select_without_gatherer(
     # Top of the ranking, kept for the trace: a later rule (a different cut,
     # a different budget) is then an offline re-read, not a re-run.
     sel["ranked"] = [[r.doc_id, round(r.score, 4)] for r in ranked]
+    # The order above is the penalised order while the scores are raw, so an
+    # offline reader needs the tier per document and the penalties in force to
+    # tell a tier effect from a bug (docs/plans/jev-postsort-tiers-sizing.md).
+    sel["tiers"] = {r.doc_id: r.tier for r in ranked}
+    sel["tier_penalties"] = list(JEV_TIER_PENALTIES)
     notes = GathererNotes(
         turns_used=0,
         tools_called=[],

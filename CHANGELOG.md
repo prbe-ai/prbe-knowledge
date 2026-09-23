@@ -6,6 +6,19 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Changed
+- **Jev ranks with a source-kind preference.** The selector subtracts a per-tier penalty from
+  Jev's probability before ordering documents: the records Probe owns (runs, projects, papers,
+  team notes) first, authored GitHub records next, high-volume commits, files and code below
+  them, coding-agent session derivatives last. A strong judgment still wins (a 0.91 session
+  outranks a 0.55 commit); the tier decides near-ties. `JEV_TIER_PENALTIES` (default
+  `0,0.03,0.08,0.12`) sets the scale; `0,0,0,0` restores pure Jev order. Sized on 400 labelled
+  searches as quality-neutral against pure Jev order (docs/plans/jev-postsort-tiers-sizing.md);
+  it replaces research-os's 0.6 transcript multiplier (a hard partition costing 0.020 NDCG@10,
+  removed in research-os#1903, which ships AFTER this so no window has no preference at all).
+  This is the Jev-ranking stage only: the RRF fuse behind the gatherer render and the
+  recall-floor top-up keeps its own per-source `score_multiplier` (claude_code 0.5, code graph 0.3).
+
 ### Fixed
 
 - A coding-agent session whose last mining pass was partial (a segment failed, the segment
