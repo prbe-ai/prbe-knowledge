@@ -1173,5 +1173,9 @@ def test_the_agent_source_list_is_shared_with_ingest():
     from engine.ingest import normalizer
     from engine.shared.constants import AGENT_SESSION_SOURCES
 
-    assert normalizer._AGENT_SESSION_SOURCES is AGENT_SESSION_SOURCES
+    # Identity against normalizer's OWN import, not a fresh module attribute:
+    # test_default_penalties_are_the_shipped_scale reloads constants, which
+    # rebuilds the tuple, so `is AGENT_SESSION_SOURCES` failed on file order.
+    assert normalizer._AGENT_SESSION_SOURCES is normalizer.AGENT_SESSION_SOURCES
+    assert normalizer._AGENT_SESSION_SOURCES == AGENT_SESSION_SOURCES
     assert frozenset(str(x) for x in AGENT_SESSION_SOURCES) == jev._AGENT_SOURCES

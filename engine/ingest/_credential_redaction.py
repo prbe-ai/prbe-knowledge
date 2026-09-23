@@ -48,6 +48,39 @@ _MODEL_TOKEN_KEYS = {
     "stop_token",
     "unk_token",
 }
+#: Sensitive names that are ALSO ordinary English words. `cookie` is a browser
+#: session cookie and a biscuit; `token` is an auth token, an NLP token and a
+#: bus fare. In FREE TEXT these sit before `=` in content that is not a
+#: credential at all: a GSM8K answer reading
+#: `60 cookies * $0.10/cookie = $<<60*0.1=6>>6.` cost a 500-row predictions file
+#: its entire upload, because `cookie` is a member of `_SENSITIVE_KEYS`.
+#:
+#: A COMPOUND name (`auth_token`, `set_cookie`, `wandb_api_key`) is unambiguous
+#: and still redacts on the name alone -- that is the module's core bet and it
+#: is untouched. Only these bare words additionally require the VALUE to look
+#: like key material, in free text AND as a dictionary key. A URL QUERY
+#: PARAMETER is the exception and keeps the name-only rule: `?token=` is a slot
+#: in machine syntax, where a word in a sentence is not.
+#:
+#: Deliberately excludes `password`/`passwd`/`pwd`/`authorization`: those are
+#: rarely ordinary nouns before `=`, and missing one costs more than the noise.
+_PLAIN_WORD_KEYS = {"cookie", "credential", "credentials", "secret", "token"}
+#: A custom redactor's marker is EVIDENCE the field held a credential, so a
+#: plain-word key canonicalizes it even though a marker is not key-shaped.
+#: `<redacted>` itself is already handled as an indirect value.
+_REDACTION_MARKER = re.compile(r"(?i)^[<\[{(]\s*redacted\b[^>\]})]*[>\]})]$")
+
+
+def _normalize_key(key: str) -> str:
+    """`setCookie`, `SET-COOKIE` and `set_cookie` are one name."""
+    separated = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", key)
+    separated = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", separated)
+    return re.sub(r"[^a-z0-9]+", "_", separated.lower()).strip("_")
+
+
+def _plain_word_key(key: str) -> bool:
+    """Sensitive ONLY because the whole name is an ordinary English word."""
+    return _normalize_key(key) in _PLAIN_WORD_KEYS
 
 
 def is_sensitive_key(key: str) -> bool:
@@ -55,9 +88,7 @@ def is_sensitive_key(key: str) -> bool:
     # Re-scrubbing them must not erase their already-scrubbed sibling values.
     if re.fullmatch(r"<redacted(?::[a-z0-9-]+)?>(?::[0-9]+)?", key):
         return False
-    separated = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", key)
-    separated = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", separated)
-    normalized = re.sub(r"[^a-z0-9]+", "_", separated.lower()).strip("_")
+    normalized = _normalize_key(key)
     parts = set(normalized.split("_"))
     token_secret = normalized.endswith("_token") and normalized not in _MODEL_TOKEN_KEYS
     signed_secret = normalized.endswith(("_signature", "_sig"))
@@ -158,7 +189,28 @@ def default_scrub(value: Any, *, key: str = "") -> Any:
     # `synthetic_credentials_absent`. Strings and numbers still use key context.
     if value is None or isinstance(value, bool):
         return value
-    if is_sensitive_key(key.replace("\x00", "")):
+    name = key.replace("\x00", "")
+    sensitive = is_sensitive_key(name)
+    if (
+        sensitive
+        and _plain_word_key(name)
+        # A CONTAINER under a credential name is a credential bundle, and the
+        # safe reading is to drop the whole subtree: `{"credentials": {...}}`
+        # can hide a key under an inner name no rule recognizes. No model
+        # output names a dict `secret` or `credentials`, so nothing is lost.
+        and isinstance(value, (str, int, float))
+        and not (
+            isinstance(value, str)
+            and (_credential_shaped(value) or _REDACTION_MARKER.match(value))
+        )
+    ):
+        # An ordinary English word names a credential FIELD only when its value
+        # is key-shaped too. `{"token": "\u0120the", "id": 262}` is a tokenizer
+        # vocabulary row and `{"token": 50257}` is an id; `{"token": "ghp_..."}`
+        # still redacts. The value is NOT waved through -- it falls to the
+        # content rules below, which catch a credential sitting in any field.
+        sensitive = False
+    if sensitive:
         return value if isinstance(value, str) and _indirect_value(value) else "<redacted>"
     if isinstance(value, (bool, int, float)):
         return value
@@ -239,6 +291,40 @@ def _indirect_value(value: str, *, allow_lookup: bool = True) -> bool:
     ))
 
 
+#: Characters an opaque credential is drawn from: base64, base64url, hex, JWT.
+#: Arithmetic and prose leave this alphabet immediately -- `$<<60*0.1=6>>6.`
+#: fails on `$`, `<` and `*` before any statistical test is needed.
+_CREDENTIAL_ALPHABET = re.compile(r"[A-Za-z0-9+/=_.~-]+")
+#: Below this, ordinary words and small integers dominate and shape says
+#: nothing. A tokenizer id (`50257`) and a count (`12`) sit under it.
+_PLAIN_WORD_MIN_LEN = 6
+#: Matches `_ENTROPY_MIN` in the tap scanner: the bar that separates an opaque
+#: value from English written in one character class.
+_PLAIN_WORD_ENTROPY_MIN = 3.5
+
+
+def _credential_shaped(value: str) -> bool:
+    """Does this value look like key material rather than prose or arithmetic?
+
+    Only consulted for `_PLAIN_WORD_KEYS`, where the name alone is ambiguous.
+    Three cheap conditions, and the GSM8K false positive fails the first one
+    outright: the value must stay inside the credential alphabet, be long
+    enough that identifiers do not dominate, and either MIX character classes
+    or be high-entropy. `hunter2` and `deadbeefdeadbeef` pass; `chocolate`,
+    `flour`, `12345` and `$<<60*0.1=6>>6.` do not.
+    """
+    from ._credential_secrets import shannon_entropy
+
+    if len(value) < _PLAIN_WORD_MIN_LEN or not _CREDENTIAL_ALPHABET.fullmatch(value):
+        return False
+    classes = (
+        any(c.islower() for c in value)
+        + any(c.isupper() for c in value)
+        + any(c.isdigit() for c in value)
+    )
+    return classes >= 2 or shannon_entropy(value) >= _PLAIN_WORD_ENTROPY_MIN
+
+
 def _keyed(match: re.Match[str]) -> str:
     if not is_sensitive_key(match.group("key")):
         # A generic prefix such as `https:` must not consume a later
@@ -250,6 +336,12 @@ def _keyed(match: re.Match[str]) -> str:
     if len(value) >= 2 and value[0] in ("'", '"') and value[-1] == value[0]:
         value = value[1:-1]
     if _indirect_value(value, allow_lookup=not quoted):
+        return match.group(0)
+    # An ordinary English word before `=` is a credential slot only when the
+    # VALUE is also key-shaped -- the same test `default_scrub` applies to a
+    # dictionary key. URL query parameters keep the name-only rule, because
+    # there the name is machine syntax rather than a word in a sentence.
+    if _plain_word_key(match.group("key")) and not _credential_shaped(value):
         return match.group(0)
     return f"{match.group('q')}{match.group('key')}{match.group('q')}=<redacted>"
 
