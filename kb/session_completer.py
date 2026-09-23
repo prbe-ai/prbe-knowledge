@@ -70,10 +70,11 @@ SELECT q.queue_id, q.customer_id, q.source_event_id AS session_id, q.enqueued_at
  LIMIT $3
 """
 
-#: At most this many pages of `limit` rows are examined per source per run.
-#: Rows that fail keep their place (oldest first), so without paging past
-#: them a run's whole budget could be spent on the same failures every hour.
-_MAX_PAGES = 5
+#: Rows that fail keep their place (oldest first), so a run pages past them
+#: until it has ENDED `limit` sessions or run out of candidates. The keyset
+#: cursor only moves forward through a finite set, so this always terminates;
+#: a page cap would let enough persistent failures starve every row behind
+#: them, run after run.
 
 #: Append the marker, return the row to the worker. Conditioned on the same
 #: eligibility, so a row that changed since it was found is skipped, not ended.
@@ -119,7 +120,7 @@ async def enqueue_idle_session_finalizers(
         for source in AGENT_SOURCES:
             ended_here = 0
             after = (datetime(1970, 1, 1, tzinfo=UTC), 0)
-            for _page in range(_MAX_PAGES):
+            while True:
                 rows = await conn.fetch(
                     _FIND_SQL, source.value, idle_minutes, limit - ended_here, *after
                 )
@@ -151,9 +152,6 @@ async def enqueue_idle_session_finalizers(
                 if ended_here >= limit:
                     capped = True
                     break
-            else:
-                # Out of pages with rows still coming: work was left behind.
-                capped = True
     log.info(
         "session_completer.run",
         idle_minutes=idle_minutes,

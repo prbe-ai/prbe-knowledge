@@ -610,16 +610,18 @@ async def test_one_failing_row_does_not_stop_the_sweep(live_db: None, monkeypatc
 
 @pytest.mark.asyncio
 async def test_failing_rows_do_not_hold_every_slot(live_db: None, monkeypatch) -> None:
-    """With a limit of one and the oldest row failing, the run pages past it
-    and still ends the next session instead of spending its budget on the
-    same failure every hour."""
+    """With a limit of one and the oldest rows failing, the run pages past
+    them and still ends the next session instead of spending its budget on
+    the same failures every hour -- however many of them there are."""
     from engine.shared.storage import get_store
 
     customer = "completer-starve-cust"
     async with get_pool().acquire() as conn:
         await conn.execute("DELETE FROM ingestion_queue WHERE customer_id = $1", customer)
-        await _seed(conn, customer, "sess-bad", [f"raw/claude_code/{customer}/2026/04/29/sess-bad:0.json"],
-                    idle="5 days")
+        for i in range(8):
+            await _seed(conn, customer, f"sess-bad-{i}",
+                        [f"raw/claude_code/{customer}/2026/04/29/sess-bad-{i}:0.json"],
+                        idle=f"{10 - i} days")
         await _seed(conn, customer, "sess-good", [f"raw/claude_code/{customer}/2026/04/29/sess-good:0.json"],
                     idle="2 days")
     store = get_store()
