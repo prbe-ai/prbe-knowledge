@@ -127,3 +127,12 @@ def test_parity_replay_on_a_synthetic_live_blob():
     sources = {d: ab.source_of(d, bodies[d]) for d in eng}
     assert ab.arm_a(eng, sources, CUST, 20) == [GH, RUN, T1]  # what /v1/search delivers today
     assert ab.arm_a(eng, sources, CUST, 2) == [GH, RUN]  # MCP-style cut drops Jev's #1
+
+
+def test_parse_takes_the_final_yes_no_token():
+    assert ab._parse_yes_no("YES") is True
+    assert ab._parse_yes_no("No.") is False
+    assert ab._parse_yes_no("The query asks whether X. The document covers it, so YES") is True
+    assert ab._parse_yes_no("**NO** -- it is a Nostradamus quote") is False  # 'Nostradamus' is not a token
+    assert ab._parse_yes_no("It does not say.") is None
+    assert ab._parse_yes_no("") is None

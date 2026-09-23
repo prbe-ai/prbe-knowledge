@@ -37,6 +37,7 @@ import json
 import math
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -394,19 +395,33 @@ class Usage:
         }
 
 
+_YES_NO = re.compile(r"\b(YES|NO)\b", re.IGNORECASE)
+
+
 def _parse_yes_no(txt: str) -> bool | None:
-    t = (txt or "").strip().upper()
-    if t.startswith("YES"):
-        return True
-    if t.startswith("NO"):
-        return False
-    return None
+    """The verdict is the LAST standalone YES/NO in the text.
+
+    Phase 0's Haiku judge ran with max_tokens=4, so the first token was the
+    answer. Opus 5.5 reasons first and sometimes writes a sentence of prose
+    before the word ("The query asks whether ... NO"); a start-of-text match
+    read a quarter of those as unanswered. The final token is the verdict in
+    both shapes.
+    """
+    found = _YES_NO.findall(txt or "")
+    if not found:
+        return None
+    return found[-1].upper() == "YES"
 
 
-def ask_anthropic(client: Any, model: str, effort: str, prompt: str, usage: Usage) -> bool | None:
+def ask_anthropic(
+    client: Any, model: str, effort: str, prompt: str, usage: Usage
+) -> tuple[bool | None, str, str | None]:
+    """(verdict, raw text tail, stop_reason)."""
     import anthropic
 
     max_tokens = 1024
+    raw = ""
+    stop = None
     for attempt in range(3):
         try:
             r = client.messages.create(
@@ -419,22 +434,27 @@ def ask_anthropic(client: Any, model: str, effort: str, prompt: str, usage: Usag
             if exc.status_code in (429, 500, 502, 503, 529):
                 time.sleep(2.0 * (attempt + 1))
                 continue
-            return None
+            return None, f"http {exc.status_code}", None
         except anthropic.APIConnectionError:
             time.sleep(2.0 * (attempt + 1))
             continue
         usage.add(model, r.usage.input_tokens, r.usage.output_tokens)
+        stop = r.stop_reason
         if r.stop_reason == "max_tokens":
             max_tokens = 4096
             continue
         if r.stop_reason == "refusal":
-            return None
+            return None, "refusal", stop
         txt = "".join(b.text for b in r.content if b.type == "text")
-        return _parse_yes_no(txt)
-    return None
+        raw = txt[-160:]
+        v = _parse_yes_no(txt)
+        if v is not None:
+            return v, raw, stop
+        # No verdict token at all: one more try before giving up on this document.
+    return None, raw, stop
 
 
-def ask_openai(client: Any, key: str, model: str, prompt: str, usage: Usage) -> bool | None:
+def ask_openai(client: Any, key: str, model: str, prompt: str, usage: Usage) -> tuple[bool | None, str, str | None]:
     for attempt in range(3):
         try:
             r = client.post(
@@ -452,24 +472,28 @@ def ask_openai(client: Any, key: str, model: str, prompt: str, usage: Usage) -> 
                 time.sleep(2.0 * (attempt + 1))
                 continue
             if r.status_code != 200:
-                return None
+                return None, f"http {r.status_code}", None
             body = r.json()
             u = body.get("usage") or {}
             usage.add(model, int(u.get("prompt_tokens") or 0), int(u.get("completion_tokens") or 0))
-            return _parse_yes_no(body["choices"][0]["message"]["content"])
+            txt = body["choices"][0]["message"]["content"] or ""
+            return _parse_yes_no(txt), txt[-160:], None
         except Exception:  # noqa: BLE001
             time.sleep(1.5 * (attempt + 1))
-    return None
+    return None, "", None
 
 
 def _done_keys(path: str) -> set[str]:
+    """Keys already ANSWERED. A row whose verdict is None is re-asked on restart."""
     keys: set[str] = set()
     if os.path.exists(path):
         for line in open(path):
             try:
-                keys.add(json.loads(line)["key"])
+                row = json.loads(line)
             except Exception:  # noqa: BLE001
                 continue
+            if row.get("verdict") is not None:
+                keys.add(row["key"])
     return keys
 
 
@@ -524,11 +548,13 @@ def cmd_judge(args: argparse.Namespace) -> int:
 
     def work(t: dict[str, Any]) -> dict[str, Any]:
         if t["model"] == args.openai_model:
-            v = ask_openai(http, openai_key, t["model"], t["prompt"], usage)
+            v, raw, stop = ask_openai(http, openai_key, t["model"], t["prompt"], usage)
         else:
-            v = ask_anthropic(anthropic_client, t["model"], args.effort, t["prompt"], usage)
+            v, raw, stop = ask_anthropic(anthropic_client, t["model"], args.effort, t["prompt"], usage)
         row = {k: v_ for k, v_ in t.items() if k != "prompt"}
         row["verdict"] = v
+        row["raw"] = raw
+        row["stop"] = stop
         return row
 
     n = 0
@@ -625,10 +651,15 @@ def cmd_report(args: argparse.Namespace) -> int:
     same_set: dict[tuple[str, int], bool] = {}
     for line in open(args.verdicts):
         row = json.loads(line)
+        # A re-asked row follows its unanswered predecessor; never let a None overwrite an answer.
         if row["kind"] == "doc":
-            verdicts[(row["trace_id"], row["doc"], row["model"], row["pass"])] = row["verdict"]
+            key = (row["trace_id"], row["doc"], row["model"], row["pass"])
+            if row["verdict"] is not None or key not in verdicts:
+                verdicts[key] = row["verdict"]
         else:
-            sets[(row["trace_id"], row["arm"], row["k"])] = row["verdict"]
+            key2 = (row["trace_id"], row["arm"], row["k"])
+            if row["verdict"] is not None or key2 not in sets:
+                sets[key2] = row["verdict"]
             same_set[(row["trace_id"], row["k"])] = row.get("same_set", False)
     model = args.model
     usage_lines = []
