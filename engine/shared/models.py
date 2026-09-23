@@ -1394,6 +1394,11 @@ class NormalizationResult(BaseModel):
     # Empty for every connector that does not re-derive children, which is all
     # of them today except claude_code/codex.
     retire_children_of: list[str] = Field(default_factory=list)
+    # Coding-agent sessions only: how this pass's mining went, written to the
+    # queue row's `extraction_outcome` after commit. Set on every COMPLETE pass
+    # (mined or deliberately skipped), None on a live pass. The idle sweep reads
+    # it to re-queue a session whose last pass was not authoritative.
+    extraction_outcome: dict[str, Any] | None = None
     # Non-fatal reason this event produced no documents (e.g. "slack edit of deleted msg").
     skipped_reason: str | None = None
 

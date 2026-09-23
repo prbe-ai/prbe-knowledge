@@ -88,6 +88,40 @@ def _nonempty_str(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+#: `extraction_outcome.reason` values. A non-authoritative pass records the
+#: bundle's problems instead (ExtractionProblem values, joined).
+OUTCOME_OK = "ok"
+OUTCOME_DISABLED = "disabled"
+
+
+def _outcome(
+    event: WebhookEvent,
+    hydrated: Mapping[str, Any],
+    now: datetime,
+    *,
+    authoritative: bool,
+    reason: str,
+    units: int = 0,
+    calls: int = 0,
+) -> dict[str, Any]:
+    """What one complete pass did, for the queue row's `extraction_outcome`.
+
+    `keys` is how many keys the row held when this pass read it. Keys are only
+    ever appended, so a row whose key count still equals it has not changed
+    since -- which is how the sweep tells "this partial pass is still the last
+    word on the session" from "new batches have arrived since".
+    """
+    return {
+        "at": now.isoformat(),
+        "authoritative": authoritative,
+        "reason": reason,
+        "completed_by": hydrated.get("completed_by"),
+        "keys": len(event.payload_s3_keys or []),
+        "units": units,
+        "calls": calls,
+    }
+
+
 #: How far a client's clock may run ahead of ours before a line it wrote
 #: before saying goodbye looks like one written after. Also the most a resume
 #: that starts right after a goodbye can be mistaken for late delivery (each
@@ -505,6 +539,7 @@ class ClaudeCodeConnector(Connector):
             employee_hostname=employee_hostname,
             events=events,
             complete=complete,
+            completed_by=hydrated.get("completed_by"),
             now=now,
         )
 
@@ -623,6 +658,11 @@ class ClaudeCodeConnector(Connector):
                 graph_nodes=graph_nodes,
                 graph_edges=graph_edges,
                 acl_snapshots=acl_rows,
+                # Recorded as its own outcome so the sweep re-queues it once
+                # mining is back on, instead of the session looking mined.
+                extraction_outcome=_outcome(
+                    event, hydrated, now, authoritative=False, reason=OUTCOME_DISABLED
+                ),
             )
 
         bundle = await _ext.extract_units_from_session(
@@ -821,6 +861,18 @@ class ClaudeCodeConnector(Connector):
             retire_children_of=(
                 [session_doc.doc_id] if bundle.authoritative and len(documents) > 1 else []
             ),
+            extraction_outcome=_outcome(
+                event,
+                hydrated,
+                now,
+                authoritative=bundle.authoritative,
+                reason=(
+                    OUTCOME_OK if bundle.authoritative
+                    else ",".join(sorted(set(bundle.problems))) or "partial"
+                ),
+                units=len(documents) - 1,
+                calls=bundle.calls,
+            ),
         )
 
     # ---- helpers ----------------------------------------------------------
@@ -955,10 +1007,18 @@ class ClaudeCodeConnector(Connector):
         events: list[dict[str, Any]],
         complete: bool,
         now: datetime,
+        completed_by: str | None = None,
     ) -> Document:
         rendered_body = _events_to_text(events)
         body_bytes = rendered_body.encode("utf-8")
-        content_hash = hashlib.sha256(body_bytes).hexdigest()
+        # Completion is part of the document's identity, not just its metadata.
+        # The normalizer skips a write whose hash is unchanged, and a completing
+        # pass usually adds no text (the end signal carries no events), so with
+        # a body-only hash `session_complete` stayed false on the document
+        # forever: 2,258 of 2,483 "incomplete" v2 session docs had units.
+        content_hash = hashlib.sha256(
+            body_bytes + (b"\x00session_complete" if complete else b"")
+        ).hexdigest()
         doc_id = f"{self._doc_id_prefix}:{event.customer_id}:{session_id}"
         first_content = ""
         if events:
@@ -984,6 +1044,7 @@ class ClaudeCodeConnector(Connector):
             "cwd": cwd,
             "device_id": event.raw_payload.get("device_id"),
             "session_complete": complete,
+            **({"completed_by": completed_by} if complete and completed_by else {}),
             "event_count": len(events),
             # How many times the agent ran out of context and summarised itself.
             # A reader wants this BEFORE opening any unit: it says whether the

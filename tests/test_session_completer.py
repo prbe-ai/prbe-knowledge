@@ -639,3 +639,150 @@ async def test_failing_rows_do_not_hold_every_slot(live_db: None, monkeypatch) -
         good = await _row(conn, customer, "sess-good")
         await conn.execute("DELETE FROM ingestion_queue WHERE customer_id = $1", customer)
     assert good["payload_s3_keys"][-1].endswith("/finalize.marker")
+
+
+# ---- "ended" is not "mined": the bounded retry (migration 0138) -------------
+
+
+def _outcome_json(**over) -> str:
+    import json
+
+    base = {"authoritative": False, "reason": "segment_failed", "keys": 2, "retries": 0}
+    base.update(over)
+    return json.dumps(base)
+
+
+async def _seed_mined(conn, customer, session_id, outcome: str | None):
+    keys = [f"raw/claude_code/{customer}/2026/04/29/{session_id}:0.json",
+            f"raw/claude_code/{customer}/{session_id}/finalize.marker"]
+    await _seed(conn, customer, session_id, keys)
+    await conn.execute(
+        "UPDATE ingestion_queue SET extraction_outcome = $3::jsonb "
+        "WHERE customer_id = $1 AND source_event_id = $2",
+        customer, session_id, outcome,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_partial_pass_is_retried_up_to_the_bound(live_db: None) -> None:
+    from kb.session_completer import MAX_EXTRACTION_RETRIES
+
+    customer, sid = "completer-retry-cust", "sess-retry"
+    async with get_pool().acquire() as conn:
+        await conn.execute("DELETE FROM ingestion_queue WHERE customer_id = $1", customer)
+        await _seed_mined(conn, customer, sid, _outcome_json())
+    for attempt in range(1, MAX_EXTRACTION_RETRIES + 1):
+        assert await enqueue_idle_session_finalizers(idle_minutes=1440) == 1, attempt
+        async with get_pool().acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT status, version, payload_s3_keys, extraction_outcome->>'retries' AS r "
+                "FROM ingestion_queue WHERE customer_id=$1", customer,
+            )
+            assert (row["status"], row["r"]) == ("pending", str(attempt))
+            assert len(row["payload_s3_keys"]) == 2, "re-queued as is: no new key"
+            # The worker's next pass is partial again; a day passes.
+            await conn.execute(
+                "UPDATE ingestion_queue SET status='done', enqueued_at=NOW()-INTERVAL '2 days' "
+                "WHERE customer_id=$1", customer,
+            )
+    assert await enqueue_idle_session_finalizers(idle_minutes=1440) == 0, "bound reached"
+    async with get_pool().acquire() as conn:
+        await conn.execute("DELETE FROM ingestion_queue WHERE customer_id = $1", customer)
+
+
+@pytest.mark.parametrize(
+    ("outcome", "retried"),
+    [
+        (None, False),  # no pass recorded since the column existed
+        ('{"authoritative": true, "reason": "ok", "keys": 2, "retries": 0}', False),
+        ('{"authoritative": false, "reason": "segment_failed", "keys": 1, "retries": 0}', False),
+        ('{"authoritative": false, "reason": "disabled", "keys": 2, "retries": 9}', True),
+    ],
+    ids=["no_record", "authoritative", "row_changed_since", "disabled_is_unbounded"],
+)
+@pytest.mark.asyncio
+async def test_only_an_unchanged_partial_pass_is_retried(live_db: None, outcome, retried) -> None:
+    customer, sid = "completer-retry-cases-cust", "sess-retry-case"
+    async with get_pool().acquire() as conn:
+        await conn.execute("DELETE FROM ingestion_queue WHERE customer_id = $1", customer)
+        await _seed_mined(conn, customer, sid, outcome)
+    assert await enqueue_idle_session_finalizers(idle_minutes=1440) == int(retried)
+    async with get_pool().acquire() as conn:
+        after = await conn.fetchval(
+            "SELECT extraction_outcome->>'retries' FROM ingestion_queue WHERE customer_id=$1", customer
+        )
+        await conn.execute("DELETE FROM ingestion_queue WHERE customer_id = $1", customer)
+    if outcome and '"disabled"' in outcome:
+        assert after == "9", "a switched-off pass spends nothing and does not count"
+
+
+@pytest.mark.asyncio
+async def test_the_worker_records_each_complete_pass(live_db: None, monkeypatch) -> None:
+    """End to end through the real normalizer: a partial pass is recorded with
+    the row's key count, and keeps the sweep's retry count; an authoritative
+    pass resets it."""
+    import orjson
+
+    from engine.ingest.handlers.base import make_default_context
+    from engine.ingest.normalizer import Normalizer
+    from engine.shared import claude_code_extraction as _ext
+    from engine.shared.constants import SourceSystem
+    from engine.shared.storage import get_store
+
+    customer, sid = "completer-outcome-cust", "sess-outcome"
+    authoritative = {"v": False}
+
+    async def mine(**kwargs):
+        return _ext.UnitBundle(
+            authoritative=authoritative["v"],
+            problems=[] if authoritative["v"] else ["segment_failed"],
+            calls=2,
+            qa=[_ext.QA(prompt="p", outcome="o")],
+        )
+
+    monkeypatch.setattr(_ext, "extract_units_from_session", mine)
+    store = get_store()
+    live_key = f"raw/claude_code/{customer}/2026/04/29/{sid}:0.json"
+    marker = f"raw/claude_code/{customer}/{sid}/finalize.marker"
+    async with get_pool().acquire() as conn:
+        await conn.execute("DELETE FROM ingestion_queue WHERE customer_id = $1", customer)
+        await _seed(conn, customer, sid, [live_key, marker])
+        await conn.execute(
+            "UPDATE ingestion_queue SET extraction_outcome = '{\"retries\": 2}'::jsonb WHERE customer_id=$1",
+            customer,
+        )
+        row = await _row(conn, customer, sid)
+    bucket = await store.bucket_for(customer)
+    await store.ensure_bucket(bucket)
+    await store.put(bucket, live_key, orjson.dumps({"_headers": {}, "payload": {
+        "device_id": "d", "session_id": sid, "batch_seq": 0, "employee_id": "emp",
+        "events": [{"line_no": 0, "employee_id": "emp", "raw": {"type": "user", "content": "hi"}}],
+    }}))
+    from engine.shared.session_signals import cron_marker_body
+
+    await store.put(bucket, marker, cron_marker_body(sid))
+
+    async def run_pass():
+        ctx = make_default_context()
+        try:
+            await Normalizer(ctx).process_queue_row(
+                queue_id=row["queue_id"], customer_id=customer,
+                source_system=SourceSystem.CLAUDE_CODE, source_event_id=sid,
+                payload_s3_keys=list(row["payload_s3_keys"]),
+            )
+        finally:
+            await ctx.http.aclose()
+        async with get_pool().acquire() as conn:
+            import json
+            return json.loads(await conn.fetchval(
+                "SELECT extraction_outcome FROM ingestion_queue WHERE queue_id=$1", row["queue_id"]
+            ))
+
+    partial = await run_pass()
+    assert (partial["authoritative"], partial["reason"], partial["keys"]) == (False, "segment_failed", 2)
+    assert (partial["completed_by"], partial["calls"], partial["retries"]) == ("cron_marker", 2, 2)
+    authoritative["v"] = True
+    full = await run_pass()
+    assert (full["authoritative"], full["reason"], full["retries"]) == (True, "ok", 0)
+    async with get_pool().acquire() as conn:
+        await conn.execute("DELETE FROM ingestion_queue WHERE customer_id = $1", customer)

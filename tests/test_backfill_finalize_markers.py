@@ -206,3 +206,37 @@ async def test_one_failing_row_is_counted_not_fatal(rows, monkeypatch) -> None:
     report = await backfill(dry_run=False, customers=[C])
     assert report.outcomes[Outcome.ERRORED] == 1
     assert report.outcomes[Outcome.RELINKED] == 1, "multi_mined still went through"
+
+
+@pytest.mark.asyncio
+async def test_legacy_partial_passes_are_handed_to_the_retry(rows) -> None:
+    """Rows the OLD worker left ending in an end signal were partial passes;
+    rows mined after the cutoff (the new worker keeps end signals by design)
+    and rows with a recorded outcome are left alone."""
+    from datetime import UTC, datetime
+
+    from scripts.backfill_finalize_markers import stamp_legacy_retry
+
+    cutoff = datetime(2026, 5, 3, tzinfo=UTC)
+    async with get_pool().acquire() as conn:
+        after_cutoff = await _seed(
+            conn, "s-new-worker",
+            [_batch("s-new-worker", "2026/05/04"), cron_marker_key("claude_code", C, "s-new-worker")],
+            enqueued="2026-05-04 07:00Z", completed="2026-05-04 07:05Z",
+        )
+    assert await stamp_legacy_retry(completed_before=cutoff, customers=[C], dry_run=True) == 1
+    assert await stamp_legacy_retry(completed_before=cutoff, customers=[C], dry_run=False) == 1
+    assert await stamp_legacy_retry(completed_before=cutoff, customers=[C], dry_run=False) == 0
+    async with get_pool().acquire() as conn:
+        import json
+
+        stamped = json.loads(await conn.fetchval(
+            "SELECT extraction_outcome FROM ingestion_queue WHERE queue_id=$1", rows["already"]
+        ))
+        untouched = await conn.fetchval(
+            "SELECT extraction_outcome FROM ingestion_queue WHERE queue_id=$1", after_cutoff
+        )
+    assert (stamped["authoritative"], stamped["reason"], stamped["keys"], stamped["retries"]) == (
+        False, "legacy_unconsumed", 2, 0
+    )
+    assert untouched is None
