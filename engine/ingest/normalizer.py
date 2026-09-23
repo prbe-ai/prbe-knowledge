@@ -39,7 +39,7 @@ from engine.ingest.chunker import (
 from engine.ingest.graph_writer import upsert_edges, upsert_nodes
 from engine.ingest.handlers.base import Connector, ConnectorContext
 from engine.ingest.handlers.registry import build_connector
-from engine.ingest.payload_redaction import redact_payload_async
+from engine.ingest.payload_redaction import redact_payload_async, redact_texts_async
 from engine.ingest.secret_redaction import redact_documents_async
 from engine.shared.chunk_reconstruction import (
     reconstruct_chunk_text,
@@ -1033,7 +1033,7 @@ class Normalizer:
         # metadata-piece construction or embedding. Keep typed model fields.
         content_fields = {
             name: getattr(doc, name) for name in
-            ("title", "body", "body_preview", "source_url", "author_id", "metadata")
+            ("title", "body_preview", "source_url", "author_id", "metadata")
         }
         nested = doc.model_dump(mode="json", include={"entities", "attachments", "doc_references"})
         content_fields.update(nested)
@@ -1041,6 +1041,14 @@ class Normalizer:
         validated = Document.model_validate({**doc.model_dump(), **clean})
         for name in content_fields:
             setattr(doc, name, getattr(validated, name))
+        # The body is scrubbed as free text, NOT as a field. The field scrubber
+        # replaces a value WHOLE when it holds any %XX/\uXXXX escape and a
+        # finding anywhere, which for a session transcript is the whole session:
+        # from 2026-09-18 that turned 28 transcripts (up to 4.5 MB each) into one
+        # `<redacted>` chunk and retired every chunk they had. Here a finding
+        # costs its own line; the rest of the body is chunked as usual.
+        if doc.body:
+            (doc.body,) = await redact_texts_async([doc.body])
 
         # Deleted docs: no body → chunks is empty → every live chunk gets closed out.
         # The metadata chunk also disappears for deleted docs (joins the removed
@@ -1055,7 +1063,7 @@ class Normalizer:
             # connector-supplied chunks need the same structured/encoded
             # scrubber before the gitleaks backstop, hashes, reuse or embedding.
             targets = list(new_pieces) + ([metadata_piece] if metadata_piece else [])
-            cleaned_contents = await redact_payload_async([piece.content for piece in targets])
+            cleaned_contents = await redact_texts_async([piece.content for piece in targets])
             rewritten = [
                 replace(piece, content=content)
                 for piece, content in zip(targets, cleaned_contents, strict=True)

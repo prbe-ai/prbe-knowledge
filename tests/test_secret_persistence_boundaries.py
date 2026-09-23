@@ -328,3 +328,91 @@ def test_combined_ingress_scrubber_preserves_only_complete_environment_reference
         assert clean == payload
     else:
         assert 'FabricatedCredential42!' not in json.dumps(clean)
+
+
+def _transcript_with_one_encoded_credential(filler_lines: int = 600) -> str:
+    """A long session body: one BENIGN percent-escape, one plain credential and
+    one ENCODED credential, each on its own line, far apart.
+
+    The shape that erased 28 whole transcripts on research (2026-09-18 on):
+    `scrub_string` decodes the WHOLE value when any `%XX`/`\\uXXXX` appears and,
+    if the decoded view changes anywhere, returns `<redacted>` for all of it.
+    """
+    lines = ["session start: opened https://example.invalid/docs/a%20b.md"]
+    lines += [
+        f"turn {i}: we discussed chunk retirement in the normalizer at length."
+        for i in range(filler_lines)
+    ]
+    lines.insert(filler_lines // 2, f"user pasted: export GITHUB_TOKEN={KEY}")
+    lines.append("callback https://example.invalid/login?next=%2Fhome%3Fpassword%3DHarbor7%21")
+    lines.append("final-marker-line: the session kept going after every finding")
+    return "\n".join(lines)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["body", "prechunked"])
+async def test_one_encoded_finding_costs_its_line_not_the_whole_body(monkeypatch, path):
+    """A finding anywhere in a multi-line body must not replace the entire body.
+
+    Before the fix the body came back as the 10-character placeholder, chunked
+    into ONE `<redacted>` chunk, and the chunk diff retired every live content
+    chunk of the session (prod: 832 chunks, 1.39M chars, in one pass).
+    """
+    from engine.shared.models import ChunkPiece
+
+    text = _transcript_with_one_encoded_credential()
+    embeddings = []
+
+    class Conn:
+        async def fetch(self, *args):
+            return []
+
+    @asynccontextmanager
+    async def tenant(*args):
+        yield Conn()
+
+    class Embedder:
+        async def embed_documents(self, docs):
+            embeddings.extend(d.content for d in docs)
+            return SimpleNamespace(
+                embedded=[
+                    SimpleNamespace(chunk_index=i, embedding=[0.0]) for i in range(len(docs))
+                ],
+                failed=[],
+            )
+
+    monkeypatch.setattr(normalizer, "with_tenant", tenant)
+    n = object.__new__(normalizer.Normalizer)
+    n._embedder = Embedder()
+    now = datetime.now(UTC)
+    doc = Document(
+        doc_id="claude_code:audit-local:synthetic-session",
+        customer_id="audit-local",
+        source_system=SourceSystem.CLAUDE_CODE,
+        source_id="synthetic-session",
+        source_url="https://example.invalid/session",
+        doc_type="claude_code.session",
+        content_hash="audit",
+        body=text if path == "body" else None,
+        created_at=now,
+        updated_at=now,
+        valid_from=now,
+        ingested_at=now,
+        acl=ACLSnapshot(principals=[], captured_at=now),
+    )
+    prechunked = (
+        [ChunkPiece(chunk_index=0, content=text, token_count=8)] if path == "prechunked" else None
+    )
+    plan = await n._plan_chunks("audit-local", doc, prechunked)
+
+    stored = "\n".join(piece.content for piece, _emb, kind in plan.added_pieces if kind == "content")
+    # The body survived: its far end, its middle and its benign escape are all there.
+    assert "final-marker-line" in stored
+    assert f"turn {300 + 1}:" in stored
+    assert "a%20b.md" in stored
+    # Both credentials are still gone -- plain and percent-encoded.
+    joined = "\n".join(embeddings)
+    assert KEY not in joined
+    assert "Harbor7" not in joined
+    # And only the encoded credential's own line was given up for it.
+    assert stored.count("<redacted>") <= 2

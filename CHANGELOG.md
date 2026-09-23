@@ -27,6 +27,18 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   anchors the value after it. The shared artifact gate now reports credentials instead of
   refusing, so the manual-upload boundary refuses on any finding itself: a credential in an
   uploaded document is still rejected before anything is stored.
+- A long session transcript is no longer erased whole by the credential scrubber. The
+  field scrubber added in #568 replaces a value ENTIRELY when it holds any `%XX`/`\uXXXX`
+  escape (or a NUL) and a finding anywhere, and it ran over the whole document body: from
+  2026-09-18 that turned 28 sessions on research (36 MB of transcript, up to 4.5 MB each) into
+  a single `<redacted>` chunk, and the chunk diff retired every chunk they had, so search and
+  the source view served nothing for them. The body and pre-chunked pieces are now scrubbed as
+  free text: a value that would collapse is scrubbed line by line (the tap scanner still sees
+  the whole text first), so a finding costs its own line. Values that do not collapse are
+  scrubbed exactly as before. Already-collapsed documents need a forced re-chunk (the
+  unchanged content hash makes a plain re-queue a no-op): `scripts/rechunk_collapsed_sessions.py`
+  re-renders each from R2, re-chunks it through the fixed scrub without mining, and writes
+  nothing but chunks. Dry run by default; `--write` applies.
 - A coding-agent session whose last mining pass was partial (a segment failed, the segment
   cap hit, the model declined the tool, or extraction was switched off) is no longer treated
   as mined for good. The worker records how every complete pass went on the session's queue
