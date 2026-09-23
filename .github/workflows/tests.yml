@@ -232,6 +232,9 @@ jobs:
       # the deferral that keeps a node queued through a Jev outage and the
       # per-(tenant, label) merge lock. test_entity_clusters_routes covers the
       # merge transaction itself (merge_cluster), which auto-merge calls.
+      # test_alias_chains_and_enqueue covers alias routing through merge chains
+      # (write and read path) and the insert-or-change gate on the post-write
+      # queue, with the two retrieval alias-helper suites beside it.
       # Keep every tests/retrieval/ path in ONE run: a file from elsewhere
       # between two of them makes pytest drop tests/retrieval/conftest.py's
       # fixtures for the second half ("fixture 'recorded' not found").
@@ -276,6 +279,8 @@ jobs:
           tests/retrieval/test_dedupe_gathered.py
           tests/retrieval/test_graph_discovery_ordering.py
           tests/retrieval/test_bm25_project_scope_shape.py
+          tests/retrieval/test_helpers_resolve_aliases.py
+          tests/retrieval/test_helpers_expand_to_cluster_members.py
           tests/test_bm25_index_generations.py
           tests/test_custom_ingest.py
           tests/test_backfill_custom_doc_types.py
@@ -285,3 +290,4 @@ jobs:
           tests/test_auto_merge_twins.py
           tests/test_auto_merge_live.py
           tests/test_entity_clusters_routes.py
+          tests/test_alias_chains_and_enqueue.py

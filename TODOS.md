@@ -38,19 +38,6 @@ or retry loop that increments version on conflict. ~10 lines.
 
 ## P2 — operational hygiene
 
-### Queue post-write work only when a node is inserted or actually changes
-**Where:** `engine/ingest/graph_writer.py:149-165` (`upsert_nodes` enqueue).
-
-Every upsert re-queues the node with `ON CONFLICT DO UPDATE`, changed or not. On
-the managed plane (logs, 2026-09-23) 80 distinct nodes produced 500 auto-merge
-judge calls in 81 minutes; one Person node was judged 86 times. That is most of
-the judge spend, and repeated draws let a noisy judge ratchet a near-threshold
-pair into a merge (a Jev pair averaging 0.932 crossed 0.95 on 4 of 20 calls).
-All three post-write steps only need insert-or-change: embedding runs only when
-`embedding IS NULL`, pending edges drain on arrival, and a newly arriving twin
-is judged itself. **Fix:** have the upsert report inserted/changed node ids and
-enqueue only those.
-
 ### Repair the documents that past auto-merges detached from the graph
 **Where:** `entity_merge_audit`, `entity_aliases` (managed plane).
 
@@ -81,17 +68,6 @@ verified independently, 11 people confirmed only by the email/login the gate
 itself requires. 0 known-false out of 14 still allows a false-merge rate of up
 to ~20% (95% bound). **Do:** a replay sampled over non-document nodes by label,
 and the day-one human review of live `jev-` audit rows, before relying on it.
-
-### Alias routing is one hop, so a merge chain strands its inner aliases
-**Where:** `engine/ingest/graph_writer.py` (`_fetch_aliases`),
-`engine/ingest/entity_clusters_routes.py` (`merge_cluster`, unmerge).
-
-Merging `b` (itself the primary of `a`) into `c` leaves `a → b` routing to a
-deleted node, so the next upsert of `a` recreates `b` as a stray copy.
-Auto-merge refuses this (`refuse_cluster_primaries`), but a human merge can
-still build the chain, and unmerge does not take the per-(tenant, label) merge
-lock. **Fix:** re-point a folded primary's aliases in the same transaction (or
-resolve routing transitively), and take the lock in unmerge too.
 
 ### The research plane never runs the post-write worker
 No side-worker runs on research, so nothing links parked edges there: 1.84M
