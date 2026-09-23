@@ -447,7 +447,10 @@ async def test_a_resumed_session_does_not_re_extract(
     hdr = {"X-Internal-Knowledge-Key": "test-internal-key", "X-Prbe-Customer": customer}
     internal = {"X-Internal-Knowledge-Key": "test-internal-key"}
 
-    async def post_batch(seq: int) -> None:
+    async def post_batch(seq: int, written_at: str | None = None) -> None:
+        raw = {"type": "user", "message": {"content": f"turn {seq}"}}
+        if written_at:
+            raw["timestamp"] = written_at
         async with (
             httpx.AsyncClient(transport=transport, base_url="http://t") as client,
             app.router.lifespan_context(app),
@@ -455,8 +458,7 @@ async def test_a_resumed_session_does_not_re_extract(
             await client.post("/webhooks/claude_code", json={
                 "device_id": device_id, "session_id": session_id, "batch_seq": seq,
                 "cwd": "/tmp", "employee_id": "emp",
-                "events": [{"line_no": seq, "raw": {"type": "user", "message":
-                            {"content": f"turn {seq}"}}}],
+                "events": [{"line_no": seq, "raw": raw}],
             }, headers=hdr)
 
     async def post_finalize() -> None:
@@ -507,10 +509,13 @@ async def test_a_resumed_session_does_not_re_extract(
     await drain()
     assert calls["n"] == 1, "the finalize should mine the session once"
 
-    # The session RESUMES: same id, a new batch. It must not be mined again
-    # just because a finalize key from last time is still lying around.
+    # The session RESUMES: same id, a new batch, lines written after the
+    # goodbye. It must not be mined again just because a finalize key from last
+    # time is still lying around.
+    from datetime import timedelta
+
     await close_pool()
-    await post_batch(1)
+    await post_batch(1, (datetime.now(UTC) + timedelta(minutes=10)).isoformat())
     await init_pool(settings)
     await drain()
     assert calls["n"] == 1, (

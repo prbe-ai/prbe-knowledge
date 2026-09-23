@@ -605,3 +605,35 @@ async def test_one_failing_row_does_not_stop_the_sweep(live_db: None, monkeypatc
         await conn.execute("DELETE FROM ingestion_queue WHERE customer_id = $1", customer)
     assert good["payload_s3_keys"][-1].endswith("/finalize.marker")
     assert len(bad["payload_s3_keys"]) == 1
+
+
+
+@pytest.mark.asyncio
+async def test_failing_rows_do_not_hold_every_slot(live_db: None, monkeypatch) -> None:
+    """With a limit of one and the oldest row failing, the run pages past it
+    and still ends the next session instead of spending its budget on the
+    same failure every hour."""
+    from engine.shared.storage import get_store
+
+    customer = "completer-starve-cust"
+    async with get_pool().acquire() as conn:
+        await conn.execute("DELETE FROM ingestion_queue WHERE customer_id = $1", customer)
+        await _seed(conn, customer, "sess-bad", [f"raw/claude_code/{customer}/2026/04/29/sess-bad:0.json"],
+                    idle="5 days")
+        await _seed(conn, customer, "sess-good", [f"raw/claude_code/{customer}/2026/04/29/sess-good:0.json"],
+                    idle="2 days")
+    store = get_store()
+    real_put = store.put
+
+    async def put(bucket, key, body):
+        if "sess-bad" in key:
+            raise RuntimeError("R2 refused")
+        return await real_put(bucket, key, body)
+
+    monkeypatch.setattr(store, "put", put)
+    monkeypatch.setattr("kb.session_completer.get_store", lambda: store)
+    assert await enqueue_idle_session_finalizers(idle_minutes=1440, limit=1) == 1
+    async with get_pool().acquire() as conn:
+        good = await _row(conn, customer, "sess-good")
+        await conn.execute("DELETE FROM ingestion_queue WHERE customer_id = $1", customer)
+    assert good["payload_s3_keys"][-1].endswith("/finalize.marker")

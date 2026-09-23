@@ -21,6 +21,8 @@ covering the ones it misses is a separate change.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from engine.shared.constants import SourceSystem
 from engine.shared.db import get_pool
 from engine.shared.logging import get_logger
@@ -58,14 +60,20 @@ def _eligible(last_key: str) -> str:
 #: The last key is read once per row: repeating the array subscript makes
 #: Postgres de-TOAST the whole array per reference (rows hold up to ~2,700 keys).
 _FIND_SQL = f"""
-SELECT q.queue_id, q.customer_id, q.source_event_id AS session_id
+SELECT q.queue_id, q.customer_id, q.source_event_id AS session_id, q.enqueued_at
   FROM ingestion_queue q
   CROSS JOIN LATERAL (SELECT {last_key_sql("q.payload_s3_keys")} AS last_key OFFSET 0) lk
  WHERE q.source_system = $1
    AND {_eligible("lk.last_key")}
- ORDER BY q.enqueued_at
+   AND (q.enqueued_at, q.queue_id) > ($4::timestamptz, $5::bigint)
+ ORDER BY q.enqueued_at, q.queue_id
  LIMIT $3
 """
+
+#: At most this many pages of `limit` rows are examined per source per run.
+#: Rows that fail keep their place (oldest first), so without paging past
+#: them a run's whole budget could be spent on the same failures every hour.
+_MAX_PAGES = 5
 
 #: Append the marker, return the row to the worker. Conditioned on the same
 #: eligibility, so a row that changed since it was found is skipped, not ended.
@@ -109,30 +117,43 @@ async def enqueue_idle_session_finalizers(
     async with get_pool().acquire() as conn:
         seen_buckets: set[str] = set()
         for source in AGENT_SOURCES:
-            rows = await conn.fetch(_FIND_SQL, source.value, idle_minutes, limit)
-            candidates += len(rows)
-            capped = capped or len(rows) >= limit
-            for r in rows:
-                try:
-                    outcome = await _end_one(
-                        conn, store, seen_buckets, source, r, idle_minutes, dry_run=dry_run
-                    )
-                except Exception as exc:
-                    # One bad row (a tenant with no bucket, an R2 error) must
-                    # not end the run: rows are taken oldest first, so the same
-                    # row would come up first every hour and nothing would
-                    # ever be ended again.
-                    log.warning(
-                        "session_completer.row_failed",
-                        queue_id=r["queue_id"],
-                        error=f"{type(exc).__name__}: {str(exc)[:200]}",
-                    )
-                    failed += 1
-                    continue
-                if outcome:
-                    enqueued += 1
-                else:
-                    skipped += 1
+            ended_here = 0
+            after = (datetime(1970, 1, 1, tzinfo=UTC), 0)
+            for _page in range(_MAX_PAGES):
+                rows = await conn.fetch(
+                    _FIND_SQL, source.value, idle_minutes, limit - ended_here, *after
+                )
+                if not rows:
+                    break
+                candidates += len(rows)
+                after = (rows[-1]["enqueued_at"], rows[-1]["queue_id"])
+                for r in rows:
+                    try:
+                        outcome = await _end_one(
+                            conn, store, seen_buckets, source, r, idle_minutes, dry_run=dry_run
+                        )
+                    except Exception as exc:
+                        # One bad row (a tenant with no bucket, an R2 error)
+                        # must not end the run, nor hold its slot: the next
+                        # page goes past it.
+                        log.warning(
+                            "session_completer.row_failed",
+                            queue_id=r["queue_id"],
+                            error=f"{type(exc).__name__}: {str(exc)[:200]}",
+                        )
+                        failed += 1
+                        continue
+                    if outcome:
+                        enqueued += 1
+                        ended_here += 1
+                    else:
+                        skipped += 1
+                if ended_here >= limit:
+                    capped = True
+                    break
+            else:
+                # Out of pages with rows still coming: work was left behind.
+                capped = True
     log.info(
         "session_completer.run",
         idle_minutes=idle_minutes,

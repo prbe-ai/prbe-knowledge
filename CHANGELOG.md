@@ -19,6 +19,12 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - The idle sweep only ends sessions that already have a queue row, re-checks under the
   session lock that no batch landed since it looked, and skips rows being processed. It no
   longer creates marker-only rows, which dead-lettered on "missing employee_id".
+- A protocol-1 batch written before the client's finalize but delivered after it (the tap
+  retries a failed batch while the finalize behind it goes out first) no longer reopens the
+  session; the transcript lines' own timestamps tell a late delivery from a resume.
+- New batches for a session that is being processed no longer free its queue row for a
+  second worker, which mined the same session twice.
+- One failing row no longer stops the idle sweep; it is counted and the run pages past it.
 - A mining pass whose model call answered in prose instead of the tool now logs
   `claude_code_extraction.tool_declined`; it was the one partial-extraction path that left
   no trace.

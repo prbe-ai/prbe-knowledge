@@ -157,7 +157,13 @@ async def _enqueue_agent(conn, customer, source, sid, key):
         "INSERT INTO ingestion_queue(customer_id,source_system,source_event_id,payload_s3_key,"
         "payload_s3_keys,status,priority,version,enqueued_at) VALUES($1,$2,$3,$4,ARRAY[$4],'pending',$5,1,now()) "
         "ON CONFLICT(customer_id,source_system,source_event_id) DO UPDATE SET "
-        "payload_s3_keys=ingestion_queue.payload_s3_keys || EXCLUDED.payload_s3_keys, status='pending',"
+        "payload_s3_keys=ingestion_queue.payload_s3_keys || EXCLUDED.payload_s3_keys,"
+        # A row being processed stays `processing`: the version bump is what
+        # tells the running worker its payload grew, and its CAS miss returns
+        # the row to pending (Worker._mark_done). Resetting it here let a
+        # second worker claim the same session mid-extraction and mine it
+        # twice -- the same fix kb/ingestion_app._enqueue already carries.
+        "status=CASE WHEN ingestion_queue.status='processing' THEN 'processing' ELSE 'pending' END,"
         "version=ingestion_queue.version+1,completed_at=NULL,error=NULL,enqueued_at=now()",
         customer,
         source.value,

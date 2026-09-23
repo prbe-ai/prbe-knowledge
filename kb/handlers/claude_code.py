@@ -89,8 +89,15 @@ def _nonempty_str(value: object) -> str | None:
 
 
 #: How far a client's clock may run ahead of ours before a line it wrote
-#: before saying goodbye looks like one written after.
+#: before saying goodbye looks like one written after. Also the most a resume
+#: that starts right after a goodbye can be mistaken for late delivery (each
+#: pass in that window re-mines), so it stays small.
 _CLIENT_CLOCK_SKEW = timedelta(minutes=2)
+
+#: For a late batch with no dated line at all: how soon after the goodbye it
+#: must have ARRIVED to count as a retry. The tap's retry backoff is capped at
+#: 5 minutes per attempt.
+_LATE_ARRIVAL_WINDOW = timedelta(minutes=15)
 
 
 def _when(value: object) -> datetime | None:
@@ -107,13 +114,18 @@ def _late_deliveries_after_client_finalize(
     trail: list[tuple[Any, str | None, list[dict[str, Any]]]],
 ) -> bool:
     """True when everything after the newest protocol-1 client finalize was
-    WRITTEN before it: batches that were delivered late, not a resumed session.
+    WRITTEN before it: batches delivered late, not a resumed session.
 
-    Judged by the transcript lines' own timestamps against the finalize's
-    arrival. A resumed session writes lines after its goodbye, so a quick
-    `--resume` is not mistaken for a retry (which would re-mine on every batch
-    of it). Anything that cannot be dated -- a missing timestamp, an unreadable
-    batch, a marker, another finalize -- is treated as a resume.
+    The tap retries a failed batch with backoff while the finalize queued
+    behind it goes out first, so `[.., finalize, batch]` can mean either. The
+    transcript lines' own timestamps decide: a retried batch holds lines
+    written before the goodbye, a resume writes lines after it. Undated lines
+    (Claude Code writes some) are ignored; a batch with no dated line at all
+    counts as late only if it ARRIVED soon after the goodbye.
+
+    Erring toward "resume" leaves a session unmined on a plane with no idle
+    sweep; erring toward "late" re-mines during the allowance. Both windows
+    are small for that reason.
     """
     fin = max(
         (i for i, (signal, _, _) in enumerate(trail)
@@ -125,13 +137,19 @@ def _late_deliveries_after_client_finalize(
     said_goodbye = _when(trail[fin][1])
     if said_goodbye is None:
         return False
-    for signal, _, events in trail[fin + 1:]:
+    for signal, arrived, events in trail[fin + 1:]:
         if signal is not None or not events:
             return False
-        for event in events:
-            raw = event.get("raw")
-            written = _when(raw.get("timestamp") if isinstance(raw, dict) else None)
-            if written is None or written > said_goodbye + _CLIENT_CLOCK_SKEW:
+        written = [
+            w for e in events
+            if (w := _when((e.get("raw") or {}).get("timestamp") if isinstance(e.get("raw"), dict) else None))
+        ]
+        if written:
+            if max(written) > said_goodbye + _CLIENT_CLOCK_SKEW:
+                return False
+        else:
+            landed = _when(arrived)
+            if landed is None or landed > said_goodbye + _LATE_ARRIVAL_WINDOW:
                 return False
     return True
 

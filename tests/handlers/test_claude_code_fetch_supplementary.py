@@ -551,6 +551,46 @@ async def test_a_quick_resume_is_not_mistaken_for_late_delivery(stub_store: _Stu
 
 
 @pytest.mark.asyncio
+async def test_undated_lines_are_ignored_and_a_fast_client_clock_is_allowed(stub_store: _StubStore) -> None:
+    """Claude Code writes some undated lines; one must not turn a retry into a
+    'resume' (on a plane with no idle sweep, that session would never be
+    mined). A client clock a minute or so fast is within the allowance."""
+    customer, session = "fs-undated-ok-cust", "sess-undated-ok"
+    bucket = await stub_store.bucket_for(customer)
+    b0 = await _put_timed_batch(stub_store, bucket, customer, session, 0, "2026-04-29T10:00:00Z")
+    fin = await _put_timed_finalize(stub_store, bucket, customer, session, "2026-04-29T10:05:00+00:00")
+    key = f"raw/claude_code/{customer}/2026/04/29/{session}:1.json"
+    await stub_store.put(bucket, key, _envelope(session_id=session, batch_seq=1, events=[
+        {"line_no": 1, "raw": {"type": "summary", "summary": "no timestamp on this kind of line"}},
+        {"line_no": 2, "raw": {"type": "user", "content": "x", "timestamp": "2026-04-29T10:06:30Z"}},
+    ]))
+    hydrated = await _hydrate(customer, session, [b0, fin, key])
+    assert (hydrated["session_complete"], hydrated["completed_by"]) == (True, "v1_client_finalize")
+
+
+@pytest.mark.asyncio
+async def test_a_late_batch_with_no_dated_line_is_judged_by_when_it_arrived(stub_store: _StubStore) -> None:
+    customer, session = "fs-arrival-cust", "sess-arrival"
+    bucket = await stub_store.bucket_for(customer)
+    b0 = await _put_timed_batch(stub_store, bucket, customer, session, 0, "2026-04-29T10:00:00Z")
+    fin = await _put_timed_finalize(stub_store, bucket, customer, session, "2026-04-29T10:05:00+00:00")
+
+    async def undated(seq, arrived):
+        key = f"raw/claude_code/{customer}/2026/04/29/{session}:{seq}.json"
+        await stub_store.put(bucket, key, orjson.dumps({
+            "_headers": {}, "received_at": arrived,
+            "payload": {"session_id": session, "batch_seq": seq,
+                        "events": [{"line_no": seq, "raw": {"type": "summary"}}]},
+        }))
+        return key
+
+    soon = await undated(1, "2026-04-29T10:12:00+00:00")
+    assert (await _hydrate(customer, session, [b0, fin, soon]))["session_complete"] is True
+    later = await undated(2, "2026-04-29T11:00:00+00:00")
+    assert (await _hydrate(customer, session, [b0, fin, later]))["session_complete"] is False
+
+
+@pytest.mark.asyncio
 async def test_an_undatable_late_batch_counts_as_a_resume(stub_store: _StubStore) -> None:
     customer, session = "fs-undated-cust", "sess-undated"
     bucket = await stub_store.bucket_for(customer)
