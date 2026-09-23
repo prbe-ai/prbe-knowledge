@@ -373,10 +373,10 @@ async def _put_client_finalize(store, bucket, customer, session, *, day="2026/04
 
 
 async def _put_marker(store, bucket, customer, session):
-    from kb.session_completer import _marker_body
+    from engine.shared.session_signals import cron_marker_body
 
     key = f"raw/claude_code/{customer}/{session}/finalize.marker"
-    await store.put(bucket, key, _marker_body(session))
+    await store.put(bucket, key, cron_marker_body(session))
     return key
 
 
@@ -494,3 +494,67 @@ async def test_an_unreadable_newest_key_does_not_end_the_session(stub_store: _St
     junk = f"raw/claude_code/{customer}/2026/04/29/{session}:9.json"
     await stub_store.put(bucket, junk, b"not json")
     assert (await _hydrate(customer, session, [fin, junk]))["session_complete"] is False
+
+
+# ---- late delivery vs resume after a protocol-1 client finalize -------------
+#
+# The tap retries a failed batch with backoff while the finalize queued behind
+# it goes out first. A batch WRITTEN before the goodbye that ARRIVES after it
+# is late delivery, and the session has still ended. A batch written after it
+# is a resume. The transcript lines' own timestamps tell the two apart.
+
+
+async def _put_timed_batch(store, bucket, customer, session, seq, written_at):
+    key = f"raw/claude_code/{customer}/2026/04/29/{session}:{seq}.json"
+    await store.put(bucket, key, _envelope(
+        session_id=session,
+        batch_seq=seq,
+        events=[{"line_no": seq, "raw": {"type": "user", "content": "x", "timestamp": written_at}}],
+    ))
+    return key
+
+
+async def _put_timed_finalize(store, bucket, customer, session, received_at):
+    key = f"raw/claude_code/{customer}/2026/04/29/{session}.json"
+    await store.put(bucket, key, orjson.dumps({
+        "_headers": {},
+        "payload": {"finalize": True, "session_id": session, "device_id": "dev-1"},
+        "received_at": received_at,
+    }))
+    return key
+
+
+@pytest.mark.asyncio
+async def test_a_batch_written_before_the_goodbye_but_delivered_after_it_still_ends(
+    stub_store: _StubStore,
+) -> None:
+    customer, session = "fs-late-cust", "sess-late"
+    bucket = await stub_store.bucket_for(customer)
+    b0 = await _put_timed_batch(stub_store, bucket, customer, session, 0, "2026-04-29T10:00:00Z")
+    fin = await _put_timed_finalize(stub_store, bucket, customer, session, "2026-04-29T10:05:00+00:00")
+    late = await _put_timed_batch(stub_store, bucket, customer, session, 1, "2026-04-29T10:04:30Z")
+    hydrated = await _hydrate(customer, session, [b0, fin, late])
+    assert (hydrated["session_complete"], hydrated["completed_by"]) == (True, "v1_client_finalize")
+    assert [e["line_no"] for e in hydrated["events"]] == [0, 1], "the late tail is mined too"
+
+
+@pytest.mark.asyncio
+async def test_a_quick_resume_is_not_mistaken_for_late_delivery(stub_store: _StubStore) -> None:
+    """A resume writes lines AFTER the goodbye. Treating it as late delivery
+    would re-mine the session on every batch of the resume."""
+    customer, session = "fs-resume-cust", "sess-quick-resume"
+    bucket = await stub_store.bucket_for(customer)
+    b0 = await _put_timed_batch(stub_store, bucket, customer, session, 0, "2026-04-29T10:00:00Z")
+    fin = await _put_timed_finalize(stub_store, bucket, customer, session, "2026-04-29T10:05:00+00:00")
+    resumed = await _put_timed_batch(stub_store, bucket, customer, session, 1, "2026-04-29T10:08:00Z")
+    assert (await _hydrate(customer, session, [b0, fin, resumed]))["session_complete"] is False
+
+
+@pytest.mark.asyncio
+async def test_an_undatable_late_batch_counts_as_a_resume(stub_store: _StubStore) -> None:
+    customer, session = "fs-undated-cust", "sess-undated"
+    bucket = await stub_store.bucket_for(customer)
+    b0 = await _put_timed_batch(stub_store, bucket, customer, session, 0, "2026-04-29T10:00:00Z")
+    fin = await _put_timed_finalize(stub_store, bucket, customer, session, "2026-04-29T10:05:00+00:00")
+    undated = await _put_batch(stub_store, bucket, customer, session, 1, "no timestamp")
+    assert (await _hydrate(customer, session, [b0, fin, undated]))["session_complete"] is False

@@ -40,9 +40,8 @@ on:
       idle_minutes:
         description: >-
           Finalize sessions idle this many minutes. Default 360 (6h).
-          Lower it only deliberately: finalizing is effectively one-way, and a
-          session that resumes afterwards re-runs the extraction LLM on every
-          later batch.
+          Lower it only deliberately: ending a session mines it, and a session
+          ended while still in use is mined again when it next goes idle.
         required: false
         default: "360"
         type: string

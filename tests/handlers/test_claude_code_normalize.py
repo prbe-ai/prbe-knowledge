@@ -725,6 +725,22 @@ async def test_a_row_with_no_events_and_no_identity_writes_nothing() -> None:
         ev, {"session_id": "s-empty", "events": [], "session_complete": True}
     )
     assert result.documents == [] and result.graph_nodes == []
+    # Without a reason the normalizer rejects an empty result as an error.
+    assert result.skipped_reason
+
+
+@pytest.mark.asyncio
+async def test_a_complete_session_with_events_but_no_identity_still_raises() -> None:
+    """The empty-row path is only for rows with nothing to write. A finished
+    session WITH events and no employee_id is still an error, not a skip."""
+    from engine.shared.exceptions import InvalidWebhookPayload
+
+    ev = _event(session_id="s-anon")
+    ev.raw_payload.pop("employee_id")
+    with pytest.raises(InvalidWebhookPayload, match="employee_id"):
+        await ClaudeCodeConnector(make_default_context()).normalize(
+            ev, {"session_id": "s-anon", "events": [{"line_no": 0, "raw": {}}], "session_complete": True}
+        )
 
 
 @pytest.mark.asyncio

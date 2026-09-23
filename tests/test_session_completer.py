@@ -1,11 +1,10 @@
-"""Verify the session completer cron upserts a finalize.marker into the
-live session row's payload_s3_keys array (post-coalescing semantics).
+"""The idle sweep ends each idle session once, by appending a finalize.marker
+to its live queue row -- and leaves alone any session whose NEWEST key is
+already an end signal (engine/shared/session_signals.py).
 
-Pre-coalescing the cron inserted a separate `<session>:finalize` queue
-row. Post-coalescing (migration 0026) finalize is just another payload
-keyed under the same session_id, appended to the same row's array via
-the same UPSERT path the live ingestion uses. The worker detects
-`finalize.marker` in the array and forces session_complete=True.
+Post-coalescing (migration 0026) a session is one queue row keyed on the bare
+session id; the sweep only UPDATEs that row, never inserts one. The worker
+treats a marker on top of the row as the session having ended.
 """
 from __future__ import annotations
 
@@ -17,7 +16,7 @@ from kb.session_completer import enqueue_idle_session_finalizers
 
 @pytest.mark.asyncio
 async def test_idle_session_gets_finalize_marker_appended(live_db: None) -> None:
-    """Cron upserts the finalize.marker key into the existing live session row."""
+    """The sweep appends the finalize.marker key to the existing live session row."""
     customer = "completer-test-cust"
     session_id = "sess-idle"
     live_key = f"raw/claude_code/{customer}/2026/04/29/{session_id}:0.json"
@@ -265,6 +264,19 @@ class TestCronIdleWindowPrecedence:
         assert args.idle_minutes is None
         assert resolve_idle_minutes(None) == get_settings().claude_code_session_idle_minutes
 
+    @pytest.mark.asyncio
+    async def test_a_window_under_an_hour_is_refused(self, monkeypatch) -> None:
+        """The flagless default is 5 minutes. Ending a session mines it, so a
+        run with it would re-mine every session after every pause."""
+        import scripts.cron_session_completer as script
+
+        async def no_pool(*a, **k):
+            return None
+
+        monkeypatch.setattr(script, "init_pool", no_pool)
+        with pytest.raises(SystemExit, match="below 60"):
+            await script._main([])
+
     def test_nonpositive_window_is_rejected(self) -> None:
         """A 0 would finalize every live session on the next sweep."""
         from scripts.cron_session_completer import _parse_args
@@ -453,20 +465,62 @@ async def test_a_batch_after_an_ending_is_ended_again_once(live_db: None) -> Non
 
 @pytest.mark.asyncio
 async def test_the_sweep_never_inserts_and_skips_rows_in_flight(live_db: None) -> None:
-    """No live row -> nothing to mine (the old INSERT made 288 dead letters).
-    A row being processed right now is not touched."""
+    """The shape the OLD sweep turned into an INSERT -- an idle session known
+    only by a legacy `<session>:<batch>` row, no bare-session-id row -- made a
+    marker-only row that dead-lettered (288 on research). Now nothing is
+    inserted and the legacy identity is not treated as a session. A row being
+    processed right now is not touched either."""
     customer = "completer-noinsert-cust"
+    legacy_key = f"raw/claude_code/{customer}/2026/04/29/sess-legacy:0.json"
     async with get_pool().acquire() as conn:
         await conn.execute("DELETE FROM ingestion_queue WHERE customer_id = $1", customer)
+        await _seed(conn, customer, "sess-legacy:0", [legacy_key])
         await _seed(conn, customer, "sess-busy",
                     [f"raw/claude_code/{customer}/2026/04/29/sess-busy:0.json"], status="processing")
         before = await conn.fetchval("SELECT count(*) FROM ingestion_queue")
     assert await enqueue_idle_session_finalizers(idle_minutes=1440) == 0
     async with get_pool().acquire() as conn:
         assert await conn.fetchval("SELECT count(*) FROM ingestion_queue") == before
-        row = await _row(conn, customer, "sess-busy")
+        legacy = await _row(conn, customer, "sess-legacy:0")
+        busy = await _row(conn, customer, "sess-busy")
         await conn.execute("DELETE FROM ingestion_queue WHERE customer_id = $1", customer)
-    assert len(row["payload_s3_keys"]) == 1 and row["status"] == "processing"
+    assert list(legacy["payload_s3_keys"]) == [legacy_key]
+    assert len(busy["payload_s3_keys"]) == 1 and busy["status"] == "processing"
+
+
+@pytest.mark.asyncio
+async def test_a_leftover_marker_only_row_is_skipped_not_dead_lettered(live_db: None) -> None:
+    """Through the REAL normalizer: an empty result needs a reason, or it
+    raises NormalizationError and the worker dead-letters the row."""
+    from engine.ingest.handlers.base import make_default_context
+    from engine.ingest.normalizer import Normalizer
+    from engine.shared.constants import SourceSystem
+    from engine.shared.exceptions import DuplicateEventIgnored
+    from engine.shared.session_signals import cron_marker_body, cron_marker_key
+    from engine.shared.storage import get_store
+
+    customer, sid = "completer-markeronly-cust", "sess-markeronly"
+    key = cron_marker_key("claude_code", customer, sid)
+    async with get_pool().acquire() as conn:
+        await conn.execute("DELETE FROM ingestion_queue WHERE customer_id = $1", customer)
+        await _seed(conn, customer, sid, [key], status="dlq")
+        row = await _row(conn, customer, sid)
+    store = get_store()
+    bucket = await store.bucket_for(customer)
+    await store.ensure_bucket(bucket)
+    await store.put(bucket, key, cron_marker_body(sid))
+    ctx = make_default_context()
+    try:
+        with pytest.raises(DuplicateEventIgnored):
+            await Normalizer(ctx).process_queue_row(
+                queue_id=row["queue_id"], customer_id=customer,
+                source_system=SourceSystem.CLAUDE_CODE, source_event_id=sid,
+                payload_s3_keys=[key],
+            )
+    finally:
+        await ctx.http.aclose()
+        async with get_pool().acquire() as conn:
+            await conn.execute("DELETE FROM ingestion_queue WHERE customer_id = $1", customer)
 
 
 @pytest.mark.asyncio
@@ -518,3 +572,36 @@ async def test_a_dead_letter_is_retried_once_not_daily(live_db: None) -> None:
     assert await enqueue_idle_session_finalizers(idle_minutes=1440) == 0
     async with get_pool().acquire() as conn:
         await conn.execute("DELETE FROM ingestion_queue WHERE customer_id = $1", customer)
+
+
+
+@pytest.mark.asyncio
+async def test_one_failing_row_does_not_stop_the_sweep(live_db: None, monkeypatch) -> None:
+    """Rows are taken oldest first. If one row raised out of the run, the same
+    row would come up first every hour and nothing would be ended again."""
+    from engine.shared.storage import get_store
+
+    customer = "completer-badrow-cust"
+    async with get_pool().acquire() as conn:
+        await conn.execute("DELETE FROM ingestion_queue WHERE customer_id = $1", customer)
+        await _seed(conn, customer, "sess-bad", [f"raw/claude_code/{customer}/2026/04/29/sess-bad:0.json"],
+                    idle="3 days")
+        await _seed(conn, customer, "sess-good", [f"raw/claude_code/{customer}/2026/04/29/sess-good:0.json"],
+                    idle="2 days")
+    store = get_store()
+    real_put = store.put
+
+    async def put(bucket, key, body):
+        if "sess-bad" in key:
+            raise RuntimeError("R2 refused")
+        return await real_put(bucket, key, body)
+
+    monkeypatch.setattr(store, "put", put)
+    monkeypatch.setattr("kb.session_completer.get_store", lambda: store)
+    assert await enqueue_idle_session_finalizers(idle_minutes=1440) == 1
+    async with get_pool().acquire() as conn:
+        good = await _row(conn, customer, "sess-good")
+        bad = await _row(conn, customer, "sess-bad")
+        await conn.execute("DELETE FROM ingestion_queue WHERE customer_id = $1", customer)
+    assert good["payload_s3_keys"][-1].endswith("/finalize.marker")
+    assert len(bad["payload_s3_keys"]) == 1

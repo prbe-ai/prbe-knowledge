@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from dataclasses import dataclass, field, fields, replace
+from enum import StrEnum
 from typing import Any
 
 from engine.shared.config import get_settings
@@ -233,6 +234,19 @@ class Directive:
     segment: SegmentRef | None = None
 
 
+class ExtractionProblem(StrEnum):
+    """Why a bundle is not authoritative. Written to the per-pass log line."""
+
+    CAPPED = "capped"
+    SEGMENT_FAILED = "segment_failed"
+    TOOL_DECLINED = "tool_declined"
+
+
+def _err(exc: BaseException) -> str:
+    """Class name AND message: httpx timeouts stringify EMPTY."""
+    return f"{type(exc).__name__}: {str(exc)[:200]}"
+
+
 @dataclass(slots=True)
 class UnitBundle:
     #: The goal for this bundle's segment. Carried here rather than in module
@@ -256,7 +270,7 @@ class UnitBundle:
     #: in segment order. A hash that repeats across passes of one session is a
     #: segment a per-segment cache would have served without a model call.
     segment_hashes: list[str] = field(default_factory=list)
-    #: Why the bundle is not authoritative: capped | segment_failed | tool_declined.
+    #: Why the bundle is not authoritative (ExtractionProblem values).
     problems: list[str] = field(default_factory=list)
     qa: list[QA] = field(default_factory=list)
     code_change: list[CodeChange] = field(default_factory=list)
@@ -822,8 +836,6 @@ def all_units(bundle: UnitBundle) -> list[Any]:
     ]
 
 
-_all_units = all_units
-
 
 def _ground_units(bundle: UnitBundle, transcript: str, spans) -> UnitBundle:
     """Check every unit's quote against the transcript it was drawn from.
@@ -844,7 +856,7 @@ def _ground_units(bundle: UnitBundle, transcript: str, spans) -> UnitBundle:
     them correctly.
     """
     normalised = _collapse(transcript)
-    for unit in _all_units(bundle):
+    for unit in all_units(bundle):
         _floor_enums(unit)
         quote = (unit.evidence or "").strip()
         if unit.confidence not in _CONFIDENCE:
@@ -964,7 +976,8 @@ async def extract_units_from_session(
     if capped:
         log.warning(
             "claude_code_extraction.segments_capped",
-            extra={"session_id": session_id, "kept": _MAX_SEGMENTS},
+            session_id=session_id,
+            kept=_MAX_SEGMENTS,
         )
 
     # A capped session is missing whole segments, so the bundle it produces is
@@ -972,7 +985,7 @@ async def extract_units_from_session(
     bundle = UnitBundle(
         authoritative=not capped,
         segments=len(segments),
-        problems=["capped"] if capped else [],
+        problems=[ExtractionProblem.CAPPED] if capped else [],
     )
     semaphore = asyncio.Semaphore(_SEGMENT_CONCURRENCY)
 
@@ -1009,17 +1022,14 @@ async def extract_units_from_session(
             # bundle is strictly better than none, and the loss is visible.
             log.warning(
                 "claude_code_extraction.segment_failed",
-                extra={
-                    "session_id": session_id,
-                    "part": index + 1,
-                    # Class name too: httpx timeouts stringify EMPTY.
-                    "error": f"{type(result).__name__}: {str(result)[:200]}",
-                },
+                session_id=session_id,
+                part=index + 1,
+                error=_err(result),
             )
             # The bundle is now missing this segment's units, so it is no longer
             # a complete picture of the session and must not replace one.
             bundle.authoritative = False
-            bundle.problems.append("segment_failed")
+            bundle.problems.append(ExtractionProblem.SEGMENT_FAILED)
             # A raised segment made its call (or tried to); count it.
             bundle.calls += 1
             continue
@@ -1103,7 +1113,8 @@ async def _link_supersessions(bundle: UnitBundle, session_id: str, agent: str) -
     if len(decisions) > _SUPERSEDE_MAX_DECISIONS:
         log.warning(
             "claude_code_extraction.supersede_capped",
-            extra={"session_id": session_id, "total": len(decisions)},
+            session_id=session_id,
+            total=len(decisions),
         )
 
     listing = "\n".join(
@@ -1139,7 +1150,8 @@ async def _link_supersessions(bundle: UnitBundle, session_id: str, agent: str) -
     except Exception as exc:
         log.warning(
             "claude_code_extraction.supersede_failed",
-            extra={"session_id": session_id, "error": str(exc)},
+            session_id=session_id,
+            error=_err(exc),
         )
         return True
 
@@ -1154,7 +1166,8 @@ async def _link_supersessions(bundle: UnitBundle, session_id: str, agent: str) -
     if not isinstance(links, list):
         log.warning(
             "claude_code_extraction.supersede_malformed",
-            extra={"session_id": session_id, "type": type(links).__name__},
+            session_id=session_id,
+            type=type(links).__name__,
         )
         return True
 
@@ -1243,13 +1256,13 @@ async def _extract_one(
             session_id=session_id,
             part=index,
             total=total,
-            error=f"{type(exc).__name__}: {str(exc)[:200]}",
+            error=_err(exc),
         )
         return UnitBundle(
             authoritative=False,
             calls=1,
             segment_hashes=[segment_hash],
-            problems=["tool_declined"],
+            problems=[ExtractionProblem.TOOL_DECLINED],
         )
 
     # Unknown keys are dropped rather than raising: a model that answers with a

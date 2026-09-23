@@ -8,7 +8,8 @@ Data flow:
 - extract_external_id_from_payload returns device_id; resolve_customer maps to customer.
 - verify_signature is a defense-in-depth path (the gateway's auth is the primary
   guard — see comment in services/ingestion/main.py).
-- parse_webhook_event keys the queue row by <session_id>:<batch_seq>.
+- parse_webhook_event keys the queue row by the bare session_id; each batch's
+  R2 key carries :<batch_seq> (kb/ingestion_app._compose_storage_id).
 - Worker invokes fetch_supplementary (assemble all R2 batches for session) +
   normalize (emit session doc + per-unit child docs).
 
@@ -22,7 +23,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from collections.abc import AsyncIterator, Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, ClassVar
 
 import orjson
@@ -85,6 +86,54 @@ _FETCH_SUPP_R2_CONCURRENCY = 16
 
 def _nonempty_str(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+#: How far a client's clock may run ahead of ours before a line it wrote
+#: before saying goodbye looks like one written after.
+_CLIENT_CLOCK_SKEW = timedelta(minutes=2)
+
+
+def _when(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _late_deliveries_after_client_finalize(
+    trail: list[tuple[Any, str | None, list[dict[str, Any]]]],
+) -> bool:
+    """True when everything after the newest protocol-1 client finalize was
+    WRITTEN before it: batches that were delivered late, not a resumed session.
+
+    Judged by the transcript lines' own timestamps against the finalize's
+    arrival. A resumed session writes lines after its goodbye, so a quick
+    `--resume` is not mistaken for a retry (which would re-mine on every batch
+    of it). Anything that cannot be dated -- a missing timestamp, an unreadable
+    batch, a marker, another finalize -- is treated as a resume.
+    """
+    fin = max(
+        (i for i, (signal, _, _) in enumerate(trail)
+         if signal == _signals.CompletedBy.V1_CLIENT_FINALIZE),
+        default=None,
+    )
+    if fin is None or fin == len(trail) - 1:
+        return False
+    said_goodbye = _when(trail[fin][1])
+    if said_goodbye is None:
+        return False
+    for signal, _, events in trail[fin + 1:]:
+        if signal is not None or not events:
+            return False
+        for event in events:
+            raw = event.get("raw")
+            written = _when(raw.get("timestamp") if isinstance(raw, dict) else None)
+            if written is None or written > said_goodbye + _CLIENT_CLOCK_SKEW:
+                return False
+    return True
 
 
 @register_connector(SourceSystem.CLAUDE_CODE)
@@ -286,6 +335,11 @@ class ClaudeCodeConnector(Connector):
         sem = asyncio.Semaphore(_FETCH_SUPP_R2_CONCURRENCY)
 
         async def _fetch(key: str) -> tuple[str, bytes]:
+            # The sweep's marker is known from its key alone and carries no
+            # events: never worth a GET, and a missing object must not fail
+            # the row. A resumed-and-re-ended session holds several.
+            if _signals.is_cron_marker_key(key):
+                return key, b""
             async with sem:
                 body = await store.get(bucket, key)
             return key, body
@@ -299,11 +353,18 @@ class ClaudeCodeConnector(Connector):
         # What the NEWEST key on the row says, in arrival order. Set on every
         # key, so after the loop it describes the last one only.
         last_signal: _signals.CompletedBy | None = None
+        # Per key, in arrival order: (signal, envelope received_at, events).
+        trail: list[tuple[_signals.CompletedBy | None, str | None, list]] = []
         for key, body in fetched:
-            # The sweep's marker is recognised by its key, before its body: the
-            # placeholder it writes also carries `finalize: true`.
-            signal = _signals.CompletedBy.CRON_MARKER if _signals.is_cron_marker_key(key) else None
-            last_signal = signal
+            # The sweep's marker and a protocol-1 client finalize are judged by
+            # their KEY, exactly as the sweep judges them
+            # (session_signals.signal_for_key): if the worker read the body
+            # instead, a key both sides disagree on could be skipped by the
+            # sweep as ended and treated by the worker as live -- never mined.
+            last_signal = _signals.signal_for_key(key, session_id)
+            trail.append((last_signal, None, []))
+            if not body:
+                continue
             try:
                 envelope = orjson.loads(body)
             except orjson.JSONDecodeError:
@@ -312,22 +373,17 @@ class ClaudeCodeConnector(Connector):
             payload = envelope.get("payload", envelope) if isinstance(envelope, dict) else {}
             if not isinstance(payload, dict):
                 continue
+            trail[-1] = (
+                last_signal,
+                envelope.get("received_at") if isinstance(envelope, dict) else None,
+                [e for e in payload.get("events") or [] if isinstance(e, dict)],
+            )
             if (
                 payload.get("protocol_version") == 2
                 and payload.get("batch_seq", -1) > last_v2_batch
             ):
                 last_v2_batch = payload["batch_seq"]
                 last_v2_finalized = payload.get("finalize") is True
-            # An explicit protocol-1 client finalize (the tap's SessionEnd hook,
-            # via the gateway's SessionFinalizeRequest route) is an ordinary
-            # coalesced payload carrying `finalize: true` and NO events, keyed
-            # `raw/<source>/<cust>/<date>/<session_id>.json`.
-            if signal is None and payload.get("finalize") is True:
-                last_signal = (
-                    _signals.CompletedBy.V2_FINALIZE
-                    if payload.get("protocol_version") == 2
-                    else _signals.CompletedBy.V1_CLIENT_FINALIZE
-                )
             _remember_payload_identity(payload)
             for obj in payload.get("events") or []:
                 if isinstance(obj, dict):
@@ -351,6 +407,13 @@ class ClaudeCodeConnector(Connector):
             completed_by = _signals.CompletedBy.V2_FINALIZE if last_v2_finalized else None
         elif last_signal == _signals.CompletedBy.V1_CLIENT_FINALIZE:
             completed_by = last_signal
+        elif _late_deliveries_after_client_finalize(trail):
+            # The tap retries a failed batch with backoff while the finalize
+            # queued behind it goes out first, so a batch written BEFORE the
+            # goodbye can land after it. That is late delivery, not a resume:
+            # without this, the session would count as live and -- on a plane
+            # with no idle sweep -- never be mined.
+            completed_by = _signals.CompletedBy.V1_CLIENT_FINALIZE
         else:
             completed_by = None
 
@@ -389,7 +452,9 @@ class ClaudeCodeConnector(Connector):
                 customer=event.customer_id,
                 session_id=session_id,
             )
-            return NormalizationResult()
+            # A reason, or the normalizer rejects an empty result as an error
+            # and the row dead-letters anyway; with one it is marked skipped.
+            return NormalizationResult(skipped_reason="agent session has no events to write")
         # Authentication proves who uploaded supplied bytes, not who authored
         # the historical conversation. There is no verified-author v2 claim.
         unverified_author = hydrated.get("protocol_version") == 2

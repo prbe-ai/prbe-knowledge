@@ -11,7 +11,9 @@ under it, so the common case needs nothing here. This is the backstop for the
 cases that leave no goodbye at all: a laptop that slept and never woke, a
 machine that lost the network before its last drain.
 
-Research runs it hourly with `--idle-minutes 1440`. A session that resumes after
+Two schedules run it: research hourly with `--idle-minutes 1440` (a CronJob in
+research-os), and the managed plane nightly with 360 (session-finalizer-nightly.yml,
+opt-in via SESSION_FINALIZER_ENABLED). A session that resumes after
 being ended is simply live again (the end signal is no longer the newest key),
 and is re-ended and re-mined once when it next goes idle. Sessions whose newest
 key is already an end signal are skipped, so re-running is free: the sweep ends
@@ -25,6 +27,9 @@ import asyncio
 from engine.shared.config import get_settings
 from engine.shared.db import init_pool
 from kb.session_completer import enqueue_idle_session_finalizers
+
+#: Same floor as session-finalizer-nightly.yml.
+MIN_IDLE_MINUTES = 60
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -45,7 +50,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Cap on sessions finalized per source per run. Every one buys a "
             "full multi-segment extraction, so this is a cost bound. Work not "
-            "reached tonight is reached tomorrow."
+            "reached this run is reached on the next."
         ),
     )
     parser.add_argument(
@@ -66,7 +71,7 @@ def resolve_idle_minutes(explicit: int | None) -> int:
 
     Split out so the precedence is testable without a live pool — getting this
     backwards would silently finalize live sessions at the 5-minute default
-    during a nightly run.
+    during a scheduled run.
     """
     if explicit is not None:
         return explicit
@@ -78,6 +83,14 @@ async def _main(argv: list[str] | None = None) -> None:
     await init_pool()
     try:
         idle_minutes = resolve_idle_minutes(args.idle_minutes)
+        if idle_minutes < MIN_IDLE_MINUTES:
+            # Ending a session mines it. A short window ends sessions people
+            # have only paused, and every pause then costs a full re-mine.
+            raise SystemExit(
+                f"refusing --idle-minutes {idle_minutes}: below {MIN_IDLE_MINUTES}. "
+                "The settings default (claude_code_session_idle_minutes) is for "
+                "tests; production passes the window explicitly."
+            )
         n = await enqueue_idle_session_finalizers(
             idle_minutes, limit=args.limit, dry_run=args.dry_run
         )

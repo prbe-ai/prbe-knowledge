@@ -14,9 +14,14 @@ transcript was mined by a complete, authoritative pass:
   1. protocol 1, `status='done'`, newest key not already an end signal. NOT
      filtered on idleness: the old loop re-ended every row within the last
      day, so an idle filter would skip exactly the rows this is for;
-  2. its LAST upsert was not a batch: `enqueued_at` falls after the end of the
-     UTC day in its newest batch key (`raw/<src>/<cust>/YYYY/MM/DD/...`), with
-     a 10-minute margin for the two clocks involved.
+  2. its LAST upsert was not a batch: `enqueued_at` is at least a full day
+     after the end of the UTC day in its newest batch key
+     (`raw/<src>/<cust>/YYYY/MM/DD/...`). The key's date comes from the app's
+     clock when a request arrives and `enqueued_at` from the database when it
+     commits; no upload request lives for a day, so a batch can never pass for
+     a later write. (A 10-minute margin was not enough: a request stalled in
+     redaction or on a lock across midnight would have. On research the full
+     day costs one row.)
      Only three writers move `enqueued_at` on an agent row -- a v1 batch, a v2
      batch, and an end-signal append -- so the last write was an end signal;
   3. `completed_at >= enqueued_at`: the worker finished a pass after that write,
@@ -40,8 +45,9 @@ Run it with the sweep SUSPENDED, dry-run first:
     python -m scripts.backfill_finalize_markers --report /tmp/r.json
 
 `--report` also lists protocol-1 rows that are done AND already end in an end
-signal: their last pass kept the key, which the old worker did only for a
-non-authoritative pass. That list is the retry population for the follow-up.
+signal. Run BEFORE the new worker has mined anything, that is the old worker's
+partial passes (it kept an end signal only then); afterwards it also includes
+sessions the new worker mined completely, which keep theirs by design.
 """
 
 from __future__ import annotations
@@ -49,68 +55,87 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from collections import Counter
 from dataclasses import asdict, dataclass, field
+from enum import StrEnum
 from typing import Any
 
 from engine.shared.db import get_pool, init_pool
 from engine.shared.logging import get_logger
 from engine.shared.session_signals import (
     cron_marker_key,
+    ends_v1_session_sql,
     has_v2_key_sql,
-    last_key_ends_v1_session_sql,
+    is_cron_marker_key_sql,
+    last_key_sql,
 )
 from engine.shared.storage import get_store
-from kb.session_completer import AGENT_SOURCES
+from kb.session_completer import AGENT_SOURCES, has_v2_stream
 from kb.session_receipts import _lock
 
 log = get_logger(__name__)
 
+
+class Outcome(StrEnum):
+    RELINKED = "relinked"
+    WOULD_RELINK = "would_relink"
+    SKIPPED_CHANGED = "skipped_changed"
+    SKIPPED_STREAM = "skipped_stream"
+    MISSING_MARKER_OBJECT = "missing_marker_object"
+    ERRORED = "errored"
+
+
 #: Newest date in any non-marker key. NULL when no key carries a date.
-_NEWEST_BATCH_DAY = """(
-    SELECT max(to_date(substring(_b FROM '/(\\d{4}/\\d{2}/\\d{2})/'), 'YYYY/MM/DD'))
-      FROM unnest(payload_s3_keys) AS _b
-     WHERE right(_b, 16) <> '/finalize.marker'
+_NEWEST_BATCH_DAY = f"""(
+    SELECT max(to_date(substring(_b FROM '/(\\d{{4}}/\\d{{2}}/\\d{{2}})/'), 'YYYY/MM/DD'))
+      FROM unnest(q.payload_s3_keys) AS _b
+     WHERE NOT {is_cron_marker_key_sql("_b")}
 )"""
 
-#: The key's date comes from the app's clock and `enqueued_at` from the
-#: database's, so a batch landing a second before midnight must not read as a
-#: later day. Erring this way costs a few extra mines, never an unmined session.
-_DAY_EDGE_MARGIN = "10 minutes"
-
-_V1_DONE = f"""
-       source_system = $1
-   AND ($2::text[] IS NULL OR customer_id = ANY($2::text[]))
-   AND status = 'done'
-   AND cardinality(payload_s3_keys) > 0
-   AND NOT {has_v2_key_sql()}
+_FROM = f"""
+  FROM ingestion_queue q
+  CROSS JOIN LATERAL (SELECT {last_key_sql("q.payload_s3_keys")} AS last_key OFFSET 0) lk
 """
 
+_V1_DONE = f"""
+       q.source_system = $1
+   AND ($2::text[] IS NULL OR q.customer_id = ANY($2::text[]))
+   AND q.status = 'done'
+   AND cardinality(q.payload_s3_keys) > 0
+   AND strpos(q.source_event_id, ':') = 0
+   AND NOT {has_v2_key_sql("q.payload_s3_keys")}
+"""
+
+_ENDED = ends_v1_session_sql("lk.last_key", "q.source_event_id")
+
 _EVIDENCE = f"""
-       NOT {last_key_ends_v1_session_sql()}
-   AND completed_at >= enqueued_at
-   AND (enqueued_at AT TIME ZONE 'UTC') >= {_NEWEST_BATCH_DAY} + 1 + interval '{_DAY_EDGE_MARGIN}'
+       NOT {_ENDED}
+   AND q.completed_at >= q.enqueued_at
+   AND (q.enqueued_at AT TIME ZONE 'UTC') >= {_NEWEST_BATCH_DAY} + 2
 """
 
 _CANDIDATES_SQL = f"""
-SELECT queue_id, customer_id, source_event_id AS session_id, version, completed_at
-  FROM ingestion_queue
+SELECT q.queue_id, q.customer_id, q.source_event_id AS session_id, q.version, q.completed_at
+{_FROM}
  WHERE {_V1_DONE}
    AND {_EVIDENCE}
- ORDER BY queue_id
+ ORDER BY q.queue_id
 """
 
 _SWEEP_ONCE_SQL = f"""
-SELECT count(*) FROM ingestion_queue
+SELECT count(*)
+{_FROM}
  WHERE {_V1_DONE}
-   AND NOT {last_key_ends_v1_session_sql()}
+   AND NOT {_ENDED}
    AND NOT ({_EVIDENCE})
 """
 
 _ALREADY_ENDED_SQL = f"""
-SELECT queue_id FROM ingestion_queue
+SELECT q.queue_id
+{_FROM}
  WHERE {_V1_DONE}
-   AND {last_key_ends_v1_session_sql()}
- ORDER BY queue_id
+   AND {_ENDED}
+ ORDER BY q.queue_id
 """
 
 #: Re-attach the marker only if the row is exactly as read.
@@ -121,7 +146,7 @@ UPDATE ingestion_queue
    AND version = $3
    AND status = 'done'
    AND completed_at = $4
-   AND NOT {last_key_ends_v1_session_sql()}
+   AND NOT {ends_v1_session_sql(last_key_sql())}
 RETURNING queue_id
 """
 
@@ -130,40 +155,47 @@ RETURNING queue_id
 class Report:
     dry_run: bool
     candidates: int = 0
-    relinked: int = 0
-    would_relink: int = 0
-    skipped_changed: int = 0
-    skipped_stream: int = 0
-    missing_marker_object: int = 0
     sweep_will_mine_once: int = 0
-    #: Done rows already ending in an end signal: kept by a non-authoritative pass.
+    outcomes: Counter = field(default_factory=Counter)
+    #: Done rows already ending in an end signal (see the module docstring).
     already_ended_queue_ids: list[int] = field(default_factory=list)
     by_source: dict[str, dict[str, int]] = field(default_factory=dict)
 
+    def summary(self) -> dict[str, Any]:
+        out = {k: v for k, v in asdict(self).items() if k not in ("already_ended_queue_ids", "outcomes")}
+        out.update({o.value: self.outcomes[o] for o in Outcome})
+        out["already_ended"] = len(self.already_ended_queue_ids)
+        return out
 
-async def _relink_one(row: Any, source: str, *, dry_run: bool, sem: asyncio.Semaphore) -> str:
+
+async def _relink_one(row: Any, source: str, *, dry_run: bool, sem: asyncio.Semaphore) -> Outcome:
+    """One row, end to end, under the concurrency cap (R2 and a pooled
+    connection alike). A failure is counted, never allowed to abort the run."""
     customer_id, session_id = row["customer_id"], row["session_id"]
     key = cron_marker_key(source, customer_id, session_id)
-    store = get_store()
     async with sem:
-        bucket = await store.bucket_for(customer_id)
-        present = await store.exists(bucket, key)
-    if not present:
-        return "missing_marker_object"
-    async with get_pool().acquire() as conn, conn.transaction():
-        await conn.execute("SELECT set_config('app.current_customer_id', $1, true)", customer_id)
-        await _lock(conn, customer_id, source, session_id)
-        if await conn.fetchval(
-            "SELECT 1 FROM session_streams WHERE customer_id=$1 AND source_system=$2 AND session_id=$3",
-            customer_id,
-            source,
-            session_id,
-        ):
-            return "skipped_stream"
-        if dry_run:
-            return "would_relink"
-        done = await conn.fetchval(_RELINK_SQL, row["queue_id"], key, row["version"], row["completed_at"])
-    return "relinked" if done is not None else "skipped_changed"
+        try:
+            store = get_store()
+            if not await store.exists(await store.bucket_for(customer_id), key):
+                return Outcome.MISSING_MARKER_OBJECT
+            async with get_pool().acquire() as conn, conn.transaction():
+                await conn.execute("SELECT set_config('app.current_customer_id', $1, true)", customer_id)
+                await _lock(conn, customer_id, source, session_id)
+                if await has_v2_stream(conn, customer_id, source, session_id):
+                    return Outcome.SKIPPED_STREAM
+                if dry_run:
+                    return Outcome.WOULD_RELINK
+                done = await conn.fetchval(
+                    _RELINK_SQL, row["queue_id"], key, row["version"], row["completed_at"]
+                )
+            return Outcome.RELINKED if done is not None else Outcome.SKIPPED_CHANGED
+        except Exception as exc:
+            log.warning(
+                "backfill_finalize_markers.row_failed",
+                queue_id=row["queue_id"],
+                error=f"{type(exc).__name__}: {str(exc)[:200]}",
+            )
+            return Outcome.ERRORED
 
 
 async def backfill(
@@ -197,30 +229,20 @@ async def backfill(
             *(_relink_one(r, source, dry_run=dry_run, sem=sem) for r in rows)
         )
         for outcome in outcomes:
-            setattr(report, outcome, getattr(report, outcome) + 1)
-            report.by_source[source][outcome] = report.by_source[source].get(outcome, 0) + 1
+            report.outcomes[outcome] += 1
+            report.by_source[source][outcome.value] = report.by_source[source].get(outcome.value, 0) + 1
     # The whole point of the report: every candidate is accounted for.
-    accounted = (
-        report.relinked
-        + report.would_relink
-        + report.skipped_changed
-        + report.skipped_stream
-        + report.missing_marker_object
-    )
+    accounted = sum(report.outcomes.values())
     if accounted != report.candidates:
         raise RuntimeError(f"accounted for {accounted} of {report.candidates} candidates")
-    log.info(
-        "backfill_finalize_markers.done",
-        **{k: v for k, v in asdict(report).items() if k != "already_ended_queue_ids"},
-        already_ended=len(report.already_ended_queue_ids),
-    )
+    log.info("backfill_finalize_markers.done", **report.summary())
     return report
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dry-run", action="store_true", help="Count and HEAD only; write nothing.")
-    parser.add_argument("--concurrency", type=int, default=16, help="Concurrent R2 HEADs.")
+    parser.add_argument("--concurrency", type=int, default=16, help="Rows in flight (R2 and DB).")
     parser.add_argument("--limit", type=int, default=None, help="Per source, for a trial run.")
     parser.add_argument("--report", default=None, help="Write the full report as JSON here.")
     parser.add_argument(
@@ -247,12 +269,11 @@ async def _main(argv: list[str] | None = None) -> None:
         from engine.shared.db import close_pool
 
         await close_pool()
-    summary = {k: v for k, v in asdict(report).items() if k != "already_ended_queue_ids"}
-    summary["already_ended"] = len(report.already_ended_queue_ids)
-    print(json.dumps(summary, indent=2, default=str))
+    print(json.dumps(report.summary(), indent=2, default=str))
     if args.report:
         with open(args.report, "w") as fh:
-            json.dump(asdict(report), fh, indent=2, default=str)
+            json.dump({**report.summary(), "already_ended_queue_ids": report.already_ended_queue_ids},
+                      fh, indent=2, default=str)
 
 
 if __name__ == "__main__":

@@ -101,8 +101,9 @@ class NormalizeOutcome:
 # per append fired one full ~300K-token bundle extraction each time, so a
 # single long session ran dozens-to-hundreds of redundant LLM calls on a doc
 # that wasn't done growing (and whose cross-source edges aren't stable until
-# it is). The session's completion pass -- a natural final turn, or the
-# finalize.marker session_completer writes for idle sessions -- normalizes
+# it is). The session's completion pass -- a client finalize, or the
+# finalize.marker session_completer writes for idle sessions, on top of the
+# row (engine/shared/session_signals.py) -- normalizes
 # with session_complete=True on the session doc and extracts the high-signal
 # unit docs (qa / decision / code_change / file_ref). We detect that pass at
 # the session level and enqueue then; every other source enqueues each doc.

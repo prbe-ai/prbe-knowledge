@@ -21,14 +21,13 @@
 # envsubst + kubectl create + wait + logs pattern.
 #
 # IDLE WINDOW: the workflow passes --idle-minutes 360, deliberately far above
-# the 5-minute default. Finalizing is effectively one-way — the marker key is
-# sticky, so a session that resumes afterwards re-runs the extraction LLM on
-# every later batch — so the sweep must only ever catch sessions that are
-# genuinely over, never one a researcher paused between meetings.
+# the 5-minute default. Ending a session mines it; a session ended while a
+# researcher has only paused is mined, then mined again when it next goes idle
+# (its end signal is no longer the newest key once it resumes).
 #
-# Idempotent: sessions whose live queue row already carries a finalize.marker
-# are filtered out by the finder query in kb/session_completer.py, so a
-# re-fire (or an overlapping manual run) costs nothing.
+# Idempotent: a session whose NEWEST key is already an end signal is skipped
+# by the finder in kb/session_completer.py, so a re-fire (or an overlapping
+# manual run) costs nothing.
 #
 # RLS: enqueue_idle_session_finalizers writes to ingestion_queue across
 # tenants using the app role's DSN, matching the trace-digest job's prior art.

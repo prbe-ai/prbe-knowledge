@@ -31,8 +31,8 @@ rate is measured. **Why:** the residual call after the cache is the changed tail
 hold nothing. **Context:** ~32k-token request cap (`docs/jev-contract.md`), so screen the tail
 truncated to its last 100k chars and log the truncation; run extraction anyway in shadow and log
 Jev's probability next to `units`; nothing is skipped until >= 500 tails show the miss rate; a
-skip is its own outcome, never "mined, found nothing" (`kb/handlers/claude_code.py:534-549` is
-the model). The key is hand-patched into `engine-secrets`; `sync-secrets` full-replaces a
+skip is its own outcome, never "mined, found nothing" (the
+`claude_code.extraction_disabled` branch of `normalize` is the model). The key is hand-patched into `engine-secrets`; `sync-secrets` full-replaces a
 Secret. **Effort:** M. **Priority:** P3. **Depends on:** the per-segment cache, and its
 measurement showing tails that produce nothing dominate the residual.
 
@@ -53,15 +53,18 @@ validates a two-field model and rebuilds the forwarded body, so this is three re
 as the Claude Code tap does (`tap/main.py:629-650`). **Why:** otherwise pi sessions rely on the
 server idle sweep alone. **Effort:** S. **Priority:** P3. **Depends on:** None.
 
-### 177 done v1 rows still carrying a finalize.marker
-**Where:** `ingestion_queue` (research kb), `engine/shared/claude_code_extraction.py`.
+### Legacy partial passes: done v1 rows whose last pass kept its end signal
+**Where:** `ingestion_queue` (research kb), `scripts/backfill_finalize_markers.py`.
 
-**What:** identify why their last pass did not consume the marker (non-authoritative: segment
-failed, capped, or the model declined the tool; the last case logs nothing today). **Why:** they
-are the population PR 2's bounded retry will re-end; knowing the cause sizes that retry.
-**Context:** `select ... where source_system='claude_code' and status='done' and exists
-(unnest(payload_s3_keys) like '%/finalize.marker')` (465 rows incl. 288 dlq marker-only rows).
-**Effort:** S. **Priority:** P3. **Depends on:** the `claude_code_extraction.pass` log line.
+**What:** find out why the old worker's last pass on these sessions was partial (a segment
+failed, the cap hit, the model declined the tool -- which logged nothing before the
+`tool_declined` warning -- or extraction was off), and re-mine them. **Why:** the old
+worker kept an end signal only after a partial pass, so these sessions hold fewer units
+than they have. **Context:** after the one-rule change, end signals are never removed, so
+"done with a marker on top" no longer identifies them; the population is the backfill's
+`--report` `already_ended_queue_ids`, captured before the new worker mined anything
+(~240 rows on research on 2026-09-23). The follow-up change records every pass's outcome
+and retries partial ones. **Effort:** S. **Priority:** P3. **Depends on:** that change.
 
 ---
 
