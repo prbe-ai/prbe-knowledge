@@ -23,6 +23,7 @@ Subcommands:
               optional gpt-4.1-mini cross-grader, optional repeat pass
     report    metrics, paired stats, decision rule, cost -> markdown
     calibrate write the 40-query hand-grading slice; --human scores it
+    tiers     size the engine-side tier-penalty follow-up (arm C) on the same labels
 
 Judge prompt is Phase 0's, verbatim: changing it is a grader change.
 """
@@ -978,6 +979,17 @@ def main() -> int:
     p.add_argument("--out", required=True)
     p.set_defaults(fn=cmd_report)
 
+    p = sub.add_parser("tiers")
+    p.add_argument("--arms", required=True)
+    p.add_argument("--verdicts", required=True)
+    p.add_argument("--live", required=True)
+    p.add_argument("--phase0", default="")
+    p.add_argument("--model", default="claude-opus-5-5")
+    p.add_argument("--penalties", default="0,0.02,0.05,0.08;0,0.03,0.08,0.12;0,0.05,0.10,0.20")
+    p.add_argument("--seed", type=int, default=7)
+    p.add_argument("--out", required=True)
+    p.set_defaults(fn=cmd_tiers)
+
     p = sub.add_parser("calibrate")
     p.add_argument("--arms", required=True)
     p.add_argument("--verdicts", default="")
@@ -990,6 +1002,175 @@ def main() -> int:
 
     args = ap.parse_args()
     return args.fn(args)
+
+
+
+# --------------------------------------------------------------------------
+# tiers: the engine-side follow-up, sized on the same labels
+#
+# Richard (2026-09-23): runs/projects/papers first; github commits and files
+# demoted because they are high-volume; transcripts last. Implemented here as
+# a per-tier PENALTY subtracted from Jev's probability, so a strong Jev
+# judgment still wins (a 0.91 session beats a 0.55 commit) and the tier only
+# decides near-ties. Arm C(penalties) = engine list re-sorted by
+# (p - penalty[tier]) -> _dedupe_by_session -> cut. Evaluated against the
+# verdicts the A/B already collected: no new judge calls.
+
+TIER_OF_KIND = {
+    # tier 0: the records Probe owns
+    "run": 0, "trial": 0, "project": 0, "group": 0, "paper": 0, "team_note": 0, "experiment": 0,
+    # tier 1: authored github records
+    "gh_pull_request": 1, "gh_pr": 1, "gh_issue": 1, "gh_review": 1, "gh_release": 1,
+    "gh_feature_rationale": 1, "gh_codeowners": 1, "gh_commit_comment": 1,
+    # tier 2: high-volume: commits, files, code
+    "gh_commit": 2, "file": 2, "code": 2,
+    # tier 3: agent-session derivatives
+    "transcript": 3, "digest": 3,
+}
+DEFAULT_TIER = 2
+
+
+def kind_of(doc_id: str) -> str:
+    parts = doc_id.split(":")
+    src = parts[0]
+    if src in TRANSCRIPT_SOURCES:
+        return "transcript"
+    if src == CUSTOM_INGEST and len(parts) >= 4:
+        sk, tail = parts[2], parts[3]
+        if sk == "session_digests":
+            return "digest"
+        if sk == "team_notes":
+            return "team_note"
+        if sk == "artifacts" or sk.startswith("workspace") or sk.startswith("shared"):
+            return "file"
+        if sk == "experiments":
+            return tail
+        return "custom_other"
+    if src == "github":
+        return "gh_" + (parts[2] if len(parts) > 2 else "unknown")
+    if src == "code_graph":
+        return "code"
+    return src
+
+
+def tier_of(doc_id: str) -> int:
+    return TIER_OF_KIND.get(kind_of(doc_id), DEFAULT_TIER)
+
+
+def arm_c(engine_docs: list[str], jev_p: dict[str, float], penalties: list[float], customer_id: str, k: int) -> list[str]:
+    order = {d: i for i, d in enumerate(engine_docs)}
+
+    def key(d: str) -> tuple[float, int]:
+        p = jev_p.get(d)
+        if p is None:
+            p = 1.0 - 0.1 * order[d]  # no probability recorded: keep engine order spacing
+        return (-(p - penalties[tier_of(d)]), order[d])
+
+    return dedupe_by_session(sorted(engine_docs, key=key), customer_id)[:k]
+
+
+def _jev_probabilities(args: argparse.Namespace, records: list[dict[str, Any]]) -> dict[str, dict[str, float]]:
+    """trace_id -> {doc_id: jev_p} from live blobs (selection.ranked) and Phase 0 rows (doc_ranked)."""
+    out: dict[str, dict[str, float]] = {}
+    live_ids = {r["trace_id"] for r in records if r["origin"] == "live"}
+    for tid, path in blob_index(args.live).items():
+        if tid not in live_ids:
+            continue
+        blob = js.load_blob(path)
+        out[tid] = {d: float(p) for d, p in ((blob.get("selection") or {}).get("ranked") or [])}
+    if args.phase0:
+        p0_ids = {r["trace_id"] for r in records if r["origin"] == "phase0"}
+        for line in gzip.open(args.phase0, "rt"):
+            row = json.loads(line)
+            if row["trace_id"] in p0_ids:
+                out[row["trace_id"]] = {d: float(p) for d, p in (row.get("doc_ranked") or [])}
+    return out
+
+
+def cmd_tiers(args: argparse.Namespace) -> int:
+    rng = random.Random(args.seed)
+    records = [json.loads(l) for l in open(args.arms)]
+    by_id = {r["trace_id"]: r for r in records}
+    jev_p = _jev_probabilities(args, records)
+    verdicts: dict[tuple[str, str], bool] = {}
+    for line in open(args.verdicts):
+        row = json.loads(line)
+        if row["kind"] == "doc" and row["model"] == args.model and row["pass"] == 1 and row["verdict"] is not None:
+            verdicts[(row["trace_id"], row["doc"])] = row["verdict"]
+
+    out: list[str] = []
+    out.append(f"# Tier penalty sizing (arm C) on the A/B labels ({args.model})\n")
+    # volume census: kinds in the engine's top-10 across the corpus, and in the live pools
+    kinds_top10: collections.Counter = collections.Counter(kind_of(d) for r in records for d in r["engine_docs"])
+    kinds_pool: collections.Counter = collections.Counter()
+    n_pool_traces = 0
+    for tid, path in blob_index(args.live).items():
+        if tid not in by_id:
+            continue
+        blob = js.load_blob(path)
+        n_pool_traces += 1
+        for cid, hit in js.pool_chunks(blob.get("prefanout")).items():
+            kinds_pool[kind_of(js.doc_of(cid, hit))] += 1
+    out.append("## Volume: what kinds show up\n")
+    out.append("| kind | tier | in engine top-10 (400 traces) | in live candidate pools (chunks, %d traces) | judged useful (Opus) |" % n_pool_traces)
+    out.append("|---|---|---|---|---|")
+    useful: dict[str, list[int]] = collections.defaultdict(lambda: [0, 0])
+    for r in records:
+        for d in r["engine_docs"]:
+            v = verdicts.get((r["trace_id"], d))
+            if v is not None:
+                useful[kind_of(d)][0] += int(v)
+                useful[kind_of(d)][1] += 1
+    for kind, n in kinds_top10.most_common():
+        u = useful[kind]
+        out.append(f"| {kind} | {tier_of('x') if False else TIER_OF_KIND.get(kind, DEFAULT_TIER)} | {n} | {kinds_pool.get(kind, 0)} | {100 * u[0] / max(1, u[1]):.0f}% ({u[1]}) |")
+
+    penalty_sets = [[float(x) for x in s.split(",")] for s in args.penalties.split(";")]
+    out.append("\n## Arms on the same labels (paired per trace; C = tier penalties applied to Jev's probability)\n")
+    out.append("| arm | NDCG@10 | P@4 | P@5 | P@8 | vs B: NDCG diff, 95% CI, wins/losses/ties | traces where C ≠ B |")
+    out.append("|---|---|---|---|---|---|---|")
+
+    def metrics_for(orders: dict[str, list[str]]) -> tuple[dict[str, float], dict[str, list[float]]]:
+        per: dict[str, list[float]] = collections.defaultdict(list)
+        for tid, order in orders.items():
+            rec = by_id[tid]
+            rel = {d: int(verdicts[(tid, d)]) for d in rec["engine_docs"] if (tid, d) in verdicts}
+            if len(rel) != len(rec["engine_docs"]):
+                continue
+            n10 = ndcg_at(order, rel, 10, rec["engine_docs"])
+            per["NDCG@10"].append(n10 if n10 is not None else float("nan"))
+            for k in (4, 5, 8):
+                per[f"P@{k}"].append(prec_at(order, rel, k))
+        means = {m: sum(x for x in v if x == x) / max(1, sum(1 for x in v if x == x)) for m, v in per.items()}
+        return means, per
+
+    arms: dict[str, dict[str, list[str]]] = {
+        "A (today)": {r["trace_id"]: dedupe_by_session(partition(r["engine_docs"], r["sources"]), r["customer_id"]) for r in records},
+        "B (engine order)": {r["trace_id"]: dedupe_by_session(list(r["engine_docs"]), r["customer_id"]) for r in records},
+    }
+    for pens in penalty_sets:
+        label = "C " + "/".join(f"{p:g}" for p in pens)
+        arms[label] = {r["trace_id"]: arm_c(r["engine_docs"], jev_p.get(r["trace_id"], {}), pens, r["customer_id"], 10) for r in records}
+    b_means, b_per = metrics_for(arms["B (engine order)"])
+    for label, orders in arms.items():
+        means, per = metrics_for(orders)
+        diffs = [c - b for c, b in zip(per["NDCG@10"], b_per["NDCG@10"]) if c == c and b == b]
+        lo, hi = bootstrap_ci(diffs, rng)
+        w, l, t, _, _ = sign_test(diffs)
+        changed = sum(1 for tid in orders if orders[tid] != arms["B (engine order)"][tid])
+        out.append(f"| {label} | {means['NDCG@10']:.3f} | {means['P@4']:.3f} | {means['P@5']:.3f} | {means['P@8']:.3f} | {sum(diffs) / max(1, len(diffs)):+.3f} [{lo:+.3f}, {hi:+.3f}] {w}/{l}/{t} | {changed}/{len(orders)} |")
+
+    # what a mid penalty does to the rank-1 slot, by kind
+    out.append("\n## Rank-1 kind under each arm\n")
+    out.append("| arm | " + " | ".join(k for k, _ in kinds_top10.most_common(8)) + " |")
+    out.append("|---|" + "---|" * min(8, len(kinds_top10)))
+    for label, orders in arms.items():
+        c = collections.Counter(kind_of(o[0]) for o in orders.values() if o)
+        out.append(f"| {label} | " + " | ".join(str(c.get(k, 0)) for k, _ in kinds_top10.most_common(8)) + " |")
+    out.append("\nJev probabilities found for %d of %d traces; a doc without one keeps its engine spacing." % (sum(1 for r in records if jev_p.get(r["trace_id"])), len(records)))
+    Path(args.out).write_text("\n".join(out) + "\n")
+    print("\n".join(out))
+    return 0
 
 
 if __name__ == "__main__":

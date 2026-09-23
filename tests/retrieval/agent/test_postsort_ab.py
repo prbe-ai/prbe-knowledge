@@ -136,3 +136,25 @@ def test_parse_takes_the_final_yes_no_token():
     assert ab._parse_yes_no("**NO** -- it is a Nostradamus quote") is False  # 'Nostradamus' is not a token
     assert ab._parse_yes_no("It does not say.") is None
     assert ab._parse_yes_no("") is None
+
+
+def test_kind_and_tier_classification():
+    assert ab.kind_of(RUN) == "run" and ab.tier_of(RUN) == 0
+    assert ab.kind_of("custom_ingest:probe:experiments:paper:1") == "paper"
+    assert ab.kind_of(FILE) == "file" and ab.tier_of(FILE) == 2
+    assert ab.kind_of(GH) == "gh_commit" and ab.tier_of(GH) == 2
+    assert ab.tier_of("github:o/r:pull_request:12") == 1 and ab.tier_of("github:o/r:pr:12") == 1
+    assert ab.kind_of(T1) == "transcript" and ab.tier_of(T1) == 3
+    assert ab.kind_of(D1) == "digest" and ab.tier_of(D1) == 3
+    assert ab.tier_of("code_graph:x:y") == 2
+
+
+def test_arm_c_penalty_only_decides_near_ties():
+    engine = [T1, GH, RUN]
+    p = {T1: 0.91, GH: 0.55, RUN: 0.53}
+    # strong Jev judgment survives; commit vs run near-tie flips to the run
+    assert ab.arm_c(engine, p, [0, 0.02, 0.05, 0.08], CUST, 10) == [T1, RUN, GH]
+    # zero penalties == engine order
+    assert ab.arm_c(engine, p, [0, 0, 0, 0], CUST, 10) == engine
+    # a transcript barely ahead of a run drops behind it
+    assert ab.arm_c([T1, RUN], {T1: 0.60, RUN: 0.58}, [0, 0.02, 0.05, 0.08], CUST, 10) == [RUN, T1]
