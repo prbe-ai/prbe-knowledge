@@ -175,7 +175,7 @@ def _warn_jev_unconfigured() -> None:
 
 def _jev_api_key() -> str | None:
     """The key when Jev is the configured judge AND has one; else None (gpt-oss)."""
-    if AUTO_MERGE_JUDGE is AutoMergeJudge.JEV:
+    if AUTO_MERGE_JUDGE == AutoMergeJudge.JEV:
         key = get_settings().typesafe_api_key
         if key:
             return key

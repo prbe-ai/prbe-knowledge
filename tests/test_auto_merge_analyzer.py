@@ -581,5 +581,7 @@ async def test_missing_key_falls_back_to_gptoss_and_warns_once(monkeypatch):
 
 
 def test_the_shipped_judge_is_jev():
-    # The other tests set the switch explicitly; this pins what ships.
-    assert constants.AUTO_MERGE_JUDGE is AutoMergeJudge.JEV
+    # The other tests set the switch explicitly; this pins what ships. By
+    # value, not identity: another suite reloads `constants`, which mints a
+    # new enum class.
+    assert constants.AUTO_MERGE_JUDGE == "jev"

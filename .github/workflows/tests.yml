@@ -232,6 +232,9 @@ jobs:
       # the deferral that keeps a node queued through a Jev outage and the
       # per-(tenant, label) merge lock. test_entity_clusters_routes covers the
       # merge transaction itself (merge_cluster), which auto-merge calls.
+      # Keep every tests/retrieval/ path in ONE run: a file from elsewhere
+      # between two of them makes pytest drop tests/retrieval/conftest.py's
+      # fixtures for the second half ("fixture 'recorded' not found").
       # NEVER put a `#` comment INSIDE the folded `run: >-`
       # scalar below: YAML folds it into one line and the first `#` comments
       # out every path after it -- CI stays green and runs none of them.
@@ -265,10 +268,6 @@ jobs:
           tests/test_litellm_key.py
           tests/retrieval/test_tenant_key_binding.py
           tests/retrieval/agent/
-          tests/test_auto_merge_analyzer.py
-          tests/test_auto_merge_jev_judge.py
-          tests/test_auto_merge_live.py
-          tests/test_entity_clusters_routes.py
           tests/retrieval/test_ann_order_by_shape.py
           tests/retrieval/test_vector_per_source_ann.py
           tests/retrieval/test_vector_per_source_ann_binding.py
@@ -281,3 +280,7 @@ jobs:
           tests/test_custom_ingest.py
           tests/test_backfill_custom_doc_types.py
           tests/test_retire_experiment_nodes.py
+          tests/test_auto_merge_analyzer.py
+          tests/test_auto_merge_jev_judge.py
+          tests/test_auto_merge_live.py
+          tests/test_entity_clusters_routes.py
