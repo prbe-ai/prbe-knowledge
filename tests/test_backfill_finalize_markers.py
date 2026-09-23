@@ -60,6 +60,10 @@ async def rows(live_db: None):
             # The last upsert WAS the newest batch: a live pass, never mined.
             "live_pass": await _seed(conn, "s-live", [_batch("s-live", "2026/05/02")],
                                      enqueued="2026-05-02 07:00Z", completed="2026-05-02 07:05Z"),
+            # Upserted two minutes after the batch's UTC day ended: inside the
+            # clock margin, so not evidence either.
+            "day_edge": await _seed(conn, "s-edge", [_batch("s-edge", "2026/05/01")],
+                                    enqueued="2026-05-02 00:02Z", completed="2026-05-02 00:03Z"),
             # Upserted after the last pass finished: that pass did not see it.
             "stale_pass": await _seed(conn, "s-stale", [_batch("s-stale", "2026/04/29")],
                                       enqueued="2026-05-02 07:00Z", completed="2026-05-02 06:00Z"),
@@ -79,7 +83,7 @@ async def rows(live_db: None):
         }
     bucket = await store.bucket_for(C)
     await store.ensure_bucket(bucket)
-    for sid in ("s-mined", "s-live", "s-stale"):
+    for sid in ("s-mined", "s-live", "s-stale", "s-edge"):
         await store.put(bucket, cron_marker_key("claude_code", C, sid), b'{"finalize": true}')
     yield ids
     async with get_pool().acquire() as conn:
@@ -93,7 +97,7 @@ async def test_dry_run_counts_every_row_and_writes_nothing(rows) -> None:
     report = await backfill(dry_run=True, customers=[C])
     assert report.candidates == 2
     assert (report.would_relink, report.missing_marker_object, report.relinked) == (1, 1, 0)
-    assert report.sweep_will_mine_once == 2, "the live pass and the stale pass"
+    assert report.sweep_will_mine_once == 3, "the live pass, the day edge, the stale pass"
     assert report.already_ended_queue_ids == [rows["already"]]
     async with get_pool().acquire() as conn:
         assert {k: await _keys(conn, q) for k, q in rows.items()} == before
@@ -116,7 +120,7 @@ async def test_only_the_evidenced_row_gets_its_marker_back(rows) -> None:
     assert after["mined"] == [*before["mined"], cron_marker_key("claude_code", C, "s-mined")]
     # No worker pass follows: version, status and completion are untouched.
     assert tuple(mined_after) == tuple(mined_row)
-    for name in ("no_object", "live_pass", "stale_pass", "already", "pending", "v2"):
+    for name in ("no_object", "live_pass", "day_edge", "stale_pass", "already", "pending", "v2"):
         assert after[name] == before[name], name
 
     # Idempotent: a second run re-links nothing; the row without its object

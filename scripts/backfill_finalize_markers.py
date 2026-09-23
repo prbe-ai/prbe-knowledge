@@ -14,8 +14,9 @@ transcript was mined by a complete, authoritative pass:
   1. protocol 1, `status='done'`, newest key not already an end signal. NOT
      filtered on idleness: the old loop re-ended every row within the last
      day, so an idle filter would skip exactly the rows this is for;
-  2. its LAST upsert was not a batch: the UTC day of `enqueued_at` is later
-     than the date in its newest batch key (`raw/<src>/<cust>/YYYY/MM/DD/...`).
+  2. its LAST upsert was not a batch: `enqueued_at` falls after the end of the
+     UTC day in its newest batch key (`raw/<src>/<cust>/YYYY/MM/DD/...`), with
+     a 10-minute margin for the two clocks involved.
      Only three writers move `enqueued_at` on an agent row -- a v1 batch, a v2
      batch, and an end-signal append -- so the last write was an end signal;
   3. `completed_at >= enqueued_at`: the worker finished a pass after that write,
@@ -71,6 +72,11 @@ _NEWEST_BATCH_DAY = """(
      WHERE right(_b, 16) <> '/finalize.marker'
 )"""
 
+#: The key's date comes from the app's clock and `enqueued_at` from the
+#: database's, so a batch landing a second before midnight must not read as a
+#: later day. Erring this way costs a few extra mines, never an unmined session.
+_DAY_EDGE_MARGIN = "10 minutes"
+
 _V1_DONE = f"""
        source_system = $1
    AND ($2::text[] IS NULL OR customer_id = ANY($2::text[]))
@@ -82,7 +88,7 @@ _V1_DONE = f"""
 _EVIDENCE = f"""
        NOT {last_key_ends_v1_session_sql()}
    AND completed_at >= enqueued_at
-   AND (enqueued_at AT TIME ZONE 'UTC')::date > {_NEWEST_BATCH_DAY}
+   AND (enqueued_at AT TIME ZONE 'UTC') >= {_NEWEST_BATCH_DAY} + 1 + interval '{_DAY_EDGE_MARGIN}'
 """
 
 _CANDIDATES_SQL = f"""
