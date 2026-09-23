@@ -309,10 +309,16 @@ def shared_identifier(
 
 
 def leaf_uuid(canonical_id: str) -> str | None:
-    """The LAST UUID in an id -- the entity's own. Earlier ones are parents:
-    `linear:<workspace>:issue:<issue>` shares its workspace with every issue."""
-    found = UUID_RE.findall(canonical_id.lower())
-    return found[-1] if found else None
+    """The id's own UUID: its LAST segment, when that segment is a UUID.
+
+    A UUID anywhere else names a parent every sibling shares:
+    `linear:<workspace>:issue:<issue>` its workspace, and
+    `custom_ingest:<customer>:<source>:<doc>` the TENANT -- so "the last UUID
+    anywhere" would make every upload without a UUID of its own match every
+    other one.
+    """
+    last = re.split(r"[:/#]", canonical_id.lower())[-1]
+    return last if UUID_RE.fullmatch(last) else None
 
 
 def _id_evidence(a: str, b: str) -> str | None:
@@ -322,7 +328,15 @@ def _id_evidence(a: str, b: str) -> str | None:
     na, nb = NUMBERED_RE.match(a), NUMBERED_RE.match(b)
     if na and nb and (na.group(1).lower(), na.group(2)) == (nb.group(1).lower(), nb.group(2)):
         return f"same repo {na.group(1)} and number {na.group(2)}"
-    if a != b and _alnum(a) and fold_id(a) == fold_id(b):
+    if (
+        a != b
+        and _alnum(a)
+        and REPO_SHAPED_RE.fullmatch(a.lower())
+        and REPO_SHAPED_RE.fullmatch(b.lower())
+        and fold_id(a) == fold_id(b)
+    ):
+        # Repo-style slugs only: GitHub names ignore case and spell -/_ both
+        # ways. An arbitrary id (a customer's upload key) is case-sensitive.
         return f"ids equal ignoring case and -/_ ({a} ~ {b})"
     if same_repo(a, b):
         return f"same repo name once owner/wiki prefix and -/_ are ignored ({a} ~ {b})"

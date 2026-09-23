@@ -281,9 +281,20 @@ class AutoMergeAnalyzer:
         if _is_path_canonical(label, canonical_id):
             return AutoMergeResult(action="skipped", rationale="path-canonical label")
 
+        # A node whose id is one of this tenant's documents IS that document's
+        # graph node: retrieval reaches the document through it
+        # (documents.doc_id = graph_nodes.canonical_id), and after a merge
+        # every later upsert routes to the primary. Folding it in -- a PR's
+        # document into its `owner/repo#N` mention -- detaches the document
+        # from the graph for good. On the managed plane 661 of the 704
+        # auto-merges before 2026-08 did exactly that (measured 2026-09-23).
+        # So a document node is never the alias; it can still be a primary.
+        if await self._is_document(conn, customer_id, canonical_id):
+            return AutoMergeResult(action="skipped", rationale="document node")
+
         # With the merge breaker open there is no judge to ask: defer BEFORE the
         # candidate search (the vector leg alone can cost ~20s of Postgres CPU
-        # per Document), so an outage costs the database nothing.
+        # per Document), so an outage costs the database one index probe.
         if _jev_api_key() and MERGE_BREAKER.is_open():
             return AutoMergeResult(
                 action="deferred",
@@ -555,6 +566,15 @@ class AutoMergeAnalyzer:
 
         return rank_candidates(merged)
 
+    async def _is_document(self, conn: asyncpg.Connection, customer_id: str, canonical_id: str) -> bool:
+        return bool(
+            await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM documents WHERE customer_id = $1 AND doc_id = $2)",
+                customer_id,
+                canonical_id,
+            )
+        )
+
     async def _judge(self, node: dict, candidates: list[Candidate]) -> Judgment:
         """Jev unless rolled back (`AUTO_MERGE_JUDGE`) or unconfigured."""
         api_key = _jev_api_key()
@@ -613,9 +633,11 @@ class AutoMergeAnalyzer:
                 alias=new_node_canonical_id,
                 error=repr(exc),
             )
-            if isinstance(exc, HTTPException) and exc.status_code == 404:
-                # A node is gone: a concurrent merge already folded one of the
-                # pair (often the twin, the other way round). Nothing to suggest.
+            if isinstance(exc, HTTPException) and exc.status_code in (404, 409):
+                # 404: a node is gone -- a concurrent merge already folded one
+                # of the pair. 409: a cluster conflict, above all the new node
+                # being a cluster primary; a suggestion would only invite a
+                # human to approve the alias chain the refusal exists to stop.
                 return AutoMergeResult(
                     action="error",
                     primary_canonical_id=primary_canonical_id,
@@ -626,8 +648,8 @@ class AutoMergeAnalyzer:
                     judge_model=judgment.model,
                     p=judgment.p,
                 )
-            # Anything else (a cluster conflict, a database error): keep the
-            # judgment as a suggestion so the merge is not silently lost.
+            # Anything else (a database error): keep the judgment as a
+            # suggestion so the merge is not silently lost.
             return await self._write_suggestion(
                 conn=conn,
                 customer_id=customer_id,

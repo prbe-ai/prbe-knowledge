@@ -119,18 +119,27 @@ class JevRequestTooLarge(JevError):
 
 
 class JevRequestRejected(JevError):
-    """400/413/422: the server refused THIS request's shape. Like
-    `JevRequestTooLarge` it is permanent for the input and says nothing about
-    the service's health, so it does not trip a breaker."""
+    """400/413/422: the server refused THIS request's shape -- permanent for
+    the input. It still counts against the breaker: a change on the server's
+    side (a new request schema) refuses every request alike, and only a run
+    of failures can tell that apart from one bad input."""
 
 
-#: Refusals that are about the request itself. Every other 4xx -- 401/403 (a
-#: revoked key), 404 (a retired model or a wrong base URL), 408, 429 -- would
-#: fail EVERY request the same way: an outage, not a verdict on one input.
+#: Refusals that may be about the request itself. Every other 4xx -- 401/403
+#: (a revoked key), 404 (a wrong base URL), 408, 429 -- fails EVERY request
+#: the same way: an outage, not a verdict on one input.
 _PER_REQUEST_REJECTIONS = frozenset({400, 413, 422})
+
+#: A 400 that is about how WE call the API, never about one input: an unknown
+#: or retired model answers `400 api_usage_error` ("Unknown model: ...",
+#: checked 2026-09-23). An outage for our purposes.
+_USAGE_ERROR_TYPE = "api_usage_error"
 
 
 _OVERFLOW_ERROR_TYPE = "max_tokens_exceeded"
+
+#: `ChoiceAnswer.model` when the response names no model.
+UNKNOWN_MODEL = "unknown"
 
 
 def _is_token_overflow(resp: httpx.Response) -> bool:
@@ -731,8 +740,10 @@ async def post_choice(
     Raises:
       JevBreakerOpen      -- nothing sent; the breaker is cooling down.
       JevRequestTooLarge  -- `max_tokens_exceeded`; permanent for this input.
-      JevRequestRejected  -- 400/413/422; permanent for this input.
-      JevError            -- transport, any other 4xx (401/403/404/408/429),
+      JevRequestRejected  -- 400/413/422; permanent for this input (still
+                             counts against the breaker).
+      JevError            -- transport, `api_usage_error` (e.g. a retired
+                             model), any other 4xx (401/403/404/408/429),
                              5xx, or a malformed answer; trips the breaker.
     """
     if not api_key:
@@ -750,7 +761,8 @@ async def post_choice(
     if _is_token_overflow(resp):
         # The input's fault, not an outage: do not trip the breaker.
         raise JevRequestTooLarge(f"http_400:{_OVERFLOW_ERROR_TYPE}")
-    if resp.status_code in _PER_REQUEST_REJECTIONS:
+    if resp.status_code in _PER_REQUEST_REJECTIONS and _error_type(resp) != _USAGE_ERROR_TYPE:
+        breaker.failure()
         raise JevRequestRejected(f"http_{resp.status_code}:{_error_type(resp)}")
     if resp.status_code != 200:
         breaker.failure()
@@ -761,7 +773,9 @@ async def post_choice(
         choice = ans["choice"]
         raw = ans["probabilities"]
         tokens = int(((body.get("usage") or {}).get("input_tokens")) or 0)
-        answered_model = str(body.get("model") or model)
+        # Never fill in the model we asked for: an answer that does not say
+        # which model produced it is not a calibrated answer.
+        answered_model = str(body.get("model") or UNKNOWN_MODEL)
     except (ValueError, KeyError, AttributeError, TypeError) as exc:
         raise _malformed(breaker, type(exc).__name__) from exc
     if not isinstance(choice, str) or choice not in criteria:

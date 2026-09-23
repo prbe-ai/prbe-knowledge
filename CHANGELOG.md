@@ -23,11 +23,17 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - When the auto-merge judge is unreachable, the entity stays queued and is retried after 5
   minutes, then 10, 20 and so on up to an hour, instead of being skipped until it next
   changes. After 12 tries it is parked as failed.
+- Auto-merge never folds a document's own graph node into another node. Search reaches a
+  document through that node, so folding it away (a PR's document into its bare
+  `owner/repo#12` mention) cut the document out of graph search for good. Most past
+  auto-merges did exactly that; documents already folded this way are not repaired here.
 - Two merges of the same kind of entity in one workspace now run one at a time, so two
   workers can no longer fold a pair of twin entities into each other at once. Auto-merge
   also no longer folds an entity that already heads a merged group into another one (its
-  merged copies would lose their target); that pair becomes a suggestion. A merge that
-  fails for any other reason is kept as a suggestion too, instead of being dropped.
+  merged copies would lose their target). A merge that fails for another reason, such as
+  a database error, is kept as a suggestion instead of being dropped.
+- If Jev stops accepting our requests (a retired model, a revoked key, a changed request
+  format), queued entities now wait for it to recover instead of being dropped one by one.
 - New graph nodes no longer hang for five minutes on their first auto-merge: the worker
   saves the node's embedding before judging, so the merge no longer waits on a lock its
   own caller holds.

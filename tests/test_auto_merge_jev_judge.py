@@ -220,8 +220,12 @@ def test_shared_identifier(a, pa, b, pb, expect):
         # workspace uuid.
         ("Document", f"linear:{WS}:issue:0f8fad5b-d9cb-469f-a165-70867728950e", {},
          f"linear:{WS}:issue:2c1b9f4e-7a3d-4e21-9b8a-5d6f7e8a9b0c", {}, False),
-        ("Document", f"linear:{WS}:issue:0f8fad5b-d9cb-469f-a165-70867728950e", {},
-         f"linear:{WS}:issue:0f8fad5b-d9cb-469f-a165-70867728950e:comment", {}, True),
+        # A UUID counts only as the id's last segment: an upload id ends in the
+        # customer's own key, and the tenant uuid before it is shared by all.
+        ("Document", f"custom_ingest:{WS}:notes:q3-plan", {}, f"custom_ingest:{WS}:notes:q3-plan-draft", {}, False),
+        ("Document", f"custom_ingest:{WS}:notes:{WS}", {}, WS, {}, True),
+        # Case and -/_ fold only for repo-style slugs.
+        ("Document", "custom_ingest:t:notes:Readme", {}, "custom_ingest:t:notes:README", {}, False),
         # Case and -/_ fold; dots and run-together letters do not.
         ("Document", "Acme-Widgets", {}, "acme_widgets", {}, True),
         ("Document", "model-v1.1", {}, "model-v11", {}, False),

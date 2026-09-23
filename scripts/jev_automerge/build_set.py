@@ -202,6 +202,21 @@ def fill_properties(decisions: list[dict]) -> None:
             d["degree"] = got.get("degree", d["degree"])
 
 
+def mark_documents(decisions: list[dict], customer: str) -> None:
+    """`is_document`: the node's id is one of the tenant's documents, which the
+    analyzer never judges (it would fold the document out of the graph)."""
+    ids = sorted({d["canonical_id"] for d in decisions})
+    found: set[str] = set()
+    for i in range(0, len(ids), 500):
+        batch = ",".join(kb.lit(x) for x in ids[i:i + 500])
+        found |= {r["doc_id"] for r in kb.rows(
+            "select row_to_json(t) from (select distinct doc_id from documents "
+            f"where customer_id = {kb.lit(customer)} and doc_id in ({batch})) t"
+        )}
+    for d in decisions:
+        d["is_document"] = d["canonical_id"] in found
+
+
 def trigram_leg(decisions: list[dict], customer: str, cache: Path) -> dict[str, list]:
     """The analyzer's trigram query per decision. ~0.5 s of CPU each on the kb
     primary, so batches pause between them and results are cached in `cache`
@@ -344,6 +359,7 @@ def main() -> None:
     if args.max_decisions:
         decisions = random.Random(args.seed).sample(decisions, min(args.max_decisions, len(decisions)))
     fill_properties(decisions)
+    mark_documents(decisions, args.customer)
     trgm = trigram_leg(decisions, args.customer, args.out / "trigram_cache.json")
     assemble(decisions, trgm, vector_leg(decisions, args.customer, aliases), args.customer)
     decisions = [d for d in decisions if d["candidates"]]

@@ -90,15 +90,38 @@ async def test_max_tokens_exceeded_is_too_large_and_does_not_trip_the_breaker():
 
 
 @pytest.mark.parametrize("status", [400, 413, 422])
-async def test_a_refused_request_is_rejected_as_permanent_and_does_not_trip_the_breaker(status):
+async def test_a_refused_request_is_rejected_as_permanent_but_counts_against_the_breaker(status):
+    # One refusal is this input's problem; a run of them is the server
+    # refusing everything (a schema change), which must open the breaker so
+    # the queue defers instead of being dropped node by node.
     b = jev.Breaker()
 
     def handler(req):
         return httpx.Response(status, json={"detail": {"error_type": "validation_error"}})
 
-    with pytest.raises(jev.JevRequestRejected):
+    for _ in range(jev.JEV_BREAKER_FAILURES):
+        with pytest.raises(jev.JevRequestRejected):
+            await _ask(handler, breaker=b)
+    assert b.is_open()
+
+
+async def test_an_unknown_model_is_an_outage_not_a_refusal_of_this_input():
+    # What Jev answers for a retired model (checked 2026-09-23).
+    b = jev.Breaker()
+
+    def handler(req):
+        return httpx.Response(400, json={"detail": {"error_type": "api_usage_error", "message": "Unknown model: x"}})
+
+    with pytest.raises(jev.JevError) as err:
         await _ask(handler, breaker=b)
-    assert b.failures == 0
+    assert not isinstance(err.value, jev.JevRequestRejected)
+    assert b.failures == 1
+
+
+@pytest.mark.parametrize("model", [None, ""])
+async def test_an_answer_that_names_no_model_is_recorded_as_unknown(model):
+    ans = await _ask(_ok(model=model), model="jev-1.13.0")
+    assert ans.model == jev.UNKNOWN_MODEL  # never the model we asked for
 
 
 # 401/403: a revoked key. 404: a retired model or a wrong base URL. Each fails

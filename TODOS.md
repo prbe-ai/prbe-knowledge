@@ -57,10 +57,29 @@ enqueue only those.
 On the managed plane one Person node proposed the same merge 18 times in 81
 minutes; every attempt failed `merge_cluster` with "one or more aliases already
 belong to a cluster" because the node is already an alias in another cluster.
-A failed merge is now kept as a (deduplicated) suggestion instead of an error,
-but the judge call is still repeated. The analyzer should resolve an
+The judge call is still repeated on every upsert. The analyzer should resolve an
 already-clustered node or candidate to its primary before proposing a merge, or
 skip it. Judge-independent.
+
+### Repair the documents that past auto-merges detached from the graph
+**Where:** `entity_merge_audit`, `entity_aliases` (managed plane).
+
+Before the document-node guard, auto-merge folded a document's own graph node
+into its mention (a PR's `github:o/r:pr:N` into `o/r#N`): 661 of 704 auto-merges
+since 2026-05, leaving 875 live documents whose `doc_id` routes to another node
+(2026-09-23). Graph retrieval joins `documents.doc_id = graph_nodes.canonical_id`,
+so those documents are unreachable through the graph. **Fix:** unmerge them (the
+snapshots make it reversible), or merge the other way -- the mention INTO the
+document node, which is the merge worth having. Measure with a replay first.
+
+### Merge a mention into its document, not the reverse
+**Where:** `engine/ingest/auto_merge/analyzer.py`.
+
+The judged node is always the alias, so the document-node guard skips the
+useful case: a new PR document and its `o/r#N` mention (the mention is
+path-canonical and never judged itself). Folding the mention INTO the document
+node would connect every mention to the document. Needs a direction rule and a
+replay before it ships.
 
 ### A commit's author email is trusted as identity
 **Where:** `engine/ingest/auto_merge/jev_judge.py` (`shared_identifier`),
@@ -83,6 +102,14 @@ With three copies of one entity among the candidates the Choice mass divides
 although Jev is sure the node is a duplicate. **Fix:** write a suggestion when
 `1 - p(none_of_these)` clears `AUTO_MERGE_JEV_SUGGEST_AT`; replay it first to
 size the extra suggestion volume.
+
+### A long Jev outage parks the whole auto-merge backlog
+**Where:** `engine/ingest/post_write/worker.py` (`_defer`).
+
+After 12 deferrals (about 9 hours) a queue row is parked as failed, and that
+counts deferrals where the breaker was open and nothing was sent. A node that
+is not upserted again is then never judged. **Fix:** do not count breaker-open
+deferrals toward the cap, or re-queue parked rows once the breaker closes.
 
 ### Auto-merge shares Jev's base URL, timeout and quota with search
 `JEV_BASE_URL` and `JEV_REQUEST_TIMEOUT_SECONDS` (2.5 s) are search settings the

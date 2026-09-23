@@ -26,8 +26,11 @@ python -m scripts.jev_automerge.score --set ~/replay/<date> --results ~/replay/<
   are pulled once and the kNN is computed locally instead.
 - `score` exits 1 when the acceptance bar fails. The bar:
   - 0 known-false and 0 unverified Jev auto-merges.
-  - At least 78 verified auto-merges. Jev drifts: four identical runs gave
-    83, 82, 81 and 80.
+  - At least 12 verified auto-merges (people confirmed by the gate count).
+    The analyzer never judges a document's own node, so `build_set` records
+    `is_document` and `score` skips those decisions: the 2026-09-23 set leaves
+    14 of 82. For non-Person pairs "verified" is mostly the gate's own
+    evidence, so it shows agreement, not independent truth.
   - At least 94% same-entity agreement with gpt-oss.
 
   Results on 2026-09-23 are in `docs/jev-contract.md` ("Entity auto-merge").

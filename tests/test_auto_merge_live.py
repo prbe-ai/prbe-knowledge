@@ -187,19 +187,59 @@ async def test_name_only_person_becomes_a_suggestion_not_a_merge(world):
     assert rows[0]["rationale"].startswith('same name "Grace Hopper"')
 
 
-async def test_new_pr_id_format_merges_into_the_old_one(world):
+async def seed_document(doc_id: str) -> None:
+    """A real `documents` row whose doc_id is a graph node's canonical_id."""
+    async with raw_conn() as conn:
+        await conn.execute(
+            """
+            INSERT INTO documents (
+                doc_id, version, customer_id, source_system, source_id, source_url,
+                doc_class, doc_type, content_type, content_hash, title,
+                body_size_bytes, body_token_count, created_at, updated_at, valid_from, ingested_at,
+                acl, metadata, entities, attachments, doc_references, normalizer_version
+            ) VALUES (
+                $1, 1, $2, 'github', $1, 'https://example/' || $1,
+                'raw_source', 'github.pull_request', 'text/markdown', 'h-' || $1, 'Add widgets',
+                0, 0, NOW(), NOW(), NOW(), NOW(),
+                '{}'::jsonb, '{}'::jsonb, '[]'::jsonb, '[]'::jsonb, '[]'::jsonb, 'v1'
+            )
+            """,
+            doc_id,
+            CUSTOMER,
+        )
+
+
+async def test_a_prs_document_node_is_never_folded_into_its_mention(world):
+    # The PR's document node (its id is the document's doc_id) and the bare
+    # `owner/repo#N` mention name the same PR. Folding the document node away
+    # would cut the document out of graph retrieval, so it is not judged.
     await ingest(make_document("acme/widgets#12", properties={"name": "Add widgets"}))
     await drain(world.worker)
 
     world.fake.decide = pick("github:acme/widgets:pr:12", "acme/widgets#12", 0.99)
+    await seed_document("github:acme/widgets:pr:12")
     await ingest(make_document("github:acme/widgets:pr:12", properties={"name": "Add widgets"}))
+    await drain(world.worker)
+
+    assert world.fake.requests == []  # skipped before the candidate search and the judge
+    assert await fetch("SELECT 1 FROM entity_merge_audit") == []
+    assert await fetch("SELECT 1 FROM entity_merge_suggestions") == []
+    assert await fetch("SELECT 1 FROM graph_nodes WHERE canonical_id = 'github:acme/widgets:pr:12'") != []
+
+
+async def test_a_non_document_repo_node_merges_into_its_owner_form(world):
+    await ingest(make_document("acme/acme-widgets", properties={"name": "acme-widgets"}))
+    await drain(world.worker)
+
+    world.fake.decide = pick("wiki:repo:acme_widgets", "acme/acme-widgets", 0.99)
+    await ingest(make_document("wiki:repo:acme_widgets", properties={"name": "acme_widgets"}))
     await drain(world.worker)
 
     audit = await fetch("SELECT primary_canonical_id, merged_alias_canonical_ids, reason FROM entity_merge_audit")
     assert [(a["primary_canonical_id"], a["merged_alias_canonical_ids"]) for a in audit] == [
-        ("acme/widgets#12", ["github:acme/widgets:pr:12"])
+        ("acme/acme-widgets", ["wiki:repo:acme_widgets"])
     ]
-    assert "rationale=same repo acme/widgets and number 12" in audit[0]["reason"]
+    assert "rationale=same repo name once owner/wiki prefix" in audit[0]["reason"]
 
 
 async def status_of(canonical_id: str) -> dict:
@@ -304,7 +344,7 @@ async def test_a_failed_pending_edge_drain_keeps_the_embedding_and_still_judges(
     assert len(await fetch("SELECT 1 FROM entity_merge_audit")) == 1
 
 
-async def test_a_reupserted_cluster_primary_is_suggested_not_folded_into_another_node(world):
+async def test_a_reupserted_cluster_primary_is_not_folded_into_another_node(world):
     # ada@example.com becomes a cluster primary (alias ada-gh).
     await ingest(make_person("ada@example.com", {"name": "Ada Lovelace", "email": "ada@example.com"}))
     await drain(world.worker)
@@ -327,9 +367,9 @@ async def test_a_reupserted_cluster_primary_is_suggested_not_folded_into_another
     aliases = await fetch("SELECT alias_canonical_id, primary_canonical_id FROM entity_aliases")
     assert [(a["alias_canonical_id"], a["primary_canonical_id"]) for a in aliases] == [("ada-gh", "ada@example.com")]
     assert await fetch("SELECT 1 FROM graph_nodes WHERE canonical_id = 'ada@example.com'") != []
-    # The judgment is kept for a human, at the confidence the judge gave.
-    rows = await fetch("SELECT primary_canonical_id, candidate_canonical_id, confidence FROM entity_merge_suggestions")
-    assert [tuple(r) for r in rows] == [("U999", "ada@example.com", "high")]
+    # No suggestion either: approving one would build the very chain the
+    # refusal stops (the approve routes do not set the flag).
+    assert await fetch("SELECT 1 FROM entity_merge_suggestions") == []
 
 
 async def test_twins_merged_into_each_other_at_once_leave_exactly_one_node(world):

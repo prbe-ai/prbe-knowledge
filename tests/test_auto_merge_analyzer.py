@@ -246,8 +246,13 @@ JUDGES = [
 
 
 class FakeConn:
-    def __init__(self) -> None:
+    def __init__(self, documents: tuple[str, ...] = ()) -> None:
         self.suggestions: list[tuple] = []
+        self.documents = set(documents)
+
+    async def fetchval(self, sql: str, *args):
+        assert "FROM documents" in sql, sql
+        return args[1] in self.documents
 
     async def fetchrow(self, sql: str, *args):
         assert "INSERT INTO entity_merge_suggestions" in sql, sql
@@ -311,16 +316,9 @@ async def test_high_merges_and_the_audit_reason_names_the_judge(monkeypatch, mod
     assert conn.suggestions == []
 
 
-@pytest.mark.parametrize(
-    "exc",
-    [
-        HTTPException(status_code=409, detail={"error": "one or more aliases are the primary of a cluster"}),
-        RuntimeError("statement timeout"),
-    ],
-)
-async def test_a_failed_merge_is_kept_as_a_high_suggestion(monkeypatch, exc):
+async def test_a_failed_merge_is_kept_as_a_high_suggestion(monkeypatch):
     j = Judgment(verdict=_verdict("acme/widgets#12", "high"), model="jev-1.13.0", p=0.99)
-    a, merges = _analyzer(monkeypatch, PR_NODE, PR_CANDS, judgment=j, merge_raises=exc)
+    a, merges = _analyzer(monkeypatch, PR_NODE, PR_CANDS, judgment=j, merge_raises=RuntimeError("statement timeout"))
     conn = FakeConn()
     result = await a.analyze(conn, "acme-test", 7)
     assert len(merges) == 1
@@ -329,14 +327,27 @@ async def test_a_failed_merge_is_kept_as_a_high_suggestion(monkeypatch, exc):
     assert row[2:5] == ("acme/widgets#12", "github:acme/widgets:pr:12", "high")
 
 
-async def test_a_merge_whose_node_is_already_gone_is_an_error_not_a_suggestion(monkeypatch):
-    # 404: a concurrent merge folded one side first (often the twin, the other
-    # way round). There is no pair left to review.
+@pytest.mark.parametrize("status", [404, 409])
+async def test_a_merge_refused_or_already_gone_is_an_error_not_a_suggestion(monkeypatch, status):
+    # 404: a concurrent merge folded one side first. 409: e.g. the new node is
+    # a cluster primary; a suggestion would invite approving the chain.
     j = Judgment(verdict=_verdict("acme/widgets#12", "high"), model="jev-1.13.0", p=0.99)
-    a, _ = _analyzer(monkeypatch, PR_NODE, PR_CANDS, judgment=j, merge_raises=HTTPException(status_code=404))
+    a, _ = _analyzer(monkeypatch, PR_NODE, PR_CANDS, judgment=j, merge_raises=HTTPException(status_code=status))
     conn = FakeConn()
     result = await a.analyze(conn, "acme-test", 7)
     assert result.action == "error" and conn.suggestions == []
+
+
+@pytest.mark.parametrize(("model", "p"), JUDGES)
+async def test_a_document_node_is_never_judged_or_merged(monkeypatch, model, p):
+    # The new node's id is one of the tenant's documents: folding it into its
+    # mention would cut the document out of graph retrieval.
+    j = Judgment(verdict=_verdict("acme/widgets#12", "high"), model=model, p=p)
+    a, merges = _analyzer(monkeypatch, PR_NODE, PR_CANDS, judgment=j)
+    conn = FakeConn(documents=("github:acme/widgets:pr:12",))
+    result = await a.analyze(conn, "acme-test", 7)
+    assert (result.action, result.rationale) == ("skipped", "document node")
+    assert merges == [] and conn.suggestions == []
 
 
 @pytest.mark.parametrize(("model", "p"), JUDGES)

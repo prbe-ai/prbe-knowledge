@@ -18,14 +18,23 @@ hard identity evidence -- never against the other model:
                different repo owners, or different page/incident/commit/session ids
   needs human  anything else -- e.g. two people who share only a name
 
-The Jev gate is scored exactly as production acts: p >= AUTO_MERGE_JEV_HIGH_AT
-AND `jev_judge.execution_evidence` (the analyzer's own gate).
+The Jev gate is scored exactly as production acts: a node whose id is one of
+the tenant's documents is skipped before judging (`is_document`, recorded by
+build_set); then p >= AUTO_MERGE_JEV_HIGH_AT, an answer from
+AUTO_MERGE_JEV_MODEL, AND `jev_judge.execution_evidence` (the analyzer's gate).
 
-Acceptance (the eng-review bar, 2026-09-23): 0 known-false and 0 needs-human
-among Jev auto-merges, >= --min-verified verified, and (when gpt-oss answers
-are given) >= --min-agreement same-entity agreement with gpt-oss. The verified
-count moves with Jev's drift: four runs of byte-identical requests over the
-2026-09-23 set gave 83, 82, 81 and 80 (all verified), hence a default of 78.
+"Verified" for a non-Person pair is mostly the SAME deterministic evidence the
+gate requires, so for those it shows the judge and the gate agree -- it is
+not independent ground truth. Independent checks are the human-approved
+merges and the known-false rules; the day-one human review of live merges is
+the rest.
+
+Acceptance: 0 known-false and 0 needs-human among Jev auto-merges, >=
+--min-verified verified (people by the gate counted in), and (when gpt-oss
+answers are given) >= --min-agreement same-entity agreement with gpt-oss.
+Before the document-node guard four identical runs gave 80-83 auto-merges;
+with it the 2026-09-23 set leaves 14 (68 of the 82 were a document's own node
+folded into its mention), hence a default of 12.
 """
 
 from __future__ import annotations
@@ -46,7 +55,12 @@ from engine.ingest.auto_merge.jev_judge import (
     same_repo,
     shared_identifier,
 )
-from engine.shared.constants import AUTO_MERGE_JEV_HIGH_AT, AUTO_MERGE_JEV_SUGGEST_AT, NodeLabel
+from engine.shared.constants import (
+    AUTO_MERGE_JEV_HIGH_AT,
+    AUTO_MERGE_JEV_MODEL,
+    AUTO_MERGE_JEV_SUGGEST_AT,
+    NodeLabel,
+)
 from scripts.jev_automerge import kb
 
 JEV_PRICE_PER_TOKEN = 0.042e-6
@@ -112,7 +126,7 @@ def main() -> int:
     ap.add_argument("--set", type=Path, required=True, help="build_set output dir")
     ap.add_argument("--results", type=Path, required=True)
     ap.add_argument("--gptoss-results", type=Path, help="results file carrying 'gptoss' answers (default: --results)")
-    ap.add_argument("--min-verified", type=int, default=78)
+    ap.add_argument("--min-verified", type=int, default=12)
     ap.add_argument("--min-agreement", type=float, default=0.94)
     args = ap.parse_args()
 
@@ -125,10 +139,16 @@ def main() -> int:
     def cand_props(d: dict, cid: str) -> dict:
         return next((c["properties"] or {} for c in d["candidates"] if c["canonical_id"] == cid), {})
 
+    if not any("is_document" in d for d in decisions.values()):
+        print("WARNING: this set predates is_document; document nodes are scored as if judged", file=sys.stderr)
+
     # ---- Jev auto-merges, gated exactly as production acts
     merges, guarded, bands = [], 0, collections.Counter()
     for did, r in results.items():
         d, j = decisions[did], (r["jev"] or [{}])[0]
+        if d.get("is_document"):
+            bands["skipped (document node)"] += 1
+            continue
         if j.get("error") or j.get("primary") is None:
             bands["unique"] += 1
             continue
@@ -136,6 +156,8 @@ def main() -> int:
             bands["unique"] += 1
         elif j["p"] < AUTO_MERGE_JEV_HIGH_AT:
             bands["suggest"] += 1
+        elif j.get("model") != AUTO_MERGE_JEV_MODEL:
+            bands["suggest (uncalibrated model)"] += 1
         elif not execution_evidence(
             d["qlabel"], d["canonical_id"], d["properties"], j["primary"], cand_props(d, j["primary"])
         ):
