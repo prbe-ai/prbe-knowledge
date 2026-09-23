@@ -144,9 +144,18 @@ _RULES: tuple[_Rule, ...] = (
     # this rule sets pairs=True.
     _r("aws-access-key-id", r"\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b",
        ("akia", "asia", "abia", "acca"), pairs=True),
-    # Anthropic.
-    _r("anthropic-api-key", r"\bsk-ant-(?:api|admin)[0-9]{2}-[A-Za-z0-9_\-]{80,120}\b",
+    # Anthropic: API and admin keys, and the OAuth access/refresh tokens a
+    # Claude Code login writes (`sk-ant-oat01-`, `sk-ant-ort01-`).
+    _r("anthropic-api-key", r"\bsk-ant-(?:api|admin|oat|ort)[0-9]{2}-[A-Za-z0-9_\-]{40,200}\b",
        ("sk-ant-",)),
+    # Probe's own credentials (app/auth/tokens.py): user PATs (and the legacy
+    # `ros_pat_`), service tokens, ingest tokens. Fixed prefix + hex, so exact.
+    # Ingest tokens come in two lengths: pairing mints 48 hex, `probe login`'s
+    # device flow 32 (app/auth/device_router.py). The anchored pass cannot catch
+    # either, because `ros` and `ing` make the value read as word-like.
+    _r("probe-token", r"\b(?:probe_pat_|ros_pat_|probe_svc_)[0-9a-f]{32}\b",
+       ("probe_pat_", "ros_pat_", "probe_svc_")),
+    _r("probe-ingest-token", r"\bros_ing_[0-9a-f]{32}(?:[0-9a-f]{16})?\b", ("ros_ing_",)),
     # OpenAI, both the project-scoped and the classic shape.
     _r("openai-api-key", r"\bsk-(?:proj|svcacct|admin)-[A-Za-z0-9_\-]{40,200}\b",
        ("sk-proj-", "sk-svcacct-", "sk-admin-")),
@@ -303,6 +312,34 @@ def _counts(value: str) -> dict[str, int]:
     return out
 
 
+#: Fewest DISTINCT characters a base64-shaped run must use before it is worth
+#: decoding as a possible credential. A run of one repeated character carries no
+#: key material: `3` x 48 is a language model doing arithmetic inside a GSM8K
+#: answer, not a secret, and `ababab...` is no better.
+#:
+#: Chosen over Shannon entropy because this floor has to hold identically for a
+#: 24-character window and a 16K one, and entropy over a short window is
+#: dominated by its LENGTH -- 24 random base64 chars and 240 of them score very
+#: differently while being equally secret. Distinct-character count is
+#: length-independent, so one number is honest at both ends.
+#:
+#: Every real credential clears it by a wide margin: base64 needs ~12 distinct
+#: characters before it can carry even 64 bits, and the least diverse fixture in
+#: the test suite uses far more. `test_diversity_floor_admits_no_real_secret` is
+#: the negative control -- it fails if this number is ever raised far enough to
+#: let a real credential through.
+_MIN_CANDIDATE_DISTINCT = 6
+
+
+def low_diversity(value: str) -> bool:
+    """True when a base64-shaped run is too uniform to encode a credential.
+
+    Shared with the artifact gate (`probe.sdk.secret_gate`) so both halves of
+    the boundary agree about what is not even worth calling a candidate.
+    """
+    return len(_counts(value)) < _MIN_CANDIDATE_DISTINCT
+
+
 #: A value is WORD-LIKE when `-`/`_` split it into three or more parts and at
 #: least two of those are plain alphabetic words. That is what a CLI flag
 #: (`--some-thing-SOME-VALUE-`), a test name, and a hyphenated identifier all
@@ -342,6 +379,40 @@ def _character_classes(value: str) -> int:
     )
 
 
+#: What `redact` writes in place of a finding. A marker names its rule, and rule
+#: names contain anchor words (`<redacted:anchored-secret>`, `probe-token`).
+_MARKER = re.compile(r"<redacted:[a-z0-9_-]+>")
+
+
+def _unmarked(pattern: re.Pattern[str], text: str) -> Any:
+    """`pattern.finditer(text)`, minus any match that touches a redaction marker.
+
+    Without this, scanning already-redacted text is not stable: the "secret" in
+    `<redacted:anchored-secret>` anchors the next value, whose own marker then
+    anchors the one after, one more value per pass. A skipped match resumes the
+    search just past the marker, so a real key name that the skipped match's
+    gap covered is still seen.
+    """
+    if "<redacted:" not in text:
+        yield from pattern.finditer(text)
+        return
+    markers = [(m.start(), m.end()) for m in _MARKER.finditer(text)]
+    pos = 0
+    while pos <= len(text):
+        match = pattern.search(text, pos)
+        if match is None:
+            return
+        crossed = next(
+            (end for start, end in markers if start < match.end() and end > match.start()),
+            None,
+        )
+        if crossed is None:
+            yield match
+            pos = max(match.end(), match.start() + 1)
+        else:
+            pos = max(crossed, match.start() + 1)
+
+
 def _is_indirect(value: str) -> bool:
     """A reference or a placeholder rather than a live credential."""
     return bool(_INDIRECT.match(value))
@@ -378,7 +449,7 @@ def scan(text: str, *, _decode: bool = True) -> list[Finding]:
                 pair_anchors.append((match.start(), match.end()))
 
     if "password" in lowered or "passwd" in lowered:
-        for match in _PASSWORD_ASSIGNMENT.finditer(text):
+        for match in _unmarked(_PASSWORD_ASSIGNMENT, text):
             group = next(name for name in ("double", "single", "bare") if match.group(name) is not None)
             value = match.group(group).rstrip()
             if not value or _is_indirect(value):
@@ -389,7 +460,7 @@ def scan(text: str, *, _decode: bool = True) -> list[Finding]:
 
     # [3] anchored entropy: a credential-shaped key name introduces the value.
     if any(k in lowered for k in _ANCHOR_KEYWORDS):
-        for match in _ANCHORED.finditer(text):
+        for match in _unmarked(_ANCHORED, text):
             if _model_token_anchor(text, match.start()):
                 continue
             value = match.group("value")
@@ -400,12 +471,30 @@ def scan(text: str, *, _decode: bool = True) -> list[Finding]:
             findings.append(
                 Finding("anchored-secret", match.start("value"), match.end("value"))
             )
-        for match in _SHORT_ANCHORED.finditer(text):
+        for match in _unmarked(_SHORT_ANCHORED, text):
             if _model_token_anchor(text, match.start()):
                 continue
             group = next(name for name in ("double", "single", "bare") if match.group(name) is not None)
             value = match.group(group)
             if _is_indirect(value):
+                continue
+            # Not key material: an escape is SERIALIZATION and a non-ASCII
+            # character is TEXT. Every credential shape is plain ASCII drawn
+            # from base64/hex, so both prove the value is content.
+            #
+            # This rule is the crude half of the anchored pass -- it accepts
+            # SHORT values, so it leans on character classes and a 2.5 entropy
+            # floor instead of length, and a tokenizer vocabulary dump walks
+            # straight through both. `{"token": "\u0120the"}` is GPT-2's space
+            # marker U+0120, and the escape alone supplies the digits and the
+            # second character class; decoded, `\u0120cookie` becomes `Gcookie`
+            # (with U+0120) whose entropy is 2.52 against a floor of 2.50. Both
+            # halves matched, so every vocabulary row was a credential.
+            #
+            # A credential genuinely written with escapes is still caught:
+            # `_encoded_findings` re-scans the decoded view and maps offsets
+            # back, which is the entire purpose of that pass.
+            if "\\" in value or not value.isascii():
                 continue
             if (_is_word_like(value) or _character_classes(value) < 2
                     or shannon_entropy(value) < 2.5):
@@ -467,6 +556,8 @@ def _encoded_findings(text: str) -> list[Finding]:
             found.append(Finding(finding.rule, offsets[finding.start][0], offsets[finding.end-1][1]))
     for match in _BASE64.finditer(text):
         value = match.group()
+        if low_diversity(value):
+            continue
         try:
             decoded = base64.b64decode(value + '=' * (-len(value) % 4), altchars=b'-_', validate=True).decode('utf-8')
         except (ValueError, UnicodeDecodeError, binascii.Error):

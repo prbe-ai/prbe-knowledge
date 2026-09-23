@@ -21,6 +21,12 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Fixed
 
+- The server-side credential scrub of ingested content (`engine/ingest/_credential_*.py`,
+  vendored from research-os) is re-synced. It now removes Probe's own tokens, including the
+  32-hex `ros_ing_` ingest tokens `probe login` mints, and a redaction marker no longer
+  anchors the value after it. The shared artifact gate now reports credentials instead of
+  refusing, so the manual-upload boundary refuses on any finding itself: a credential in an
+  uploaded document is still rejected before anything is stored.
 - A coding-agent session whose last mining pass was partial (a segment failed, the segment
   cap hit, the model declined the tool, or extraction was switched off) is no longer treated
   as mined for good. The worker records how every complete pass went on the session's queue

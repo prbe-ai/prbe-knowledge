@@ -277,6 +277,11 @@ async def create_manual_uploads(
                 inspect_bytes, body,
                 scan_policy=ScanPolicy(max_bytes=64 * 1024 * 1024, allow_opaque=True),
             )
+            # The shared gate REPORTS credentials rather than refusing: research-os
+            # artifacts are redacted in place and uploaded. A manual upload keeps its
+            # ORIGINAL bytes, which nothing here may rewrite, so any finding refuses it.
+            if inspection.has_findings:
+                raise CredentialBlocked("upload contains credentials")
             parsed = await asyncio.to_thread(parse_manual_upload, filename, content_type, body)
             if await redact_payload_async(parsed.text) != parsed.text:
                 raise CredentialBlocked("extracted text contains credentials")
