@@ -42,12 +42,14 @@ import numpy as np
 
 from engine.ingest.auto_merge.analyzer import (
     TOTAL_CANDIDATE_CAP,
+    TRIGRAM_CANDIDATES_SQL,
     TRIGRAM_FLOOR,
     TRIGRAM_TOP_K,
     VECTOR_TOP_K,
     Candidate,
     _is_path_canonical,
     _properties_conflict,
+    rank_candidates,
 )
 from scripts.jev_automerge import kb
 
@@ -62,50 +64,14 @@ def _pr_pair(new_id: str, primary: str) -> bool:
     return bool(m) and primary == f"{m.group(1)}#{m.group(3)}"
 
 
-# Verbatim from AutoMergeAnalyzer._find_candidates (trigram path), with the
-# node's values inlined and each result wrapped as one JSON line.
-_TRIGRAM_SQL = """
-SELECT json_build_object('k', {k}, 'rows', COALESCE((SELECT json_agg(row_to_json(t)) FROM (
-            SELECT
-                node_id,
-                canonical_id,
-                properties,
-                degree,
-                GREATEST(
-                    similarity(LOWER(canonical_id), LOWER({cid})),
-                    CASE WHEN {name} <> '' THEN
-                        similarity(LOWER(COALESCE(properties->>'name','')), LOWER({name}))
-                    ELSE 0 END
-                ) AS trigram_score
-            FROM graph_nodes
-            WHERE label = {label}
-              AND node_id <> {self_id}
-              AND NOT EXISTS (
-                  SELECT 1 FROM entity_aliases ea
-                  WHERE ea.label = graph_nodes.label
-                    AND ea.alias_canonical_id = graph_nodes.canonical_id
-              )
-              AND (
-                  similarity(LOWER(canonical_id), LOWER({cid})) >= {floor}
-                  OR ({name} <> '' AND similarity(LOWER(COALESCE(properties->>'name','')), LOWER({name})) >= {floor})
-              )
-            ORDER BY trigram_score DESC
-            LIMIT {topk}
-) t), '[]'::json));
-"""
-
-
-def _rank(merged: dict[str, Candidate]) -> list[Candidate]:
-    """AutoMergeAnalyzer._find_candidates' final sort + cap, verbatim."""
-    ranked = sorted(
-        merged.values(),
-        key=lambda c: (
-            -(int(c.trigram_score is not None) + int(c.vector_distance is not None)),
-            -(c.trigram_score or 0.0),
-            c.vector_distance if c.vector_distance is not None else 1.0,
-        ),
-    )
-    return ranked[:TOTAL_CANDIDATE_CAP]
+# The analyzer's own trigram query text, with its $n parameters inlined as
+# escaped literals and each result wrapped as one JSON line.
+_TRIGRAM_SQL = (
+    "SELECT json_build_object('k', {k}, 'rows', COALESCE((SELECT json_agg(row_to_json(t)) FROM ("
+    + TRIGRAM_CANDIDATES_SQL.replace("$1", "{label}").replace("$2", "{cid}").replace("$3", "{name}")
+    .replace("$4", "{self_id}").replace("$5", "{floor}").replace("$6", "{topk}")
+    + ") t), '[]'::json));"
+)
 
 
 def _decision(did, stratum, customer, label, cid, cur, props, degree, hist, **extra) -> dict:
@@ -119,9 +85,14 @@ def _decision(did, stratum, customer, label, cid, cur, props, degree, hist, **ex
 
 def collect(
     customer: str, logged: Path | None, pr_pairs: int, unjudged: int, seed: int
-) -> tuple[list[dict], list[dict], list[dict]]:
+) -> tuple[list[dict], list[dict], list[dict], set]:
     rng = random.Random(seed)
     c = kb.lit(customer)
+    alias_rows = kb.rows(
+        "select row_to_json(t) from (select label, alias_canonical_id, primary_canonical_id "
+        f"from entity_aliases where customer_id = {c}) t"
+    )
+    aliases = {(a["label"], a["alias_canonical_id"]) for a in alias_rows}
     nodes = kb.rows(
         "select row_to_json(t) from (select node_id, label, canonical_id, properties->>'doc_type' doc_type, "
         "degree, updated_at, (embedding is not null) has_emb from graph_nodes "
@@ -201,9 +172,6 @@ def collect(
                  "confidence": r.get("confidence") if dup else None, "rationale": None,
                  "ts": r["timestamp"], "human": None},
             ))
-    aliases = {(a["label"], a["alias_canonical_id"]) for a in kb.rows(
-        f"select row_to_json(t) from (select label, alias_canonical_id from entity_aliases where customer_id = {c}) t"
-    )}
     pool = sorted(
         (n for n in nodes
          if (n["label"], n["canonical_id"]) not in touched and (n["label"], n["canonical_id"]) not in aliases
@@ -216,11 +184,8 @@ def collect(
             {"verdict": "unique?", "primary": None, "confidence": None, "rationale": None,
              "ts": n["updated_at"], "human": None},
         ))
-    graph += [{"a": a["alias_canonical_id"], "b": a["primary_canonical_id"], "why": "alias"} for a in kb.rows(
-        "select row_to_json(t) from (select alias_canonical_id, primary_canonical_id from entity_aliases "
-        f"where customer_id = {c}) t"
-    )]
-    return decisions, human, graph
+    graph += [{"a": a["alias_canonical_id"], "b": a["primary_canonical_id"], "why": "alias"} for a in alias_rows]
+    return decisions, human, graph, aliases
 
 
 def fill_properties(decisions: list[dict]) -> None:
@@ -260,11 +225,8 @@ def trigram_leg(decisions: list[dict], customer: str, cache: Path) -> dict[str, 
     return out
 
 
-def vector_leg(decisions: list[dict], customer: str) -> dict[str, list]:
+def vector_leg(decisions: list[dict], customer: str, aliases: set) -> dict[str, list]:
     """Exact cosine top-k per decision, same filters as the analyzer's SQL."""
-    aliases = {(a["label"], a["alias_canonical_id"]) for a in kb.rows(
-        f"select row_to_json(t) from (select label, alias_canonical_id from entity_aliases where customer_id = {kb.lit(customer)}) t"
-    )}
     out: dict[str, list] = {}
     for label in sorted({d["qlabel"] for d in decisions if d["has_emb"] and d["node_id"]}):
         ids, cids, vecs = [], [], []
@@ -311,7 +273,11 @@ def vector_leg(decisions: list[dict], customer: str) -> dict[str, list]:
 
 
 def assemble(decisions: list[dict], trgm: dict, vec: dict, customer: str) -> None:
-    need = sorted({r["node_id"] for rows in vec.values() for r in rows} - {r["node_id"] for rows in trgm.values() for r in rows})
+    # Properties for every candidate, from ANY decision's trigram rows or a
+    # fetch -- a node can be a trigram hit for one decision and vector-only
+    # for another, and must carry its real properties in both.
+    known: dict[int, dict] = {r["node_id"]: r for rows in trgm.values() for r in rows}
+    need = sorted({r["node_id"] for rows in vec.values() for r in rows} - set(known))
     extra: dict[int, dict] = {}
     for i in range(0, len(need), 300):
         ids = ",".join(str(x) for x in need[i : i + 300])
@@ -326,10 +292,12 @@ def assemble(decisions: list[dict], trgm: dict, vec: dict, customer: str) -> Non
             if r["canonical_id"] in merged:
                 merged[r["canonical_id"]].vector_distance = r["distance"]
                 continue
-            e = extra.get(r["node_id"], {})
-            merged[r["canonical_id"]] = Candidate(r["canonical_id"], e.get("properties") or {}, e.get("degree", 0), None, r["distance"])
+            e = known.get(r["node_id"]) or extra.get(r["node_id"]) or {}
+            p = e.get("properties")
+            p = p if isinstance(p, dict) else json.loads(p or "{}")
+            merged[r["canonical_id"]] = Candidate(r["canonical_id"], p, e.get("degree", 0), None, r["distance"])
         props = d["properties"] if isinstance(d["properties"], dict) else {}
-        d["candidates"] = [c.__dict__ for c in _rank(merged) if not _properties_conflict(props, c.properties)]
+        d["candidates"] = [c.__dict__ for c in rank_candidates(merged) if not _properties_conflict(props, c.properties)]
         d["mode"] = "rebuilt"
     # Put back stored primaries the rebuilt set no longer contains.
     missing = [d for d in decisions if d["hist"].get("primary") and d["hist"]["primary"] not in {c["canonical_id"] for c in d["candidates"]}]
@@ -372,12 +340,12 @@ def main() -> None:
     ap.add_argument("--max-decisions", type=int, help="random subset, for a cheap smoke run of the harness")
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
-    decisions, human, graph = collect(args.customer, args.logged, args.pr_pairs, args.unjudged, args.seed)
+    decisions, human, graph, aliases = collect(args.customer, args.logged, args.pr_pairs, args.unjudged, args.seed)
     if args.max_decisions:
         decisions = random.Random(args.seed).sample(decisions, min(args.max_decisions, len(decisions)))
     fill_properties(decisions)
     trgm = trigram_leg(decisions, args.customer, args.out / "trigram_cache.json")
-    assemble(decisions, trgm, vector_leg(decisions, args.customer), args.customer)
+    assemble(decisions, trgm, vector_leg(decisions, args.customer, aliases), args.customer)
     decisions = [d for d in decisions if d["candidates"]]
     kb.write_jsonl(args.out / "decisions.jsonl", decisions)
     kb.write_jsonl(args.out / "human_merges.jsonl", human)
@@ -391,4 +359,7 @@ if __name__ == "__main__":
     try:
         main()
     except subprocess.CalledProcessError as exc:
-        raise SystemExit(f"KB_PSQL failed: {exc.stderr[-500:]}") from exc
+        # First line only: psql's LINE/context lines echo the failing SQL,
+        # which carries tenant ids and names into the terminal.
+        first = next((ln for ln in (exc.stderr or "").splitlines() if ln.strip()), "no stderr")
+        raise SystemExit(f"KB_PSQL failed: {first[:200]}") from exc

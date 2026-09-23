@@ -144,7 +144,21 @@ email or login, a human-approved merge):
 Pairwise Noul looks safer but found 58 of the 107 verified duplicates against
 83 for the Choice, and its score cannot separate the one risky pair (0.80, while
 verified pairs go as low as 0.78). So the Choice stays, and the name-only class
-is handled by a deterministic rule instead.
+is handled by a deterministic gate instead.
+
+**The shipped gate.** A `high` answer (p ≥ 0.95) executes only when
+`jev_judge.execution_evidence` finds identity evidence the pair shares: an exact
+email or login (a login only within one source system) for people; for other
+labels also the same repo + PR/issue number, the same LEAF UUID (the last one in
+the id: sibling issues share their workspace UUID), the same id up to case and
+`-`/`_` (dots are kept: `v1.1` is not `v11`), or the same repo name with a
+compatible owner. Otherwise it is written as a suggestion. Re-scored on the
+frozen T7 set (463 decisions) with the production code: 82 auto-merges, 71
+verified by independent evidence, 11 people confirmed only by the shared
+email/login the gate itself requires (reported apart, never as "verified"), 0
+known false, 0 needing a human, 1 downgraded to a suggestion; `score.py` prints
+`ACCEPTANCE: PASS`. The tightened UUID and punctuation rules cost no merge on
+that set.
 
 **Two properties of the Choice probability to design around:**
 
@@ -160,4 +174,14 @@ is handled by a deterministic rule instead.
 
 `max_tokens_exceeded` is permanent for its input (same state, same answer), so
 `post_choice` raises `JevRequestTooLarge` and does not trip the breaker; string
-property values are trimmed at 500 characters before that can happen, keys never.
+property values are trimmed at 500 characters and lists at 50 items before that
+can happen, keys never (no replayed property held a list, so the list cap
+changes no measured request).
+
+**Failure classes.** 400/413/422 are refusals of one request
+(`JevRequestRejected`): the node is dropped from the queue as an error. Every
+other non-200 -- 401/403 (a revoked key), 404 (a retired model or wrong URL),
+408, 429, 5xx -- and any malformed answer counts against `MERGE_BREAKER` and
+DEFERS the node (5 min doubling to 1 h, parked after 12). An answer naming a
+model other than `AUTO_MERGE_JEV_MODEL` may suggest but never auto-merges: the
+bands were measured on that model.

@@ -11,6 +11,9 @@ Salts in production:
                         around the custom-ingest door's read-then-write.
     leiden-community  : per-customer lock the Leiden cron takes around a
                         community-detection pass.
+    entity-merge      : per-(customer, label) lock merge_cluster takes so
+                        concurrent merges cannot fold two nodes into each
+                        other.
 
 Stable across processes — same input bytes always hash to the same
 bigint, so locks work cluster-wide without coordination beyond the DB.

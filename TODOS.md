@@ -57,8 +57,21 @@ enqueue only those.
 On the managed plane one Person node proposed the same merge 18 times in 81
 minutes; every attempt failed `merge_cluster` with "one or more aliases already
 belong to a cluster" because the node is already an alias in another cluster.
-The analyzer should resolve an already-clustered node or candidate to its
-primary before proposing a merge, or skip it. Judge-independent.
+A failed merge is now kept as a (deduplicated) suggestion instead of an error,
+but the judge call is still repeated. The analyzer should resolve an
+already-clustered node or candidate to its primary before proposing a merge, or
+skip it. Judge-independent.
+
+### Alias routing is one hop, so a merge chain strands its inner aliases
+**Where:** `engine/ingest/graph_writer.py` (`_fetch_aliases`),
+`engine/ingest/entity_clusters_routes.py` (`merge_cluster`, unmerge).
+
+Merging `b` (itself the primary of `a`) into `c` leaves `a → b` routing to a
+deleted node, so the next upsert of `a` recreates `b` as a stray copy.
+Auto-merge refuses this (`refuse_cluster_primaries`), but a human merge can
+still build the chain, and unmerge does not take the per-(tenant, label) merge
+lock. **Fix:** re-point a folded primary's aliases in the same transaction (or
+resolve routing transitively), and take the lock in unmerge too.
 
 ### Auto-merge vector leg is an exact scan (~19.5 s CPU per Document)
 **Where:** `engine/ingest/auto_merge/analyzer.py` (`_find_candidates`, vector path).

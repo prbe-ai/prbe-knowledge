@@ -12,6 +12,7 @@ import types
 import uuid
 
 import pytest
+from fastapi import HTTPException
 
 from engine.ingest.auto_merge import analyzer as az
 from engine.ingest.auto_merge.analyzer import (
@@ -22,11 +23,20 @@ from engine.ingest.auto_merge.analyzer import (
 )
 from engine.ingest.auto_merge.jev_judge import Judgment
 from engine.ingest.auto_merge.models import AutoMergeVerdict
-from engine.retrieval.agent.jev import JevBreakerOpen, JevError, JevRequestTooLarge
+from engine.retrieval.agent import jev
+from engine.retrieval.agent.jev import (
+    JevBreakerOpen,
+    JevError,
+    JevRequestRejected,
+    JevRequestTooLarge,
+)
+from engine.shared import constants
 from engine.shared.constants import (
+    AUTO_MERGE_BREAKER_JITTER_SECONDS,
     AUTO_MERGE_RETRY_SECONDS,
-    JEV_BREAKER_SECONDS,
+    JEV_BREAKER_FAILURES,
     SEARCH_AGENT_INFERENCE_MODEL,
+    AutoMergeJudge,
 )
 from engine.shared.llm import LLMError
 
@@ -223,7 +233,7 @@ PERSON_NODE = {
     "node_id": 8,
     "label": "Person",
     "canonical_id": "ada-gh",
-    "properties": {"name": "Ada Lovelace", "login": "ada-gh"},
+    "properties": {"name": "Ada Lovelace", "login": "ada-gh", "source_system": "github"},
     "degree": 1,
     "has_embedding": True,
 }
@@ -253,7 +263,7 @@ def _verdict(primary: str | None, confidence: str | None) -> AutoMergeVerdict:
     )
 
 
-def _analyzer(monkeypatch, node, cands, *, judgment=None, raises=None, execute=True):
+def _analyzer(monkeypatch, node, cands, *, judgment=None, raises=None, execute=True, merge_raises=None):
     a = az.AutoMergeAnalyzer(execute_high_confidence=execute)
 
     async def load(conn, node_id):
@@ -271,6 +281,8 @@ def _analyzer(monkeypatch, node, cands, *, judgment=None, raises=None, execute=T
 
     async def fake_merge(body):
         merges.append(body)
+        if merge_raises is not None:
+            raise merge_raises
         return types.SimpleNamespace(merge_id=uuid.uuid4())
 
     monkeypatch.setattr(a, "_load_node", load)
@@ -293,7 +305,38 @@ async def test_high_merges_and_the_audit_reason_names_the_judge(monkeypatch, mod
     assert body.alias_canonical_ids == ["github:acme/widgets:pr:12"]
     expected_p = " p=0.99" if p is not None else ""
     assert body.reason == f"auto: model={model} confidence=high{expected_p} rationale=same repo and number"
+    # A re-upserted cluster primary must not be folded in (its aliases would
+    # route to a deleted node): merge_cluster enforces it under its lock.
+    assert body.refuse_cluster_primaries is True
     assert conn.suggestions == []
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        HTTPException(status_code=409, detail={"error": "one or more aliases are the primary of a cluster"}),
+        RuntimeError("statement timeout"),
+    ],
+)
+async def test_a_failed_merge_is_kept_as_a_high_suggestion(monkeypatch, exc):
+    j = Judgment(verdict=_verdict("acme/widgets#12", "high"), model="jev-1.13.0", p=0.99)
+    a, merges = _analyzer(monkeypatch, PR_NODE, PR_CANDS, judgment=j, merge_raises=exc)
+    conn = FakeConn()
+    result = await a.analyze(conn, "acme-test", 7)
+    assert len(merges) == 1
+    assert result.action == "suggested"
+    (row,) = conn.suggestions
+    assert row[2:5] == ("acme/widgets#12", "github:acme/widgets:pr:12", "high")
+
+
+async def test_a_merge_whose_node_is_already_gone_is_an_error_not_a_suggestion(monkeypatch):
+    # 404: a concurrent merge folded one side first (often the twin, the other
+    # way round). There is no pair left to review.
+    j = Judgment(verdict=_verdict("acme/widgets#12", "high"), model="jev-1.13.0", p=0.99)
+    a, _ = _analyzer(monkeypatch, PR_NODE, PR_CANDS, judgment=j, merge_raises=HTTPException(status_code=404))
+    conn = FakeConn()
+    result = await a.analyze(conn, "acme-test", 7)
+    assert result.action == "error" and conn.suggestions == []
 
 
 @pytest.mark.parametrize(("model", "p"), JUDGES)
@@ -352,7 +395,8 @@ async def test_person_on_a_name_alone_is_a_suggestion_not_a_merge(monkeypatch, m
 
 @pytest.mark.parametrize(("model", "p"), JUDGES)
 async def test_person_with_a_shared_login_merges(monkeypatch, model, p):
-    cands = [Candidate("ada@example.com", {"name": "Ada Lovelace", "login": "ADA-GH"}, 4, 0.4, 0.05)]
+    cands = [Candidate("ada@example.com", {"name": "Ada Lovelace", "login": "ADA-GH", "source_system": "github"},
+                       4, 0.4, 0.05)]
     j = Judgment(verdict=_verdict("ada@example.com", "high"), model=model, p=p)
     a, merges = _analyzer(monkeypatch, PERSON_NODE, cands, judgment=j)
     result = await a.analyze(FakeConn(), "acme-test", 8)
@@ -360,26 +404,73 @@ async def test_person_with_a_shared_login_merges(monkeypatch, model, p):
     assert merges[0].primary_canonical_id == "ada@example.com"
 
 
-async def test_open_breaker_defers_without_spending_an_attempt(monkeypatch):
-    a, merges = _analyzer(monkeypatch, PR_NODE, PR_CANDS, raises=JevBreakerOpen("breaker_open"))
+@pytest.mark.parametrize(("model", "p"), JUDGES)
+async def test_a_login_from_another_source_system_is_not_identity(monkeypatch, model, p):
+    # A GitHub login can collide with an opaque id from elsewhere (a Slack user
+    # id is also a short token): a login only counts within one source system.
+    node = dict(PERSON_NODE, canonical_id="u012abcdef",
+                properties={"name": "Ada", "login": "u012abcdef", "source_system": "github"})
+    cands = [Candidate("U012ABCDEF", {"name": "Ada", "source_system": "slack"}, 4, 1.0, 0.05)]
+    j = Judgment(verdict=_verdict("U012ABCDEF", "high"), model=model, p=p)
+    a, merges = _analyzer(monkeypatch, node, cands, judgment=j)
+    result = await a.analyze(FakeConn(), "acme-test", 8)
+    assert result.action == "suggested" and merges == []
+
+
+@pytest.mark.parametrize(("model", "p"), JUDGES)
+async def test_document_without_id_evidence_is_a_suggestion_not_a_merge(monkeypatch, model, p):
+    # Two different pages the judge is sure about: no shared id, so no auto-merge.
+    node = dict(PR_NODE, canonical_id="notion:page:1111", properties={"title": "Q3 plan"})
+    cands = [Candidate("notion:page:2222", {"title": "Q3 plan"}, 2, 0.9, 0.01)]
+    j = Judgment(verdict=_verdict("notion:page:2222", "high"), model=model, p=p)
+    a, merges = _analyzer(monkeypatch, node, cands, judgment=j)
+    conn = FakeConn()
+    result = await a.analyze(conn, "acme-test", 7)
+    assert result.action == "suggested" and merges == []
+    assert conn.suggestions[0][4] == "medium"
+
+
+async def test_open_breaker_defers_before_the_candidate_search(monkeypatch):
+    a, merges = _analyzer(monkeypatch, PR_NODE, PR_CANDS, raises=AssertionError("judge must not run"))
+
+    async def no_search(conn, n):
+        raise AssertionError("an open breaker must not pay for the candidate search")
+
+    monkeypatch.setattr(a, "_find_candidates", no_search)
+    monkeypatch.setattr(az, "get_settings", lambda: types.SimpleNamespace(typesafe_api_key="k"))
+    monkeypatch.setattr(az, "AUTO_MERGE_JUDGE", AutoMergeJudge.JEV)
+    breaker = jev.Breaker()
+    for _ in range(JEV_BREAKER_FAILURES):
+        breaker.failure()
+    monkeypatch.setattr(az, "MERGE_BREAKER", breaker)
     result = await a.analyze(FakeConn(), "acme-test", 7)
     assert result.action == "deferred"
-    assert result.spend_attempt is False
-    assert result.retry_after_seconds == int(JEV_BREAKER_SECONDS * 2)
+    assert 1 <= result.retry_after_seconds <= breaker.seconds_until_closed() + 1 + AUTO_MERGE_BREAKER_JITTER_SECONDS
     assert merges == []
 
 
-async def test_jev_outage_defers_and_spends_an_attempt(monkeypatch):
+async def test_breaker_opening_mid_call_defers(monkeypatch):
+    a, merges = _analyzer(monkeypatch, PR_NODE, PR_CANDS, raises=JevBreakerOpen("breaker_open"))
+    result = await a.analyze(FakeConn(), "acme-test", 7)
+    assert result.action == "deferred"
+    assert result.retry_after_seconds >= 1
+    assert merges == []
+
+
+async def test_jev_outage_defers(monkeypatch):
     a, merges = _analyzer(monkeypatch, PR_NODE, PR_CANDS, raises=JevError("ReadTimeout: <empty>"))
     result = await a.analyze(FakeConn(), "acme-test", 7)
     assert result.action == "deferred"
-    assert result.spend_attempt is True
     assert result.retry_after_seconds == AUTO_MERGE_RETRY_SECONDS
     assert merges == []
 
 
-async def test_oversize_request_is_an_error_not_a_retry(monkeypatch):
-    a, _ = _analyzer(monkeypatch, PR_NODE, PR_CANDS, raises=JevRequestTooLarge("http_400:max_tokens_exceeded"))
+@pytest.mark.parametrize(
+    "exc",
+    [JevRequestTooLarge("http_400:max_tokens_exceeded"), JevRequestRejected("http_422:validation_error")],
+)
+async def test_permanent_request_failures_are_errors_not_retries(monkeypatch, exc):
+    a, _ = _analyzer(monkeypatch, PR_NODE, PR_CANDS, raises=exc)
     result = await a.analyze(FakeConn(), "acme-test", 7)
     assert result.action == "error"
 
@@ -407,7 +498,7 @@ async def test_rollback_switch_runs_the_gptoss_path_unchanged(monkeypatch):
         return _gptoss_response({"verdict": "duplicate", "primary_canonical_id": "acme/widgets#12",
                                  "confidence": "high", "rationale": "same PR"})
 
-    monkeypatch.setattr(az, "AUTO_MERGE_JUDGE", "gptoss")
+    monkeypatch.setattr(az, "AUTO_MERGE_JUDGE", AutoMergeJudge.GPTOSS)
     monkeypatch.setattr(az, "acompletion", fake_acompletion)
     monkeypatch.setattr(az.jev_judge, "judge", lambda *a, **k: pytest.fail("Jev must not be called"))
     judgment = await az.AutoMergeAnalyzer()._judge(PR_NODE, PR_CANDS)
@@ -431,7 +522,7 @@ async def test_jev_is_the_default_judge(monkeypatch):
         seen.update(node=node, n=len(candidates), api_key=api_key)
         return Judgment(verdict=_verdict(None, None), model="jev-1.13.0", p=0.9)
 
-    monkeypatch.setattr(az, "AUTO_MERGE_JUDGE", "jev")
+    monkeypatch.setattr(az, "AUTO_MERGE_JUDGE", AutoMergeJudge.JEV)
     monkeypatch.setattr(az, "get_settings", lambda: types.SimpleNamespace(typesafe_api_key="k-test"))
     monkeypatch.setattr(az.jev_judge, "judge", fake_judge)
     monkeypatch.setattr(az, "acompletion", lambda **k: pytest.fail("gpt-oss must not be called"))
@@ -445,12 +536,20 @@ async def test_missing_key_falls_back_to_gptoss_and_warns_once(monkeypatch):
         return _gptoss_response({"verdict": "unique", "rationale": "no"})
 
     warnings: list = []
-    monkeypatch.setattr(az, "AUTO_MERGE_JUDGE", "jev")
+    monkeypatch.setattr(az, "AUTO_MERGE_JUDGE", AutoMergeJudge.JEV)
     monkeypatch.setattr(az, "get_settings", lambda: types.SimpleNamespace(typesafe_api_key=""))
     monkeypatch.setattr(az, "acompletion", fake_acompletion)
-    monkeypatch.setattr(az, "_jev_unconfigured_logged", False)
     monkeypatch.setattr(az.log, "warning", lambda event, **kw: warnings.append(event))
-    for _ in range(3):
-        judgment = await az.AutoMergeAnalyzer()._judge(PR_NODE, PR_CANDS)
-        assert judgment.model == SEARCH_AGENT_INFERENCE_MODEL
+    az._warn_jev_unconfigured.cache_clear()
+    try:
+        for _ in range(3):
+            judgment = await az.AutoMergeAnalyzer()._judge(PR_NODE, PR_CANDS)
+            assert judgment.model == SEARCH_AGENT_INFERENCE_MODEL
+    finally:
+        az._warn_jev_unconfigured.cache_clear()
     assert warnings == ["auto_merge.jev_unconfigured"]
+
+
+def test_the_shipped_judge_is_jev():
+    # The other tests set the switch explicitly; this pins what ships.
+    assert constants.AUTO_MERGE_JUDGE is AutoMergeJudge.JEV

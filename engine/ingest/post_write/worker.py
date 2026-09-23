@@ -8,24 +8,24 @@ Lifecycle of a queued row::
 
   PostWriteWorker._claim_loop polls:
     SELECT (customer_id, node_id) FROM node_post_write_queue
-    WHERE (locked_until IS NULL)
-      AND ((analyzer_status->'auto_merge'->>'attempts')::int < 3
-           OR analyzer_status->'auto_merge'->>'attempts' IS NULL)
-    FOR UPDATE SKIP LOCKED LIMIT 1
+    WHERE (locked_until IS NULL OR locked_until < NOW())
+      AND COALESCE((analyzer_status->'auto_merge'->>'attempts')::int, 0) < 3
+    ORDER BY enqueued_at FOR UPDATE SKIP LOCKED LIMIT 1
     UPDATE SET locked_until = NOW() + INTERVAL '5 minutes'
 
-  Process:
-    1. Embed the node text via GeminiEmbedder if graph_nodes.embedding IS NULL
-    2. Run AutoMergeAnalyzer.analyze(); honor per-customer auto_merge_execute
-       toggle if/when added (default suggestion-only for safety in v1)
+  Process (two transactions -- see _process):
+    1. Embed the node text via GeminiEmbedder if graph_nodes.embedding IS NULL,
+       and drain pending edges waiting on this node   [tx 1, committed]
+    2. Run AutoMergeAnalyzer.analyze()                   [tx 2]
 
   On success: DELETE FROM node_post_write_queue WHERE (customer_id, node_id) = (...)
   On failure: clear locked_until, bump attempts in analyzer_status JSONB; if
               attempts hit 3 the WHERE clause stops picking it back up.
   On deferral (the judge was unreachable, action="deferred"): KEEP the row and
-              push locked_until into the future; the claim query reclaims it
-              once that passes. A failed call bumps attempts; an open breaker
-              (nothing sent) does not.
+              push locked_until into the future (the claim query reclaims it
+              once that passes), doubling per consecutive deferral. An outage
+              does NOT spend the 3 attempts; after AUTO_MERGE_MAX_DEFERRALS in a
+              row the row is parked as failed, visible with its last error.
 
 Concurrency: 16 tasks per process (POST_WRITE_CONCURRENCY env var).
 Runs alongside InferredEdgesWorker — both pull from independent queues
@@ -46,6 +46,11 @@ import asyncpg
 from engine.ingest.auto_merge import AutoMergeAnalyzer
 from engine.ingest.graph_writer import drain_pending_edges, reap_expired_pending_edges
 from engine.ingest.normalizer import _pg_vector
+from engine.shared.constants import (
+    AUTO_MERGE_MAX_DEFERRALS,
+    AUTO_MERGE_RETRY_MAX_SECONDS,
+    AUTO_MERGE_RETRY_SECONDS,
+)
 from engine.shared.db import raw_conn, with_tenant
 from engine.shared.embeddings import get_embedder_v2
 from engine.shared.logging import get_logger
@@ -183,21 +188,12 @@ class PostWriteWorker:
                 p=result.p,
             )
             if result.action == "deferred":
-                attempts = int(status.get("auto_merge", {}).get("attempts", 0))
-                if result.spend_attempt:
-                    attempts += 1
-                await self._defer(
-                    customer_id,
-                    node_id,
-                    attempts,
-                    result.error or "judge unavailable",
-                    delay_seconds=(result.retry_after_seconds or 60) * max(1, attempts),
-                )
+                await self._defer(customer_id, node_id, status, result)
                 return
             await self._delete_queue_row(customer_id, node_id)
 
         except Exception as exc:
-            attempts = int(status.get("auto_merge", {}).get("attempts", 0)) + 1
+            attempts = _auto_merge_status(status).get("attempts", 0) + 1
             log.exception(
                 "post_write_worker.process_failed",
                 customer=customer_id,
@@ -224,11 +220,15 @@ class PostWriteWorker:
         if row is None:
             return
         try:
-            await drain_pending_edges(
-                conn, customer_id, row["label"], row["canonical_id"]
-            )
-            # Opportunistic TTL sweep for this tenant -- no separate cron.
-            await reap_expired_pending_edges(conn, customer_id)
+            # A SAVEPOINT, so a failed drain rolls back only itself. Without it
+            # the error aborts the whole transaction, which then rolls back the
+            # embedding written just before -- silently, since this is caught.
+            async with conn.transaction():
+                await drain_pending_edges(
+                    conn, customer_id, row["label"], row["canonical_id"]
+                )
+                # Opportunistic TTL sweep for this tenant -- no separate cron.
+                await reap_expired_pending_edges(conn, customer_id)
         except Exception as exc:
             log.warning(
                 "post_write_worker.drain_pending_edges_failed",
@@ -292,33 +292,69 @@ class PostWriteWorker:
         self,
         customer_id: str,
         node_id: int,
-        attempts: int,
-        error: str,
-        *,
-        delay_seconds: int,
+        status: dict,
+        result,
     ) -> None:
-        """Keep the row; make it claimable again only after `delay_seconds`.
+        """Keep the row; make it claimable again only after a backoff.
 
         The claim query reclaims rows whose `locked_until` has passed, so a
-        future lock IS the retry schedule. `attempts` still caps it: a node
-        whose judge call keeps failing parks after _MAX_ATTEMPTS, visible in
-        the queue with its last error, instead of retrying forever.
+        future lock IS the retry schedule. Deferrals double from the
+        analyzer's base delay up to AUTO_MERGE_RETRY_MAX_SECONDS and do not
+        touch `attempts` -- an outage is not this node's fault. After
+        AUTO_MERGE_MAX_DEFERRALS in a row the row is parked (attempts set to
+        the cap, status "failed") so a judge that never recovers cannot keep a
+        node cycling forever. A new upsert of the node resets all of this.
         """
-        new_status = json.dumps(
-            {"auto_merge": {"status": "deferred", "attempts": attempts, "last_error": error[:240]}}
+        prev = _auto_merge_status(status)
+        deferrals = prev.get("deferrals", 0) + 1
+        error = (result.error or "judge unavailable")[:240]
+        if deferrals > AUTO_MERGE_MAX_DEFERRALS:
+            log.warning(
+                "post_write_worker.deferral_cap_reached",
+                customer=customer_id,
+                node_id=node_id,
+                deferrals=deferrals - 1,
+                error=error,
+            )
+            await self._write_status(
+                customer_id,
+                node_id,
+                {"status": "failed", "attempts": _MAX_ATTEMPTS, "deferrals": deferrals - 1, "last_error": error},
+                delay_seconds=None,
+            )
+            return
+        base = result.retry_after_seconds or AUTO_MERGE_RETRY_SECONDS
+        delay = min(base * 2 ** (deferrals - 1), AUTO_MERGE_RETRY_MAX_SECONDS)
+        await self._write_status(
+            customer_id,
+            node_id,
+            {"status": "deferred", "attempts": prev.get("attempts", 0), "deferrals": deferrals, "last_error": error},
+            delay_seconds=delay,
         )
+
+    async def _write_status(
+        self,
+        customer_id: str,
+        node_id: int,
+        auto_merge_status: dict,
+        *,
+        delay_seconds: float | None,
+    ) -> None:
+        """Set analyzer_status.auto_merge and the lock: NULL (claimable now) or
+        NOW() + delay (claimable after it)."""
         async with raw_conn() as conn:
             await conn.execute(
                 """
                 UPDATE node_post_write_queue
-                SET locked_until = NOW() + make_interval(secs => $3),
+                SET locked_until = CASE WHEN $3::float8 IS NULL THEN NULL
+                                        ELSE NOW() + make_interval(secs => $3::float8) END,
                     analyzer_status = $4::jsonb
                 WHERE customer_id = $1 AND node_id = $2
                 """,
                 customer_id,
                 node_id,
-                float(delay_seconds),
-                new_status,
+                None if delay_seconds is None else float(delay_seconds),
+                json.dumps({"auto_merge": auto_merge_status}),
             )
 
     async def _record_failure(
@@ -331,21 +367,18 @@ class PostWriteWorker:
         # Clear lock so the row CAN be re-tried, but bump attempts. When
         # attempts hits _MAX_ATTEMPTS, the claim WHERE clause stops picking
         # it back up — row stays in queue for visibility but won't process.
-        new_status = json.dumps(
-            {"auto_merge": {"status": "failed", "attempts": attempts, "last_error": error[:240]}}
+        await self._write_status(
+            customer_id,
+            node_id,
+            {"status": "failed", "attempts": attempts, "last_error": error[:240]},
+            delay_seconds=None,
         )
-        async with raw_conn() as conn:
-            await conn.execute(
-                """
-                UPDATE node_post_write_queue
-                SET locked_until = NULL,
-                    analyzer_status = $3::jsonb
-                WHERE customer_id = $1 AND node_id = $2
-                """,
-                customer_id,
-                node_id,
-                new_status,
-            )
+
+
+def _auto_merge_status(status: dict) -> dict:
+    """analyzer_status["auto_merge"] with integer counters (0 when absent)."""
+    raw = status.get("auto_merge") or {}
+    return {**raw, "attempts": int(raw.get("attempts", 0)), "deferrals": int(raw.get("deferrals", 0))}
 
 
 # --------------------------------------------------------------------------- #

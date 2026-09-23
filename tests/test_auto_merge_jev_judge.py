@@ -109,6 +109,14 @@ def test_long_string_values_are_trimmed_but_every_key_survives():
     assert out["nested"]["note"].endswith("…")
 
 
+def test_long_lists_keep_a_bounded_prefix_and_say_how_many_were_cut():
+    out = jj.trim_values({"members": [f"u{i}" for i in range(jj.MAX_LIST_ITEMS + 7)]})
+    assert out["members"][: jj.MAX_LIST_ITEMS] == [f"u{i}" for i in range(jj.MAX_LIST_ITEMS)]
+    assert out["members"][-1] == "… 7 more"
+    assert len(out["members"]) == jj.MAX_LIST_ITEMS + 1
+    assert jj.trim_values(["a", "b"]) == ["a", "b"]
+
+
 def test_request_trims_both_sides():
     node = dict(NODE, properties={"email": "ada@example.com", "bio": "y" * 5000})
     cand = Cand("c", {"description": "z" * 5000})
@@ -125,10 +133,10 @@ _, _, KEYS = jj.build_request(NODE, CANDS)
 
 
 def test_none_of_these_is_unique():
-    verdict, p = jj.verdict_from_answer(_answer(jj.NONE_OF_THESE, 0.91), KEYS, NODE)
-    assert verdict.verdict == "unique"
-    assert verdict.primary_canonical_id is None
-    assert p == 0.91
+    j = jj.verdict_from_answer(_answer(jj.NONE_OF_THESE, 0.91), KEYS, NODE)
+    assert j.verdict.verdict == "unique"
+    assert j.verdict.primary_canonical_id is None
+    assert (j.p, j.model) == (0.91, "jev-1.13.0")
 
 
 @pytest.mark.parametrize(
@@ -143,13 +151,21 @@ def test_none_of_these_is_unique():
     ],
 )
 def test_probability_bands(p, verdict, confidence):
-    v, got_p = jj.verdict_from_answer(_answer("c0", p), KEYS, NODE)
+    j = jj.verdict_from_answer(_answer("c0", p), KEYS, NODE)
+    v = j.verdict
     assert v.verdict == verdict
     assert v.confidence == confidence
-    assert got_p == p
+    assert j.p == p
     if verdict == "duplicate":
         assert v.primary_canonical_id == "ada@example.com"
     assert len(v.rationale) <= 240
+
+
+def test_an_answer_from_another_model_never_auto_merges():
+    # The bands were measured on AUTO_MERGE_JEV_MODEL; a server that answers
+    # with a different model gets a suggestion at most.
+    j = jj.verdict_from_answer(_answer("c0", 0.99, model="jev-2.0.0"), KEYS, NODE)
+    assert (j.verdict.verdict, j.verdict.confidence, j.model) == ("duplicate", "medium", "jev-2.0.0")
 
 
 def test_bands_are_the_reviewed_values():
@@ -161,13 +177,22 @@ def test_bands_are_the_reviewed_values():
 # --------------------------------------------------------------------------- #
 
 
+GH = {"source_system": "github"}
+WS = "11111111-2222-4333-8444-555555555555"
+
+
 @pytest.mark.parametrize(
     ("a", "pa", "b", "pb", "expect"),
     [
         ("x", {"email": "Ada@Example.com"}, "y", {"email": "ada@example.com "}, "shared email Ada@Example.com"),
-        ("x", {"login": "ada-gh"}, "y", {"login": "ADA-GH"}, "shared handle ada-gh"),
-        ("ada-gh", {}, "y", {"login": "ada-gh"}, "login ada-gh is the other entity's id"),
         ("ada@example.com", {}, "y", {"email": "ada@example.com"}, "email ada@example.com is the other entity's id"),
+        ("x", {"login": "ada-gh", **GH}, "y", {"login": "ADA-GH", **GH}, "shared handle ada-gh"),
+        ("ada-gh", GH, "y", {"login": "ada-gh", **GH}, "login ada-gh is the other entity's id"),
+        # A login is only an identifier within one source system: a GitHub
+        # login can equal an opaque id from somewhere else.
+        ("U012ABCDEF", {"source_system": "slack"}, "y", {"login": "u012abcdef", **GH}, None),
+        ("x", {"login": "ada-gh"}, "y", {"login": "ada-gh"}, None),  # source system unknown
+        ("x", {"login": "ada-gh", **GH}, "y", {"login": "ada-gh", "source_system": "slack"}, None),
         ("x", {"name": "Ada Lovelace"}, "y", {"name": "Ada Lovelace"}, None),  # a name is not an identifier
         ("x", {"email": ""}, "y", {"email": ""}, None),
         ("x", {"email": None}, "y", {}, None),
@@ -176,6 +201,39 @@ def test_bands_are_the_reviewed_values():
 )
 def test_shared_identifier(a, pa, b, pb, expect):
     assert jj.shared_identifier(a, pa, b, pb) == expect
+
+
+@pytest.mark.parametrize(
+    ("label", "a", "pa", "b", "pb", "has_evidence"),
+    [
+        ("Document", "github:acme/widgets:pr:12", {}, "acme/widgets#12", {}, True),
+        ("Document", "github:acme/widgets:pr:12", {}, "acme/widgets#13", {}, False),
+        ("Document", "linear:ws:issue:0f8fad5b-d9cb-469f-a165-70867728950e", {},
+         "0f8fad5b-d9cb-469f-a165-70867728950e", {}, True),
+        ("Document", "acme_widget_tool", {}, "acme-widget-tool", {}, True),
+        ("Document", "acme/acme-widgets", {}, "acme-widgets", {}, True),
+        ("Document", "wiki:repo:acme_widgets", {}, "acme/acme-widgets", {}, True),
+        ("Document", "alice/utils", {}, "bob/utils", {}, False),  # same name, different owners
+        ("Document", "alice-x/utils", {}, "alice/x-utils", {}, False),  # same letters, different segments
+        ("Document", "notion:page:1", {"title": "Plan"}, "notion:page:2", {"title": "Plan"}, False),
+        # Only the LEAF uuid is the entity's own: sibling issues share their
+        # workspace uuid.
+        ("Document", f"linear:{WS}:issue:0f8fad5b-d9cb-469f-a165-70867728950e", {},
+         f"linear:{WS}:issue:2c1b9f4e-7a3d-4e21-9b8a-5d6f7e8a9b0c", {}, False),
+        ("Document", f"linear:{WS}:issue:0f8fad5b-d9cb-469f-a165-70867728950e", {},
+         f"linear:{WS}:issue:0f8fad5b-d9cb-469f-a165-70867728950e:comment", {}, True),
+        # Case and -/_ fold; dots and run-together letters do not.
+        ("Document", "Acme-Widgets", {}, "acme_widgets", {}, True),
+        ("Document", "model-v1.1", {}, "model-v11", {}, False),
+        ("Document", "acme-widget", {}, "acmewidget", {}, False),
+        ("Person", "ada-gh", GH, "ada@example.com", {"login": "ada-gh", **GH}, True),
+        ("Person", "U1", {"name": "Ada"}, "U2", {"name": "Ada"}, False),
+        # People need a shared email/login: id look-alikes are not enough.
+        ("Person", "acme_widget_tool", {}, "acme-widget-tool", {}, False),
+    ],
+)
+def test_execution_evidence(label, a, pa, b, pb, has_evidence):
+    assert (jj.execution_evidence(label, a, pa, b, pb) is not None) == has_evidence
 
 
 # --------------------------------------------------------------------------- #
@@ -200,7 +258,7 @@ def _t(a, pa, b, pb, tri=None, vec=None, p=None):
         ),
         ("github:acme/widgets:pr:12", {}, "acme/widgets#12", {}, "same repo acme/widgets and number 12"),
         ("github:acme/widgets:issue:3", {}, "acme/widgets#3", {}, "same repo acme/widgets and number 3"),
-        ("acme_widget_tool", {}, "acme-widget-tool", {}, "ids equal ignoring punctuation"),
+        ("acme_widget_tool", {}, "acme-widget-tool", {}, "ids equal ignoring case and -/_"),
         ("acme-widgets", {}, "acme/acme-widgets", {}, "same repo name once owner/wiki prefix"),
         ("wiki:repo:acme_widgets", {}, "acme/acme-widgets", {}, "same repo name once owner/wiki prefix"),
         ("U123", {"name": "Ada Lovelace"}, "U456", {"display_name": "Ada  Lovelace"}, 'same name "Ada Lovelace"'),
@@ -229,6 +287,17 @@ def test_template_is_capped_at_240():
 # --------------------------------------------------------------------------- #
 # judge(): one call, end to end over a MockTransport
 # --------------------------------------------------------------------------- #
+
+
+async def test_candidates_too_long_to_be_a_primary_are_never_offered():
+    too_long = Cand("x" * (jj.MAX_PRIMARY_ID_CHARS + 1), {"email": "ada@example.com"})
+
+    def handler(req: httpx.Request):
+        pytest.fail("nothing left to ask about")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        judgment = await jj.judge(NODE, [too_long], api_key="k", client=client)
+    assert judgment.verdict.verdict == "unique"
 
 
 async def test_judge_sends_the_pinned_model_and_returns_the_answering_model():

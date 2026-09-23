@@ -9,7 +9,9 @@ psql against the kb database and read SQL on stdin, e.g. (managed plane):
 `-A -t` matters: every query here prints one JSON document per line.
 
 Safety: each session opens with `SET default_transaction_read_only = on`, so
-a write fails loudly. Queries that must see what production sees run under
+a write fails loudly. That is a session setting, not a permission: prefer a
+role that CANNOT write (e.g. one granted pg_read_all_data) or a read replica
+over the postgres superuser when your platform offers one. Queries that must see what production sees run under
 `SET ROLE <app role>` + the tenant GUC, i.e. with the same row-level security.
 """
 
@@ -33,7 +35,12 @@ def _cmd() -> list[str]:
 
 
 def run(sql: str, *, timeout_s: int = 120) -> str:
-    prefix = f"SET default_transaction_read_only = on; SET statement_timeout = '{timeout_s}s';\n"
+    # standard_conforming_strings keeps lit()'s quote-doubling the ONLY escape
+    # rule, so a backslash in tenant text cannot end a literal.
+    prefix = (
+        "SET default_transaction_read_only = on; SET standard_conforming_strings = on; "
+        f"SET statement_timeout = '{timeout_s}s';\n"
+    )
     out = subprocess.run(
         [*_cmd(), "-v", "ON_ERROR_STOP=1", "-f", "-"],
         input=prefix + sql,

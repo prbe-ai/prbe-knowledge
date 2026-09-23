@@ -12,6 +12,10 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+#: One cap for the rationale everywhere: this model, the templated Jev
+#: rationale, and the entity_merge_suggestions insert.
+RATIONALE_MAX_CHARS = 240
+
 
 class AutoMergeVerdict(BaseModel):
     """LLM's verdict on whether a primary entity is the same as one of N candidates.
@@ -46,6 +50,6 @@ class AutoMergeVerdict(BaseModel):
     )
     rationale: str = Field(
         ...,
-        max_length=240,
+        max_length=RATIONALE_MAX_CHARS,
         description="One-sentence reason (~30 words). Name the shared signal.",
     )

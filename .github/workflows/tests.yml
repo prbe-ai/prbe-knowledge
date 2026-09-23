@@ -227,9 +227,11 @@ jobs:
       #
       # The three test_auto_merge_* files cover entity auto-merge, which on the
       # managed plane EXECUTES real merges: the Jev judge's request and verdict
-      # bands, the Person shared-identifier guard, the gpt-oss rollback path,
-      # and (live) ingest -> queue -> worker -> merge on real Postgres, including
-      # the deferral that keeps a node queued through a Jev outage.
+      # bands, the execution-evidence gate, the gpt-oss rollback path, and
+      # (live) ingest -> queue -> worker -> merge on real Postgres, including
+      # the deferral that keeps a node queued through a Jev outage and the
+      # per-(tenant, label) merge lock. test_entity_clusters_routes covers the
+      # merge transaction itself (merge_cluster), which auto-merge calls.
       # NEVER put a `#` comment INSIDE the folded `run: >-`
       # scalar below: YAML folds it into one line and the first `#` comments
       # out every path after it -- CI stays green and runs none of them.
@@ -266,6 +268,7 @@ jobs:
           tests/test_auto_merge_analyzer.py
           tests/test_auto_merge_jev_judge.py
           tests/test_auto_merge_live.py
+          tests/test_entity_clusters_routes.py
           tests/retrieval/test_ann_order_by_shape.py
           tests/retrieval/test_vector_per_source_ann.py
           tests/retrieval/test_vector_per_source_ann_binding.py

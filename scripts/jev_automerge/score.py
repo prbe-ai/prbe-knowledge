@@ -7,15 +7,19 @@ acceptance bar fails.
 PRECISION, NOT AGREEMENT. Each auto-merge a gate would make is checked against
 hard identity evidence -- never against the other model:
 
-  verified     same repo + PR/issue number, a shared UUID, a shared email or
-               login (Person), the same repo name once owner/wiki prefix and
-               -/_ are ignored, or a human-approved merge of the pair
-  known false  different PR/issue numbers, different UUIDs (Documents), or
-               different page / incident / commit / session ids
+  verified     a human-approved merge of the pair; or (non-Person) the same
+               repo + PR/issue number, the same leaf UUID, a shared
+               email/login, the same repo name (same owner, or one side
+               unowned), or the same id up to case and -/_
+  by guard     a Person pair whose only confirmation is the shared email/login
+               the execution gate itself required -- NOT independent evidence,
+               so it is reported on its own line, never folded into "verified"
+  known false  different PR/issue numbers, different leaf UUIDs,
+               different repo owners, or different page/incident/commit/session ids
   needs human  anything else -- e.g. two people who share only a name
 
 The Jev gate is scored exactly as production acts: p >= AUTO_MERGE_JEV_HIGH_AT
-AND, for a Person, a shared identifier (`jev_judge.shared_identifier`).
+AND `jev_judge.execution_evidence` (the analyzer's own gate).
 
 Acceptance (the eng-review bar, 2026-09-23): 0 known-false and 0 needs-human
 among Jev auto-merges, >= --min-verified verified, and (when gpt-oss answers
@@ -28,19 +32,24 @@ from __future__ import annotations
 
 import argparse
 import collections
-import re
 import statistics
 import sys
 from pathlib import Path
 
-from engine.ingest.auto_merge.jev_judge import _repo_key, shared_identifier
-from engine.shared.constants import AUTO_MERGE_JEV_HIGH_AT, AUTO_MERGE_JEV_SUGGEST_AT
+from engine.ingest.auto_merge.jev_judge import (
+    NUMBERED_RE,
+    REPO_SHAPED_RE,
+    execution_evidence,
+    fold_id,
+    leaf_uuid,
+    repo_parts,
+    same_repo,
+    shared_identifier,
+)
+from engine.shared.constants import AUTO_MERGE_JEV_HIGH_AT, AUTO_MERGE_JEV_SUGGEST_AT, NodeLabel
 from scripts.jev_automerge import kb
 
 JEV_PRICE_PER_TOKEN = 0.042e-6
-_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-_NUMBERED = re.compile(r"^(?:github:)?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?::(?:pr|issue):|#)(\d+)$")
-_REPO_SHAPED = re.compile(r"(?:wiki:repo:)?(?:[a-z0-9_.-]+/)?[a-z0-9_.-]+")
 _DISTINCT_ID_PREFIXES = ("notion:page:", "pd:incident:", "slack:", "granola:meeting:", "claude_code:", "agent_session:")
 
 
@@ -66,31 +75,32 @@ class Clusters:
 def same_entity(graph: Clusters, a: str | None, b: str | None) -> bool:
     if a is None or b is None:
         return a == b
-    if a == b or graph.same(a, b):
-        return True
-    shaped = all(_REPO_SHAPED.fullmatch(x.lower()) and "@" not in x for x in (a, b))
-    return bool(shaped and len(_repo_key(a)) > 3 and _repo_key(a) == _repo_key(b))
+    return a == b or graph.same(a, b) or same_repo(a, b)
 
 
 def adjudicate(human: Clusters, label: str, a: str, pa: dict, b: str, pb: dict) -> tuple[str, str]:
     if human.same(a, b):
         return "verified", "human-approved merge"
-    if label == "Person":
+    if label == NodeLabel.PERSON:
         why = shared_identifier(a, pa, b, pb)
-        return ("verified", why) if why else ("needs_human", "person: name-level evidence only")
+        return ("by_guard", why) if why else ("needs_human", "person: name-level evidence only")
     al, bl = a.lower(), b.lower()
-    ma, mb = _NUMBERED.match(a), _NUMBERED.match(b)
+    ma, mb = NUMBERED_RE.match(a), NUMBERED_RE.match(b)
     if ma and mb:
         same = (ma.group(1).lower(), ma.group(2)) == (mb.group(1).lower(), mb.group(2))
         return ("verified", "same repo + number") if same else ("known_false", "different PR/issue")
-    ua, ub = set(_UUID.findall(al)), set(_UUID.findall(bl))
+    ua, ub = leaf_uuid(a), leaf_uuid(b)
     if ua and ub:
-        return ("verified", "shared uuid") if ua & ub else ("known_false", "different uuids")
+        return ("verified", "same leaf uuid") if ua == ub else ("known_false", "different leaf uuids")
     why = shared_identifier(a, pa, b, pb)
     if why:
         return "verified", why
-    if _REPO_SHAPED.fullmatch(al) and _REPO_SHAPED.fullmatch(bl) and len(_repo_key(a)) > 3:
-        return ("verified", "same repo name") if _repo_key(a) == _repo_key(b) else ("known_false", "different names")
+    if fold_id(a) == fold_id(b):
+        return "verified", "same id up to case and -/_"
+    if REPO_SHAPED_RE.fullmatch(al) and REPO_SHAPED_RE.fullmatch(bl) and len(repo_parts(a)[1]) > 3:
+        if same_repo(a, b):
+            return "verified", "same repo name"
+        return "known_false", "different repos"
     for prefix in _DISTINCT_ID_PREFIXES:
         if al.startswith(prefix) and bl.startswith(prefix):
             return "known_false", f"different {prefix.rstrip(':')} ids"
@@ -111,7 +121,6 @@ def main() -> int:
     graph = Clusters(kb.read_jsonl(args.set / "graph_merges.jsonl"))
     results = {r["did"]: r for r in kb.read_jsonl(args.results)}
     gpt_src = {r["did"]: r for r in kb.read_jsonl(args.gptoss_results)} if args.gptoss_results else results
-    label = lambda d: {"Repo": "Document", "WikiPerson": "Person"}.get(d["label"], d["label"])  # noqa: E731
 
     def cand_props(d: dict, cid: str) -> dict:
         return next((c["properties"] or {} for c in d["candidates"] if c["canonical_id"] == cid), {})
@@ -127,20 +136,26 @@ def main() -> int:
             bands["unique"] += 1
         elif j["p"] < AUTO_MERGE_JEV_HIGH_AT:
             bands["suggest"] += 1
-        elif label(d) == "Person" and not shared_identifier(d["canonical_id"], d["properties"], j["primary"], cand_props(d, j["primary"])):
-            bands["suggest (person guard)"] += 1
+        elif not execution_evidence(
+            d["qlabel"], d["canonical_id"], d["properties"], j["primary"], cand_props(d, j["primary"])
+        ):
+            bands["suggest (no execution evidence)"] += 1
             guarded += 1
         else:
             bands["merge"] += 1
             merges.append((d, j))
-    verdicts = [(d, j, *adjudicate(human, label(d), d["canonical_id"], d["properties"] or {}, j["primary"], cand_props(d, j["primary"])))
-                for d, j in merges]
+    verdicts = [
+        (d, j, *adjudicate(human, d["qlabel"], d["canonical_id"], d["properties"] or {}, j["primary"],
+                           cand_props(d, j["primary"])))
+        for d, j in merges
+    ]
     tally = collections.Counter(v[2] for v in verdicts)
     print(f"Jev actions: {dict(bands)}")
-    print(f"Jev auto-merges: {len(merges)}  verified {tally['verified']}  known false {tally['known_false']}  "
-          f"needs human {tally['needs_human']}  (person guard downgraded {guarded})")
+    print(f"Jev auto-merges: {len(merges)}  verified {tally['verified']}  person-by-guard {tally['by_guard']}  "
+          f"known false {tally['known_false']}  needs human {tally['needs_human']}  "
+          f"(execution gate downgraded {guarded})")
     for d, j, verdict, why in verdicts:
-        if verdict != "verified":
+        if verdict not in ("verified", "by_guard"):
             print(f"   [{verdict}: {why}] {d['did']}  p={j['p']:.2f}")
 
     # ---- agreement with gpt-oss on the same entity (identical inputs)
@@ -178,8 +193,8 @@ def main() -> int:
     failures = []
     if tally["known_false"] or tally["needs_human"]:
         failures.append("Jev auto-merges that are not verified")
-    if tally["verified"] < args.min_verified:
-        failures.append(f"only {tally['verified']} verified auto-merges (< {args.min_verified})")
+    if tally["verified"] + tally["by_guard"] < args.min_verified:
+        failures.append(f"only {tally['verified'] + tally['by_guard']} verified auto-merges (< {args.min_verified})")
     if agreement is not None and agreement < args.min_agreement:
         failures.append(f"agreement {agreement:.1%} < {args.min_agreement:.0%}")
     print("ACCEPTANCE:", "PASS" if not failures else "FAIL -- " + "; ".join(failures))

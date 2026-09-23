@@ -3,8 +3,10 @@
 WHAT THIS REPLACES. `AutoMergeAnalyzer._judge` asked Cerebras gpt-oss-120b for an
 `AutoMergeVerdict`. Here Jev answers ONE Choice question instead -- "which of
 these candidates is the same real-world thing as the new entity, or none of
-them?" -- and this module turns the answer into the same `AutoMergeVerdict`, so
-everything in `analyze()` after the judge is unchanged.
+them?" -- and this module turns the answer into the same `AutoMergeVerdict`
+contract, so the analyzer acts on either judge the same way. (After the judge,
+`analyze()` also applies the execution-evidence gate below: an auto-merge needs
+a deterministic identifier the pair shares, whichever judge proposed it.)
 
     new entity + filtered candidates (<= 10)
         │
@@ -25,7 +27,7 @@ MEASURED, NOT ASSUMED: a replay of 477 managed-plane decisions (2026-09-23)
 asked both models the same questions on identical inputs. Jev and gpt-oss picked
 the same real-world entity 94.8% of the time (98.8% on everyday traffic), and at
 >= 0.95 Jev's 84 auto-merges were 83 verified by hard identity evidence plus one
-name-only Person pair -- the case the shared-identifier guard in `analyzer.py`
+name-only Person pair -- the case `execution_evidence` (the analyzer's gate)
 downgrades. Numbers: docs/jev-contract.md, "Entity auto-merge".
 
 The request shape below IS what the replay measured. Rewording the
@@ -37,18 +39,22 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from engine.ingest.auto_merge.models import AutoMergeVerdict
+from engine.ingest.auto_merge.models import RATIONALE_MAX_CHARS, AutoMergeVerdict
 from engine.retrieval.agent.jev import MERGE_BREAKER, ChoiceAnswer, post_choice
 from engine.shared.constants import (
     AUTO_MERGE_JEV_HIGH_AT,
     AUTO_MERGE_JEV_MAX_VALUE_CHARS,
     AUTO_MERGE_JEV_MODEL,
     AUTO_MERGE_JEV_SUGGEST_AT,
+    NodeLabel,
 )
+
+if TYPE_CHECKING:  # the analyzer imports this module; the type is enough here
+    from engine.ingest.auto_merge.analyzer import Candidate
 
 NONE_OF_THESE = "none_of_these"
 
@@ -64,17 +70,9 @@ _INSTRUCTIONS = (
     "embedding similarity alone does not."
 )
 
-_RATIONALE_MAX_CHARS = 240  # AutoMergeVerdict.rationale / the suggestions column
-
-
-class CandidateLike(Protocol):
-    """`analyzer.Candidate`, without importing the analyzer (it imports us)."""
-
-    canonical_id: str
-    properties: dict
-    degree: int
-    trigram_score: float | None
-    vector_distance: float | None
+#: A candidate id longer than this cannot be a verdict's primary
+#: (AutoMergeVerdict.primary_canonical_id max_length), so it is never offered.
+MAX_PRIMARY_ID_CHARS = 512
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,8 +90,13 @@ class Judgment:
 # the request
 
 
+#: A list property keeps at most this many elements (a marker notes the rest),
+#: so one huge array cannot push every judgment it appears in over the cap.
+MAX_LIST_ITEMS = 50
+
+
 def trim_values(value: Any, limit: int = AUTO_MERGE_JEV_MAX_VALUE_CHARS) -> Any:
-    """Trim long STRING values; keep every key and every list element.
+    """Trim long STRING values and long lists; keep every KEY.
 
     A blanket size cap could cut an identity field off while keeping a
     matching name. Trimming only long free text keeps ids, emails and logins
@@ -104,19 +107,22 @@ def trim_values(value: Any, limit: int = AUTO_MERGE_JEV_MAX_VALUE_CHARS) -> Any:
     if isinstance(value, dict):
         return {k: trim_values(v, limit) for k, v in value.items()}
     if isinstance(value, list):
-        return [trim_values(v, limit) for v in value]
+        kept = [trim_values(v, limit) for v in value[:MAX_LIST_ITEMS]]
+        if len(value) > MAX_LIST_ITEMS:
+            kept.append(f"… {len(value) - MAX_LIST_ITEMS} more")
+        return kept
     return value
 
 
 def build_request(
-    node: dict[str, Any], candidates: list[CandidateLike]
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, CandidateLike]]:
+    node: dict[str, Any], candidates: list[Candidate]
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Candidate]]:
     """(state, question, key -> candidate) for one judgment.
 
     Keys are `c0..cN` in the analyzer's ranking order, never canonical ids:
     an id can be long, contain any character, or look like instructions.
     """
-    keys: dict[str, CandidateLike] = {}
+    keys: dict[str, Candidate] = {}
     cands: dict[str, Any] = {}
     for i, c in enumerate(candidates):
         key = f"c{i}"
@@ -155,47 +161,56 @@ def build_request(
 
 
 def verdict_from_answer(
-    answer: ChoiceAnswer, keys: dict[str, CandidateLike], node: dict[str, Any]
-) -> tuple[AutoMergeVerdict, float]:
+    answer: ChoiceAnswer, keys: dict[str, Candidate], node: dict[str, Any]
+) -> Judgment:
     """Map Jev's choice + probability onto the analyzer's verdict contract."""
     p = answer.probabilities[answer.choice]
     if answer.choice == NONE_OF_THESE:
-        return (
-            AutoMergeVerdict(
-                verdict="unique",
-                rationale=f"Jev: none of the {len(keys)} candidates is the same entity (p={p:.2f})",
-            ),
-            p,
+        verdict = AutoMergeVerdict(
+            verdict="unique",
+            rationale=f"Jev: none of the {len(keys)} candidates is the same entity (p={p:.2f})",
         )
-    cand = keys[answer.choice]
-    if p < AUTO_MERGE_JEV_SUGGEST_AT:
-        return (
-            AutoMergeVerdict(
-                verdict="unique",
-                rationale=f"Jev's best pick {cand.canonical_id[:120]} is below the suggestion bar (p={p:.2f})",
+    elif p < AUTO_MERGE_JEV_SUGGEST_AT:
+        verdict = AutoMergeVerdict(
+            verdict="unique",
+            rationale=(
+                f"Jev's best pick {keys[answer.choice].canonical_id[:120]} "
+                f"is below the suggestion bar (p={p:.2f})"
             ),
-            p,
         )
-    return (
-        AutoMergeVerdict(
+    else:
+        cand = keys[answer.choice]
+        # The bands were calibrated on AUTO_MERGE_JEV_MODEL. An answer from any
+        # other model may still suggest, but never auto-merge.
+        calibrated = answer.model == AUTO_MERGE_JEV_MODEL
+        verdict = AutoMergeVerdict(
             verdict="duplicate",
             primary_canonical_id=cand.canonical_id,
-            confidence="high" if p >= AUTO_MERGE_JEV_HIGH_AT else "medium",
+            confidence="high" if p >= AUTO_MERGE_JEV_HIGH_AT and calibrated else "medium",
             rationale=template_rationale(node, cand, p),
-        ),
-        p,
-    )
+        )
+    return Judgment(verdict=verdict, model=answer.model, p=p)
 
 
 async def judge(
     node: dict[str, Any],
-    candidates: list[CandidateLike],
+    candidates: list[Candidate],
     *,
     api_key: str,
     client: httpx.AsyncClient | None = None,
 ) -> Judgment:
-    """One Jev call -> Judgment. Raises what `post_choice` raises."""
-    state, question, keys = build_request(node, candidates)
+    """One Jev call -> Judgment. Raises what `post_choice` raises.
+
+    With no candidate left to offer (every id too long to store as a
+    primary) there is nothing to ask, and the verdict is unique.
+    """
+    offered = [c for c in candidates if len(c.canonical_id) <= MAX_PRIMARY_ID_CHARS]
+    if not offered:
+        return Judgment(
+            verdict=AutoMergeVerdict(verdict="unique", rationale="no candidate id short enough to merge into"),
+            model=AUTO_MERGE_JEV_MODEL,
+        )
+    state, question, keys = build_request(node, offered)
     answer = await post_choice(
         state,
         question,
@@ -204,17 +219,17 @@ async def judge(
         breaker=MERGE_BREAKER,
         client=client,
     )
-    verdict, p = verdict_from_answer(answer, keys, node)
-    return Judgment(verdict=verdict, model=answer.model, p=p)
+    return verdict_from_answer(answer, keys, node)
 
 
 # --------------------------------------------------------------------------
 # identity evidence (also the analyzer's Person guard) and the rationale
 
-_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 #: `github:<owner>/<repo>:pr:<n>` or `<owner>/<repo>#<n>` (PRs and issues).
-_NUMBERED = re.compile(r"^(?:github:)?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?::(?:pr|issue):|#)(\d+)$")
-_REPO_SHAPED = re.compile(r"(?:wiki:repo:)?(?:[a-z0-9_.-]+/)?[a-z0-9_.-]+")
+NUMBERED_RE = re.compile(r"^(?:github:)?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?::(?:pr|issue):|#)(\d+)$")
+#: `name`, `owner/name` or `wiki:repo:name` -- the ids repos appear under.
+REPO_SHAPED_RE = re.compile(r"(?:wiki:repo:)?(?:[a-z0-9_.-]+/)?[a-z0-9_.-]+")
 _HEX = re.compile(r"\b[0-9a-f]{7,40}\b")
 
 
@@ -226,13 +241,39 @@ def _alnum(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value.lower())
 
 
-def _repo_key(canonical_id: str) -> str:
-    """`prbe-ai/prbe-agent-tap`, `wiki:repo:prbe_agent_tap`, `prbe-agent-tap` -> `prbeagenttap`."""
+def fold_id(value: str) -> str:
+    """Case and the -/_ spelling difference only. Dots and every other
+    character stay: `model-v1.1` is not `model-v11`."""
+    return value.lower().replace("-", "_")
+
+
+def repo_parts(canonical_id: str) -> tuple[str | None, str]:
+    """(owner or None, name folded to [a-z0-9]) for a repo-shaped id.
+
+    `prbe-ai/prbe-agent-tap` -> ("prbe-ai", "prbe_agent_tap");
+    `wiki:repo:prbe_agent_tap` and `prbe-agent-tap` -> (None, "prbe_agent_tap").
+    """
     c = canonical_id.lower()
+    wiki = c.startswith("wiki:repo:")
     c = c.removeprefix("wiki:repo:")
-    if re.fullmatch(r"[a-z0-9_.-]+/[a-z0-9_.-]+", c):
-        c = c.split("/", 1)[1]
-    return _alnum(c)
+    if "/" in c and not wiki:
+        owner, name = c.split("/", 1)
+        return owner, fold_id(name)
+    return None, fold_id(c)
+
+
+def same_repo(a: str, b: str) -> bool:
+    """Both ids name the same repository: the same name up to case and -/_,
+    at least one of them in a repo form (`owner/name` or `wiki:repo:name`),
+    and the same owner whenever both carry one (`alice/utils` is not
+    `bob/utils`). Two bare slugs are left to the punctuation rule."""
+    la, lb = a.lower(), b.lower()
+    if not (REPO_SHAPED_RE.fullmatch(la) and REPO_SHAPED_RE.fullmatch(lb)):
+        return False
+    if not any("/" in x or x.startswith("wiki:repo:") for x in (la, lb)):
+        return False
+    (oa, na), (ob, nb) = repo_parts(a), repo_parts(b)
+    return len(na) > 3 and na == nb and (oa is None or ob is None or oa == ob)
 
 
 def shared_identifier(
@@ -240,45 +281,73 @@ def shared_identifier(
 ) -> str | None:
     """A concrete identifier the two entities share, described; else None.
 
-    Exact email or login (case-insensitive), or one side's email/login being
-    the other side's canonical id (Person ids are often an email or a login).
-    Names are deliberately NOT identifiers.
+    Email: an exact (case-insensitive) match of the property, or one side's
+    email being the other side's canonical id. Emails are global, so any
+    source counts. Login: the same, but ONLY within one source system -- a
+    GitHub login can collide with an opaque id from somewhere else (a Slack
+    user id is also a short upper/lower-case token). Names are NOT identifiers.
     """
     pa, pb = a_props or {}, b_props or {}
-    for key, what in (("email", "email"), ("login", "handle")):
-        va, vb = _text(pa.get(key)), _text(pb.get(key))
-        if va and va.lower() == vb.lower():
-            return f"shared {what} {va}"
+    ea, eb = _text(pa.get("email")), _text(pb.get("email"))
+    if ea and ea.lower() == eb.lower():
+        return f"shared email {ea}"
     for side, other_id in ((pa, b_id), (pb, a_id)):
-        for key in ("email", "login"):
-            v = _text(side.get(key))
-            if v and v.lower() == other_id.strip().lower():
-                return f"{key} {v} is the other entity's id"
+        e = _text(side.get("email"))
+        if e and e.lower() == other_id.strip().lower():
+            return f"email {e} is the other entity's id"
+    sa, sb = _text(pa.get("source_system")).lower(), _text(pb.get("source_system")).lower()
+    if not sa or sa != sb:
+        return None
+    la, lb = _text(pa.get("login")), _text(pb.get("login"))
+    if la and la.lower() == lb.lower():
+        return f"shared handle {la}"
+    for side, other_id in ((pa, b_id), (pb, a_id)):
+        login = _text(side.get("login"))
+        if login and login.lower() == other_id.strip().lower():
+            return f"login {login} is the other entity's id"
     return None
 
 
+def leaf_uuid(canonical_id: str) -> str | None:
+    """The LAST UUID in an id -- the entity's own. Earlier ones are parents:
+    `linear:<workspace>:issue:<issue>` shares its workspace with every issue."""
+    found = UUID_RE.findall(canonical_id.lower())
+    return found[-1] if found else None
+
+
 def _id_evidence(a: str, b: str) -> str | None:
-    ua, ub = set(_UUID.findall(a.lower())), set(_UUID.findall(b.lower()))
-    if ua & ub:
-        return f"shared id {sorted(ua & ub)[0]}"
-    na, nb = _NUMBERED.match(a), _NUMBERED.match(b)
+    ua, ub = leaf_uuid(a), leaf_uuid(b)
+    if ua and ua == ub:
+        return f"shared id {ua}"
+    na, nb = NUMBERED_RE.match(a), NUMBERED_RE.match(b)
     if na and nb and (na.group(1).lower(), na.group(2)) == (nb.group(1).lower(), nb.group(2)):
         return f"same repo {na.group(1)} and number {na.group(2)}"
-    if _alnum(a) and _alnum(a) == _alnum(b):
-        return f"ids equal ignoring punctuation ({a} ~ {b})"
-    ka = _repo_key(a)
-    if (
-        len(ka) > 3
-        and ka == _repo_key(b)
-        and _REPO_SHAPED.fullmatch(a.lower())
-        and _REPO_SHAPED.fullmatch(b.lower())
-    ):
+    if a != b and _alnum(a) and fold_id(a) == fold_id(b):
+        return f"ids equal ignoring case and -/_ ({a} ~ {b})"
+    if same_repo(a, b):
         return f"same repo name once owner/wiki prefix and -/_ are ignored ({a} ~ {b})"
     return None
 
 
-def template_rationale(node: dict[str, Any], cand: CandidateLike, p: float | None) -> str:
-    """The one strongest shared signal, then the numbers. <= 240 chars.
+def execution_evidence(
+    label: str, a_id: str, a_props: dict[str, Any] | None, b_id: str, b_props: dict[str, Any] | None
+) -> str | None:
+    """The deterministic identity evidence an AUTO-merge requires; None if absent.
+
+    A judge proposes; this decides whether the proposal may execute without a
+    human. People need a shared email or login (a name is not identity). Other
+    entities also accept id evidence: a shared UUID, the same repo + PR/issue
+    number, the same id up to punctuation, or the same repo name. On the
+    2026-09-23 replay every verified Jev auto-merge carried such evidence; the
+    one that did not was a name-only Person pair.
+    """
+    if label == NodeLabel.PERSON:
+        return shared_identifier(a_id, a_props, b_id, b_props)
+    return shared_identifier(a_id, a_props, b_id, b_props) or _id_evidence(a_id, b_id)
+
+
+def template_rationale(node: dict[str, Any], cand: Candidate, p: float | None) -> str:
+    """The one strongest shared signal, then the numbers. <= RATIONALE_MAX_CHARS.
 
     Order: shared email/login > shared UUID > same repo + PR/issue number >
     same id ignoring punctuation > same repo name > same display name >
@@ -304,4 +373,4 @@ def template_rationale(node: dict[str, Any], cand: CandidateLike, p: float | Non
     if p is not None:
         numbers.append(f"Jev p={p:.2f}")
     text = (evidence or "no shared identifier") + ("; " + ", ".join(numbers) if numbers else "")
-    return text[:_RATIONALE_MAX_CHARS]
+    return text[:RATIONALE_MAX_CHARS]

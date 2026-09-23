@@ -43,7 +43,7 @@ async def ask_jev(client: httpx.AsyncClient, api_key: str, d: dict) -> dict:
     t0 = time.perf_counter()
     try:
         ans = await jev.post_choice(state, question, api_key=api_key, model=AUTO_MERGE_JEV_MODEL,
-                                    breaker=jev._Breaker(), client=client)
+                                    breaker=jev.Breaker(), client=client)
     except jev.JevError as exc:
         return {"error": f"{type(exc).__name__}: {exc}", "ms": (time.perf_counter() - t0) * 1000}
     primary = None if ans.choice == NONE_OF_THESE else keys[ans.choice].canonical_id
@@ -56,14 +56,7 @@ async def ask_jev(client: httpx.AsyncClient, api_key: str, d: dict) -> dict:
 
 async def ask_gptoss(client: httpx.AsyncClient, url: str, key: str, d: dict) -> dict:
     cands = [az.Candidate(**c) for c in d["candidates"]]
-    body = {
-        "model": az.SEARCH_AGENT_INFERENCE_MODEL,
-        "messages": [{"role": "system", "content": az._SYSTEM_PROMPT},
-                     {"role": "user", "content": az._build_prompt(_node(d), cands)}],
-        "response_format": az._VERDICT_RESPONSE_FORMAT,
-        "temperature": 0.1,
-        "max_tokens": 512,
-    }
+    body = {"model": az.SEARCH_AGENT_INFERENCE_MODEL, **az.gptoss_request(_node(d), cands)}
     t0 = time.perf_counter()
     try:
         r = await client.post(f"{url}/chat/completions", headers={"Authorization": f"Bearer {key}"}, json=body, timeout=90)

@@ -2068,16 +2068,24 @@ JEV_EXTRACTION_GRACE_SECONDS = 0.25
 # PR number, same UUID, shared email/login, a human-approved merge); the 84th was a
 # name-only Person pair, which the shared-identifier guard in analyzer.py downgrades.
 #
-# Rollback: set AUTO_MERGE_JUDGE = "gptoss" (today's Cerebras path, verbatim).
+# Rollback: set AUTO_MERGE_JUDGE = AutoMergeJudge.GPTOSS (the Cerebras path).
 # Code, not env, on purpose -- the same convention as SEARCH_SELECTOR_DEFAULT.
-AUTO_MERGE_JUDGE = "jev"
+
+
+class AutoMergeJudge(StrEnum):
+    JEV = "jev"
+    GPTOSS = "gptoss"
+
+
+AUTO_MERGE_JUDGE = AutoMergeJudge.JEV
 # Pinned apart from JEV_MODEL: that one is env-overridable for search, and a
 # search config change must not silently change who decides a merge.
 AUTO_MERGE_JEV_MODEL = "jev-1.13.0"
 # p = probability of the chosen candidate. Two things to know about it:
 #  * It splits across copies of the same entity (98 of 215 replay picks), so a
 #    repo with three spellings in the graph scores lower. That errs toward a
-#    suggestion, never toward a wrong merge.
+#    suggestion -- or, below AUTO_MERGE_JEV_SUGGEST_AT, toward no action --
+#    never toward a wrong merge.
 #  * Jev drifts +/-0.02-0.03 between identical calls, and every upsert re-queues
 #    its node, so a pair is judged many times: under that churn 0.95 behaves like
 #    "averages ~0.92" (a pair averaging 0.932 crossed 0.95 on 4 of 20 calls).
@@ -2088,8 +2096,16 @@ AUTO_MERGE_JEV_SUGGEST_AT = 0.70
 # Keys are never dropped: an identity field must not vanish behind a size cap.
 # The largest replay request was 3,154 tokens of Jev's ~32k cap.
 AUTO_MERGE_JEV_MAX_VALUE_CHARS = 500
-# A node whose judge was unreachable is retried after this delay (x attempts).
+# A node whose judge was unreachable stays queued and is retried: after this
+# delay, doubling per consecutive deferral up to the max. Outages end, so an
+# outage does NOT spend the node's 3 processing attempts; only after
+# AUTO_MERGE_MAX_DEFERRALS in a row (~8h of backoff) is the row parked.
 AUTO_MERGE_RETRY_SECONDS = 300
+AUTO_MERGE_RETRY_MAX_SECONDS = 3600
+AUTO_MERGE_MAX_DEFERRALS = 12
+# With the merge breaker open, a node waits out the breaker window plus up to
+# this much jitter, so a whole queue does not re-probe Jev in the same second.
+AUTO_MERGE_BREAKER_JITTER_SECONDS = 30
 # The rewrite is skipped when less than this is left of the agent stage budget:
 # it costs an LLM call, a fan-out and a rescore (~2-3s typical).
 SEARCH_REWRITE_MIN_BUDGET_SECONDS = float(os.getenv("SEARCH_REWRITE_MIN_BUDGET_SECONDS", "8.0"))

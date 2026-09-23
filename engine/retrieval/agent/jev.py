@@ -34,6 +34,10 @@ THE MEASURED CONTRACT (docs/jev-contract.md -- the published one is looser):
 
 Everything here is pure or async-over-httpx; the caller owns timeouts and the
 fallback to the recall floor.
+
+`post_choice` (bottom of the file) is the second, smaller use: ONE Choice
+question with a validated answer, asked by entity auto-merge
+(engine/ingest/auto_merge/jev_judge.py) with its own breaker and pinned model.
 """
 
 from __future__ import annotations
@@ -95,7 +99,11 @@ def _error_type(resp: httpx.Response) -> str:
 
 
 class JevError(RuntimeError):
-    """Jev did not produce scores. The caller falls back to the recall floor."""
+    """Jev produced no usable answer (transport, status, or a malformed body).
+
+    What happens next is the caller's call: search falls back to the recall
+    floor; entity auto-merge defers the node and retries it later.
+    """
 
 
 class JevBreakerOpen(JevError):
@@ -108,6 +116,26 @@ class JevRequestTooLarge(JevError):
     Permanent for THIS input -- retrying the same state gets the same answer --
     so callers must not treat it like an outage.
     """
+
+
+class JevRequestRejected(JevError):
+    """400/413/422: the server refused THIS request's shape. Like
+    `JevRequestTooLarge` it is permanent for the input and says nothing about
+    the service's health, so it does not trip a breaker."""
+
+
+#: Refusals that are about the request itself. Every other 4xx -- 401/403 (a
+#: revoked key), 404 (a retired model or a wrong base URL), 408, 429 -- would
+#: fail EVERY request the same way: an outage, not a verdict on one input.
+_PER_REQUEST_REJECTIONS = frozenset({400, 413, 422})
+
+
+_OVERFLOW_ERROR_TYPE = "max_tokens_exceeded"
+
+
+def _is_token_overflow(resp: httpx.Response) -> bool:
+    """The server's own verdict that the request is over its token cap."""
+    return resp.status_code == 400 and _OVERFLOW_ERROR_TYPE in resp.text
 
 
 # --------------------------------------------------------------------------
@@ -269,7 +297,7 @@ def _shared_client() -> httpx.AsyncClient:
 
 
 @dataclass(slots=True)
-class _Breaker:
+class Breaker:
     """Stop calling Jev for a while after repeated failures.
 
     Without it, an outage charges EVERY search a full timeout -- twice, once
@@ -294,15 +322,33 @@ class _Breaker:
         if self.failures >= JEV_BREAKER_FAILURES:
             self.open_until = time.monotonic() + JEV_BREAKER_SECONDS
 
+    def seconds_until_closed(self) -> float:
+        """How long until the next probe is allowed through (0 when closed)."""
+        return max(0.0, self.open_until - time.monotonic())
+
+
+#: Kept for callers written against the private name.
+_Breaker = Breaker
+
 
 #: Scoring and the extraction shadow get SEPARATE breakers. They hit the same
 #: service with very different payloads (a full pool vs one query), and small
 #: extraction calls succeeding would otherwise keep resetting a breaker that
 #: full-pool scoring keeps tripping -- so a scoring outage never opens it.
 #: Entity auto-merge (ingest side) gets its own for the same reason.
-BREAKER = _Breaker()
-EXTRACT_BREAKER = _Breaker()
-MERGE_BREAKER = _Breaker()
+BREAKER = Breaker()
+EXTRACT_BREAKER = Breaker()
+MERGE_BREAKER = Breaker()
+
+
+def _probability(value: Any) -> float | None:
+    """A probability, or None. NaN sorts ahead of 0.99 and disables threshold
+    checks; a bool is an int to Python; out-of-range numbers are not answers."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        return None
+    return float(value)
 
 
 def _err(exc: BaseException) -> str:
@@ -358,7 +404,7 @@ async def _score_batch(
     except httpx.HTTPError as exc:
         out.errors.append(_err(exc))
         return
-    overflow = resp.status_code == 400 and "max_tokens_exceeded" in resp.text
+    overflow = _is_token_overflow(resp)
     if overflow and len(cids) > 1 and depth < JEV_MAX_SPLIT_DEPTH:
         out.splits += 1
         mid = len(cids) // 2
@@ -389,14 +435,9 @@ async def _score_batch(
         # not ask about is not an answer. An answer missing for a chunk is
         # ABSENT, not zero: reading "the server did not answer" as
         # "irrelevant" silently deletes a document.
-        if (
-            cid in asked
-            and isinstance(val, (int, float))
-            and not isinstance(val, bool)
-            and math.isfinite(val)
-            and 0.0 <= val <= 1.0
-        ):
-            out.scores[cid] = float(val)
+        p = _probability(val)
+        if cid in asked and p is not None:
+            out.scores[cid] = p
 
 
 async def score_pool(
@@ -654,14 +695,18 @@ class ChoiceAnswer:
     elapsed_ms: float
 
 
-def _probability(value: Any) -> float | None:
-    """A probability, or None. Same guard as `_score_batch`: NaN, bools and
-    out-of-range numbers are not answers."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
-        return None
-    return float(value)
+#: A Choice's probabilities sum to 1. Over 1,908 real answers the sum ranged
+#: 0.99-1.00 and the chosen key was always the most probable; anything outside
+#: these bounds is a malformed answer, not a verdict to act on.
+_CHOICE_SUM_TOLERANCE = 0.05
+_CHOICE_ARGMAX_TOLERANCE = 0.01
+
+
+def _malformed(breaker: Breaker, why: str) -> JevError:
+    """A malformed 200 is a vendor fault: count it, so a schema regression
+    opens the breaker instead of burning every queued node's retries."""
+    breaker.failure()
+    return JevError(f"malformed answer: {why}")
 
 
 async def post_choice(
@@ -670,7 +715,7 @@ async def post_choice(
     *,
     api_key: str,
     model: str,
-    breaker: _Breaker,
+    breaker: Breaker,
     client: httpx.AsyncClient | None = None,
 ) -> ChoiceAnswer:
     """Ask ONE Choice question about `state` and return the validated answer.
@@ -678,10 +723,17 @@ async def post_choice(
     `model` is explicit on purpose: `JEV_MODEL` is env-overridable for search,
     and a search config change must not silently change another caller's judge.
 
+    The answer is only returned when it is a well-formed distribution over
+    EXACTLY the question's criteria keys, summing to ~1, with the chosen key
+    the most probable. An answer that could authorize an action must not be
+    accepted on its shape alone.
+
     Raises:
       JevBreakerOpen      -- nothing sent; the breaker is cooling down.
       JevRequestTooLarge  -- `max_tokens_exceeded`; permanent for this input.
-      JevError            -- transport, status or a malformed answer.
+      JevRequestRejected  -- 400/413/422; permanent for this input.
+      JevError            -- transport, any other 4xx (401/403/404/408/429),
+                             5xx, or a malformed answer; trips the breaker.
     """
     if not api_key:
         raise JevError("TYPESAFE_API_KEY is not configured")
@@ -695,9 +747,11 @@ async def post_choice(
     except httpx.HTTPError as exc:
         breaker.failure()
         raise JevError(_err(exc)) from exc
-    if resp.status_code == 400 and "max_tokens_exceeded" in resp.text:
+    if _is_token_overflow(resp):
         # The input's fault, not an outage: do not trip the breaker.
-        raise JevRequestTooLarge("http_400:max_tokens_exceeded")
+        raise JevRequestTooLarge(f"http_400:{_OVERFLOW_ERROR_TYPE}")
+    if resp.status_code in _PER_REQUEST_REJECTIONS:
+        raise JevRequestRejected(f"http_{resp.status_code}:{_error_type(resp)}")
     if resp.status_code != 200:
         breaker.failure()
         raise JevError(f"http_{resp.status_code}:{_error_type(resp)}")
@@ -706,21 +760,25 @@ async def post_choice(
         ans = (body.get("answers") or {})[_CHOICE_ID]
         choice = ans["choice"]
         raw = ans["probabilities"]
-        if not isinstance(raw, dict):
-            raise TypeError("probabilities is not an object")
         tokens = int(((body.get("usage") or {}).get("input_tokens")) or 0)
         answered_model = str(body.get("model") or model)
     except (ValueError, KeyError, AttributeError, TypeError) as exc:
-        raise JevError(f"malformed answer: {type(exc).__name__}") from exc
-    if choice not in criteria:
-        raise JevError("malformed answer: choice outside the criteria")
-    probabilities = {k: p for k, p in ((k, _probability(v)) for k, v in raw.items()) if p is not None}
-    if choice not in probabilities:
-        raise JevError("malformed answer: no probability for the choice")
+        raise _malformed(breaker, type(exc).__name__) from exc
+    if not isinstance(choice, str) or choice not in criteria:
+        raise _malformed(breaker, "choice outside the criteria")
+    if not isinstance(raw, dict) or set(raw) != set(criteria):
+        raise _malformed(breaker, "probabilities do not cover exactly the criteria")
+    probabilities = {k: _probability(v) for k, v in raw.items()}
+    if any(p is None for p in probabilities.values()):
+        raise _malformed(breaker, "a probability is not a number in [0, 1]")
+    if abs(sum(probabilities.values()) - 1.0) > _CHOICE_SUM_TOLERANCE:
+        raise _malformed(breaker, "probabilities do not sum to 1")
+    if probabilities[choice] < max(probabilities.values()) - _CHOICE_ARGMAX_TOLERANCE:
+        raise _malformed(breaker, "the choice is not the most probable key")
     breaker.success()
     return ChoiceAnswer(
         choice=choice,
-        probabilities=probabilities,
+        probabilities=probabilities,  # type: ignore[arg-type]  # None ruled out above
         model=answered_model,
         input_tokens=tokens,
         elapsed_ms=(time.perf_counter() - t0) * 1000,

@@ -49,7 +49,7 @@ async def run(
     execute: bool,
     label: str | None,
     limit: int | None,
-) -> None:
+) -> int:
     settings = get_settings()
     configure_logging(settings.log_level)
     await init_pool(settings)
@@ -117,6 +117,12 @@ async def run(
         print(f"\nProcessed {processed} nodes for customer={customer_id}")
         print(f"  Actions: {dict(action_counts)}")
         print(f"  Avg candidates surfaced per node: {avg_candidates:.2f}")
+        deferred = action_counts.get("deferred", 0)
+        if deferred:
+            # A backfill has no queue to retry from: these nodes were NOT judged.
+            print(f"  WARNING: {deferred} nodes were deferred (judge unreachable) and not judged; re-run to cover them.")
+            return 1
+        return 0
     finally:
         await close_pool()
 
@@ -133,7 +139,7 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=None, help="Cap nodes processed (testing)")
     args = ap.parse_args()
     try:
-        asyncio.run(
+        code = asyncio.run(
             run(
                 args.customer,
                 execute=args.execute,
@@ -143,6 +149,7 @@ def main() -> None:
         )
     except KeyboardInterrupt:
         sys.exit(130)
+    sys.exit(code)
 
 
 if __name__ == "__main__":

@@ -35,6 +35,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from engine.shared.config import get_settings
 from engine.shared.db import with_tenant
+from engine.shared.locks import advisory_lock_key
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/entity-clusters", tags=["internal-api"])
@@ -74,6 +75,11 @@ class MergeRequest(BaseModel):
     primary_canonical_id: str            = Field(..., min_length=1, max_length=512)
     alias_canonical_ids:  list[str]      = Field(..., min_length=1, max_length=64)
     reason:               str | None     = Field(default=None, max_length=2000)
+    # Refuse (409) when an alias is itself the primary of an existing cluster.
+    # Folding it in deletes its node while its own aliases still route to it
+    # (routing is one hop), so their next upsert resurrects it as a stray
+    # copy. Auto-merge sets this; a human merge may still build the chain.
+    refuse_cluster_primaries: bool = False
 
     @field_validator("alias_canonical_ids")
     @classmethod
@@ -117,6 +123,17 @@ async def merge_cluster(body: MergeRequest) -> MergeResponse:
     merge_id = uuid.uuid4()
 
     async with with_tenant(customer_id) as conn:
+        # 0. One merge at a time per (tenant, label). Every check below reads
+        #    rows a concurrent merge may be about to change: two workers folding
+        #    twin nodes into EACH OTHER both pass them, and the loser dies
+        #    mid-merge on a row the winner deleted (a foreign-key error, not a
+        #    clean 404). Serialized, the loser sees the node gone and 404s.
+        #    Transaction-scoped, taken before any other lock.
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock($1)",
+            advisory_lock_key("entity-merge", customer_id, body.label),
+        )
+
         # 1. Existence check.
         existing_rows = await conn.fetch(
             """
@@ -159,6 +176,25 @@ async def merge_cluster(body: MergeRequest) -> MergeResponse:
                     },
                 },
             )
+
+        # 2b. Optionally, no alias is the primary of a cluster.
+        if body.refuse_cluster_primaries:
+            primaries = await conn.fetch(
+                """
+                SELECT DISTINCT primary_canonical_id FROM entity_aliases
+                WHERE customer_id = $1 AND label = $2
+                  AND primary_canonical_id = ANY($3::text[])
+                """,
+                customer_id, body.label, body.alias_canonical_ids,
+            )
+            if primaries:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "one or more aliases are the primary of a cluster",
+                        "cluster_primaries": [r["primary_canonical_id"] for r in primaries],
+                    },
+                )
 
         # 3. Primary not itself an alias.
         primary_as_alias = await conn.fetchrow(

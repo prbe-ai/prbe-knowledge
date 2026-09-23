@@ -16,10 +16,21 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   same entity 94.8% of the time and every auto-merge it made checked out against hard
   identity evidence, for about a tenth of the cost. Setting `AUTO_MERGE_JUDGE = "gptoss"`
   restores the old judge.
-- A person is only merged automatically when the two records share an exact email or
-  login. A matching name alone now becomes a suggestion instead, whichever model judged it.
-- When the auto-merge judge is unreachable, the entity stays queued and is retried a few
-  minutes later instead of being skipped until it next changes.
+- An auto-merge now runs only when the pair shares hard identity evidence: an exact email
+  or login for people; for anything else also the same repo and PR number, the same id
+  (UUID), or the same id up to case and `-`/`_`. Without it the pair becomes a suggestion,
+  whichever model judged it. A matching name alone is never enough.
+- When the auto-merge judge is unreachable, the entity stays queued and is retried after 5
+  minutes, then 10, 20 and so on up to an hour, instead of being skipped until it next
+  changes. After 12 tries it is parked as failed.
+- Two merges of the same kind of entity in one workspace now run one at a time, so two
+  workers can no longer fold a pair of twin entities into each other at once. Auto-merge
+  also no longer folds an entity that already heads a merged group into another one (its
+  merged copies would lose their target); that pair becomes a suggestion. A merge that
+  fails for any other reason is kept as a suggestion too, instead of being dropped.
+- New graph nodes no longer hang for five minutes on their first auto-merge: the worker
+  saves the node's embedding before judging, so the merge no longer waits on a lock its
+  own caller holds.
 - Merge audit rows and suggestions now record the model that actually made the call, and
   its probability, instead of always naming gpt-oss.
 
