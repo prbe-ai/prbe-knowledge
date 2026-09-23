@@ -227,11 +227,16 @@ async def approve_suggestion(
                 primary_canonical_id=row["primary_canonical_id"],
                 alias_canonical_ids=[row["candidate_canonical_id"]],
                 reason=f"approved suggestion {suggestion_id}: {(row['rationale'] or '')[:160]}",
+                # A suggestion is an auto-merge proposal: approving it obeys
+                # auto-merge's safety rules (409 -> dismissed below).
+                refuse_cluster_primaries=True,
+                refuse_document_aliases=True,
             )
         )
     except HTTPException as e:
-        # If the alias is already in a cluster, flip to dismissed rather
-        # than 409ing — the merge effect is already in place.
+        # The alias is already in a cluster, or the merge is refused (a
+        # cluster primary, a document's own node): flip to dismissed rather
+        # than 409ing -- there is nothing to apply.
         if e.status_code in (404, 409):
             async with with_tenant(body.customer_id) as conn:
                 await conn.execute(
@@ -393,6 +398,8 @@ async def approve_all_suggestions(body: ApproveAllRequest) -> ApproveAllResponse
                     primary_canonical_id=r["primary_canonical_id"],
                     alias_canonical_ids=[r["candidate_canonical_id"]],
                     reason=f"approve-all: {(r['rationale'] or '')[:160]}",
+                    refuse_cluster_primaries=True,
+                    refuse_document_aliases=True,
                 )
             )
             async with with_tenant(body.customer_id) as conn:
@@ -408,8 +415,9 @@ async def approve_all_suggestions(body: ApproveAllRequest) -> ApproveAllResponse
                 )
             )
         except HTTPException as e:
-            # 404 (alias node already deleted) or 409 (alias already in cluster)
-            # → the merge effect is already in place. Dismiss the row.
+            # 404 (alias node already deleted), 409 (alias already in a
+            # cluster, or refused: a cluster primary or a document's own node)
+            # → nothing left to apply. Dismiss the row.
             if e.status_code in (404, 409):
                 async with with_tenant(body.customer_id) as conn:
                     await conn.execute(

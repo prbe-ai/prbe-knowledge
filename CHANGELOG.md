@@ -8,6 +8,41 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Changed
 
+- Entity auto-merge now asks Jev, not gpt-oss, whether a new entity duplicates one already
+  in the graph. Jev picks one candidate or none; at 0.95 or above the pair is merged, from
+  0.70 a suggestion is written for review, below that nothing happens. The suggestion's
+  explanation is built from the evidence the analyzer already has (shared email, same PR
+  number, name similarity). Replayed on 477 past decisions, Jev agreed with gpt-oss on the
+  same entity 94.8% of the time and every auto-merge it made checked out against hard
+  identity evidence, for about a tenth of the cost. Setting `AUTO_MERGE_JUDGE = "gptoss"`
+  restores the old judge.
+- An auto-merge now runs only when the pair shares hard identity evidence: an exact email
+  or login for people; for anything else also the same repo and PR number, the same id
+  (UUID), or the same id up to case and `-`/`_`. Without it the pair becomes a suggestion,
+  whichever model judged it. A matching name alone is never enough.
+- When the auto-merge judge is unreachable, the entity stays queued and is retried after 5
+  minutes, then 10, 20 and so on up to an hour, instead of being skipped until it next
+  changes. After 12 tries it is parked as failed.
+- Auto-merge never folds a document's own graph node into another node. Search reaches a
+  document through that node, so folding it away (a PR's document into its bare
+  `owner/repo#12` mention) cut the document out of graph search for good. Most past
+  auto-merges did exactly that; documents already folded this way are not repaired here.
+  Approving a merge suggestion now follows the same rule (and the no-chains rule below):
+  a suggestion that would fold a document is dismissed instead of applied.
+- Two merges of the same kind of entity in one workspace now run one at a time, so two
+  workers can no longer fold a pair of twin entities into each other at once. Auto-merge
+  also no longer folds an entity that already heads a merged group into another one (its
+  merged copies would lose their target). A merge that fails for another reason, such as
+  a database error, is kept as a suggestion instead of being dropped.
+- If Jev stops accepting our requests (a retired model, a revoked key, a changed request
+  format), queued entities now wait for it to recover instead of being dropped one by one.
+  One workspace's oversized entities no longer pause auto-merge for everyone.
+- New graph nodes no longer hang for five minutes on their first auto-merge: the worker
+  saves the node's embedding before judging, so the merge no longer waits on a lock its
+  own caller holds.
+- Merge audit rows and suggestions now record the model that actually made the call, and
+  its probability, instead of always naming gpt-oss.
+
 - Every tenant's searches now pick their results with Jev. If Jev fails or is slow, that
   search is served by the recall floor instead.
 - Retire the `Experiment` graph node label and the `experiment` entity type:

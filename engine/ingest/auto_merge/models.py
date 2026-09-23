@@ -1,8 +1,9 @@
-"""Pydantic schemas for the AutoMergeAnalyzer's Cerebras judge call.
+"""The verdict contract every auto-merge judge returns.
 
-`response_format=AutoMergeVerdict` is constrained-decoded by Cerebras
-gpt-oss-120b via the LiteLLM proxy — same pattern as
-services/retrieval/agent/models.py:EntityExtraction.
+Jev (the default, `jev_judge.py`) builds an `AutoMergeVerdict` from one Choice
+answer. The gpt-oss rollback path (`AUTO_MERGE_JUDGE = "gptoss"`) still asks
+Cerebras gpt-oss-120b for it as `response_format`, constrained-decoded via the
+LiteLLM proxy.
 """
 
 from __future__ import annotations
@@ -10,6 +11,10 @@ from __future__ import annotations
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+
+#: One cap for the rationale everywhere: this model, the templated Jev
+#: rationale, and the entity_merge_suggestions insert.
+RATIONALE_MAX_CHARS = 240
 
 
 class AutoMergeVerdict(BaseModel):
@@ -45,6 +50,6 @@ class AutoMergeVerdict(BaseModel):
     )
     rationale: str = Field(
         ...,
-        max_length=240,
+        max_length=RATIONALE_MAX_CHARS,
         description="One-sentence reason (~30 words). Name the shared signal.",
     )

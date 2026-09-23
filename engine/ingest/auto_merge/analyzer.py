@@ -1,9 +1,10 @@
 """Entity auto-merge analyzer.
 
 Reads a graph_nodes row, finds duplicate candidates via trigram + vector,
-filters conflicting properties, asks Cerebras gpt-oss-120b to judge, then
-either fires the merge transaction directly or writes a suggestion row
-for the dashboard to surface.
+filters conflicting properties, asks a judge -- Jev by default
+(`jev_judge.py`), Cerebras gpt-oss-120b as the code-level rollback
+(`AUTO_MERGE_JUDGE`) -- then either fires the merge transaction directly or
+writes a suggestion row for the dashboard to surface.
 
 Single-tenant per call: caller supplies (customer_id, node_id). Wrap in
 ``with_tenant(customer_id)`` for RLS.
@@ -11,22 +12,41 @@ Single-tenant per call: caller supplies (customer_id, node_id). Wrap in
 
 from __future__ import annotations
 
+import functools
 import json
+import random
 import re
 import uuid
 from dataclasses import dataclass
 from typing import Any
 
 import asyncpg
+from fastapi import HTTPException
 from pydantic import ValidationError
 
-from engine.ingest.auto_merge.models import AutoMergeVerdict
+from engine.ingest.auto_merge import jev_judge
+from engine.ingest.auto_merge.jev_judge import Judgment, execution_evidence
+from engine.ingest.auto_merge.models import RATIONALE_MAX_CHARS, AutoMergeVerdict
 from engine.ingest.entity_clusters_routes import (
     MergeRequest,
     MergeResponse,
     merge_cluster,
 )
-from engine.shared.constants import SEARCH_AGENT_INFERENCE_MODEL
+from engine.retrieval.agent.jev import (
+    MERGE_BREAKER,
+    JevBreakerOpen,
+    JevError,
+    JevRequestRejected,
+    JevRequestTooLarge,
+)
+from engine.shared.config import get_settings
+from engine.shared.constants import (
+    AUTO_MERGE_BREAKER_JITTER_SECONDS,
+    AUTO_MERGE_JUDGE,
+    AUTO_MERGE_RETRY_SECONDS,
+    SEARCH_AGENT_INFERENCE_MODEL,
+    AutoMergeJudge,
+)
 from engine.shared.llm import LLMError, acompletion
 from engine.shared.logging import get_logger
 
@@ -127,7 +147,9 @@ class Candidate:
 class AutoMergeResult:
     """Outcome of running the analyzer on one (customer_id, node_id)."""
 
-    action: str  # "merged" | "suggested" | "no_candidates" | "unique" | "skipped" | "error"
+    # "merged" | "suggested" | "no_candidates" | "unique" | "skipped" | "error"
+    # | "deferred" (the judge was unreachable: keep the queue row, retry later)
+    action: str
     primary_canonical_id: str | None = None
     confidence: str | None = None
     rationale: str | None = None
@@ -135,10 +157,99 @@ class AutoMergeResult:
     merge_id: uuid.UUID | None = None
     suggestion_id: uuid.UUID | None = None
     error: str | None = None
+    #: Which model decided, and its probability when it has one (Jev does).
+    judge_model: str | None = None
+    p: float | None = None
+    #: For action="deferred": the base delay before the worker retries it.
+    retry_after_seconds: int | None = None
+
+
+@functools.cache
+def _warn_jev_unconfigured() -> None:
+    """Once per process: auto-merge fell back to gpt-oss for want of a key."""
+    log.warning(
+        "auto_merge.jev_unconfigured",
+        detail="TYPESAFE_API_KEY is empty; judging with gpt-oss instead",
+    )
+
+
+def _jev_api_key() -> str | None:
+    """The key when Jev is the configured judge AND has one; else None (gpt-oss)."""
+    if AUTO_MERGE_JUDGE == AutoMergeJudge.JEV:
+        key = get_settings().typesafe_api_key
+        if key:
+            return key
+        _warn_jev_unconfigured()
+    return None
+
+
+def _breaker_wait_seconds() -> int:
+    """Out the merge breaker's window, with jitter so a queue does not stampede."""
+    return int(MERGE_BREAKER.seconds_until_closed()) + 1 + random.randint(0, AUTO_MERGE_BREAKER_JITTER_SECONDS)
+
+
+# The analyzer's trigram candidate query ($1 label, $2 canonical_id, $3 name,
+# $4 self node_id, $5 floor, $6 limit). Module-level so the replay harness
+# (scripts/jev_automerge/build_set.py) runs exactly this text.
+TRIGRAM_CANDIDATES_SQL = """
+            SELECT
+                node_id,
+                canonical_id,
+                properties,
+                degree,
+                GREATEST(
+                    similarity(LOWER(canonical_id), LOWER($2)),
+                    CASE WHEN $3 <> '' THEN
+                        similarity(LOWER(COALESCE(properties->>'name','')), LOWER($3))
+                    ELSE 0 END
+                ) AS trigram_score
+            FROM graph_nodes
+            WHERE label = $1
+              AND node_id <> $4
+              AND NOT EXISTS (
+                  SELECT 1 FROM entity_aliases ea
+                  WHERE ea.label = graph_nodes.label
+                    AND ea.alias_canonical_id = graph_nodes.canonical_id
+              )
+              AND (
+                  similarity(LOWER(canonical_id), LOWER($2)) >= $5
+                  OR ($3 <> '' AND similarity(LOWER(COALESCE(properties->>'name','')), LOWER($3)) >= $5)
+              )
+            ORDER BY trigram_score DESC
+            LIMIT $6
+            """
+
+
+def rank_candidates(merged: dict[str, Candidate]) -> list[Candidate]:
+    """Rank: prefer rows that surfaced in both signals, then trigram score, then
+    vector distance; cap. Shared with the replay harness, which must rank
+    exactly as production does."""
+    ranked = sorted(
+        merged.values(),
+        key=lambda c: (
+            -(int(c.trigram_score is not None) + int(c.vector_distance is not None)),
+            -(c.trigram_score or 0.0),
+            c.vector_distance if c.vector_distance is not None else 1.0,
+        ),
+    )
+    return ranked[:TOTAL_CANDIDATE_CAP]
+
+
+def gptoss_request(node: dict, candidates: list[Candidate]) -> dict[str, Any]:
+    """The gpt-oss judge's request, minus the model -- shared with the replay."""
+    return {
+        "messages": [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": _build_prompt(node, candidates)},
+        ],
+        "response_format": _VERDICT_RESPONSE_FORMAT,
+        "temperature": 0.1,
+        "max_tokens": 512,
+    }
 
 
 class AutoMergeAnalyzer:
-    """LLM-judged entity dedup.
+    """Model-judged entity dedup.
 
     Caller is responsible for tenant context — wrap in ``with_tenant()``.
     """
@@ -170,6 +281,28 @@ class AutoMergeAnalyzer:
         if _is_path_canonical(label, canonical_id):
             return AutoMergeResult(action="skipped", rationale="path-canonical label")
 
+        # A node whose id is one of this tenant's documents IS that document's
+        # graph node: retrieval reaches the document through it
+        # (documents.doc_id = graph_nodes.canonical_id), and after a merge
+        # every later upsert routes to the primary. Folding it in -- a PR's
+        # document into its `owner/repo#N` mention -- detaches the document
+        # from the graph for good. On the managed plane 661 of the 704
+        # auto-merges before 2026-08 did exactly that (measured 2026-09-23).
+        # So a document node is never the alias; it can still be a primary. A
+        # `doc_type` marks a stub written before its document row exists.
+        if "doc_type" in properties or await self._is_document(conn, customer_id, canonical_id):
+            return AutoMergeResult(action="skipped", rationale="document node")
+
+        # With the merge breaker open there is no judge to ask: defer BEFORE the
+        # candidate search (the vector leg alone can cost ~20s of Postgres CPU
+        # per Document), so an outage costs the database one index probe.
+        if _jev_api_key() and MERGE_BREAKER.is_open():
+            return AutoMergeResult(
+                action="deferred",
+                error="JevBreakerOpen('breaker_open')",
+                retry_after_seconds=_breaker_wait_seconds(),
+            )
+
         candidates = await self._find_candidates(conn, node)
         if not candidates:
             return AutoMergeResult(action="no_candidates", candidate_count=0)
@@ -186,8 +319,19 @@ class AutoMergeAnalyzer:
             )
 
         try:
-            verdict = await self._judge(node, filtered)
-        except (LLMError, ValidationError) as exc:
+            judgment = await self._judge(node, filtered)
+        except JevBreakerOpen as exc:
+            # Opened between the check above and the call. Nothing was sent.
+            log.info("auto_merge.judge_deferred", customer=customer_id, node_id=node_id, error=repr(exc))
+            return AutoMergeResult(
+                action="deferred",
+                candidate_count=len(filtered),
+                error=repr(exc),
+                retry_after_seconds=_breaker_wait_seconds(),
+            )
+        except (JevRequestTooLarge, JevRequestRejected, LLMError, ValidationError) as exc:
+            # Permanent for this input (an oversize or refused request, an LLM
+            # failure, an unparseable verdict): retrying would send the same.
             log.warning(
                 "auto_merge.judge_failed",
                 customer=customer_id,
@@ -199,12 +343,44 @@ class AutoMergeAnalyzer:
                 candidate_count=len(filtered),
                 error=repr(exc),
             )
+        except JevError as exc:
+            # Timeout, 5xx, malformed answer: an outage, not a verdict. Returning
+            # "error" here would let the worker DELETE the queue row, so the node
+            # would go unjudged until its next upsert.
+            log.warning(
+                "auto_merge.judge_deferred",
+                customer=customer_id,
+                node_id=node_id,
+                error=repr(exc),
+            )
+            return AutoMergeResult(
+                action="deferred",
+                candidate_count=len(filtered),
+                error=repr(exc),
+                retry_after_seconds=AUTO_MERGE_RETRY_SECONDS,
+            )
+
+        verdict = judgment.verdict
+        log.info(
+            "auto_merge.judged",
+            customer=customer_id,
+            node_id=node_id,
+            label=label,
+            judge_model=judgment.model,
+            verdict=verdict.verdict,
+            confidence=verdict.confidence,
+            p=judgment.p,
+            primary=verdict.primary_canonical_id,
+            candidates=len(filtered),
+        )
 
         if verdict.verdict == "unique":
             return AutoMergeResult(
                 action="unique",
                 rationale=verdict.rationale,
                 candidate_count=len(filtered),
+                judge_model=judgment.model,
+                p=judgment.p,
             )
 
         # Verdict says duplicate. Validate primary_canonical_id is one of ours.
@@ -223,18 +399,43 @@ class AutoMergeAnalyzer:
             return AutoMergeResult(
                 action="error",
                 candidate_count=len(filtered),
-                error="LLM returned primary_canonical_id not in candidate list",
+                error="judge returned primary_canonical_id not in candidate list",
             )
 
+        confidence = verdict.confidence or "low"
+        # A judge proposes; only deterministic identity evidence the pair shares
+        # lets a proposal execute without a human (execution_evidence: a shared
+        # email/login for people; for other entities also a shared UUID, the
+        # same repo + PR number, the same id up to punctuation, the same repo
+        # name). Without it the pair becomes a suggestion. Model confidence
+        # alone is not enough: a name can match two people, and text a stranger
+        # can write (a PR title) reaches the judge. On the replay every verified
+        # Jev auto-merge carried such evidence, so this costs no measured merges.
+        if confidence == "high":
+            primary = next(c for c in filtered if c.canonical_id == verdict.primary_canonical_id)
+            if execution_evidence(label, canonical_id, properties, primary.canonical_id, primary.properties) is None:
+                log.info(
+                    "auto_merge.execution_gate_downgraded",
+                    customer=customer_id,
+                    node_id=node_id,
+                    label=label,
+                    primary=verdict.primary_canonical_id,
+                    judge_model=judgment.model,
+                    p=judgment.p,
+                )
+                confidence = "medium"
+
         # Fire either the merge or the suggestion path.
-        if verdict.confidence == "high" and self._execute:
+        if confidence == "high" and self._execute:
             return await self._fire_merge(
+                conn=conn,
                 customer_id=customer_id,
                 label=label,
                 new_node_canonical_id=canonical_id,
                 primary_canonical_id=verdict.primary_canonical_id,
                 rationale=verdict.rationale,
                 candidate_count=len(filtered),
+                judgment=judgment,
             )
         return await self._write_suggestion(
             conn=conn,
@@ -242,9 +443,10 @@ class AutoMergeAnalyzer:
             label=label,
             new_node_canonical_id=canonical_id,
             primary_canonical_id=verdict.primary_canonical_id,
-            confidence=verdict.confidence or "low",
+            confidence=confidence,
             rationale=verdict.rationale,
             candidate_count=len(filtered),
+            judgment=judgment,
         )
 
     # ------------------------------------------------------------------ #
@@ -295,33 +497,7 @@ class AutoMergeAnalyzer:
 
         # Trigram path: same label, similar canonical_id OR similar properties->>'name'.
         trigram_rows = await conn.fetch(
-            """
-            SELECT
-                node_id,
-                canonical_id,
-                properties,
-                degree,
-                GREATEST(
-                    similarity(LOWER(canonical_id), LOWER($2)),
-                    CASE WHEN $3 <> '' THEN
-                        similarity(LOWER(COALESCE(properties->>'name','')), LOWER($3))
-                    ELSE 0 END
-                ) AS trigram_score
-            FROM graph_nodes
-            WHERE label = $1
-              AND node_id <> $4
-              AND NOT EXISTS (
-                  SELECT 1 FROM entity_aliases ea
-                  WHERE ea.label = graph_nodes.label
-                    AND ea.alias_canonical_id = graph_nodes.canonical_id
-              )
-              AND (
-                  similarity(LOWER(canonical_id), LOWER($2)) >= $5
-                  OR ($3 <> '' AND similarity(LOWER(COALESCE(properties->>'name','')), LOWER($3)) >= $5)
-              )
-            ORDER BY trigram_score DESC
-            LIMIT $6
-            """,
+            TRIGRAM_CANDIDATES_SQL,
             label,
             canonical_id,
             name or "",
@@ -389,29 +565,30 @@ class AutoMergeAnalyzer:
                 vector_distance=float(r["distance"]),
             )
 
-        # Rank: prefer rows that surfaced in both signals, then trigram score, then vector distance.
-        ranked = sorted(
-            merged.values(),
-            key=lambda c: (
-                -(int(c.trigram_score is not None) + int(c.vector_distance is not None)),
-                -(c.trigram_score or 0.0),
-                c.vector_distance if c.vector_distance is not None else 1.0,
-            ),
-        )
-        return ranked[:TOTAL_CANDIDATE_CAP]
+        return rank_candidates(merged)
 
-    async def _judge(self, node: dict, candidates: list[Candidate]) -> AutoMergeVerdict:
-        prompt = _build_prompt(node, candidates)
+    async def _is_document(self, conn: asyncpg.Connection, customer_id: str, canonical_id: str) -> bool:
+        return bool(
+            await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM documents WHERE customer_id = $1 AND doc_id = $2)",
+                customer_id,
+                canonical_id,
+            )
+        )
+
+    async def _judge(self, node: dict, candidates: list[Candidate]) -> Judgment:
+        """Jev unless rolled back (`AUTO_MERGE_JUDGE`) or unconfigured."""
+        api_key = _jev_api_key()
+        if api_key:
+            return await jev_judge.judge(node, candidates, api_key=api_key)
+        verdict = await self._judge_gptoss(node, candidates)
+        return Judgment(verdict=verdict, model=SEARCH_AGENT_INFERENCE_MODEL)
+
+    async def _judge_gptoss(self, node: dict, candidates: list[Candidate]) -> AutoMergeVerdict:
         response = await acompletion(
             model=SEARCH_AGENT_INFERENCE_MODEL,
-            messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            response_format=_VERDICT_RESPONSE_FORMAT,
             custom_llm_provider="openai",  # gateway routes via OpenAI-shape wire
-            temperature=0.1,
-            max_tokens=512,
+            **gptoss_request(node, candidates),
         )
         content = response["choices"][0]["message"]["content"]
         if not content:
@@ -421,15 +598,18 @@ class AutoMergeAnalyzer:
     async def _fire_merge(
         self,
         *,
+        conn: asyncpg.Connection,
         customer_id: str,
         label: str,
         new_node_canonical_id: str,
         primary_canonical_id: str,
         rationale: str,
         candidate_count: int,
+        judgment: Judgment,
     ) -> AutoMergeResult:
         # The MergeRequest convention: primary survives, aliases merge in.
         # Treat the *new* node as the alias merging into the *existing* primary.
+        p = f" p={judgment.p:.2f}" if judgment.p is not None else ""
         body = MergeRequest(
             customer_id=customer_id,
             performed_by_user_id=SYSTEM_USER_ID,
@@ -437,9 +617,14 @@ class AutoMergeAnalyzer:
             primary_canonical_id=primary_canonical_id,
             alias_canonical_ids=[new_node_canonical_id],
             reason=(
-                f"auto: model={SEARCH_AGENT_INFERENCE_MODEL} "
-                f"confidence=high rationale={rationale[:120]}"
+                f"auto: model={judgment.model} "
+                f"confidence=high{p} rationale={rationale[:120]}"
             ),
+            # A re-upserted cluster primary is judged like a new node; folding
+            # it in would strand its own aliases. Re-checked under the merge
+            # lock, as is the document guard above.
+            refuse_cluster_primaries=True,
+            refuse_document_aliases=True,
         )
         try:
             resp: MergeResponse = await merge_cluster(body)
@@ -451,14 +636,33 @@ class AutoMergeAnalyzer:
                 alias=new_node_canonical_id,
                 error=repr(exc),
             )
-            # Fall back to writing a suggestion so the merge isn't silently lost.
-            return AutoMergeResult(
-                action="error",
+            if isinstance(exc, HTTPException) and exc.status_code in (404, 409):
+                # 404: a node is gone -- a concurrent merge already folded one
+                # of the pair. 409: a cluster conflict, above all the new node
+                # being a cluster primary; a suggestion would only invite a
+                # human to approve the alias chain the refusal exists to stop.
+                return AutoMergeResult(
+                    action="error",
+                    primary_canonical_id=primary_canonical_id,
+                    confidence="high",
+                    rationale=rationale,
+                    candidate_count=candidate_count,
+                    error=repr(exc),
+                    judge_model=judgment.model,
+                    p=judgment.p,
+                )
+            # Anything else (a database error): keep the judgment as a
+            # suggestion so the merge is not silently lost.
+            return await self._write_suggestion(
+                conn=conn,
+                customer_id=customer_id,
+                label=label,
+                new_node_canonical_id=new_node_canonical_id,
                 primary_canonical_id=primary_canonical_id,
                 confidence="high",
                 rationale=rationale,
                 candidate_count=candidate_count,
-                error=repr(exc),
+                judgment=judgment,
             )
         log.info(
             "auto_merge.merged",
@@ -474,6 +678,8 @@ class AutoMergeAnalyzer:
             rationale=rationale,
             candidate_count=candidate_count,
             merge_id=resp.merge_id,
+            judge_model=judgment.model,
+            p=judgment.p,
         )
 
     async def _write_suggestion(
@@ -487,6 +693,7 @@ class AutoMergeAnalyzer:
         confidence: str,
         rationale: str,
         candidate_count: int,
+        judgment: Judgment,
     ) -> AutoMergeResult:
         # ON CONFLICT DO NOTHING — uq_entity_merge_suggestions_pair prevents
         # duplicate pending rows for the same pair.
@@ -506,8 +713,8 @@ class AutoMergeAnalyzer:
             primary_canonical_id,
             new_node_canonical_id,
             confidence,
-            rationale[:240],
-            SEARCH_AGENT_INFERENCE_MODEL,
+            rationale[:RATIONALE_MAX_CHARS],
+            judgment.model,
         )
         sid = row["suggestion_id"] if row else None
         log.info(
@@ -526,6 +733,8 @@ class AutoMergeAnalyzer:
             rationale=rationale,
             candidate_count=candidate_count,
             suggestion_id=sid,
+            judge_model=judgment.model,
+            p=judgment.p,
         )
 
 
