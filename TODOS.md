@@ -62,6 +62,36 @@ but the judge call is still repeated. The analyzer should resolve an
 already-clustered node or candidate to its primary before proposing a merge, or
 skip it. Judge-independent.
 
+### A commit's author email is trusted as identity
+**Where:** `engine/ingest/auto_merge/jev_judge.py` (`shared_identifier`),
+`kb/handlers/github.py` (commit author, `Co-authored-by`).
+
+The auto-merge gate accepts a shared exact email as proof two Person records
+are one person. A git author email and a `Co-authored-by` trailer are free text
+anyone can write, so a commit can claim someone else's email and be merged into
+their Person; later upserts then merge its name/login into that record
+(`properties || EXCLUDED.properties`). The gate is still far tighter than the
+gpt-oss path it replaced (which merged on the model's word alone). **Fix:**
+record where an email came from and let only verified sources (a connector's
+account email, not commit text) count as execution evidence.
+
+### Suggest when Jev's probability splits across copies of one entity
+**Where:** `engine/ingest/auto_merge/jev_judge.py` (`verdict_from_answer`).
+
+With three copies of one entity among the candidates the Choice mass divides
+(e.g. c0 0.48, c1 0.47): the top pick is below 0.70 and nothing is written,
+although Jev is sure the node is a duplicate. **Fix:** write a suggestion when
+`1 - p(none_of_these)` clears `AUTO_MERGE_JEV_SUGGEST_AT`; replay it first to
+size the extra suggestion volume.
+
+### Auto-merge shares Jev's base URL, timeout and quota with search
+`JEV_BASE_URL` and `JEV_REQUEST_TIMEOUT_SECONDS` (2.5 s) are search settings the
+merge judge also reads, and a backlog drain (16 tasks x 2 pods) spends the same
+key as live search. Whether that can 429 search is unmeasured. Separately, if
+`TYPESAFE_API_KEY` goes missing the judge falls back to gpt-oss with one
+warning per process; the execution gate still applies, but nothing alerts.
+**Fix:** measure the rate limit; alert on `auto_merge.jev_unconfigured`.
+
 ### Alias routing is one hop, so a merge chain strands its inner aliases
 **Where:** `engine/ingest/graph_writer.py` (`_fetch_aliases`),
 `engine/ingest/entity_clusters_routes.py` (`merge_cluster`, unmerge).

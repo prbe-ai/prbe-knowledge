@@ -40,6 +40,7 @@ import json
 import os
 import socket
 import uuid
+from datetime import datetime
 
 import asyncpg
 
@@ -111,8 +112,9 @@ class PostWriteWorker:
     async def _claim_one(self) -> asyncpg.Record | None:
         """Claim one pending row via FOR UPDATE SKIP LOCKED.
 
-        Returns a row with (customer_id, node_id, analyzer_status). Atomically
-        flips locked_until to NOW() + 5min so concurrent workers skip it.
+        Returns a row with (customer_id, node_id, analyzer_status, enqueued_at).
+        Atomically flips locked_until to NOW() + 5min so concurrent workers
+        skip it.
 
         Also reclaims rows whose previous lock has expired (locked_until in
         the past) — those got stuck because a worker pod died mid-process,
@@ -122,7 +124,7 @@ class PostWriteWorker:
         async with raw_conn() as conn, conn.transaction():
             row = await conn.fetchrow(
                 """
-                SELECT customer_id, node_id, analyzer_status
+                SELECT customer_id, node_id, analyzer_status, enqueued_at
                 FROM node_post_write_queue
                 WHERE (locked_until IS NULL OR locked_until < NOW())
                   AND COALESCE(
@@ -150,6 +152,11 @@ class PostWriteWorker:
     async def _process(self, row: asyncpg.Record) -> None:
         customer_id: str = row["customer_id"]
         node_id: int = row["node_id"]
+        # Every write back to the row is conditional on this: an upsert of the
+        # node mid-processing re-enqueues it (new enqueued_at, lock cleared),
+        # and that fresh row must be processed again, not deleted or stamped
+        # with this pass's stale counters.
+        claimed_at = row["enqueued_at"]
         status_json = row["analyzer_status"]
         status = json.loads(status_json) if isinstance(status_json, str) else (status_json or {})
 
@@ -188,9 +195,9 @@ class PostWriteWorker:
                 p=result.p,
             )
             if result.action == "deferred":
-                await self._defer(customer_id, node_id, status, result)
+                await self._defer(customer_id, node_id, claimed_at, status, result)
                 return
-            await self._delete_queue_row(customer_id, node_id)
+            await self._delete_queue_row(customer_id, node_id, claimed_at)
 
         except Exception as exc:
             attempts = _auto_merge_status(status).get("attempts", 0) + 1
@@ -201,7 +208,7 @@ class PostWriteWorker:
                 attempts=attempts,
                 error=str(exc),
             )
-            await self._record_failure(customer_id, node_id, attempts, repr(exc))
+            await self._record_failure(customer_id, node_id, claimed_at, attempts, repr(exc))
 
     async def _drain_pending_edges(
         self, conn: asyncpg.Connection, customer_id: str, node_id: int
@@ -280,18 +287,20 @@ class PostWriteWorker:
             node_id,
         )
 
-    async def _delete_queue_row(self, customer_id: str, node_id: int) -> None:
+    async def _delete_queue_row(self, customer_id: str, node_id: int, claimed_at: datetime) -> None:
         async with raw_conn() as conn:
             await conn.execute(
-                "DELETE FROM node_post_write_queue WHERE customer_id = $1 AND node_id = $2",
+                "DELETE FROM node_post_write_queue WHERE customer_id = $1 AND node_id = $2 AND enqueued_at = $3",
                 customer_id,
                 node_id,
+                claimed_at,
             )
 
     async def _defer(
         self,
         customer_id: str,
         node_id: int,
+        claimed_at: datetime,
         status: dict,
         result,
     ) -> None:
@@ -319,6 +328,7 @@ class PostWriteWorker:
             await self._write_status(
                 customer_id,
                 node_id,
+                claimed_at,
                 {"status": "failed", "attempts": _MAX_ATTEMPTS, "deferrals": deferrals - 1, "last_error": error},
                 delay_seconds=None,
             )
@@ -328,6 +338,7 @@ class PostWriteWorker:
         await self._write_status(
             customer_id,
             node_id,
+            claimed_at,
             {"status": "deferred", "attempts": prev.get("attempts", 0), "deferrals": deferrals, "last_error": error},
             delay_seconds=delay,
         )
@@ -336,12 +347,14 @@ class PostWriteWorker:
         self,
         customer_id: str,
         node_id: int,
+        claimed_at: datetime,
         auto_merge_status: dict,
         *,
         delay_seconds: float | None,
     ) -> None:
         """Set analyzer_status.auto_merge and the lock: NULL (claimable now) or
-        NOW() + delay (claimable after it)."""
+        NOW() + delay (claimable after it). A no-op if the row was re-enqueued
+        since it was claimed."""
         async with raw_conn() as conn:
             await conn.execute(
                 """
@@ -349,18 +362,20 @@ class PostWriteWorker:
                 SET locked_until = CASE WHEN $3::float8 IS NULL THEN NULL
                                         ELSE NOW() + make_interval(secs => $3::float8) END,
                     analyzer_status = $4::jsonb
-                WHERE customer_id = $1 AND node_id = $2
+                WHERE customer_id = $1 AND node_id = $2 AND enqueued_at = $5
                 """,
                 customer_id,
                 node_id,
                 None if delay_seconds is None else float(delay_seconds),
                 json.dumps({"auto_merge": auto_merge_status}),
+                claimed_at,
             )
 
     async def _record_failure(
         self,
         customer_id: str,
         node_id: int,
+        claimed_at: datetime,
         attempts: int,
         error: str,
     ) -> None:
@@ -370,6 +385,7 @@ class PostWriteWorker:
         await self._write_status(
             customer_id,
             node_id,
+            claimed_at,
             {"status": "failed", "attempts": attempts, "last_error": error[:240]},
             delay_seconds=None,
         )

@@ -353,3 +353,16 @@ async def test_twins_merged_into_each_other_at_once_leave_exactly_one_node(world
         assert [getattr(f, "status_code", None) for f in failed] == [404], failed
         survivors = await fetch("SELECT canonical_id FROM graph_nodes WHERE canonical_id = ANY($1::text[])", [a, b])
         assert [r["canonical_id"] for r in survivors] == [ok[0].primary_canonical_id]
+
+
+async def test_a_node_reupserted_mid_processing_stays_queued_for_another_pass(world):
+    await ingest(make_person("ada@example.com", {"name": "Ada Lovelace", "email": "ada@example.com"}))
+    row = await world.worker._claim_one()
+    # The node changes while this pass is judging it: the upsert re-enqueues it.
+    await ingest(make_person("ada@example.com", {"name": "Ada Lovelace", "email": "ada@example.com", "title": "CTO"}))
+    await world.worker._process(row)
+    # The stale pass neither deleted the fresh row nor stamped it.
+    (queued,) = await fetch("SELECT analyzer_status, locked_until FROM node_post_write_queue")
+    assert (json.loads(queued["analyzer_status"]), queued["locked_until"]) == ({}, None)
+    assert await drain(world.worker) == 1
+    assert await fetch("SELECT 1 FROM node_post_write_queue") == []
