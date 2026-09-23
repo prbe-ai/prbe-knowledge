@@ -350,6 +350,25 @@ async def test_a_document_node_is_never_judged_or_merged(monkeypatch, model, p):
     assert merges == [] and conn.suggestions == []
 
 
+async def test_a_document_stub_written_before_its_document_is_skipped_too(monkeypatch):
+    # Some writers create a document's node (marked with doc_type) before the
+    # documents row exists; the row check alone would miss it.
+    j = Judgment(verdict=_verdict("acme/widgets#12", "high"), model="jev-1.13.0", p=0.99)
+    node = dict(PR_NODE, properties={"doc_type": "github.pull_request"})
+    a, merges = _analyzer(monkeypatch, node, PR_CANDS, judgment=j)
+    result = await a.analyze(FakeConn(), "acme-test", 7)
+    assert (result.action, result.rationale) == ("skipped", "document node")
+    assert merges == []
+
+
+async def test_the_merge_rechecks_both_refusals_under_the_lock(monkeypatch):
+    j = Judgment(verdict=_verdict("acme/widgets#12", "high"), model="jev-1.13.0", p=0.99)
+    a, merges = _analyzer(monkeypatch, PR_NODE, PR_CANDS, judgment=j)
+    await a.analyze(FakeConn(), "acme-test", 7)
+    (body,) = merges
+    assert (body.refuse_cluster_primaries, body.refuse_document_aliases) == (True, True)
+
+
 @pytest.mark.parametrize(("model", "p"), JUDGES)
 async def test_high_without_execute_writes_a_suggestion_stamped_with_the_judge(monkeypatch, model, p):
     j = Judgment(verdict=_verdict("acme/widgets#12", "high"), model=model, p=p)

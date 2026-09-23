@@ -230,6 +230,12 @@ def test_shared_identifier(a, pa, b, pb, expect):
         ("Document", "Acme-Widgets", {}, "acme_widgets", {}, True),
         ("Document", "model-v1.1", {}, "model-v11", {}, False),
         ("Document", "acme-widget", {}, "acmewidget", {}, False),
+        # The repo NAME rules are identity only for repos (Documents); for any
+        # other entity they would be "same name".
+        ("Project", "trainer", {}, "acme/trainer", {}, False),
+        ("Service", "api-gateway", {}, "API_Gateway", {}, False),
+        ("Project", "linear:ws:project:0f8fad5b-d9cb-469f-a165-70867728950e", {},
+         "0f8fad5b-d9cb-469f-a165-70867728950e", {}, True),
         ("Person", "ada-gh", GH, "ada@example.com", {"login": "ada-gh", **GH}, True),
         ("Person", "U1", {"name": "Ada"}, "U2", {"name": "Ada"}, False),
         # People need a shared email/login: id look-alikes are not enough.

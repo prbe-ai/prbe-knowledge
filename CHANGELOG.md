@@ -27,6 +27,8 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   document through that node, so folding it away (a PR's document into its bare
   `owner/repo#12` mention) cut the document out of graph search for good. Most past
   auto-merges did exactly that; documents already folded this way are not repaired here.
+  Approving a merge suggestion now follows the same rule (and the no-chains rule below):
+  a suggestion that would fold a document is dismissed instead of applied.
 - Two merges of the same kind of entity in one workspace now run one at a time, so two
   workers can no longer fold a pair of twin entities into each other at once. Auto-merge
   also no longer folds an entity that already heads a merged group into another one (its
@@ -34,6 +36,7 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   a database error, is kept as a suggestion instead of being dropped.
 - If Jev stops accepting our requests (a retired model, a revoked key, a changed request
   format), queued entities now wait for it to recover instead of being dropped one by one.
+  One workspace's oversized entities no longer pause auto-merge for everyone.
 - New graph nodes no longer hang for five minutes on their first auto-merge: the worker
   saves the node's embedding before judging, so the merge no longer waits on a lock its
   own caller holds.

@@ -26,6 +26,7 @@ import pytest
 from engine.ingest.auto_merge import analyzer as az
 from engine.ingest.auto_merge import jev_judge
 from engine.ingest.entity_clusters_routes import MergeRequest, merge_cluster
+from engine.ingest.entity_merge_suggestions_routes import ApproveAllRequest, approve_all_suggestions
 from engine.ingest.graph_writer import upsert_nodes
 from engine.ingest.post_write import worker as worker_module
 from engine.ingest.post_write.worker import PostWriteWorker
@@ -36,6 +37,7 @@ from engine.shared.constants import (
     AUTO_MERGE_RETRY_SECONDS,
     JEV_BREAKER_FAILURES,
     AutoMergeJudge,
+    NodeLabel,
 )
 from engine.shared.db import raw_conn, with_tenant
 from engine.shared.models import GraphNodeSpec, make_document, make_person
@@ -224,6 +226,38 @@ async def test_a_prs_document_node_is_never_folded_into_its_mention(world):
     assert world.fake.requests == []  # skipped before the candidate search and the judge
     assert await fetch("SELECT 1 FROM entity_merge_audit") == []
     assert await fetch("SELECT 1 FROM entity_merge_suggestions") == []
+    assert await fetch("SELECT 1 FROM graph_nodes WHERE canonical_id = 'github:acme/widgets:pr:12'") != []
+
+
+async def test_a_document_stub_written_before_its_document_is_not_folded(world):
+    # A writer (feature_nodes_routes) creates the PR's node, marked with its
+    # doc_type, before the document row exists.
+    await ingest(make_document("acme/widgets#12", properties={"name": "Add widgets"}))
+    await drain(world.worker)
+    world.fake.decide = pick("github:acme/widgets:pr:12", "acme/widgets#12", 0.99)
+    await ingest(GraphNodeSpec(label=NodeLabel.DOCUMENT, canonical_id="github:acme/widgets:pr:12",
+                               properties={"doc_type": "github.pull_request"}))
+    await drain(world.worker)
+    assert world.fake.requests == []
+    assert await fetch("SELECT 1 FROM entity_merge_audit") == []
+
+
+async def test_approving_an_old_suggestion_never_folds_a_document(world):
+    # Suggestions written before the guard can still name a document's node
+    # as the alias; approve-all must refuse (and dismiss) them.
+    await ingest(make_document("acme/widgets#12", properties={"name": "Add widgets"}),
+                 make_document("github:acme/widgets:pr:12", properties={"name": "Add widgets"}))
+    await seed_document("github:acme/widgets:pr:12")
+    async with raw_conn() as conn:
+        await conn.execute(
+            "INSERT INTO entity_merge_suggestions (customer_id, label, primary_canonical_id, "
+            "candidate_canonical_id, confidence, rationale, llm_model, status) "
+            "VALUES ($1, 'Document', 'acme/widgets#12', 'github:acme/widgets:pr:12', 'high', 'x', 'm', 'pending')",
+            CUSTOMER,
+        )
+    out = await approve_all_suggestions(ApproveAllRequest(customer_id=CUSTOMER, confidence="high"))
+    assert (out.approved, out.dismissed_already_merged) == (0, 1)
+    assert await fetch("SELECT 1 FROM entity_merge_audit") == []
     assert await fetch("SELECT 1 FROM graph_nodes WHERE canonical_id = 'github:acme/widgets:pr:12'") != []
 
 

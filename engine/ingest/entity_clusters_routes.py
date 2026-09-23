@@ -78,8 +78,14 @@ class MergeRequest(BaseModel):
     # Refuse (409) when an alias is itself the primary of an existing cluster.
     # Folding it in deletes its node while its own aliases still route to it
     # (routing is one hop), so their next upsert resurrects it as a stray
-    # copy. Auto-merge sets this; a human merge may still build the chain.
+    # copy. Auto-merge and suggestion approvals set this; a direct human
+    # merge may still build the chain.
     refuse_cluster_primaries: bool = False
+    # Refuse (409) when an alias is a document's own node: a documents row
+    # with its id, or a node marked with a doc_type (a stub written before its
+    # document). Retrieval reaches a document through that node, and after
+    # the merge every later write routes away from it. Set by the same callers.
+    refuse_document_aliases: bool = False
 
     @field_validator("alias_canonical_ids")
     @classmethod
@@ -193,6 +199,29 @@ async def merge_cluster(body: MergeRequest) -> MergeResponse:
                     detail={
                         "error": "one or more aliases are the primary of a cluster",
                         "cluster_primaries": [r["primary_canonical_id"] for r in primaries],
+                    },
+                )
+
+        # 2c. Optionally, no alias is a document's own node.
+        if body.refuse_document_aliases:
+            documents = await conn.fetch(
+                """
+                SELECT gn.canonical_id FROM graph_nodes gn
+                WHERE gn.customer_id = $1 AND gn.label = $2
+                  AND gn.canonical_id = ANY($3::text[])
+                  AND (gn.properties ? 'doc_type'
+                       OR EXISTS (SELECT 1 FROM documents d
+                                  WHERE d.customer_id = gn.customer_id
+                                    AND d.doc_id = gn.canonical_id))
+                """,
+                customer_id, body.label, body.alias_canonical_ids,
+            )
+            if documents:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "one or more aliases are a document's own node",
+                        "documents": [r["canonical_id"] for r in documents],
                     },
                 )
 

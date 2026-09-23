@@ -321,13 +321,18 @@ def leaf_uuid(canonical_id: str) -> str | None:
     return last if UUID_RE.fullmatch(last) else None
 
 
-def _id_evidence(a: str, b: str) -> str | None:
+def _id_evidence(a: str, b: str, *, repo_rules: bool = True) -> str | None:
+    """Id-shaped evidence. `repo_rules` adds the two name rules (repo-style
+    slug up to case and -/_, the same repo name): for a repo they are
+    identity, for any other entity they amount to "same name"."""
     ua, ub = leaf_uuid(a), leaf_uuid(b)
     if ua and ua == ub:
         return f"shared id {ua}"
     na, nb = NUMBERED_RE.match(a), NUMBERED_RE.match(b)
     if na and nb and (na.group(1).lower(), na.group(2)) == (nb.group(1).lower(), nb.group(2)):
         return f"same repo {na.group(1)} and number {na.group(2)}"
+    if not repo_rules:
+        return None
     if (
         a != b
         and _alnum(a)
@@ -350,14 +355,17 @@ def execution_evidence(
 
     A judge proposes; this decides whether the proposal may execute without a
     human. People need a shared email or login (a name is not identity). Other
-    entities also accept id evidence: a shared UUID, the same repo + PR/issue
-    number, the same id up to punctuation, or the same repo name. On the
-    2026-09-23 replay every verified Jev auto-merge carried such evidence; the
-    one that did not was a name-only Person pair.
+    entities also accept id evidence: the same leaf UUID or the same repo +
+    PR/issue number; Documents (where repos live) also the same repo-style
+    slug up to case and -/_, or the same repo name. On the 2026-09-23 replay
+    every verified Jev auto-merge carried such evidence; the one that did not
+    was a name-only Person pair.
     """
     if label == NodeLabel.PERSON:
         return shared_identifier(a_id, a_props, b_id, b_props)
-    return shared_identifier(a_id, a_props, b_id, b_props) or _id_evidence(a_id, b_id)
+    return shared_identifier(a_id, a_props, b_id, b_props) or _id_evidence(
+        a_id, b_id, repo_rules=label == NodeLabel.DOCUMENT
+    )
 
 
 def template_rationale(node: dict[str, Any], cand: Candidate, p: float | None) -> str:

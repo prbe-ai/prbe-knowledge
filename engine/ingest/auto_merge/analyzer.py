@@ -288,8 +288,9 @@ class AutoMergeAnalyzer:
         # document into its `owner/repo#N` mention -- detaches the document
         # from the graph for good. On the managed plane 661 of the 704
         # auto-merges before 2026-08 did exactly that (measured 2026-09-23).
-        # So a document node is never the alias; it can still be a primary.
-        if await self._is_document(conn, customer_id, canonical_id):
+        # So a document node is never the alias; it can still be a primary. A
+        # `doc_type` marks a stub written before its document row exists.
+        if "doc_type" in properties or await self._is_document(conn, customer_id, canonical_id):
             return AutoMergeResult(action="skipped", rationale="document node")
 
         # With the merge breaker open there is no judge to ask: defer BEFORE the
@@ -620,8 +621,10 @@ class AutoMergeAnalyzer:
                 f"confidence=high{p} rationale={rationale[:120]}"
             ),
             # A re-upserted cluster primary is judged like a new node; folding
-            # it in would strand its own aliases. That pair goes to a human.
+            # it in would strand its own aliases. Re-checked under the merge
+            # lock, as is the document guard above.
             refuse_cluster_primaries=True,
+            refuse_document_aliases=True,
         )
         try:
             resp: MergeResponse = await merge_cluster(body)

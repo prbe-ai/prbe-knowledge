@@ -2,7 +2,7 @@
 acceptance bar fails.
 
     python -m scripts.jev_automerge.score --set <dir> --results <dir>/results.jsonl \
-        [--gptoss-results <file with "gptoss" answers>] [--min-verified 78] [--min-agreement 0.94]
+        [--gptoss-results <file with "gptoss" answers>] [--min-verified 12] [--min-agreement 0.94]
 
 PRECISION, NOT AGREEMENT. Each auto-merge a gate would make is checked against
 hard identity evidence -- never against the other model:
@@ -139,33 +139,42 @@ def main() -> int:
     def cand_props(d: dict, cid: str) -> dict:
         return next((c["properties"] or {} for c in d["candidates"] if c["canonical_id"] == cid), {})
 
-    if not any("is_document" in d for d in decisions.values()):
-        print("WARNING: this set predates is_document; document nodes are scored as if judged", file=sys.stderr)
+    if not all("is_document" in d for d in decisions.values()):
+        print("ERROR: this set predates is_document (the analyzer's document-node guard); "
+              "rebuild it with build_set", file=sys.stderr)
+        return 2
 
-    # ---- Jev auto-merges, gated exactly as production acts
-    merges, guarded, bands = [], 0, collections.Counter()
-    for did, r in results.items():
-        d, j = decisions[did], (r["jev"] or [{}])[0]
-        if d.get("is_document"):
-            bands["skipped (document node)"] += 1
-            continue
-        if j.get("error") or j.get("primary") is None:
-            bands["unique"] += 1
-            continue
-        if j["p"] < AUTO_MERGE_JEV_SUGGEST_AT:
-            bands["unique"] += 1
-        elif j["p"] < AUTO_MERGE_JEV_HIGH_AT:
-            bands["suggest"] += 1
-        elif j.get("model") != AUTO_MERGE_JEV_MODEL:
-            bands["suggest (uncalibrated model)"] += 1
-        elif not execution_evidence(
+    def band(d: dict, j: dict) -> str:
+        """What production does with one answer."""
+        if d["is_document"] or "doc_type" in (d["properties"] or {}):
+            return "skipped (document node)"
+        if j.get("error") or j.get("primary") is None or j["p"] < AUTO_MERGE_JEV_SUGGEST_AT:
+            return "unique"
+        if j["p"] < AUTO_MERGE_JEV_HIGH_AT:
+            return "suggest"
+        if j.get("model") != AUTO_MERGE_JEV_MODEL:
+            return "suggest (uncalibrated model)"
+        if not execution_evidence(
             d["qlabel"], d["canonical_id"], d["properties"], j["primary"], cand_props(d, j["primary"])
         ):
-            bands["suggest (no execution evidence)"] += 1
-            guarded += 1
-        else:
-            bands["merge"] += 1
-            merges.append((d, j))
+            return "suggest (no execution evidence)"
+        return "merge"
+
+    # ---- Jev auto-merges, gated exactly as production acts. Production asks
+    # about a node on every upsert, so a pair ANY repetition would execute is
+    # an auto-merge: adjudicate each distinct (decision, primary) once.
+    merged: dict[tuple[str, str], tuple[dict, dict]] = {}
+    bands = collections.Counter()
+    for did, r in results.items():
+        d = decisions[did]
+        for i, j in enumerate(r["jev"] or [{}]):
+            b = band(d, j)
+            if i == 0:
+                bands[b] += 1  # the action table reads the first repetition
+            if b == "merge":
+                merged.setdefault((did, j["primary"]), (d, j))
+    merges = list(merged.values())
+    guarded = bands["suggest (no execution evidence)"]
     verdicts = [
         (d, j, *adjudicate(human, d["qlabel"], d["canonical_id"], d["properties"] or {}, j["primary"],
                            cand_props(d, j["primary"])))
@@ -173,7 +182,7 @@ def main() -> int:
     ]
     tally = collections.Counter(v[2] for v in verdicts)
     print(f"Jev actions: {dict(bands)}")
-    print(f"Jev auto-merges: {len(merges)}  verified {tally['verified']}  person-by-guard {tally['by_guard']}  "
+    print(f"Jev auto-merges (distinct pairs over all repetitions): {len(merges)}  verified {tally['verified']}  person-by-guard {tally['by_guard']}  "
           f"known false {tally['known_false']}  needs human {tally['needs_human']}  "
           f"(execution gate downgraded {guarded})")
     for d, j, verdict, why in verdicts:

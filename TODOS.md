@@ -103,6 +103,24 @@ although Jev is sure the node is a duplicate. **Fix:** write a suggestion when
 `1 - p(none_of_these)` clears `AUTO_MERGE_JEV_SUGGEST_AT`; replay it first to
 size the extra suggestion volume.
 
+### Measure auto-merge precision on the merges that still run
+**Where:** `scripts/jev_automerge/`.
+
+With document nodes skipped, the 2026-09-23 replay leaves 14 auto-merges: 3
+verified independently, 11 people confirmed only by the email/login the gate
+itself requires. 0 known-false out of 14 still allows a false-merge rate of up
+to ~20% (95% bound). **Do:** a replay sampled over non-document nodes by label,
+and the day-one human review of live `jev-` audit rows, before relying on it.
+
+### Cap keys and depth in Jev's entity properties
+**Where:** `engine/ingest/auto_merge/jev_judge.py` (`trim_values`).
+
+`trim_values` trims long strings and lists but keeps every key, and custom-ingest
+properties have no size limit, so one tenant's huge property map can push every
+judgment it appears in over Jev's cap (the node is then dropped as an error; it
+no longer trips the shared breaker). Cap keys per map and nesting depth; replay
+first, since it changes the request.
+
 ### A long Jev outage parks the whole auto-merge backlog
 **Where:** `engine/ingest/post_write/worker.py` (`_defer`).
 

@@ -119,10 +119,12 @@ class JevRequestTooLarge(JevError):
 
 
 class JevRequestRejected(JevError):
-    """400/413/422: the server refused THIS request's shape -- permanent for
-    the input. It still counts against the breaker: a change on the server's
-    side (a new request schema) refuses every request alike, and only a run
-    of failures can tell that apart from one bad input."""
+    """400/413/422: the server refused THIS request -- permanent for the
+    input. A request-SCHEMA refusal (a list `detail`, FastAPI's shape) still
+    counts against the breaker: a change on the server's side refuses every
+    request alike, and only a run of them tells that apart from one bad
+    input. Other refusals do not: the merge breaker is shared by every tenant,
+    and one tenant's oversized entities must not pause everyone's."""
 
 
 #: Refusals that may be about the request itself. Every other 4xx -- 401/403
@@ -740,8 +742,9 @@ async def post_choice(
     Raises:
       JevBreakerOpen      -- nothing sent; the breaker is cooling down.
       JevRequestTooLarge  -- `max_tokens_exceeded`; permanent for this input.
-      JevRequestRejected  -- 400/413/422; permanent for this input (still
-                             counts against the breaker).
+      JevRequestRejected  -- 400/413/422; permanent for this input (only a
+                             request-schema refusal counts against the
+                             breaker).
       JevError            -- transport, `api_usage_error` (e.g. a retired
                              model), any other 4xx (401/403/404/408/429),
                              5xx, or a malformed answer; trips the breaker.
@@ -758,12 +761,14 @@ async def post_choice(
     except httpx.HTTPError as exc:
         breaker.failure()
         raise JevError(_err(exc)) from exc
-    if _is_token_overflow(resp):
-        # The input's fault, not an outage: do not trip the breaker.
-        raise JevRequestTooLarge(f"http_400:{_OVERFLOW_ERROR_TYPE}")
-    if resp.status_code in _PER_REQUEST_REJECTIONS and _error_type(resp) != _USAGE_ERROR_TYPE:
-        breaker.failure()
-        raise JevRequestRejected(f"http_{resp.status_code}:{_error_type(resp)}")
+    error_type = _error_type(resp) if resp.status_code != 200 else ""
+    if resp.status_code in _PER_REQUEST_REJECTIONS and error_type != _USAGE_ERROR_TYPE:
+        if _is_token_overflow(resp):
+            # The input's fault, not an outage: do not trip the breaker.
+            raise JevRequestTooLarge(f"http_400:{_OVERFLOW_ERROR_TYPE}")
+        if error_type == "validation_error":
+            breaker.failure()
+        raise JevRequestRejected(f"http_{resp.status_code}:{error_type}")
     if resp.status_code != 200:
         breaker.failure()
         raise JevError(f"http_{resp.status_code}:{_error_type(resp)}")

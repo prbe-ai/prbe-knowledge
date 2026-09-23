@@ -89,20 +89,48 @@ async def test_max_tokens_exceeded_is_too_large_and_does_not_trip_the_breaker():
     assert b.failures == 0
 
 
-@pytest.mark.parametrize("status", [400, 413, 422])
-async def test_a_refused_request_is_rejected_as_permanent_but_counts_against_the_breaker(status):
-    # One refusal is this input's problem; a run of them is the server
-    # refusing everything (a schema change), which must open the breaker so
-    # the queue defers instead of being dropped node by node.
+@pytest.mark.parametrize("status", [400, 422])
+async def test_a_request_schema_refusal_counts_against_the_breaker(status):
+    # A run of schema refusals (FastAPI's list `detail`) is the server
+    # refusing everything, which must open the breaker so the queue defers
+    # instead of being dropped node by node.
     b = jev.Breaker()
 
     def handler(req):
-        return httpx.Response(status, json={"detail": {"error_type": "validation_error"}})
+        return httpx.Response(status, json={"detail": [{"loc": ["body", "state"], "msg": "field required"}]})
 
     for _ in range(jev.JEV_BREAKER_FAILURES):
         with pytest.raises(jev.JevRequestRejected):
             await _ask(handler, breaker=b)
     assert b.is_open()
+
+
+@pytest.mark.parametrize("status", [400, 413, 422])
+async def test_other_refusals_drop_one_input_without_touching_the_shared_breaker(status):
+    # The merge breaker is shared by every tenant: one tenant's oversized
+    # entities must not pause auto-merge for everyone.
+    b = jev.Breaker()
+
+    def handler(req):
+        return httpx.Response(status, json={"detail": {"error_type": "payload_too_large"}})
+
+    for _ in range(jev.JEV_BREAKER_FAILURES):
+        with pytest.raises(jev.JevRequestRejected):
+            await _ask(handler, breaker=b)
+    assert b.failures == 0
+
+
+async def test_a_usage_error_echoing_the_overflow_text_is_still_an_outage():
+    # An error body can echo request text; only the error TYPE decides.
+    b = jev.Breaker()
+
+    def handler(req):
+        return httpx.Response(400, json={"detail": {"error_type": "api_usage_error", "message": "max_tokens_exceeded"}})
+
+    with pytest.raises(jev.JevError) as err:
+        await _ask(handler, breaker=b)
+    assert not isinstance(err.value, (jev.JevRequestRejected, jev.JevRequestTooLarge))
+    assert b.failures == 1
 
 
 async def test_an_unknown_model_is_an_outage_not_a_refusal_of_this_input():

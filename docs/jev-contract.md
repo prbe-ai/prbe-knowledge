@@ -149,7 +149,11 @@ is handled by a deterministic gate instead.
 **Document nodes are never judged.** A node whose id is one of the tenant's
 documents is that document's graph node -- retrieval joins
 `documents.doc_id = graph_nodes.canonical_id` -- so the analyzer skips it before
-the candidate search. It may still be the primary another node merges into.
+the candidate search, as it does a node whose properties carry a `doc_type` (a
+stub some writers create before the document row). It may still be the primary
+another node merges into. `merge_cluster` re-checks both under its lock when
+the caller sets `refuse_document_aliases`, which auto-merge and both suggestion
+approve routes do.
 On the managed plane 661 of the 704 auto-merges made before 2026-08 folded a
 document's node into its mention (above all a PR's `github:o/r:pr:N` document
 into the bare `o/r#N`), and on the replay 68 of Jev's 82 would have too; 875
@@ -190,9 +194,10 @@ can happen, keys never (no replayed property held a list, so the list cap
 changes no measured request).
 
 **Failure classes.** 400/413/422 are refusals of one request
-(`JevRequestRejected`): the node is dropped from the queue as an error, and the
-refusal still counts against `MERGE_BREAKER`, so a server that refuses
-everything opens it. `400 api_usage_error` -- what an unknown or retired model
+(`JevRequestRejected`): the node is dropped from the queue as an error. Only a
+request-SCHEMA refusal (a list `detail`) counts against `MERGE_BREAKER`, so a
+server that changed its schema opens it; other refusals do not, because the
+breaker is shared by every tenant. `400 api_usage_error` -- what an unknown or retired model
 gets (checked 2026-09-23) -- and every other non-200 -- 401/403 (a revoked
 key), 404 (a wrong URL), 408, 429, 5xx -- and any malformed answer count
 against the breaker and DEFER the node (5 min doubling to 1 h, parked after
