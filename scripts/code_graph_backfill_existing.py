@@ -51,6 +51,7 @@ from engine.shared.config import get_settings
 from engine.shared.constants import GITHUB_INSTALLATION_SCOPE_PREFIX, SourceSystem
 from engine.shared.db import close_pool, init_pool, raw_conn
 from engine.shared.logging import configure_logging, get_logger
+from engine.shared.tenant_status import active_tenant_sql
 from kb.code_graph.bridge import enqueue_initial_backfill
 
 log = get_logger(__name__)
@@ -80,7 +81,11 @@ async def _list_tenants(customer_id: str | None) -> list[_Tenant]:
     PAT-based github tokens (not in our prod tenants any more) don't carry
     an installation id and would need a different path; we skip them.
     """
-    where = ["source_system = 'github'", "status = 'active'"]
+    where = [
+        "source_system = 'github'",
+        "status = 'active'",
+        active_tenant_sql("integration_tokens.customer_id"),
+    ]
     params: list[object] = []
     if customer_id is not None:
         params.append(customer_id)

@@ -74,6 +74,7 @@ from engine.shared.logging import bind_trace, configure_logging, get_logger
 from engine.shared.schema_readiness import wait_for_github_control_schema
 from engine.shared.source_registry import ingestion_priority_for
 from engine.shared.storage import get_store
+from engine.shared.tenant_status import refusal_for
 from engine.system_settings import get_ingestion_killswitch
 from kb.admin_routes import router as admin_router
 from kb.backfill_routes import router as backfill_router
@@ -215,6 +216,10 @@ async def create_manual_uploads(
         )
 
     customer_id = x_prbe_customer
+    # A held (terminated) tenant takes no new writes (shared.tenant_status).
+    if (refusal := await refusal_for(customer_id)) is not None:
+        log.info("manual_upload.tenant_not_active", customer=customer_id, **refusal)
+        raise HTTPException(status_code=409, detail=refusal)
     trace_id = x_trace_id or f"manual-{int(datetime.now().timestamp() * 1000)}"
     safe_headers = {
         key: value for key, value in request.headers.items()
@@ -544,6 +549,15 @@ async def webhook(
         body_sha256_prefix=hashlib.sha256(raw_body).hexdigest()[:8],
         trace_id=trace_id,
     )
+
+    # A held (terminated) tenant takes no new writes -- no batch, receipt,
+    # lifecycle event or queue row (shared.tenant_status). 409 is permanent,
+    # and nothing retries it in a loop: research-os revokes the tenant's
+    # capture tokens when it terminates it (its gateway 401s the tap before a
+    # batch gets here), and the managed gateway hands a 4xx back to the source.
+    if (refusal := await refusal_for(customer_id)) is not None:
+        log.info("ingestion.tenant_not_active", source=source, customer=customer_id, **refusal)
+        raise HTTPException(status_code=409, detail=refusal)
 
     try:
         payload = orjson.loads(raw_body) if raw_body else {}

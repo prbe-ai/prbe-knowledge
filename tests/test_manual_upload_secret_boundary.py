@@ -60,6 +60,8 @@ def boundary(monkeypatch):
     monkeypatch.setattr(
         app, "get_ingestion_killswitch", AsyncMock(return_value=SimpleNamespace(enabled=True))
     )
+    # An active tenant: the door's status check reads `customers`.
+    monkeypatch.setattr(app, "refusal_for", AsyncMock(return_value=None))
     monkeypatch.setattr(app, "_insert_manual_upload_row", insert)
     monkeypatch.setattr(app, "_enqueue", enqueue)
     request = Request(

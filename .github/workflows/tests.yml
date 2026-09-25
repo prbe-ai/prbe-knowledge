@@ -199,6 +199,7 @@ jobs:
           tests/test_scanner_image_packaging.py
           tests/test_claim_protocol.py
           tests/test_queue_age.py
+          tests/test_inactive_tenants.py
 
       # Scoped to the STORAGE suite (Postgres + MinIO), not `tests/` wholesale.
       # The full suite has ~42 pre-existing failures unrelated to storage: tests that

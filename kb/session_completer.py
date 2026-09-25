@@ -28,6 +28,9 @@ MAX_EXTRACTION_RETRIES times. A pass skipped because extraction was switched
 off is re-queued up to MAX_DISABLED_RETRIES times (daily), and not at all while
 this sweep's own settings say extraction is off. A session that only hit the
 segment cap is final: the same transcript hits the same cap every time.
+
+Only ACTIVE tenants are swept, for both halves (shared.tenant_status): a
+terminated tenant's sessions are held for its purge, never ended or re-mined.
 """
 
 from __future__ import annotations
@@ -47,6 +50,7 @@ from engine.shared.session_signals import (
     last_key_sql,
 )
 from engine.shared.storage import get_store
+from engine.shared.tenant_status import ACTIVE_TENANTS_SQL, active_tenant_sql
 from kb.session_receipts import _lock
 
 log = get_logger(__name__)
@@ -146,6 +150,7 @@ _RETRYABLE = f"""
 _RETRY_FIND_SQL = f"""
 SELECT queue_id FROM ingestion_queue
  WHERE {_RETRYABLE}
+   AND {active_tenant_sql("ingestion_queue.customer_id")}
  ORDER BY enqueued_at
  LIMIT $4
 """
@@ -190,9 +195,9 @@ async def enqueue_idle_session_finalizers(
     capped = False
     async with get_pool().acquire() as conn:
         seen_buckets: set[str] = set()
-        tenants = [r["customer_id"] for r in await conn.fetch(
-            "SELECT customer_id FROM customers ORDER BY customer_id"
-        )]
+        # ACTIVE tenants only: a terminated tenant's sessions are held, not
+        # mined (shared.tenant_status). This used to be every `customers` row.
+        tenants = [r["customer_id"] for r in await conn.fetch(ACTIVE_TENANTS_SQL)]
         for source in AGENT_SOURCES:
             ended_here = 0
             for tenant in tenants:

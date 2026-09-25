@@ -37,6 +37,7 @@ from engine.shared.exceptions import (
 )
 from engine.shared.logging import bind_trace, get_logger
 from engine.shared.storage import get_store
+from engine.shared.tenant_status import active_tenant_sql
 
 log = get_logger(__name__)
 
@@ -235,8 +236,12 @@ class Worker:
             # (`Settings.per_customer_cap`), so it can never quietly rise above
             # the number of loops and stop capping anything, which is what 30
             # against 6 had been doing.
+            #
+            # Only an ACTIVE tenant's rows are claimable. A held tenant's rows
+            # stay pending, untouched, until its purge cascades them away
+            # (shared.tenant_status, which also records what the check costs).
             row = await conn.fetchrow(
-                """
+                f"""
                     WITH inflight AS (
                         SELECT customer_id, priority, COUNT(*) AS cnt
                         FROM ingestion_queue
@@ -250,6 +255,7 @@ class Worker:
                            ON i.customer_id = q.customer_id AND i.priority = q.priority
                     WHERE q.status = $1
                       AND COALESCE(i.cnt, 0) < $3
+                      AND {active_tenant_sql("q.customer_id")}
                     ORDER BY q.priority DESC, q.enqueued_at
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
@@ -283,8 +289,10 @@ class Worker:
         enqueue logic stays single-source. Returns [] when nothing is
         claimable."""
         async with get_pool().acquire() as conn, conn.transaction():
+            # The tenant check sits on `pick` alone: every row claimed below
+            # belongs to the one tenant it picked.
             rows = await conn.fetch(
-                """
+                f"""
                     WITH inflight AS (
                         SELECT customer_id, priority, COUNT(*) AS cnt
                         FROM ingestion_queue
@@ -298,6 +306,7 @@ class Worker:
                                ON i.customer_id = q.customer_id AND i.priority = q.priority
                         WHERE q.status = $1
                           AND COALESCE(i.cnt, 0) < $3
+                          AND {active_tenant_sql("q.customer_id")}
                         ORDER BY q.priority DESC, q.enqueued_at
                         LIMIT 1
                     )

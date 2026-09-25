@@ -18,6 +18,7 @@ from typing import Any
 
 from engine.shared.constants import SourceSystem
 from engine.shared.db import raw_conn, with_tenant
+from engine.shared.tenant_status import active_tenant_sql
 
 
 @dataclass
@@ -61,14 +62,18 @@ async def list_due_cursors(
     sees every tenant's rows — the scheduler itself doesn't have a
     tenant scope. Per-row processing later wraps the cursor update in
     ``with_tenant`` so writes ARE policy-gated.
+
+    ACTIVE tenants only (shared.tenant_status): a held tenant's sources are
+    not polled with its credentials.
     """
     async with raw_conn() as conn:
         rows = await conn.fetch(
-            """
+            f"""
             SELECT customer_id, source, resource_id, cursor_value,
                    polled_at, created_at, last_error, last_error_at
               FROM ingestion_cursors
              WHERE polled_at < (now() - make_interval(secs => $1))
+               AND {active_tenant_sql("ingestion_cursors.customer_id")}
              ORDER BY polled_at ASC
              LIMIT $2
             """,

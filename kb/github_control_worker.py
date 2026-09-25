@@ -25,6 +25,7 @@ from engine.shared.exceptions import (
 from engine.shared.logging import get_logger
 from engine.shared.models import WebhookEvent
 from engine.shared.schema_readiness import github_control_schema_ready
+from engine.shared.tenant_status import ACTIVE_TENANTS_SQL
 from kb.github_control import (
     MAX_HISTORY_QUEUE,
     GitHubQueueCapacityReached,
@@ -89,10 +90,11 @@ class GitHubControlWorker:
             while not self.shutdown_event.is_set():
                 if heartbeat.done():
                     heartbeat.result()  # never advertise readiness with a dead heartbeat/drain
+                # ACTIVE tenants only (shared.tenant_status): a held tenant's
+                # GitHub work -- live, history, crash recovery -- waits for
+                # its purge, and its installation is never called.
                 async with raw_conn() as conn:
-                    tenants = await conn.fetch(
-                        "SELECT customer_id FROM customers ORDER BY customer_id"
-                    )
+                    tenants = await conn.fetch(ACTIVE_TENANTS_SQL)
                 did_work = False
                 for tenant in tenants:
                     customer = tenant["customer_id"]

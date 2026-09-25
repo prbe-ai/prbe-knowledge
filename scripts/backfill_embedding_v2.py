@@ -52,6 +52,7 @@ from engine.shared.constants import EMBEDDING_V2_DIM, EMBEDDING_V2_MODEL
 from engine.shared.db import close_pool, init_pool, raw_conn
 from engine.shared.embeddings import DocItem, get_embedder_v2
 from engine.shared.logging import configure_logging, get_logger
+from engine.shared.tenant_status import active_tenant_sql
 
 log = get_logger(__name__)
 
@@ -103,7 +104,7 @@ async def _fetch_batch(
     which would never equal a non-negative worker_id.
     """
     rows = await conn.fetch(
-        """
+        f"""
         SELECT c.chunk_id, c.customer_id, c.content, d.title
         FROM chunks c
         LEFT JOIN LATERAL (
@@ -116,6 +117,7 @@ async def _fetch_batch(
         ) d ON TRUE
         WHERE c.embedding_v2 IS NULL
           AND ($1::text IS NULL OR c.customer_id = $1)
+          AND {active_tenant_sql("c.customer_id")}
           AND mod(abs(hashtext(c.chunk_id)), $3::int) = $4::int
         ORDER BY c.chunk_id
         LIMIT $2

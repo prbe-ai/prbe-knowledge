@@ -294,6 +294,7 @@ async def test_webhook_trace_and_parsed_event_id_never_persist_raw(monkeypatch, 
         return True
     monkeypatch.setattr(app, 'get_settings', lambda: SimpleNamespace(internal_knowledge_api_key=None, default_customer_id='test'))
     monkeypatch.setattr(app, 'get_ingestion_killswitch', AsyncMock(return_value=SimpleNamespace(enabled=True)))
+    monkeypatch.setattr(app, 'refusal_for', AsyncMock(return_value=None))
     monkeypatch.setattr(app, 'get_connector_class', lambda source: Connector)
     monkeypatch.setattr(app, 'build_connector', lambda *args: Connector())
     monkeypatch.setattr(app, 'bind_trace', lambda value: logs.append({'bound': value}))

@@ -89,6 +89,7 @@ from engine.shared.embeddings import (
 from engine.shared.exceptions import StorageNotFound
 from engine.shared.models import Document, WebhookEvent
 from engine.shared.session_signals import is_cron_marker_key
+from engine.shared.tenant_status import ACTIVE_TENANTS_SQL
 
 # THE CONNECTORS REGISTER ON IMPORT (engine/ingest/handlers/registry.py), and
 # only the ingestion app and the worker import them at startup. Without this the
@@ -209,8 +210,9 @@ async def _tenants(customers: list[str] | None, all_tenants: bool) -> list[str]:
         return list(dict.fromkeys(customers or []))
     # `customers` is not row-secured: the readable tenant list is what makes
     # the per-tenant GUC loop possible (same as scripts/cron_chunk_retention).
+    # ACTIVE tenants only: a held tenant is not re-rendered or re-embedded.
     async with get_pool().acquire() as conn:
-        rows = await conn.fetch("SELECT customer_id FROM customers ORDER BY customer_id")
+        rows = await conn.fetch(ACTIVE_TENANTS_SQL)
     return [r["customer_id"] for r in rows]
 
 
@@ -471,7 +473,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     scope = parser.add_mutually_exclusive_group(required=True)
     scope.add_argument("--customer", action="append", help="Tenant to repair (repeatable).")
-    scope.add_argument("--all-tenants", action="store_true", help="Every tenant in `customers`.")
+    scope.add_argument("--all-tenants", action="store_true", help="Every ACTIVE tenant in `customers`.")
     parser.add_argument("--doc-id", default=None, help="Only this document.")
     parser.add_argument(
         "--write", action="store_true", help="Embed and apply. Without it: dry run, no writes."

@@ -58,6 +58,7 @@ from engine.shared.db import raw_conn, with_tenant
 from engine.shared.embeddings import get_embedder_v2
 from engine.shared.logging import get_logger
 from engine.shared.metrics import counter
+from engine.shared.tenant_status import active_tenant_sql
 from scripts.backfill_graph_node_embeddings import _embedding_text
 
 log = get_logger(__name__)
@@ -73,11 +74,15 @@ _LOCK_DURATION = "5 minutes"
 # so every claim sorted the whole queue -- nothing on managed, where the queue
 # is near empty, but ~2 cores of Postgres at 2 rows/s against research's 220k
 # backlog (2026-09-23).
-_CLAIM_FRESH = """
+#
+# Both legs claim only an ACTIVE tenant's rows (shared.tenant_status): a held
+# tenant's rows stay queued, unlocked, until its purge cascades them.
+_CLAIM_FRESH = f"""
     SELECT customer_id, node_id, analyzer_status, enqueued_at
     FROM node_post_write_queue
     WHERE locked_until IS NULL
       AND COALESCE((analyzer_status->'auto_merge'->>'attempts')::int, 0) < $1
+      AND {active_tenant_sql("node_post_write_queue.customer_id")}
     ORDER BY enqueued_at ASC
     FOR UPDATE SKIP LOCKED
     LIMIT 1
@@ -85,11 +90,12 @@ _CLAIM_FRESH = """
 # A lease that expired (a worker died mid-process) or a deferral whose delay
 # has passed. No index serves it, so it runs when there is no fresh row, and
 # first on every _DUE_EVERY-th claim so a long backlog cannot starve retries.
-_CLAIM_DUE = """
+_CLAIM_DUE = f"""
     SELECT customer_id, node_id, analyzer_status, enqueued_at
     FROM node_post_write_queue
     WHERE locked_until < NOW()
       AND COALESCE((analyzer_status->'auto_merge'->>'attempts')::int, 0) < $1
+      AND {active_tenant_sql("node_post_write_queue.customer_id")}
     ORDER BY enqueued_at ASC
     FOR UPDATE SKIP LOCKED
     LIMIT 1

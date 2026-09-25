@@ -45,6 +45,7 @@ from engine.shared.config import get_settings
 from engine.shared.db import close_pool, init_pool, raw_conn, with_tenant
 from engine.shared.locks import advisory_lock_key
 from engine.shared.logging import configure_logging, get_logger
+from engine.shared.tenant_status import ACTIVE_TENANTS_SQL
 
 log = get_logger(__name__)
 
@@ -181,9 +182,7 @@ async def run_leiden_all_tenants() -> None:
 
     try:
         async with raw_conn() as list_conn:
-            customers = await list_conn.fetch(
-                "SELECT customer_id FROM customers ORDER BY customer_id"
-            )
+            customers = await list_conn.fetch(ACTIVE_TENANTS_SQL)
 
         customer_ids = [r["customer_id"] for r in customers]
         log.info("leiden.start", tenant_count=len(customer_ids))

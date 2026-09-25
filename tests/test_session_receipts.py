@@ -60,7 +60,7 @@ async def database(monkeypatch):
     admin = await asyncpg.connect(dsn)
     await admin.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public")
     await admin.execute("""
-        CREATE TABLE customers(customer_id TEXT PRIMARY KEY);
+        CREATE TABLE customers(customer_id TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'active');
         INSERT INTO customers VALUES('tenant-a'),('tenant-b');
         CREATE TABLE documents(customer_id TEXT,doc_id TEXT);
         CREATE TABLE ingestion_queue(queue_id BIGSERIAL PRIMARY KEY,customer_id TEXT,source_system TEXT,source_event_id TEXT,

@@ -773,8 +773,14 @@ class IntegrationStatus(StrEnum):
 
 
 class CustomerStatus(StrEnum):
+    """`customers.status`. Only ACTIVE tenants are processed or accept writes
+    (shared.tenant_status); every other value means "hold, do nothing"."""
+
     ACTIVE = "active"
     SUSPENDED = "suspended"
+    #: research-os's hold after a team is terminated (~22 days, then DELETED).
+    TERMINATED = "terminated"
+    #: Tombstone awaiting purge (research-os), or a managed-plane soft delete.
     DELETED = "deleted"
 
 

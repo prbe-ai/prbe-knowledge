@@ -32,6 +32,13 @@ A row that has been `processing` for twenty minutes is twenty minutes of
 latency to whoever is waiting for it. Counting only `pending` would hide a
 worker that claims rows promptly and then crawls, which is the exact failure
 that started this.
+
+WHY A HELD TENANT'S ROWS DO NOT
+-------------------------------
+A tenant that is not active has its rows held, never claimed, until its purge
+(shared.tenant_status) -- for research-os that is ~22 days. They are not a
+backlog anyone is waiting on, and counting them would pin `oldest_age_seconds`
+at the hold's age for its whole length.
 """
 
 from __future__ import annotations
@@ -45,6 +52,7 @@ from engine.shared.config import get_settings
 from engine.shared.db import get_pool
 from engine.shared.logging import get_logger
 from engine.shared.ops_alert import capture
+from engine.shared.tenant_status import active_tenant_sql
 
 log = get_logger(__name__)
 
@@ -52,7 +60,7 @@ log = get_logger(__name__)
 #: a full-table aggregate on an indexed predicate -- cheap, but not free.
 SAMPLE_INTERVAL_SECONDS = 60.0
 
-_SAMPLE_SQL = """
+_SAMPLE_SQL = f"""
     SELECT
         COUNT(*) FILTER (WHERE status = 'pending')                  AS pending,
         COUNT(*) FILTER (WHERE status = 'processing')               AS processing,
@@ -61,6 +69,7 @@ _SAMPLE_SQL = """
         )::bigint                                                    AS oldest_age_seconds
     FROM ingestion_queue
     WHERE status IN ('pending', 'processing')
+      AND {active_tenant_sql("ingestion_queue.customer_id")}
 """
 
 
