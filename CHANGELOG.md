@@ -21,9 +21,10 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   and stay until the source or tenant is purged. Live documents keep their history. Tenants
   that are not `active`, or carry `customers.metadata.legal_hold`
   (`engine/shared/legal_hold.py`), are skipped, re-checked before every committed batch.
-  Migration 0139 adds the partial index `idx_documents_tombstones`; build it `CONCURRENTLY`
-  on large planes before deploying (see the migration). The research-os chart schedules the
-  job daily.
+  Migration 0139 builds the partial index `idx_documents_tombstones` `CONCURRENTLY`, so the
+  unattended deploy hooks never block writes to a large `documents` table; if a deploy stalls
+  there, look for a long-lived transaction (see the migration). The research-os chart
+  schedules the job daily.
 
 ### Fixed
 
