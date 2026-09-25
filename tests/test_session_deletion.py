@@ -1059,3 +1059,79 @@ async def test_a_stalled_run_is_reported_and_resumed_by_its_id(env, monkeypatch)
         held = await client.post(f"/api/session-deletions/{deletion_id}/resume", headers=_headers(a))
         assert held.status_code == 423
     assert not await store.list_keys(bucket, f"raw/{CC.value}/{a}/")
+
+
+@pytest.mark.asyncio
+async def test_resume_deletes_protocol1_batches_known_only_from_the_journal(env) -> None:
+    """Protocol-1 batches live in date folders no prefix covers. Once the row
+    phase has committed, the journal is the only list of them."""
+    (a, _b), store = env
+    sid = _sid()
+    keys = await v1_session(a, sid)
+    ref = sd.SessionRef(CC.value, sid)
+    await sd.record_sessions(a, [ref], deletion_id=str(uuid.uuid4()), reason="r", ticket=None,
+                             selector={"by": "id"})
+    await sd._journal_and_delete_rows(a, ref, set())  # the pod dies here
+    bucket = await store.bucket_for(a)
+    assert all([await store.exists(bucket, k) for k in keys])
+    async with db_module.with_tenant(a) as conn:
+        assert set(keys) <= set(await conn.fetchval("SELECT pending_keys FROM session_deletions"))
+
+    outcome = await sd.erase_session(a, ref, grace_s=0)  # what /resume runs
+
+    assert outcome["verified"], outcome
+    assert not any([await store.exists(bucket, k) for k in keys])
+
+
+@pytest.mark.asyncio
+async def test_an_object_only_a_deep_scan_found_is_journaled_before_its_delete(env, monkeypatch) -> None:
+    """No row names an object only a deep scan found. If its delete fails, a
+    /resume without deep_scan must still know it."""
+    (a, _b), store = env
+    sid = _sid()
+    await v1_session(a, sid)
+    bucket = await store.bucket_for(a)
+    orphan = _legacy_key(a, sid, "2025/02/03", 9)
+    await store.put(bucket, orphan, b"{}")
+    real = type(store).delete_keys
+
+    async def orphan_fails(self, bucket, keys):
+        deleted, failed = await real(self, bucket, [k for k in keys if k != orphan])
+        return deleted, failed + ([orphan] if orphan in keys else [])
+
+    monkeypatch.setattr(type(store), "delete_keys", orphan_fails)
+    first = (await delete(a, [sid], deep_scan=True))["sessions"][f"claude_code:{sid}"]
+    assert not first["verified"] and first["r2_failed_key_count"] == 1, first
+    monkeypatch.setattr(type(store), "delete_keys", real)
+
+    again = await sd.erase_session(a, sd.SessionRef(CC.value, sid), grace_s=0)
+
+    assert again["verified"], again
+    assert not await store.exists(bucket, orphan)
+
+
+@pytest.mark.asyncio
+async def test_resume_repeats_the_deep_scan_the_request_asked_for(env) -> None:
+    """A run that died before or during its deep scan journaled nothing the
+    scan would have found. /resume with no body must scan again."""
+    import asyncio
+
+    (a, _b), store = env
+    sid = _sid()
+    bucket = await store.bucket_for(a)
+    orphan = _legacy_key(a, sid, "2025/02/03", 3)
+    await store.put(bucket, orphan, b"{}")
+    deletion_id = str(uuid.uuid4())
+    await sd.record_sessions(a, [sd.SessionRef(CC.value, sid)], deletion_id=deletion_id, reason="r",
+                             ticket=None, selector={"by": "id", "deep_scan": True})
+    async with _client() as client:
+        resumed = await client.post(f"/api/session-deletions/{deletion_id}/resume", headers=_headers(a))
+        assert resumed.status_code == 202, resumed.text
+        status = None
+        for _ in range(200):
+            status = (await client.get(f"/api/session-deletions/{deletion_id}", headers=_headers(a))).json()
+            if status["status"] not in ("running", "stalled"):
+                break
+            await asyncio.sleep(0.05)
+    assert status["status"] == "done", status
+    assert not await store.exists(bucket, orphan)

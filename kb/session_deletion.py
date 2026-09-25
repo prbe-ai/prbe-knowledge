@@ -790,6 +790,7 @@ async def record_sessions(
                 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, 'pending', $8::text[])
                 ON CONFLICT (customer_id, source_system, session_id) DO UPDATE SET
                     deletion_id  = EXCLUDED.deletion_id,
+                    selector     = EXCLUDED.selector,
                     ticket       = COALESCE(session_deletions.ticket, EXCLUDED.ticket),
                     status       = 'pending',
                     error        = NULL,
@@ -920,7 +921,6 @@ async def erase_session(
     customer_id: str,
     ref: SessionRef,
     *,
-    deep_keys: set[str] | None = None,
     grace_s: float | None = None,
 ) -> dict[str, Any]:
     """Phases 2-4 for one recorded session. Idempotent; never raises for a
@@ -950,7 +950,7 @@ async def erase_session(
             if hold is not None:
                 raise _HoldPlaced(hold)
             n, failed, r2_left = await _delete_objects(
-                store, bucket, customer_id, ref, sorted(set(keys) | (deep_keys or set()))
+                store, bucket, customer_id, ref, sorted(keys)
             )
             result["r2_objects_deleted"] += n
             if not failed:
@@ -993,6 +993,20 @@ async def erase_session(
 async def _wait_for_in_flight(seconds: float) -> None:
     """The pause before the second sweep. A seam: tests replace it with a writer."""
     await asyncio.sleep(seconds)
+
+
+async def _journal_keys(customer_id: str, ref: SessionRef, keys: set[str]) -> None:
+    own = f"raw/{ref.source}/{customer_id}/"
+    async with with_tenant(customer_id) as conn:
+        await conn.execute(
+            "UPDATE session_deletions "
+            "SET pending_keys = ARRAY(SELECT DISTINCT unnest(pending_keys || $4::text[])) "
+            "WHERE customer_id = $1 AND source_system = $2 AND session_id = $3",
+            customer_id,
+            ref.source,
+            ref.session_id,
+            sorted(k for k in keys if k.startswith(own)),
+        )
 
 
 async def _clear_journal(customer_id: str, ref: SessionRef) -> None:
@@ -1090,19 +1104,23 @@ async def run_deletion(
     person_ids: set[str] | None = None,
     grace_s: float | None = None,
 ) -> dict[str, Any]:
-    """Erase every recorded session in `refs`. Returns per-session outcomes."""
-    deep: dict[str, set[str]] = {}
+    """Erase every recorded session in `refs`. Returns per-session outcomes.
+
+    What a deep scan finds is journaled before anything is deleted: no row
+    names those objects, so after a failed delete or a crash the journal is
+    the only place a /resume can find them again.
+    """
     if deep_scan and refs:
         store = get_store()
         bucket = await store.bucket_for(customer_id)
         for source in sorted({r.source for r in refs}):
             wanted = {r.session_id for r in refs if r.source == source}
             for sid, keys in (await _deep_scan(store, bucket, customer_id, source, wanted)).items():
-                deep[f"{source}\0{sid}"] = keys
+                await _journal_keys(customer_id, SessionRef(source, sid), keys)
     outcomes: dict[str, Any] = {}
     for ref in refs:
         outcomes[f"{ref.source}:{ref.session_id}"] = await erase_session(
-            customer_id, ref, deep_keys=deep.get(f"{ref.source}\0{ref.session_id}"), grace_s=grace_s
+            customer_id, ref, grace_s=grace_s
         )
     persons = 0
     if person_ids:
@@ -1313,7 +1331,9 @@ async def delete_sessions(
                 "unattributed_sessions": selection.unattributed,
                 "skipped_invalid_ids": selection.skipped_invalid[:50]}
     deletion_id = str(uuid.uuid4())
-    selector = {"by": "id" if body.session_ids is not None else "author"}
+    # deep_scan is kept so a /resume repeats the scan the request asked for:
+    # a run that died mid-scan journaled nothing it had found.
+    selector = {"by": "id" if body.session_ids is not None else "author", "deep_scan": body.deep_scan}
     assert body.reason is not None
     await record_sessions(
         customer_id,
@@ -1389,7 +1409,7 @@ async def resume_deletion(
             """
             UPDATE session_deletions SET status = 'pending', error = NULL
              WHERE customer_id = $1 AND deletion_id = $2 AND status <> 'done'
-         RETURNING source_system, session_id
+         RETURNING source_system, session_id, selector
             """,
             customer_id,
             wanted,
@@ -1401,7 +1421,10 @@ async def resume_deletion(
         return {"deletion_id": deletion_id, "status": "nothing_to_resume", "sessions": []}
     log.info("session_deletion.resumed", customer=customer_id, deletion_id=deletion_id,
              sessions=len(refs))
-    _spawn(customer_id, deletion_id, refs, bool(body and body.deep_scan), set())
+    deep_scan = bool(body and body.deep_scan) or any(
+        (_decode(r["selector"]) or {}).get("deep_scan") for r in rows
+    )
+    _spawn(customer_id, deletion_id, refs, deep_scan, set())
     return JSONResponse(
         status_code=202,
         content={
