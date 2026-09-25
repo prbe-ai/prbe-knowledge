@@ -19,6 +19,7 @@ The boundaries pinned:
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -181,6 +182,29 @@ async def _doc(
                 None if deleted_at else "a body preview the customer deleted",
                 json.dumps(metadata or {}),
             )
+
+
+async def _recreate(conn, customer_id: str, doc_id: str, version: int, source_system: str) -> None:
+    """What an applied re-push leaves: the tombstone closed, a live version on top."""
+    await conn.execute(
+        "UPDATE documents SET valid_to = now()"
+        " WHERE customer_id = $1 AND doc_id = $2 AND valid_to IS NULL",
+        customer_id,
+        doc_id,
+    )
+    await conn.execute(
+        """
+        INSERT INTO documents (customer_id, doc_id, version, source_system, source_id,
+                               source_url, doc_type, content_hash, created_at, updated_at,
+                               valid_from, acl, title, body_preview, metadata)
+        VALUES ($1, $2, $3, $4, $2, 'https://x', 't', 'h-back', now(), now(), now(),
+                '{}'::jsonb, 'back again', 'the customer re-created it', '{}'::jsonb)
+        """,
+        customer_id,
+        doc_id,
+        version,
+        source_system,
+    )
 
 
 async def _chunk(
@@ -749,14 +773,32 @@ async def test_in_flight_recreate_is_left_alone(app_settings, settings, bucket_f
     assert await store.list_keys(bucket, "raw/") == [new_payload]
 
 
-async def test_dry_run_deletes_nothing(app_settings, settings) -> None:
+async def test_dry_run_deletes_nothing_and_sizes_the_work(app_settings, settings) -> None:
+    """An attended first run faces the whole historical backlog; the dry run is
+    what sizes it, so it reports rows and sources, not just a document count."""
     cid = "t-dry"
     await _tenant(cid)
     await _doc(cid, "slack:C1:1.0", versions=2, tombstone_days=9)
+    await _chunk(cid, "slack:C1:1.0", "c1", 1, 1, live=False)
+    await _doc(cid, "slack:C1:live", versions=2, tombstone_days=None)
+    await _chunk(cid, "slack:C1:live", "c2", 1, 1, live=False)
 
     assert await _run(app_settings, settings, dry_run=True) == purge.EXIT_OK
 
     assert await _doc_rows(cid, "slack:C1:1.0") == 2
+    assert await _chunk_rows(cid, "slack:C1:1.0") == 1
+
+    result = await purge.purge_tenant(
+        cid,
+        cutoff=datetime.now(UTC) - timedelta(days=TOMBSTONE_PURGE_DAYS),
+        deadline=float("inf"),
+        dry_run=True,
+    )
+    assert result.eligible == 1
+    assert result.eligible_rows == {"documents": 2, "chunks": 1}
+    assert result.by_source == {"slack": 1}
+    assert result.oldest_deleted_at is not None
+    assert result.documents == 0 and not result.rows
 
 
 async def test_budget_exhausted_stops_and_says_so(app_settings, settings) -> None:
@@ -767,6 +809,111 @@ async def test_budget_exhausted_stops_and_says_so(app_settings, settings) -> Non
     assert await _run(app_settings, settings, max_seconds=0) == purge.EXIT_BUDGET_EXHAUSTED
 
     assert await _doc_rows(cid, "slack:C1:1.0") == 1
+
+
+async def test_revived_chunk_survives_a_racing_delete(live_db) -> None:
+    """A closed code-graph tombstone gives a re-create no row lock to wait on,
+    so its chunk upsert can revive a chunk IN PLACE (ON CONFLICT ... SET
+    last_seen_version) while the purge's DELETE waits on that row. The DELETE
+    must re-check the version bound on the row it deletes, not trust the
+    snapshot it selected from."""
+    cid = "t-revive"
+    await _tenant(cid)
+    doc_id = "code_graph:acme/app:src/x.py:f"
+    await _doc(cid, doc_id, versions=2, tombstone_days=20, closed=True,
+               source_system=SourceSystem.CODE_GRAPH.value)
+    await _chunk(cid, doc_id, "revived", 1, 2, live=False)
+    await _chunk(cid, doc_id, "dead", 1, 1, live=False)
+
+    pool = db_module.get_pool()
+    writer = await pool.acquire()
+    try:
+        tx = writer.transaction()
+        await tx.start()
+        await writer.execute(
+            "UPDATE chunks SET last_seen_version = 3, valid_to = NULL"
+            " WHERE customer_id = $1 AND chunk_id = 'revived'",
+            cid,
+        )
+
+        async def delete():
+            async with db_module.with_tenant(cid) as conn:
+                return await conn.fetchrow(purge._DELETE_CHUNKS_SQL, cid, [doc_id], [2], 100)
+
+        task = asyncio.create_task(delete())
+        await asyncio.sleep(0.5)
+        assert not task.done(), "the DELETE should be waiting on the writer's row"
+        await tx.commit()
+        row = await asyncio.wait_for(task, 10)
+    finally:
+        await pool.release(writer)
+
+    assert (row["selected"], row["deleted"]) == (2, 1)
+    assert await _count(
+        "SELECT count(*) FROM chunks WHERE customer_id = $1 AND chunk_id = 'revived'", cid
+    ) == 1
+    assert await _count(
+        "SELECT count(*) FROM chunks WHERE customer_id = $1 AND chunk_id = 'dead'", cid
+    ) == 0
+
+
+async def test_recreated_after_scan_keeps_its_payloads(
+    app_settings, settings, bucket_for, monkeypatch
+) -> None:
+    """A re-push applied between the candidate scan and the raw delete has no
+    queue row in flight any more, and the listing holds the LIVE document's
+    payload. Eligibility is re-read before the objects go."""
+    cid = "t-recreated"
+    await _tenant(cid)
+    store = storage_module.get_store()
+    bucket = await bucket_for(cid)
+    ci = SourceSystem.CUSTOM_INGEST.value
+    doc_id = custom_ingest_doc_id(cid, SOURCE_KEY, "run:1")
+    await _doc(cid, doc_id, versions=1, tombstone_days=9, source_system=ci)
+    live_payload = document_payload_key(cid, SOURCE_KEY, "run:1", "back")
+    await store.put(bucket, live_payload, b"{}")
+
+    real_list = storage_module.ObjectStore.list_keys
+    recreated = False
+
+    async def list_then_recreate(self, bucket_name: str, prefix: str) -> list[str]:
+        nonlocal recreated
+        keys = await real_list(self, bucket_name, prefix)
+        if not recreated:
+            recreated = True
+            async with db_module.with_tenant(cid) as conn:
+                await _recreate(conn, cid, doc_id, 2, ci)
+        return keys
+
+    monkeypatch.setattr(storage_module.ObjectStore, "list_keys", list_then_recreate)
+    assert await _run(app_settings, settings) == purge.EXIT_OK
+
+    assert recreated
+    assert await real_list(store, bucket, "raw/") == [live_payload]
+    assert await _doc_rows(cid, doc_id) == 2
+
+
+async def test_one_tenants_discovery_failure_does_not_stop_the_rest(
+    app_settings, settings, monkeypatch
+) -> None:
+    await _tenant("t-bad")
+    await _tenant("t-good")
+    await _doc("t-bad", "slack:C1:1.0", versions=1, tombstone_days=9)
+    await _doc("t-good", "slack:C1:1.0", versions=1, tombstone_days=9)
+    real = purge.with_tenant
+
+    @asynccontextmanager
+    async def flaky(customer_id: str) -> AsyncIterator:
+        if customer_id == "t-bad":
+            raise RuntimeError("canceling statement due to statement timeout")
+        async with real(customer_id) as conn:
+            yield conn
+
+    monkeypatch.setattr(purge, "with_tenant", flaky)
+    assert await _run(app_settings, settings) == purge.EXIT_FAILED
+
+    assert await _doc_rows("t-good", "slack:C1:1.0") == 0
+    assert await _doc_rows("t-bad", "slack:C1:1.0") == 1
 
 
 def test_window_fits_the_deletion_deadline() -> None:

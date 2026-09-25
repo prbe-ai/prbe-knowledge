@@ -28,7 +28,10 @@ WHAT IS DELETED, per eligible document, in this order:
        manual uploads  the manual_uploads row's payload and staging objects
      Listed, then deleted by exact key, so a payload a re-create writes after
      the listing survives. A document with a queued or in-flight custom-ingest
-     row is skipped for this run: it is being re-created right now.
+     row is skipped for this run: it is being re-created right now. So is one
+     that stopped being eligible after the scan (its re-create already
+     applied): eligibility is re-read, and the row locked, right before each
+     document's objects are deleted.
   2. chunks, in batches.
   3. Superseded document versions, in batches.
   4. In one final transaction: failed_chunks, the tombstone version, then --
@@ -120,6 +123,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 import time
 from collections import Counter
@@ -195,9 +199,30 @@ _CANDIDATES_SQL = f"""
     LIMIT $5
 """
 
-_COUNT_SQL = f"""
-    SELECT count(*) FROM documents d
-    WHERE d.customer_id = $1 AND {_ELIGIBLE.format(cutoff="$2")}
+# What a real run would delete, for --dry-run: an attended first run faces the
+# whole historical backlog, and its size in chunk rows (26 GB table) and raw
+# prefixes (one listing per custom-ingest document) is what sizes the job.
+_DRY_RUN_SQL = f"""
+    WITH eligible AS (
+        SELECT d.doc_id, d.version, d.deleted_at, d.source_system
+        FROM documents d
+        WHERE d.customer_id = $1 AND {_ELIGIBLE.format(cutoff="$2")}
+    )
+    SELECT
+        (SELECT count(*) FROM eligible) AS documents,
+        (SELECT min(deleted_at) FROM eligible) AS oldest_deleted_at,
+        (SELECT count(*) FROM eligible e
+           JOIN documents d
+             ON d.customer_id = $1 AND d.doc_id = e.doc_id AND d.version < e.version
+        ) AS superseded_versions,
+        (SELECT count(*) FROM eligible e
+           JOIN chunks c
+             ON c.customer_id = $1 AND c.doc_id = e.doc_id
+            AND c.last_seen_version <= e.version
+        ) AS chunks,
+        (SELECT coalesce(jsonb_object_agg(source_system, n), '{{}}'::jsonb)
+           FROM (SELECT source_system, count(*) AS n FROM eligible GROUP BY 1) s
+        ) AS by_source
 """
 
 # Re-validates and locks at the start of every batch. SKIP LOCKED: a document a
@@ -226,10 +251,19 @@ _MANUAL_UPLOAD_KEYS_SQL = """
 """
 
 # Chunks carry the version range they were live in. Bounding by the
-# tombstone's version keeps a chunk a racing re-create just revived.
+# tombstone's version keeps a chunk a racing re-create just revived -- and the
+# bound is repeated on the DELETE itself, not only in `doomed`: the chunk
+# upsert revives a row IN PLACE (ON CONFLICT ... SET last_seen_version), and a
+# revival that commits while this statement waits on the row is re-checked
+# against the DELETE's own quals (EvalPlanQual), never against `doomed`'s
+# snapshot. A closed code-graph tombstone gives the re-create no row lock to
+# wait on, so this re-check is its only protection.
+# Returns (selected, deleted): the loop moves on from chunks only when fewer
+# than the batch were SELECTED, so rows a concurrent delete took, or a revival
+# kept, never read as "no chunks left".
 _DELETE_CHUNKS_SQL = """
     WITH doomed AS (
-        SELECT c.chunk_id
+        SELECT c.chunk_id, t.version
         FROM unnest($2::text[], $3::int[]) AS t(doc_id, version)
         JOIN chunks c ON c.customer_id = $1 AND c.doc_id = t.doc_id
         WHERE c.last_seen_version <= t.version
@@ -238,10 +272,13 @@ _DELETE_CHUNKS_SQL = """
     gone AS (
         DELETE FROM chunks c
         USING doomed
-        WHERE c.customer_id = $1 AND c.chunk_id = doomed.chunk_id
+        WHERE c.customer_id = $1
+          AND c.chunk_id = doomed.chunk_id
+          AND c.last_seen_version <= doomed.version
         RETURNING 1
     )
-    SELECT count(*) FROM gone
+    SELECT (SELECT count(*) FROM doomed) AS selected,
+           (SELECT count(*) FROM gone) AS deleted
 """
 
 _DELETE_OLD_VERSIONS_SQL = """
@@ -442,6 +479,9 @@ class TenantResult:
     in_flight_skipped: int = 0
     contended_groups: int = 0
     eligible: int = 0
+    eligible_rows: Counter[str] = field(default_factory=Counter)
+    oldest_deleted_at: datetime | None = None
+    by_source: dict[str, int] = field(default_factory=dict)
     blocked: str | None = None
     budget_exhausted: bool = False
 
@@ -490,11 +530,32 @@ def _custom_ingest_identity(customer_id: str, doc: _Doc) -> tuple[str, str] | No
 
 
 async def _purge_raw(
-    customer_id: str, docs: list[_Doc], result: TenantResult
+    customer_id: str,
+    docs: list[_Doc],
+    cutoff: datetime,
+    deadline: float,
+    result: TenantResult,
 ) -> list[_Doc]:
     """Step 1. Delete each document's own raw payloads; return the documents
     whose rows may now go. A document whose payloads could not be removed keeps
     its rows -- they are the only way the next run finds the payloads again."""
+    failed: set[str] = set()
+    try:
+        return await _purge_raw_inner(customer_id, docs, cutoff, deadline, result, failed)
+    finally:
+        # Counted even when a lock timeout or a hold ends the group early, so a
+        # storage failure earlier in it still makes the run exit 1.
+        result.failed_documents += len(failed)
+
+
+async def _purge_raw_inner(
+    customer_id: str,
+    docs: list[_Doc],
+    cutoff: datetime,
+    deadline: float,
+    result: TenantResult,
+    failed: set[str],
+) -> list[_Doc]:
     custom = [d for d in docs if d.source_system == SourceSystem.CUSTOM_INGEST.value]
     async with with_tenant(customer_id) as conn:
         manual_rows = await conn.fetch(
@@ -505,20 +566,25 @@ async def _purge_raw(
 
     keys: dict[str, list[str]] = {}
     event_prefix: dict[str, str] = {}
-    failed: set[str] = set()
     store = get_store()
     try:
         bucket = await store.bucket_for(customer_id)
     except StorageUnavailable as exc:
         log.error("tombstone_purge.bucket_failed", customer_id=customer_id, error=str(exc))
-        blocked = {d.doc_id for d in custom} | {r["doc_id"] for r in manual_rows}
-        result.failed_documents += len(blocked)
-        return [d for d in docs if d.doc_id not in blocked]
+        failed.update(d.doc_id for d in custom)
+        failed.update(r["doc_id"] for r in manual_rows)
+        return [d for d in docs if d.doc_id not in failed]
 
     # List BEFORE reading the in-flight set: a re-create writes its payload,
     # then enqueues, so any payload this listing can see has its queue row
     # visible to the read that follows.
     for doc in custom:
+        # One storage round trip per document, up to a group of them: the
+        # budget is checked here as well as between row batches, so a slow
+        # store stops the run cleanly instead of running into the pod's
+        # activeDeadlineSeconds.
+        if time.monotonic() >= deadline:
+            raise _BudgetExhausted
         identity = _custom_ingest_identity(customer_id, doc)
         if identity is None:
             log.error(
@@ -564,10 +630,20 @@ async def _purge_raw(
             continue
         doc_keys = keys.get(doc.doc_id)
         if doc_keys:
+            if time.monotonic() >= deadline:
+                raise _BudgetExhausted
             try:
                 # Holding the gate across the delete: a hold set now waits
                 # for this one document, and the next one sees it.
-                async with _gated(customer_id):
+                async with _gated(customer_id) as conn:
+                    # Still eligible, re-read now and locked: a document
+                    # re-created since the scan whose new version has already
+                    # been applied is no longer in flight, and the listing
+                    # holds its LIVE payload. One a writer holds is left for
+                    # the next run.
+                    if not await conn.fetch(_LOCK_SQL, customer_id, [doc.doc_id], cutoff):
+                        result.in_flight_skipped += 1
+                        continue
                     deleted, errors = await store.delete_keys(bucket, doc_keys)
             except StorageUnavailable as exc:
                 log.error(
@@ -590,7 +666,6 @@ async def _purge_raw(
                 continue
             result.r2_objects += deleted
         ready.append(doc)
-    result.failed_documents += len(failed)
     return ready
 
 
@@ -696,9 +771,11 @@ async def _purge_rows(
             ids = [r["doc_id"] for r in locked]
             versions = [r["version"] for r in locked]
             budget = TOMBSTONE_PURGE_BATCH_SIZE
-            n = await conn.fetchval(_DELETE_CHUNKS_SQL, customer_id, ids, versions, budget)
-            batch["chunks"] += n
-            budget -= n
+            chunks = await conn.fetchrow(
+                _DELETE_CHUNKS_SQL, customer_id, ids, versions, budget
+            )
+            batch["chunks"] += chunks["deleted"]
+            budget -= chunks["selected"]
             if budget > 0:
                 n = await conn.fetchval(
                     _DELETE_OLD_VERSIONS_SQL, customer_id, ids, versions, budget
@@ -735,11 +812,23 @@ async def purge_tenant(
     result = TenantResult(customer_id)
     if dry_run:
         async with with_tenant(customer_id) as conn:
-            result.eligible = int(await conn.fetchval(_COUNT_SQL, customer_id, cutoff))
+            row = await conn.fetchrow(_DRY_RUN_SQL, customer_id, cutoff)
+        result.eligible = int(row["documents"])
+        result.eligible_rows.update(
+            documents=result.eligible + int(row["superseded_versions"]),
+            chunks=int(row["chunks"]),
+        )
+        result.oldest_deleted_at = row["oldest_deleted_at"]
+        result.by_source = dict(json.loads(row["by_source"]))
         log.info(
             "tombstone_purge.would_delete",
             customer_id=customer_id,
             documents=result.eligible,
+            rows=dict(result.eligible_rows),
+            by_source=result.by_source,
+            oldest_deleted_at=(
+                result.oldest_deleted_at.isoformat() if result.oldest_deleted_at else None
+            ),
             window_days=TOMBSTONE_PURGE_DAYS,
         )
         return result
@@ -773,7 +862,7 @@ async def purge_tenant(
             for r in rows
         ]
         try:
-            ready = await _purge_raw(customer_id, docs, result)
+            ready = await _purge_raw(customer_id, docs, cutoff, deadline, result)
             if ready:
                 await _purge_rows(customer_id, ready, cutoff, deadline, result)
         except _TenantBlocked as exc:
@@ -839,12 +928,32 @@ async def run_once(
     # Most overdue first. A run that stops at --max-seconds must not always
     # spend its budget on the same tenant while the last one in a fixed order
     # never gets reached.
+    if customer is not None and customer not in candidates:
+        log.warning(
+            "tombstone_purge.customer_not_eligible",
+            customer_id=customer,
+            reason="absent, not active, or on legal hold",
+        )
     oldest: dict[str, datetime] = {}
+    failed = False
     for customer_id in candidates:
-        async with with_tenant(customer_id) as conn:
-            first = await conn.fetchrow(
-                _CANDIDATES_SQL, customer_id, cutoff, *_WALK_START, 1
+        try:
+            async with with_tenant(customer_id) as conn:
+                first = await conn.fetchrow(
+                    _CANDIDATES_SQL, customer_id, cutoff, *_WALK_START, 1
+                )
+        except Exception as exc:
+            # Same rule as the purge loop below: one tenant's failure makes
+            # the run red but must not stop every other tenant's deletions.
+            failed = True
+            log.error(
+                "tombstone_purge.tenant_failed",
+                customer_id=customer_id,
+                stage="discover",
+                error_type=type(exc).__name__,
+                error=str(exc),
             )
+            continue
         if first is not None:
             oldest[customer_id] = first["deleted_at"]
     tenants = sorted(oldest, key=lambda c: (oldest[c], c))
@@ -857,9 +966,10 @@ async def run_once(
         cutoff=cutoff.isoformat(),
         dry_run=dry_run,
     )
-    failed = budget_exhausted = False
+    budget_exhausted = False
     totals = Counter[str]()
     documents = 0
+    eligible = 0
     for customer_id in tenants:
         try:
             result = await purge_tenant(
@@ -878,6 +988,8 @@ async def run_once(
             continue
         documents += result.documents
         totals.update(result.rows)
+        totals.update(result.eligible_rows)
+        eligible += result.eligible
         failed = failed or result.failed_documents > 0
         if result.budget_exhausted:
             budget_exhausted = True
@@ -885,7 +997,10 @@ async def run_once(
     log.info(
         "tombstone_purge.done",
         tenants=len(tenants),
+        # A dry run deletes nothing: its totals are what a real run WOULD
+        # delete, reported as `would_delete_documents` so the two never mix.
         documents=documents,
+        would_delete_documents=eligible if dry_run else None,
         rows=dict(totals),
         failed=failed,
         budget_exhausted=budget_exhausted,
