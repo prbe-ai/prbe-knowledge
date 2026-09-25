@@ -99,7 +99,10 @@ per committed transaction, the tombstone version last, so a killed run leaves a
 still-eligible document for the next one. Documents are walked in
 (deleted_at, doc_id) order, each at most once per run, over the partial index
 idx_documents_tombstones (migration 0139). No new batch starts after
---max-seconds.
+--max-seconds. The final batch's deletes on the big side tables
+(acl_snapshots, pending_edges, inferred_edges_queue) are index lookups
+(migration 0141); before it, the first production run spent ~5 minutes per
+batch scanning them and timed out.
 
 SCHEDULE. research-os schedules engine crons in its own chart; this needs one
 CronJob shaped like engine-cron-chunk-retention PLUS R2 credentials
@@ -130,6 +133,7 @@ import time
 from collections import Counter
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -326,30 +330,47 @@ _GONE_SQL = """
 """
 
 #: Rows that name a document by id and nothing else. Run only for documents
-#: with no version left.
-_BY_DOC_ID: tuple[tuple[str, str], ...] = (
+#: with no version left. (stage, table, statement). inferred_edges_queue,
+#: manual_uploads and both pending_edges statements are lookups on an index
+#: keyed (customer_id, <that id>) -- without one, a delete reads the whole
+#: table once per batch, which is what timed the first production run out
+#: (migration 0141). github_document_bindings has only its primary key
+#: (customer_id, installation_id, doc_id) and is small: GitHub documents only.
+#:
+#: pending_edges is TWO statements, not one `from ... OR to ...`: each side has
+#: its own partial index (WHERE <side>_label = 'Document'), and the label is a
+#: literal here because a partial index serves only a query that restates its
+#: predicate. A row with both endpoints gone is deleted by the first and simply
+#: not found by the second.
+_BY_DOC_ID: tuple[tuple[str, str, str], ...] = (
     (
+        "inferred_edges_queue",
         "inferred_edges_queue",
         "DELETE FROM inferred_edges_queue "
         "WHERE customer_id = $1 AND anchor_doc_id = ANY($2::text[])",
     ),
     (
         "github_document_bindings",
+        "github_document_bindings",
         "DELETE FROM github_document_bindings "
         "WHERE customer_id = $1 AND doc_id = ANY($2::text[])",
     ),
     (
         "manual_uploads",
+        "manual_uploads",
         "DELETE FROM manual_uploads WHERE customer_id = $1 AND doc_id = ANY($2::text[])",
     ),
     (
+        "pending_edges.from",
         "pending_edges",
-        f"""
-        DELETE FROM pending_edges
-        WHERE customer_id = $1
-          AND ((from_label = '{_DOC_LABEL}' AND from_canonical_id = ANY($2::text[]))
-            OR (to_label = '{_DOC_LABEL}' AND to_canonical_id = ANY($2::text[])))
-        """,
+        f"DELETE FROM pending_edges WHERE customer_id = $1"
+        f" AND from_label = '{_DOC_LABEL}' AND from_canonical_id = ANY($2::text[])",
+    ),
+    (
+        "pending_edges.to",
+        "pending_edges",
+        f"DELETE FROM pending_edges WHERE customer_id = $1"
+        f" AND to_label = '{_DOC_LABEL}' AND to_canonical_id = ANY($2::text[])",
     ),
 )
 
@@ -357,17 +378,40 @@ _BY_DOC_ID: tuple[tuple[str, str], ...] = (
 # source_id, sometimes a container (a GitHub repo). Only a row naming THIS
 # document by one of its own ids goes, and only while no surviving document of
 # the same source answers to that id.
+#
+# Written as equality lookups, because the natural spelling cannot use an
+# index: `a.resource_id IN (g.doc_id, g.source_id)` joined against the tenant's
+# whole acl_snapshots, and a surviving-document check of
+# `x.doc_id = a.resource_id OR x.source_id = a.resource_id` became a BitmapOr
+# over the TRIGRAM index on source_id for every matched row. So each document
+# contributes its two ids as separate (source, id) rows, each an index lookup
+# on idx_acl_snapshots_resource, and "no survivor answers to it" is two
+# NOT EXISTS: by doc_id (documents_pkey) and by source_id
+# (idx_documents_customer_source, whose source_system is the row's own).
+# NOT EXISTS (p OR q) is NOT EXISTS p AND NOT EXISTS q, and a row matched by
+# both ids is still deleted once, so what goes is exactly what went before.
 _DELETE_ACL_SQL = """
+    WITH ids AS (
+        SELECT g.source_system, r.resource_id
+        FROM unnest($2::text[], $3::text[], $4::text[]) AS g(doc_id, source_system, source_id)
+        CROSS JOIN LATERAL (VALUES (g.doc_id), (g.source_id)) AS r(resource_id)
+    )
     DELETE FROM acl_snapshots a
-    USING unnest($2::text[], $3::text[], $4::text[]) AS g(doc_id, source_system, source_id)
+    USING ids
     WHERE a.customer_id = $1
-      AND a.source_system = g.source_system
-      AND a.resource_id IN (g.doc_id, g.source_id)
+      AND a.resource_id = ids.resource_id
+      AND a.source_system = ids.source_system
+      AND NOT EXISTS (
+          SELECT 1 FROM documents x
+          WHERE x.customer_id = $1
+            AND x.doc_id = a.resource_id
+            AND x.source_system = a.source_system
+      )
       AND NOT EXISTS (
           SELECT 1 FROM documents x
           WHERE x.customer_id = $1
             AND x.source_system = a.source_system
-            AND (x.doc_id = a.resource_id OR x.source_id = a.resource_id)
+            AND x.source_id = a.resource_id
       )
 """
 
@@ -467,6 +511,33 @@ _DELETE_NODE_QUEUE_SQL = """
 """
 
 
+#: What the purge was doing when a tenant failed or a group was contended,
+#: named in `tombstone_purge.tenant_failed` / `.group_contended`. Set before
+#: every statement and storage call. The first production failure logged only
+#: `error_type=TimeoutError error=""` -- asyncpg's client command_timeout raises
+#: an empty TimeoutError -- and nothing said which of ~20 statements it was.
+_STAGE: ContextVar[str] = ContextVar("tombstone_purge_stage", default="start")
+
+
+def _at(stage: str) -> None:
+    _STAGE.set(stage)
+
+
+def _error_text(exc: BaseException) -> str:
+    """str(exc), never empty: a bare TimeoutError from asyncpg's client-side
+    command_timeout (db_statement_timeout_ms) stringifies to ''."""
+    text = str(exc)
+    if text:
+        return text
+    if isinstance(exc, TimeoutError):
+        timeout_ms = get_settings().db_statement_timeout_ms
+        return (
+            f"no reply within the client command_timeout ({timeout_ms} ms, "
+            "db_statement_timeout_ms)"
+        )
+    return repr(exc)
+
+
 class _TenantBlocked(Exception):
     """The tenant went on hold or stopped being active: stop deleting."""
 
@@ -514,6 +585,7 @@ async def _gated(customer_id: str) -> AsyncIterator[asyncpg.Connection]:
     is re-checked under FOR SHARE on its customers row: a hold committed
     before this point stops it, and one set while it runs waits for it.
     """
+    _at("gate")
     async with with_tenant(customer_id) as conn:
         await conn.execute(f"SET LOCAL lock_timeout = '{_LOCK_TIMEOUT}'")
         reason = await purge_blocked_reason(conn, customer_id, lock=True)
@@ -588,6 +660,7 @@ async def _purge_raw_inner(
     failed: set[str],
 ) -> list[_Doc]:
     custom = [d for d in docs if d.source_system == SourceSystem.CUSTOM_INGEST.value]
+    _at("raw.manual_upload_keys")
     async with with_tenant(customer_id) as conn:
         manual_rows = await conn.fetch(
             _MANUAL_UPLOAD_KEYS_SQL, customer_id, [d.doc_id for d in docs]
@@ -598,6 +671,7 @@ async def _purge_raw_inner(
     keys: dict[str, list[str]] = {}
     event_prefix: dict[str, str] = {}
     store = _store()
+    _at("raw.bucket")
     try:
         bucket = await store.bucket_for(customer_id)
     except StorageUnavailable as exc:
@@ -627,6 +701,7 @@ async def _purge_raw_inner(
             failed.add(doc.doc_id)
             continue
         event_prefix[doc.doc_id] = document_event_prefix(*identity)
+        _at("raw.list")
         try:
             keys[doc.doc_id] = await store.list_keys(
                 bucket, document_payload_prefix(customer_id, *identity)
@@ -707,8 +782,10 @@ async def _clear_payloads(
     it is waiting to be applied.
     """
     async with _gated(customer_id) as conn:
+        _at("raw.lock")
         if not await conn.fetch(_LOCK_SQL, customer_id, [doc_id], cutoff):
             return None
+        _at("raw.in_flight")
         if event_prefix is not None and await conn.fetchval(
             _IN_FLIGHT_SQL,
             customer_id,
@@ -719,6 +796,7 @@ async def _clear_payloads(
             return None
         if not keys:
             return 0, 0
+        _at("raw.delete")
         return await store.delete_keys(bucket, keys)
 
 
@@ -727,7 +805,9 @@ async def _purge_graph(
 ) -> None:
     ids = [d.doc_id for d in docs]
     sources = [d.source_system for d in docs]
+    _at("graph.neighbours")
     neighbours = await conn.fetch(_NEIGHBOURS_SQL, customer_id, ids, sources, _DOC_LABEL)
+    _at("graph.doc_nodes")
     doc_nodes = [
         r["node_id"]
         for r in await conn.fetch(_DELETE_DOC_NODES_SQL, customer_id, ids, _DOC_LABEL)
@@ -740,6 +820,7 @@ async def _purge_graph(
         (r["node_id"], r["source_system"]) for r in neighbours if r["node_id"] not in deleted
     ]
     if candidates:
+        _at("graph.lock_neighbours")
         locked = {
             r["node_id"]
             for r in await conn.fetch(
@@ -748,6 +829,7 @@ async def _purge_graph(
         }
         candidates = [c for c in candidates if c[0] in locked]
         if candidates:
+            _at("graph.orphans")
             orphans = [
                 r["node_id"]
                 for r in await conn.fetch(
@@ -762,8 +844,10 @@ async def _purge_graph(
             gone_nodes.extend(orphans)
             survivors = sorted(locked - set(orphans))
             if survivors:
+                _at("graph.recount_degree")
                 await conn.execute(_RECOUNT_DEGREE_SQL, customer_id, survivors)
     if gone_nodes:
+        _at("node_post_write_queue")
         counts["node_post_write_queue"] += _rows(
             await conn.execute(_DELETE_NODE_QUEUE_SQL, customer_id, gone_nodes)
         )
@@ -778,20 +862,26 @@ async def _finish(
 ) -> int:
     """Step 4, inside the batch's transaction. Returns documents fully gone."""
     ids = [d.doc_id for d in docs]
+    _at("failed_chunks")
     counts["failed_chunks"] += _rows(
         await conn.execute(_DELETE_FAILED_CHUNKS_SQL, customer_id, ids, versions)
     )
+    _at("tombstones")
     counts["documents"] += _rows(
         await conn.execute(_DELETE_TOMBSTONES_SQL, customer_id, ids, versions)
     )
+    _at("graph.lock_doc_nodes")
     await conn.execute(_LOCK_DOC_NODES_SQL, customer_id, ids, _DOC_LABEL)
+    _at("gone")
     gone_ids = {r["doc_id"] for r in await conn.fetch(_GONE_SQL, customer_id, ids)}
     gone = [d for d in docs if d.doc_id in gone_ids]
     if not gone:
         return 0
     gone_list = [d.doc_id for d in gone]
-    for table, sql in _BY_DOC_ID:
+    for stage, table, sql in _BY_DOC_ID:
+        _at(stage)
         counts[table] += _rows(await conn.execute(sql, customer_id, gone_list))
+    _at("acl_snapshots")
     counts["acl_snapshots"] += _rows(
         await conn.execute(
             _DELETE_ACL_SQL,
@@ -818,19 +908,23 @@ async def _purge_rows(
         if time.monotonic() >= deadline:
             raise _BudgetExhausted
         batch = Counter[str]()
+        started = time.monotonic()
         async with _gated(customer_id) as conn:
+            _at("rows.lock")
             locked = await conn.fetch(_LOCK_SQL, customer_id, list(pending), cutoff)
             if not locked:
                 return
             ids = [r["doc_id"] for r in locked]
             versions = [r["version"] for r in locked]
             budget = TOMBSTONE_PURGE_BATCH_SIZE
+            _at("chunks")
             chunks = await conn.fetchrow(
                 _DELETE_CHUNKS_SQL, customer_id, ids, versions, budget
             )
             batch["chunks"] += chunks["deleted"]
             budget -= chunks["selected"]
             if budget > 0:
+                _at("old_versions")
                 n = await conn.fetchval(
                     _DELETE_OLD_VERSIONS_SQL, customer_id, ids, versions, budget
                 )
@@ -851,6 +945,7 @@ async def _purge_rows(
             customer_id=customer_id,
             documents=finished,
             rows=dict(batch),
+            seconds=round(time.monotonic() - started, 2),
         )
         await asyncio.sleep(_BATCH_PAUSE_SECONDS)
 
@@ -865,6 +960,7 @@ async def purge_tenant(
     """Purge one tenant's eligible tombstoned documents."""
     result = TenantResult(customer_id)
     if dry_run:
+        _at("dry_run")
         async with with_tenant(customer_id) as conn:
             row = await conn.fetchrow(_DRY_RUN_SQL, customer_id, cutoff)
         result.eligible = int(row["documents"])
@@ -892,6 +988,7 @@ async def purge_tenant(
         if time.monotonic() >= deadline:
             result.budget_exhausted = True
             break
+        _at("scan")
         async with with_tenant(customer_id) as conn:
             rows = await conn.fetch(
                 _CANDIDATES_SQL,
@@ -935,6 +1032,7 @@ async def purge_tenant(
             log.warning(
                 "tombstone_purge.group_contended",
                 customer_id=customer_id,
+                stage=_STAGE.get(),
                 error=type(exc).__name__,
             )
     log.info(
@@ -1006,7 +1104,7 @@ async def run_once(
                 customer_id=customer_id,
                 stage="discover",
                 error_type=type(exc).__name__,
-                error=str(exc),
+                error=_error_text(exc),
             )
             continue
         if first is not None:
@@ -1026,6 +1124,7 @@ async def run_once(
     documents = 0
     eligible = 0
     for customer_id in tenants:
+        _at("start")
         try:
             result = await purge_tenant(
                 customer_id, cutoff=cutoff, deadline=deadline, dry_run=dry_run
@@ -1037,8 +1136,9 @@ async def run_once(
             log.error(
                 "tombstone_purge.tenant_failed",
                 customer_id=customer_id,
+                stage=_STAGE.get(),
                 error_type=type(exc).__name__,
-                error=str(exc),
+                error=_error_text(exc),
             )
             continue
         documents += result.documents
