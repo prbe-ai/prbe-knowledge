@@ -76,12 +76,17 @@ jobs:
         # The step fails BEFORE pytest, so the whole gate goes red and no test
         # result is produced -- which reads as "the merge broke the tests"
         # rather than "the image vanished". Worth knowing when this recurs.
+        #
+        # It recurred 2026-09-25: MinIO withdrew its free distribution (quay.io
+        # `no such manifest`, Docker Hub `unauthorized`, dl.min.io 410). Chainguard
+        # still publishes a free build; pinned by digest because its only free
+        # tag is `latest`. Same `server /data` command and env; healthy in 2 s.
         run: |
           docker run -d --name minio \
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            quay.io/minio/minio server /data
+            cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1 server /data
           for i in {1..30}; do
             curl -sf http://localhost:9000/minio/health/live && exit 0
             sleep 2
