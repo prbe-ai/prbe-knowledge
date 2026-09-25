@@ -12,7 +12,9 @@ X-Internal-Knowledge-Key header, tenant from X-Prbe-Customer, never the body)
     POST /api/session-deletions
         {
           "session_ids": ["<id>", ...],             # exactly one of these two
-          "author": {"employee_id": "<uuid>", "email": "a@b.c"},   # either or both keys
+          "author": {"employee_id": "<uuid>", "email": "a@b.c"},   # either or both keys;
+                                                    # with both, the id decides wherever
+                                                    # a capture names one
           "sources": ["claude_code", "codex", "pi"],  # optional filter, default all three
           "dry_run": true,                          # DEFAULT: report, change nothing
           "reason": "customer request",             # required to apply
@@ -354,6 +356,12 @@ async def select_by_author(
     records only who UPLOADED it (`uploader_id`, `uploader_email`, author_id NULL)
     because a copied transcript's author is unverified. For a deletion request
     both mean "this person's capture", so both match.
+
+    Given both `employee_id` and `email`, the id decides for every capture that
+    names an id, and the email reaches only captures that name none. An email
+    can move between people (a reused alias, a rehire); an id cannot, and
+    "Alice's id AND this email" must never reach Bob's captures because Bob
+    once held the address.
     """
     selection = Selection(refs=[])
     async with with_tenant(customer_id) as conn:
@@ -373,9 +381,11 @@ async def select_by_author(
              WHERE customer_id = $1 AND source_system = ANY($2::text[])
                AND (
                     ($3::text IS NOT NULL AND (author_id = $3 OR metadata->>'uploader_id' = $3))
-                 OR ($4::text IS NOT NULL AND (
-                        lower(metadata->>'employee_email') = lower($4)
-                     OR lower(metadata->>'uploader_email') = lower($4)))
+                 OR ($4::text IS NOT NULL
+                     AND ($3::text IS NULL
+                          OR (author_id IS NULL AND metadata->>'uploader_id' IS NULL))
+                     AND (lower(metadata->>'employee_email') = lower($4)
+                          OR lower(metadata->>'uploader_email') = lower($4)))
                )
             """,
             customer_id,
@@ -441,7 +451,7 @@ async def select_by_author(
             continue
         sid, emp, mail = identity
         if (employee_id and emp == employee_id) or (
-            email and mail and mail.lower() == email.lower()
+            email and mail and mail.lower() == email.lower() and not (employee_id and emp)
         ):
             if valid_session_id(sid):
                 refs.add(SessionRef(r["source_system"], sid))

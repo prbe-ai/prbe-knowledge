@@ -435,6 +435,27 @@ async def test_delete_by_author_takes_every_capture_of_that_person_only(env, mon
     assert ALICE not in persons and BOB in persons
 
 
+@pytest.mark.asyncio
+async def test_with_both_selectors_an_email_never_outvotes_the_id(env) -> None:
+    """Bob now holds the address Alice once used. "Alice's id and that email"
+    takes Alice's captures and not Bob's; the email alone -- the caller's own
+    choice -- takes every capture carrying it."""
+    (a, _b), store = env
+    alice_s, bob_s, bob_unmined = _sid(), _sid(), _sid()
+    await v2_session(a, alice_s)
+    await v2_session(a, bob_s, BOB, ALICE_EMAIL)
+    await sr.accept(_v2_batches(bob_unmined, BOB, ALICE_EMAIL)[0], a, CC, store)
+
+    both = await sd.select_by_author(a, [CC.value], employee_id=ALICE, email=ALICE_EMAIL)
+    email_only = await sd.select_by_author(a, [CC.value], employee_id=None, email=ALICE_EMAIL)
+
+    assert set(both.refs) == {sd.SessionRef(CC.value, alice_s)}
+    assert BOB not in both.person_ids
+    assert set(email_only.refs) == {
+        sd.SessionRef(CC.value, s) for s in (alice_s, bob_s, bob_unmined)
+    }
+
+
 def test_only_the_two_legacy_suffixes_name_a_sessions_own_rows() -> None:
     from engine.shared.session_suppression import is_own_folder_key, session_of_event_id
 
