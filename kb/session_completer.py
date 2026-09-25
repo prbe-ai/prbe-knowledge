@@ -49,6 +49,7 @@ from engine.shared.session_signals import (
     is_cron_marker_key,
     last_key_sql,
 )
+from engine.shared.session_suppression import deleted_sessions
 from engine.shared.storage import get_store
 from engine.shared.tenant_status import ACTIVE_TENANTS_SQL, active_tenant_sql
 from kb.session_receipts import _lock
@@ -265,6 +266,11 @@ async def _end_one(conn, store, seen_buckets: set[str], source, r, idle_minutes:
     async with conn.transaction():
         await conn.execute("SELECT set_config('app.current_customer_id', $1, true)", customer_id)
         await _lock(conn, customer_id, source.value, session_id)
+        # A deleted session keeps its queue row only until the deletion's row
+        # phase runs; writing a marker in that gap would leave an object the
+        # deletion's R2 sweep may already have passed.
+        if await deleted_sessions(conn, customer_id, source.value, [session_id]):
+            return False
         if await _v2_client_already_ended(conn, r["queue_id"], customer_id, source.value, session_id):
             return False
         if dry_run:

@@ -35,13 +35,13 @@ def test_fresh_bootstrap_includes_tenant_fenced_session_receipts(monkeypatch):
             rows = await connection.fetch(
                 "SELECT relname, relrowsecurity, relforcerowsecurity FROM pg_class "
                 "WHERE relnamespace='public'::regnamespace AND relname=ANY($1::text[])",
-                ["session_streams", "session_batch_receipts"],
+                ["session_streams", "session_batch_receipts", "session_deletions"],
             )
-            assert len(rows) == 2
+            assert len(rows) == 3
             assert all(row["relrowsecurity"] and row["relforcerowsecurity"] for row in rows)
             assert await connection.fetchval("SELECT count(*) FROM pg_policies WHERE "
                 "schemaname='public' AND tablename=ANY($1::text[]) AND policyname='tenant_isolation'",
-                ["session_streams", "session_batch_receipts"]) == 2
+                ["session_streams", "session_batch_receipts", "session_deletions"]) == 3
             return await connection.fetchval("SELECT version_num FROM alembic_version")
         finally:
             await connection.close()

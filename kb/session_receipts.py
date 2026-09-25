@@ -19,6 +19,12 @@ from engine.ingest.connectedness import is_source_connected
 from engine.ingest.payload_redaction import redact_payload_async
 from engine.shared.constants import SourceSystem
 from engine.shared.db import with_tenant
+from engine.shared.session_suppression import (
+    DELETED_REASON,
+    DELETED_STATUS,
+    deleted_sessions,
+    lock_session,
+)
 from engine.shared.source_registry import ingestion_priority_for
 from kb.admin_routes import verify_internal_knowledge_key
 
@@ -105,10 +111,27 @@ def validate_payload(payload: dict) -> None:
 
 
 async def _lock(conn, customer: str, source: str, session: str) -> None:
-    await conn.execute(
-        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-        f"session-stream:{customer}:{source}:{session}",
-    )
+    await lock_session(conn, customer, source, session)
+
+
+async def refuse_deleted(conn, customer: str, source: str, session: str) -> None:
+    """410 for a session a customer had deleted. Caller holds the session lock.
+
+    Checked before any byte is written: a capture client keeps a session's
+    transcript on disk and re-sends it (retries, reconnects, a fresh stream from
+    batch 0), and accepting it would restore exactly what was erased.
+    """
+    if await deleted_sessions(conn, customer, source, [session]):
+        raise HTTPException(
+            DELETED_STATUS,
+            {
+                "reason": DELETED_REASON,
+                "message": "this session was deleted at the customer's request; "
+                "do not resend it",
+                "source": source,
+                "session_id": session,
+            },
+        )
 
 
 async def _legacy_exists(conn, customer: str, source: str, session: str) -> bool:
@@ -144,6 +167,7 @@ async def accept_legacy(payload, envelope, customer, source, store, key, enqueue
     envelope = json.dumps(await redact_payload_async(json.loads(envelope))).encode()
     async with with_tenant(customer) as conn:
         await _lock(conn, customer, source.value, payload["session_id"])
+        await refuse_deleted(conn, customer, source.value, payload["session_id"])
         await reject_legacy_writer(conn, customer, source.value, payload["session_id"])
         bucket = await store.bucket_for(customer)
         await store.ensure_bucket(bucket)
@@ -201,6 +225,7 @@ async def accept(payload: dict, customer: str, source: SourceSystem, store) -> d
     key = f"raw/{source.value}/{customer}/sessions-v2/{sid}/{payload['batch_seq']}-{digest}.json"
     async with with_tenant(customer) as conn:
         await _lock(conn, customer, source.value, sid)
+        await refuse_deleted(conn, customer, source.value, sid)
         stream = await conn.fetchrow(
             "SELECT * FROM session_streams WHERE customer_id=$1 "
             "AND source_system=$2 AND session_id=$3",
@@ -341,13 +366,20 @@ async def receipts(
             session_id,
         )
         if not stream:
-            legacy = await _legacy_exists(conn, x_prbe_customer, source, session_id)
+            if await deleted_sessions(conn, x_prbe_customer, source, [session_id]):
+                # Said outright rather than "absent": an absent session is one a
+                # client should start uploading, and this one must never be.
+                state = "deleted"
+            elif await _legacy_exists(conn, x_prbe_customer, source, session_id):
+                state = "legacy"
+            else:
+                state = "absent"
             return {
                 "protocol_version": 2,
                 "customer_id": x_prbe_customer,
                 "source": source,
                 "session_id": session_id,
-                "state": "legacy" if legacy else "absent",
+                "state": state,
                 "receipts": [],
             }
         rows = await conn.fetch(
