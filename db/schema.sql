@@ -296,6 +296,14 @@ CREATE INDEX IF NOT EXISTS idx_documents_stats_live
     ON documents (customer_id, doc_id, source_system, ingested_at)
     WHERE valid_to IS NULL AND deleted_at IS NULL;
 
+-- Tombstoned versions, for scripts/cron_tombstone_purge.py's oldest-first
+-- walk over (deleted_at, doc_id) (migration 0139). Not also partial on
+-- valid_to: a code-graph repo disconnect closes its tombstones, so they have
+-- no live row.
+CREATE INDEX IF NOT EXISTS idx_documents_tombstones
+    ON documents (customer_id, deleted_at, doc_id)
+    WHERE deleted_at IS NOT NULL;
+
 ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE documents FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON documents
