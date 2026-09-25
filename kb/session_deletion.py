@@ -704,6 +704,17 @@ async def record_sessions(
                 json.dumps(selector),
                 sorted(inv.keys),
             )
+            # Nothing to mine any more: a pending row claimed before the row
+            # phase would pay for a full extraction whose write is then refused.
+            # A row already `processing` is left alone; the row phase sees it
+            # and waits the pass out.
+            await conn.execute(
+                "UPDATE ingestion_queue SET status = 'done', completed_at = now(), "
+                "error = 'session deleted' WHERE customer_id = $1 AND queue_id = ANY($2::bigint[]) "
+                "AND status = 'pending'",
+                customer_id,
+                inv.queue_ids,
+            )
 
 
 async def _journal_and_delete_rows(customer_id: str, ref: SessionRef) -> tuple[dict[str, int], list[str], bool]:

@@ -671,3 +671,27 @@ async def test_the_coalesced_write_path_refuses_a_deleted_session_too(env) -> No
         )
     assert refused.value.transient
     assert await snapshot(a) == before
+
+
+@pytest.mark.asyncio
+async def test_recording_a_deletion_stops_a_pending_session_being_mined(env) -> None:
+    (a, _b), store = env
+    pending, busy = _sid(), _sid()
+    for sid in (pending, busy):
+        for payload in _v2_batches(sid, ALICE, ALICE_EMAIL)[:1]:
+            await sr.accept(payload, a, CC, store)
+    async with db_module.raw_conn() as conn:
+        await conn.execute(
+            "UPDATE ingestion_queue SET status = 'processing' WHERE customer_id = $1 "
+            "AND source_event_id = $2", a, busy,
+        )
+    await sd.record_sessions(a, [sd.SessionRef(CC.value, s) for s in (pending, busy)],
+                             deletion_id=str(uuid.uuid4()), reason="r", ticket=None,
+                             selector={"by": "id"})
+    async with db_module.raw_conn() as conn:
+        status = dict(await conn.fetch(
+            "SELECT source_event_id, status FROM ingestion_queue WHERE customer_id = $1", a
+        ))
+    # The pending one is not worth an extraction; the one mid-pass is left for
+    # the row phase to see (and wait out).
+    assert status == {pending: "done", busy: "processing"}
