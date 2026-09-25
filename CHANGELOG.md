@@ -35,9 +35,12 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   cache, and the date-foldered protocol-1 batches, found through the rows that name them and
   journaled before those rows go. A deleted session is recorded in the new `session_deletions`
   table (migration 0140), and every writer of a session (both ingest doors, the idle sweep, the
-  worker's write) checks it under the session's lock: a re-upload is refused with `410
-  session_deleted`, and a worker mid-pass cannot write it back. A tenant under
-  `metadata.legal_hold` is refused with 423, re-checked when the run executes.
+  worker's write, the inferred-edges worker) checks it under the session's lock: a re-upload is
+  refused with `410 session_deleted`, and a worker mid-pass cannot write it back. A tenant under
+  `metadata.legal_hold` is refused with 423, re-checked under the lock before anything is
+  removed. A run interrupted by a restart, a failure or a released hold is finished with `POST
+  /api/session-deletions/{deletion_id}/resume`, which works after an author request's rows are
+  gone.
 
 ### Fixed
 

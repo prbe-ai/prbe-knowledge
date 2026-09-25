@@ -365,10 +365,14 @@ async def receipts(
             source,
             session_id,
         )
-        if not stream:
-            if await deleted_sessions(conn, x_prbe_customer, source, [session_id]):
-                # Said outright rather than "absent": an absent session is one a
-                # client should start uploading, and this one must never be.
+        # Asked first, not only when no stream is left: between the deletion
+        # being recorded and its rows going, the stream still exists, and
+        # `ready` would invite the client to keep sending. Said outright rather
+        # than "absent": an absent session is one a client should start
+        # uploading, and this one must never be.
+        deleted = bool(await deleted_sessions(conn, x_prbe_customer, source, [session_id]))
+        if deleted or not stream:
+            if deleted:
                 state = "deleted"
             elif await _legacy_exists(conn, x_prbe_customer, source, session_id):
                 state = "legacy"

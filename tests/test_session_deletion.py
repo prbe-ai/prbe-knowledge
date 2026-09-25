@@ -1269,3 +1269,53 @@ async def test_a_late_sweep_that_fails_reopens_the_deletion(env, monkeypatch) ->
     outcome = await sd.erase_session(a, sd.SessionRef(CC.value, sid), grace_s=0)
     assert outcome["verified"], outcome
     assert not await store.exists(bucket, late)
+
+
+@pytest.mark.asyncio
+async def test_a_resumed_or_re_requested_run_does_not_read_stalled(env, monkeypatch) -> None:
+    """`stalled` tells the caller to /resume. Right after a /resume or a new
+    request it must not, or the caller starts a second run beside the first."""
+    (a, _b), _store = env
+    sid = _sid()
+    deletion_id = str(uuid.uuid4())
+    await sd.record_sessions(a, [sd.SessionRef(CC.value, sid)], deletion_id=deletion_id,
+                             reason="r", ticket=None, selector={"by": "id"})
+
+    async def age_the_stamps() -> None:
+        async with db_module.with_tenant(a) as conn:
+            await conn.execute(
+                "UPDATE session_deletions SET status = 'pending', "
+                "requested_at = now() - interval '1 hour', attempted_at = now() - interval '1 hour'"
+            )
+
+    spawned: list = []
+    monkeypatch.setattr(sd, "_spawn", lambda *args: spawned.append(args))
+    async with _client() as client:
+        async def status_of(did: str) -> str:
+            return (await client.get(f"/api/session-deletions/{did}", headers=_headers(a))).json()["status"]
+
+        await age_the_stamps()
+        assert await status_of(deletion_id) == "stalled"
+        resumed = await client.post(f"/api/session-deletions/{deletion_id}/resume", headers=_headers(a))
+        assert resumed.status_code == 202, resumed.text
+        assert await status_of(deletion_id) == "running"
+
+        await age_the_stamps()
+        again = await client.post("/api/session-deletions", headers=_headers(a),
+                                  json={"session_ids": [sid], "dry_run": False, "reason": "again"})
+        assert again.status_code == 202, again.text
+        assert await status_of(again.json()["deletion_id"]) == "running"
+    assert len(spawned) == 2
+
+
+@pytest.mark.asyncio
+async def test_receipts_read_deleted_as_soon_as_the_deletion_is_recorded(env) -> None:
+    """Between recording a deletion and removing its rows the stream still
+    exists; the receipts read must already say `deleted`, not `ready`."""
+    (a, _b), store = env
+    sid = _sid()
+    await sr.accept(_v2_batches(sid, ALICE, ALICE_EMAIL)[0], a, CC, store)
+    await sd.record_sessions(a, [sd.SessionRef(CC.value, sid)], deletion_id=str(uuid.uuid4()),
+                             reason="r", ticket=None, selector={"by": "id"})
+    receipts = await sr.receipts(CC.value, sid, x_prbe_customer=a, after=-1, limit=10)
+    assert receipts["state"] == "deleted" and receipts["receipts"] == []

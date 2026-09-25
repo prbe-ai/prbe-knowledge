@@ -28,7 +28,7 @@ X-Internal-Knowledge-Key header, tenant from X-Prbe-Customer, never the body)
         apply       -> 202 {"deletion_id", "status": "running", "sessions": [{"source", "session_id"}]}
                        200 {"status": "nothing_to_delete", "sessions": []}
         legal hold  -> 423 {"detail": {"reason": "legal_hold", "legal_hold": "<why>"}}
-        no tenant   -> 404
+        no tenant   -> 404; no X-Prbe-Customer header -> 400
     GET /api/session-deletions/{deletion_id}
         -> 200 {"deletion_id", "status": running|stalled|done|failed|held, "sessions": [
                  {"source", "session_id", "status", "requested_at", "attempted_at",
@@ -791,6 +791,8 @@ async def record_sessions(
                 ON CONFLICT (customer_id, source_system, session_id) DO UPDATE SET
                     deletion_id  = EXCLUDED.deletion_id,
                     selector     = EXCLUDED.selector,
+                    -- A new request: `stalled` must not read the old one's age.
+                    requested_at = now(),
                     ticket       = COALESCE(session_deletions.ticket, EXCLUDED.ticket),
                     status       = 'pending',
                     error        = NULL,
@@ -972,22 +974,25 @@ async def erase_session(
         )
         status = "done" if result["verified"] else "failed"
         if not result["verified"]:
-            error = "residue remains; re-run the deletion"
+            error = "residue remains; resume the deletion (POST .../{deletion_id}/resume)"
         return result
     except _HoldPlaced as exc:
         status, error = "held", f"legal hold: {exc.hold}"
         return result
     except asyncio.CancelledError:
-        # Shutdown mid-run. The row keeps its key journal; a re-POST resumes.
-        error = "cancelled (worker shutdown); re-POST the request to resume"
+        # Shutdown mid-run. The row keeps its key journal; /resume finishes it.
+        error = "cancelled (worker shutdown); resume the deletion (POST .../{deletion_id}/resume)"
         raise
     except Exception as exc:  # the outcome is the row, never a lost exception
         log.exception("session_deletion.failed", customer=customer_id, **ref.as_dict())
         error = f"{type(exc).__name__}: {exc}"[:2000]
         return result
     finally:
-        with contextlib.suppress(Exception):
+        try:
             await _finish(customer_id, ref, status, result, error)
+        except Exception:
+            # The row stays `pending` and reads `stalled`; /resume re-runs it.
+            log.exception("session_deletion.finish_failed", customer=customer_id, **ref.as_dict())
 
 
 async def _wait_for_in_flight(seconds: float) -> None:
@@ -1124,9 +1129,13 @@ async def run_deletion(
         )
     persons = 0
     if person_ids:
-        with contextlib.suppress(Exception):
+        try:
             if await legal_hold(customer_id) is None:
                 persons = await remove_orphaned_persons(customer_id, person_ids)
+        except Exception:
+            # Not repeated by /resume: say so where an operator will look.
+            log.exception("session_deletion.person_cleanup_failed", customer=customer_id,
+                          persons=len(person_ids))
     return {"sessions": outcomes, "person_nodes_deleted": persons}
 
 
@@ -1280,7 +1289,8 @@ async def _background(
             person_nodes_deleted=outcome["person_nodes_deleted"],
         )
     except asyncio.CancelledError:
-        # Shutdown mid-run: rows stay `pending` with their journal; a re-POST resumes.
+        # Shutdown mid-run: sessions not reached stay `pending` (the one in
+        # progress reads `failed`), all with their journal; /resume finishes.
         log.warning("session_deletion.cancelled", customer=customer_id, deletion_id=deletion_id)
         raise
     except Exception:
@@ -1398,7 +1408,8 @@ async def resume_deletion(
     except SessionDeletionError as exc:
         raise HTTPException(exc.status, exc.detail) from exc
     if hold is not None:
-        raise HTTPException(423, _held(hold).detail)
+        held = _held(hold)
+        raise HTTPException(held.status, held.detail)
     async with with_tenant(customer_id) as conn:
         known = await conn.fetchval(
             "SELECT count(*) FROM session_deletions WHERE customer_id = $1 AND deletion_id = $2",
@@ -1407,7 +1418,11 @@ async def resume_deletion(
         )
         rows = await conn.fetch(
             """
-            UPDATE session_deletions SET status = 'pending', error = NULL
+            UPDATE session_deletions SET status = 'pending', error = NULL,
+                   -- The run starts now; without this the status reads
+                   -- `stalled` until its first session commits, inviting a
+                   -- second /resume and two runs at once.
+                   attempted_at = now()
              WHERE customer_id = $1 AND deletion_id = $2 AND status <> 'done'
          RETURNING source_system, session_id, selector
             """,

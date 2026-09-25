@@ -2215,7 +2215,8 @@ CREATE TABLE IF NOT EXISTS session_deletions (
                   CHECK (status IN ('pending', 'done', 'failed', 'held')),
     requested_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     -- When a run last started on this session. A `pending` row whose attempt
-    -- is old was interrupted (pod restart); re-POSTing the request resumes it.
+    -- is old was interrupted (pod restart); POST
+    -- /api/session-deletions/{deletion_id}/resume finishes it.
     attempted_at  TIMESTAMPTZ,
     -- Set when a run found no row and no raw object of the session left.
     deleted_at    TIMESTAMPTZ,
