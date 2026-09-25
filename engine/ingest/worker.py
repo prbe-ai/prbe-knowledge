@@ -20,6 +20,7 @@ from engine.ingest import queue_age
 from engine.ingest.handlers.base import ConnectorContext
 from engine.ingest.normalizer import Normalizer
 from engine.shared.constants import (
+    AGENT_SESSION_SOURCES,
     QUEUE_ERROR_BACKOFF_SECONDS,
     QUEUE_HEARTBEAT_INTERVAL_SECONDS,
     QUEUE_RECLAIM_THRESHOLD_SECONDS,
@@ -36,6 +37,14 @@ from engine.shared.exceptions import (
     UnsupportedEventType,
 )
 from engine.shared.logging import bind_trace, get_logger
+from engine.shared.session_suppression import (
+    SessionDeleted,
+    is_session_deleted,
+    reopen_deletion,
+    session_of_event_id,
+    sweep_session_folders,
+    tenant_legal_hold,
+)
 from engine.shared.storage import get_store
 from engine.shared.tenant_status import active_tenant_sql
 
@@ -369,6 +378,12 @@ class Worker:
                 payload_key = payload_keys[0] if payload_keys else ""
                 captured_version = row["version"]
                 attempts = row["attempts"] + 1
+                if await self._deleted_session(customer_id, source, event_id):
+                    await self._mark_skipped(
+                        queue_id, customer_id, source, event_id, payload_key,
+                        "session deleted", captured_version,
+                    )
+                    continue
                 try:
                     result = await self._normalizer._normalize_only(
                         customer_id, source, payload_keys
@@ -387,6 +402,7 @@ class Worker:
                         str(exc), captured_version,
                     )
                 except PrbeError as exc:
+                    await self._sweep_if_deleted(customer_id, source, event_id)
                     await self._fail_batch_row(
                         queue_id, attempts, str(exc), source, customer_id, event_id,
                         transient=getattr(exc, "transient", False),
@@ -394,6 +410,7 @@ class Worker:
                     )
                 except Exception as exc:  # pragma: no cover — last-resort
                     log.exception("worker.batch_normalize_unhandled", queue_id=queue_id)
+                    await self._sweep_if_deleted(customer_id, source, event_id)
                     await self._fail_batch_row(
                         queue_id, attempts, repr(exc), source, customer_id, event_id,
                         transient=True, captured_version=captured_version,
@@ -416,6 +433,11 @@ class Worker:
                     [(result, row["queue_id"]) for (row, result) in normalized],
                 )
             except PrbeError as exc:
+                if isinstance(exc, SessionDeleted):
+                    await self._sweep_deleted(exc)
+                else:
+                    for row, _ in normalized:
+                        await self._sweep_if_deleted(customer_id, source, row["source_event_id"])
                 transient = getattr(exc, "transient", False)
                 for row, _ in normalized:
                     await self._fail_batch_row(
@@ -426,6 +448,8 @@ class Worker:
                 return
             except Exception as exc:  # pragma: no cover
                 log.exception("worker.batch_persist_unhandled", customer=customer_id)
+                for row, _ in normalized:
+                    await self._sweep_if_deleted(customer_id, source, row["source_event_id"])
                 for row, _ in normalized:
                     await self._fail_batch_row(
                         row["queue_id"], row["attempts"] + 1, repr(exc),
@@ -454,11 +478,96 @@ class Worker:
                     log.exception(
                         "worker.batch_finalize_failed", queue_id=row["queue_id"],
                     )
+        except asyncio.CancelledError:
+            # Shutdown mid-batch: as in `_process`, sweep any session deleted
+            # while this batch ran, bounded, then let the cancellation go on.
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(
+                    asyncio.gather(*(
+                        self._sweep_if_deleted(customer_id, source, r["source_event_id"])
+                        for r in rows
+                    )),
+                    timeout=10,
+                )
+            raise
         finally:
             for hb in heartbeats:
                 hb.cancel()
             for hb in heartbeats:
                 await self._stop_heartbeat(hb)
+
+    @staticmethod
+    async def _deleted_session(
+        customer_id: str, source: SourceSystem, event_id: str
+    ) -> bool:
+        """A coding-agent session deleted at the customer's request is not mined.
+
+        Best-effort: an error here must not stop the drain, and the write
+        fence in the normalizer still refuses the session under its lock.
+        """
+        if source not in AGENT_SESSION_SOURCES:
+            return False
+        try:
+            return await is_session_deleted(customer_id, source.value, event_id)
+        except Exception:
+            log.warning("worker.deleted_session_check_failed", exc_info=True)
+            return False
+
+    @staticmethod
+    async def _sweep_deleted(exc: SessionDeleted) -> None:
+        """This pass may have saved extraction-cache answers for a session that
+        was deleted while it ran, after the deletion's last sweep. Remove them.
+
+        The worker is the last writer and nothing sweeps after it, so a sweep
+        that does not finish re-opens the deletion for /resume rather than
+        leaving the objects behind a `done` status.
+        """
+        why = None
+        try:
+            hold = await tenant_legal_hold(exc.customer_id)
+            if hold is not None:
+                # Evidence now: keep it, and say so where the deletion is read.
+                await reopen_deletion(
+                    exc, f"legal hold: {hold}; late objects kept, resume once released",
+                    status="held",
+                )
+                return
+            removed, failed = await sweep_session_folders(get_store(), exc)
+            log.info(
+                "worker.deleted_session_swept",
+                customer=exc.customer_id,
+                source=exc.source,
+                sessions=len(exc.session_ids),
+                objects=removed,
+                failed=failed,
+            )
+            if failed:
+                why = f"{failed} late extraction-cache object(s) not deleted; resume the deletion"
+        except Exception as err:
+            log.warning("worker.deleted_session_sweep_failed", exc_info=True)
+            why = f"late sweep failed ({type(err).__name__}); resume the deletion"
+        if why is not None:
+            try:
+                await reopen_deletion(exc, why)
+            except Exception:
+                log.warning("worker.deleted_session_reopen_failed", exc_info=True)
+
+    async def _sweep_if_deleted(
+        self, customer_id: str, source: SourceSystem, event_id: str
+    ) -> None:
+        """A pass that FAILED for another reason (an extraction or embedding
+        error, a cancelled pod) never reaches the write fence, yet may have
+        saved extraction-cache answers for a session deleted while it ran.
+        Its queue row is gone, so nothing retries it: sweep now."""
+        if await self._deleted_session(customer_id, source, event_id):
+            await self._sweep_deleted(
+                SessionDeleted(
+                    "session deleted during a failed pass",
+                    customer_id=customer_id,
+                    source=source.value,
+                    session_ids={session_of_event_id(event_id)},
+                )
+            )
 
     async def _fail_batch_row(
         self,
@@ -511,6 +620,12 @@ class Worker:
         attempts = row["attempts"] + 1
 
         bind_trace(f"queue-{queue_id}")
+        if await self._deleted_session(customer_id, source, event_id):
+            await self._mark_skipped(
+                queue_id, customer_id, source, event_id, payload_s3_key,
+                "session deleted", captured_version,
+            )
+            return
         heartbeat_task = asyncio.create_task(self._heartbeat(queue_id))
         try:
             outcome = await self._normalizer.process_queue_row(
@@ -533,6 +648,8 @@ class Worker:
             )
         except DuplicateEventIgnored as exc:
             log.info("worker.skipped", queue_id=queue_id, reason=str(exc))
+            if isinstance(exc, SessionDeleted):
+                await self._sweep_deleted(exc)
             await self._mark_skipped(
                 queue_id,
                 customer_id,
@@ -554,6 +671,7 @@ class Worker:
                 captured_version,
             )
         except PrbeError as exc:
+            await self._sweep_if_deleted(customer_id, source, event_id)
             transient = getattr(exc, "transient", False)
             dead = await self._on_error(
                 queue_id,
@@ -565,6 +683,15 @@ class Worker:
             if dead and source == SourceSystem.MANUAL_UPLOAD:
                 with contextlib.suppress(Exception):
                     await self._mark_manual_upload_failed_ingest(customer_id, event_id, str(exc))
+        except asyncio.CancelledError:
+            # Shutdown mid-pass: no error branch runs for a cancellation, and
+            # the pass may have saved cache answers for a session deleted
+            # while it ran. Bounded, then the cancellation goes on.
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(
+                    self._sweep_if_deleted(customer_id, source, event_id), timeout=10
+                )
+            raise
         except Exception as exc:  # pragma: no cover — last-resort
             # Unknown error: assume transient so we don't burn data on a single
             # network blip / OOM / unwrapped httpx error / asyncpg connection
@@ -572,6 +699,7 @@ class Worker:
             # Anything that should permanently DLQ on first try must raise a
             # PrbeError subclass with `transient = False`.
             log.exception("worker.unhandled", queue_id=queue_id)
+            await self._sweep_if_deleted(customer_id, source, event_id)
             error = repr(exc)
             dead = await self._on_error(
                 queue_id,

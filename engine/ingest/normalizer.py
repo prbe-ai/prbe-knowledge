@@ -76,6 +76,7 @@ from engine.shared.models import (
     NormalizationResult,
     WebhookEvent,
 )
+from engine.shared.session_suppression import refuse_deleted_sessions, session_ids_of
 from engine.shared.storage import ObjectStore, get_store
 
 log = get_logger(__name__)
@@ -437,6 +438,17 @@ class Normalizer:
         all_doc_ids = {doc.doc_id for (doc, _, _) in all_docs}
 
         async with with_tenant(customer_id) as conn:
+            if source_system in _AGENT_SESSION_SOURCES:
+                # A session deleted while this pass was reading or embedding it
+                # must not be written back (engine/shared/session_suppression).
+                # Under the session lock, so the deletion either sees these rows
+                # or this sees the deletion -- never neither.
+                await refuse_deleted_sessions(
+                    conn,
+                    customer_id,
+                    source_system.value,
+                    session_ids_of(doc for (doc, _, _) in all_docs),
+                )
             if source_system == SourceSystem.GITHUB and queue_id is not None:
                 from kb.github_control import admit_projection
 
@@ -797,6 +809,19 @@ class Normalizer:
 
         # ---- Phase B: ONE transaction for the whole batch ------------------
         async with with_tenant(customer_id) as conn:
+            if source_system in _AGENT_SESSION_SOURCES:
+                # Same fence as _persist. SessionDeleted is transient, so the
+                # whole batch rolls back and the healthy siblings go back to
+                # pending; on the next claim the worker's pre-check skips the
+                # deleted row, so this costs them one attempt, once.
+                await refuse_deleted_sessions(
+                    conn,
+                    customer_id,
+                    source_system.value,
+                    session_ids_of(
+                        doc for docs in per_item_docs for (doc, _, _) in docs
+                    ),
+                )
             if source_system == SourceSystem.GITHUB:
                 for doc_id in sorted(all_doc_ids):
                     await conn.execute("SELECT pg_advisory_xact_lock($1)",

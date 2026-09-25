@@ -44,6 +44,7 @@ from engine.shared.constants import NodeLabel
 from engine.shared.db import get_pool, with_tenant
 from engine.shared.logging import get_logger
 from engine.shared.metrics import counter, gauge
+from engine.shared.session_suppression import SessionDeleted, refuse_deleted_graph_refs
 from engine.shared.tenant_status import active_tenant_sql
 
 log = get_logger(__name__)
@@ -172,6 +173,18 @@ class InferredEdgesWorker:
                     return
 
                 if extraction.edges:
+                    # The bundle was read before an LLM call that can outlast
+                    # a session deletion: fence the write the way every other
+                    # writer of a session is fenced.
+                    await refuse_deleted_graph_refs(
+                        conn,
+                        customer_id,
+                        [
+                            ("Document", anchor_doc_id),
+                            *((e.from_label, e.from_canonical_id) for e in extraction.edges),
+                            *((e.to_label, e.to_canonical_id) for e in extraction.edges),
+                        ],
+                    )
                     await _upsert_inferred_edges(conn, customer_id, extraction.edges)
 
                 counter(
@@ -187,6 +200,13 @@ class InferredEdgesWorker:
 
             await _mark_done(queue_id)
 
+        except SessionDeleted:
+            log.info(
+                "inferred_edges_worker.session_deleted",
+                queue_id=queue_id,
+                customer=customer_id,
+            )
+            await _mark_done(queue_id)
         except Exception as exc:
             log.exception(
                 "inferred_edges_worker.process_failed",

@@ -70,6 +70,8 @@ async def database(monkeypatch):
         DO $$ BEGIN CREATE ROLE receipt_app NOLOGIN; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
     """)
     await admin.execute((Path(__file__).parents[1] / "kb/session_receipts_schema.sql").read_text())
+    # Every ingest door asks whether the session was deleted, under its lock.
+    await admin.execute((Path(__file__).parents[1] / "kb/session_deletions_schema.sql").read_text())
     await admin.execute(
         "GRANT USAGE ON SCHEMA public TO receipt_app; GRANT ALL ON ALL TABLES IN SCHEMA public TO receipt_app"
     )

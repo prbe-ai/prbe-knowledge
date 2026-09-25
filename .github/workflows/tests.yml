@@ -201,6 +201,7 @@ jobs:
           tests/test_queue_age.py
           tests/test_inactive_tenants.py
           tests/test_tenant_purge_coverage.py
+          tests/test_session_deletion.py
 
       # Scoped to the STORAGE suite (Postgres + MinIO), not `tests/` wholesale.
       # The full suite has ~42 pre-existing failures unrelated to storage: tests that
