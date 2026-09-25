@@ -21,11 +21,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections import Counter
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlsplit, urlunsplit
 
+import asyncpg
 import pytest
 import pytest_asyncio
 
@@ -275,6 +277,21 @@ async def _edge(customer_id: str, edge_type: str, from_id: int, to_id: int) -> N
 async def _count(sql: str, *args) -> int:
     async with db_module.raw_conn() as conn:
         return int(await conn.fetchval(sql, *args))
+
+
+async def _wait_for_lock_wait(fragment: str) -> None:
+    """Until a backend whose query mentions `fragment` waits on a lock -- the
+    interleaving a race test needs, asserted rather than slept for."""
+    for _ in range(200):
+        async with db_module.raw_conn() as conn:
+            if await conn.fetchval(
+                "SELECT count(*) FROM pg_stat_activity"
+                " WHERE wait_event_type = 'Lock' AND query ILIKE $1",
+                f"%{fragment}%",
+            ):
+                return
+        await asyncio.sleep(0.05)
+    pytest.fail(f"nothing running {fragment!r} ever waited on a lock")
 
 
 async def _doc_rows(customer_id: str, doc_id: str) -> int:
@@ -841,8 +858,7 @@ async def test_revived_chunk_survives_a_racing_delete(live_db) -> None:
                 return await conn.fetchrow(purge._DELETE_CHUNKS_SQL, cid, [doc_id], [2], 100)
 
         task = asyncio.create_task(delete())
-        await asyncio.sleep(0.5)
-        assert not task.done(), "the DELETE should be waiting on the writer's row"
+        await _wait_for_lock_wait("DELETE FROM chunks")
         await tx.commit()
         row = await asyncio.wait_for(task, 10)
     finally:
@@ -891,6 +907,142 @@ async def test_recreated_after_scan_keeps_its_payloads(
     assert recreated
     assert await real_list(store, bucket, "raw/") == [live_payload]
     assert await _doc_rows(cid, doc_id) == 2
+
+
+async def test_node_of_a_recreated_document_survives_the_final_batch(live_db) -> None:
+    """A re-connect re-creates a closed code-graph tombstone without touching
+    the row the purge locked: it inserts version N+1 and upserts the document's
+    node. Once that commits, the node and the edges written with it belong to a
+    live document again, and the final batch must not delete them."""
+    cid = "t-node-race"
+    await _tenant(cid)
+    cg = SourceSystem.CODE_GRAPH.value
+    doc_id = "code_graph:acme/app:src/x.py"
+    await _doc(cid, doc_id, versions=2, tombstone_days=20, closed=True, source_system=cg)
+    node = await _node(cid, NodeLabel.DOCUMENT.value, doc_id, source=cg)
+    symbol = await _node(cid, NodeLabel.CODE_SYMBOL.value, "acme/app:f", source=cg)
+    await _edge(cid, EdgeType.COMPILED_FROM.value, node, symbol)
+
+    pool = db_module.get_pool()
+    writer = await pool.acquire()
+    try:
+        tx = writer.transaction()
+        await tx.start()
+        await _recreate(writer, cid, doc_id, 3, cg)
+        await writer.execute(
+            "UPDATE graph_nodes SET properties = properties || '{\"back\": true}'::jsonb"
+            " WHERE node_id = $1",
+            node,
+        )
+
+        async def finish() -> int:
+            doc = purge._Doc(doc_id, 2, cg, doc_id, None, None)
+            async with purge._gated(cid) as conn:
+                return await purge._finish(conn, cid, [doc], [2], Counter())
+
+        task = asyncio.create_task(finish())
+        await _wait_for_lock_wait("graph_nodes")
+        await tx.commit()
+        gone = await asyncio.wait_for(task, 10)
+    finally:
+        await pool.release(writer)
+
+    assert gone == 0
+    assert await _count(
+        "SELECT count(*) FROM graph_nodes WHERE node_id = ANY($1::bigint[])", [node, symbol]
+    ) == 2
+    assert await _count("SELECT count(*) FROM graph_edges WHERE from_node_id = $1", node) == 1
+    assert await _doc_rows(cid, doc_id) == 1  # version 3; the old tombstone is history
+
+
+async def test_hold_set_between_raw_deletes_stops_the_rest(
+    app_settings, settings, bucket_for, monkeypatch
+) -> None:
+    """Deleting a raw payload is the one step nothing can undo, so the hold is
+    re-checked before each document's, not once per group."""
+    monkeypatch.setattr(purge, "TOMBSTONE_PURGE_DOCS_PER_GROUP", 2)
+    cid = "t-hold-raw"
+    await _tenant(cid)
+    store = storage_module.get_store()
+    bucket = await bucket_for(cid)
+    ci = SourceSystem.CUSTOM_INGEST.value
+    first = custom_ingest_doc_id(cid, SOURCE_KEY, "run:1")
+    second = custom_ingest_doc_id(cid, SOURCE_KEY, "run:2")
+    await _doc(cid, first, versions=1, tombstone_days=20, source_system=ci)
+    await _doc(cid, second, versions=1, tombstone_days=10, source_system=ci)
+    first_key = document_payload_key(cid, SOURCE_KEY, "run:1", "aaa")
+    second_key = document_payload_key(cid, SOURCE_KEY, "run:2", "bbb")
+    for key in (first_key, second_key):
+        await store.put(bucket, key, b"{}")
+    _hold_on_gate_entry(monkeypatch, cid, entry=2)
+
+    assert await _run(app_settings, settings) == purge.EXIT_OK
+
+    assert await store.list_keys(bucket, "raw/") == [second_key]
+    # Rows go only after the whole group's payloads, so both are still here.
+    assert await _doc_rows(cid, first) == 1
+    assert await _doc_rows(cid, second) == 1
+
+
+async def test_acl_shared_with_a_live_document_is_kept(app_settings, settings) -> None:
+    """ACL resource ids are per source, and a container id (a channel, a repo)
+    names every document in it. The deleted document's own row goes; the one a
+    surviving document of the same source still answers to stays."""
+    cid = "t-acl"
+    await _tenant(cid)
+    await _doc(cid, "slack:C1:gone", versions=1, tombstone_days=9, source_id="C1")
+    await _doc(cid, "slack:C1:live", versions=1, tombstone_days=None, source_id="C1")
+    async with db_module.raw_conn() as conn:
+        for resource_id in ("C1", "slack:C1:gone"):
+            await conn.execute(
+                """
+                INSERT INTO acl_snapshots (customer_id, source_system, principal_type,
+                                           principal_id, resource_type, resource_id,
+                                           permission, valid_from)
+                VALUES ($1, 'slack', 'workspace', $1, 'slack.channel', $2, 'read', now())
+                """,
+                cid,
+                resource_id,
+            )
+
+    assert await _run(app_settings, settings) == purge.EXIT_OK
+
+    assert await _doc_rows(cid, "slack:C1:gone") == 0
+    assert await _count(
+        "SELECT count(*) FROM acl_snapshots WHERE customer_id = $1 AND resource_id = 'C1'", cid
+    ) == 1
+    assert await _count(
+        "SELECT count(*) FROM acl_snapshots WHERE customer_id = $1"
+        " AND resource_id = 'slack:C1:gone'",
+        cid,
+    ) == 0
+
+
+async def test_tombstone_a_writer_holds_waits_for_the_next_run(app_settings, settings) -> None:
+    """SKIP LOCKED: a tombstone row a writer holds (a re-create closing it) is
+    left alone, and the next run finishes it."""
+    cid = "t-held-row"
+    await _tenant(cid)
+    await _doc(cid, "slack:C1:1.0", versions=2, tombstone_days=9)
+    await _chunk(cid, "slack:C1:1.0", "c1", 1, 1, live=False)
+    # Outside the pool: _run swaps pools, and closing one waits for its
+    # connections to come back.
+    writer = await asyncpg.connect(settings.database_url)
+    try:
+        async with writer.transaction():
+            await writer.execute(
+                "SELECT 1 FROM documents WHERE customer_id = $1 AND version = 2 FOR UPDATE",
+                cid,
+            )
+            assert await _run(app_settings, settings) == purge.EXIT_OK
+            assert await _doc_rows(cid, "slack:C1:1.0") == 2
+            assert await _chunk_rows(cid, "slack:C1:1.0") == 1
+    finally:
+        await writer.close()
+
+    assert await _run(app_settings, settings) == purge.EXIT_OK
+    assert await _doc_rows(cid, "slack:C1:1.0") == 0
+    assert await _chunk_rows(cid, "slack:C1:1.0") == 0
 
 
 async def test_one_tenants_discovery_failure_does_not_stop_the_rest(

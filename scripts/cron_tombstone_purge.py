@@ -123,6 +123,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import json
 import sys
 import time
@@ -149,7 +150,7 @@ from engine.shared.db import close_pool, get_pool, init_pool, with_tenant
 from engine.shared.exceptions import StorageUnavailable
 from engine.shared.legal_hold import purge_blocked_reason, purge_eligible_tenant_sql
 from engine.shared.logging import configure_logging, get_logger
-from engine.shared.storage import get_store
+from engine.shared.storage import ObjectStore
 
 log = get_logger(__name__)
 
@@ -237,11 +238,15 @@ _LOCK_SQL = f"""
     FOR UPDATE OF d SKIP LOCKED
 """
 
-# Custom-ingest rows still to be applied. Rows for a document that is being
-# re-created are among them, and its raw prefix must not be cleared under it.
+# Is a custom-ingest row for this ONE document still to be applied? Then it is
+# being re-created and its raw prefix must not be cleared under it. Every
+# source_event_id of a document starts with its document_event_prefix.
 _IN_FLIGHT_SQL = """
-    SELECT source_event_id FROM ingestion_queue
-    WHERE customer_id = $1 AND source_system = $2 AND status = ANY($3::text[])
+    SELECT EXISTS (
+        SELECT 1 FROM ingestion_queue
+        WHERE customer_id = $1 AND source_system = $2 AND status = ANY($3::text[])
+          AND starts_with(source_event_id, $4)
+    )
 """
 
 _MANUAL_UPLOAD_KEYS_SQL = """
@@ -385,6 +390,21 @@ _NEIGHBOURS_SQL = """
     JOIN graph_edges e ON e.customer_id = $1 AND e.to_node_id = dn.node_id
 """
 
+# Taken BEFORE deciding which documents are gone, and the decision is a later
+# statement, so it reads everything committed up to it (READ COMMITTED). A
+# closed code-graph tombstone gives a re-connect no row lock to wait on: it
+# inserts version N+1 and upserts the document's node alongside it. Holding the
+# node first, either that writer is already past it -- its commit is what we
+# waited for, so _GONE_SQL sees N+1 and the node stays -- or it waits for this
+# batch, then re-creates a fresh node. Deciding first and deleting later would
+# delete the node the writer just updated, and every edge it wrote with it.
+_LOCK_DOC_NODES_SQL = """
+    SELECT n.node_id FROM graph_nodes n
+    WHERE n.customer_id = $1 AND n.label = $3 AND n.canonical_id = ANY($2::text[])
+    ORDER BY n.node_id
+    FOR UPDATE
+"""
+
 _DELETE_DOC_NODES_SQL = """
     DELETE FROM graph_nodes n
     USING unnest($2::text[]) AS g(doc_id)
@@ -502,6 +522,17 @@ async def _gated(customer_id: str) -> AsyncIterator[asyncpg.Connection]:
         yield conn
 
 
+@functools.cache
+def _store() -> ObjectStore:
+    """Short storage timeouts, unlike get_store()'s botocore defaults (60 s,
+    4 tries): each delete runs while this job holds the tenant's customers row
+    FOR SHARE and the tombstone row FOR UPDATE, so a stalled store must cost
+    seconds of those locks, not minutes, and must not carry the run past the
+    chart's activeDeadlineSeconds. A failed call keeps the rows and retries
+    next run. Built once per run (run_once clears it)."""
+    return ObjectStore(connect_timeout=5, read_timeout=30, total_max_attempts=3)
+
+
 def _rows(status: str) -> int:
     """asyncpg returns 'DELETE <n>'."""
     try:
@@ -566,7 +597,7 @@ async def _purge_raw_inner(
 
     keys: dict[str, list[str]] = {}
     event_prefix: dict[str, str] = {}
-    store = get_store()
+    store = _store()
     try:
         bucket = await store.bucket_for(customer_id)
     except StorageUnavailable as exc:
@@ -575,9 +606,12 @@ async def _purge_raw_inner(
         failed.update(r["doc_id"] for r in manual_rows)
         return [d for d in docs if d.doc_id not in failed]
 
-    # List BEFORE reading the in-flight set: a re-create writes its payload,
-    # then enqueues, so any payload this listing can see has its queue row
-    # visible to the read that follows.
+    # List first; in-flight and eligibility are read per document afterwards,
+    # right before its delete. A re-create PUTs its payload and then enqueues,
+    # so a payload this listing saw has its queue row visible to a later read
+    # -- unless that read falls inside the route's own put-to-enqueue gap (a
+    # few milliseconds; closing it needs a lock the route shares). The read
+    # being per document and last keeps it as far from the listing as it can.
     for doc in custom:
         # One storage round trip per document, up to a group of them: the
         # budget is checked here as well as between row batches, so a slow
@@ -610,63 +644,82 @@ async def _purge_raw_inner(
             if key:
                 keys.setdefault(row["doc_id"], []).append(key)
 
-    in_flight: set[str] = set()
-    if custom:
-        async with with_tenant(customer_id) as conn:
-            rows = await conn.fetch(
-                _IN_FLIGHT_SQL,
-                customer_id,
-                SourceSystem.CUSTOM_INGEST.value,
-                [QueueStatus.PENDING.value, QueueStatus.PROCESSING.value],
-            )
-        in_flight = {r["source_event_id"].rpartition(":")[0] + ":" for r in rows}
-
     ready: list[_Doc] = []
     for doc in docs:
         if doc.doc_id in failed:
             continue
-        if event_prefix.get(doc.doc_id) in in_flight:
+        doc_keys = keys.get(doc.doc_id, [])
+        prefix = event_prefix.get(doc.doc_id)
+        if not doc_keys and prefix is None:
+            ready.append(doc)  # nothing in R2 is this document's alone
+            continue
+        if time.monotonic() >= deadline:
+            raise _BudgetExhausted
+        try:
+            outcome = await _clear_payloads(
+                customer_id, doc.doc_id, doc_keys, prefix, store, bucket, cutoff
+            )
+        except StorageUnavailable as exc:
+            log.error(
+                "tombstone_purge.delete_failed",
+                customer_id=customer_id,
+                doc_id=doc.doc_id,
+                error=str(exc),
+            )
+            failed.add(doc.doc_id)
+            continue
+        if outcome is None:
             result.in_flight_skipped += 1
             continue
-        doc_keys = keys.get(doc.doc_id)
-        if doc_keys:
-            if time.monotonic() >= deadline:
-                raise _BudgetExhausted
-            try:
-                # Holding the gate across the delete: a hold set now waits
-                # for this one document, and the next one sees it.
-                async with _gated(customer_id) as conn:
-                    # Still eligible, re-read now and locked: a document
-                    # re-created since the scan whose new version has already
-                    # been applied is no longer in flight, and the listing
-                    # holds its LIVE payload. One a writer holds is left for
-                    # the next run.
-                    if not await conn.fetch(_LOCK_SQL, customer_id, [doc.doc_id], cutoff):
-                        result.in_flight_skipped += 1
-                        continue
-                    deleted, errors = await store.delete_keys(bucket, doc_keys)
-            except StorageUnavailable as exc:
-                log.error(
-                    "tombstone_purge.delete_failed",
-                    customer_id=customer_id,
-                    doc_id=doc.doc_id,
-                    error=str(exc),
-                )
-                failed.add(doc.doc_id)
-                continue
-            if errors:
-                log.error(
-                    "tombstone_purge.delete_partial",
-                    customer_id=customer_id,
-                    doc_id=doc.doc_id,
-                    deleted=deleted,
-                    errors=errors,
-                )
-                failed.add(doc.doc_id)
-                continue
-            result.r2_objects += deleted
+        deleted, errors = outcome
+        if errors:
+            log.error(
+                "tombstone_purge.delete_partial",
+                customer_id=customer_id,
+                doc_id=doc.doc_id,
+                deleted=deleted,
+                errors=errors,
+            )
+            failed.add(doc.doc_id)
+            continue
+        result.r2_objects += deleted
         ready.append(doc)
     return ready
+
+
+async def _clear_payloads(
+    customer_id: str,
+    doc_id: str,
+    keys: list[str],
+    event_prefix: str | None,
+    store: ObjectStore,
+    bucket: str,
+    cutoff: datetime,
+) -> tuple[int, int] | None:
+    """Delete one document's listed payloads: (deleted, errors), or None when
+    the document must be left alone this run.
+
+    Inside the gate, so a hold set now waits for this one document and the next
+    one sees it. Then, re-read now and with the row locked: the document is
+    still eligible (one re-created since the scan, whose new version is already
+    applied, has no queue row in flight and the listing holds its LIVE payload;
+    one a writer holds is left for the next run), and no custom-ingest row for
+    it is waiting to be applied.
+    """
+    async with _gated(customer_id) as conn:
+        if not await conn.fetch(_LOCK_SQL, customer_id, [doc_id], cutoff):
+            return None
+        if event_prefix is not None and await conn.fetchval(
+            _IN_FLIGHT_SQL,
+            customer_id,
+            SourceSystem.CUSTOM_INGEST.value,
+            [QueueStatus.PENDING.value, QueueStatus.PROCESSING.value],
+            event_prefix,
+        ):
+            return None
+        if not keys:
+            return 0, 0
+        return await store.delete_keys(bucket, keys)
 
 
 async def _purge_graph(
@@ -731,6 +784,7 @@ async def _finish(
     counts["documents"] += _rows(
         await conn.execute(_DELETE_TOMBSTONES_SQL, customer_id, ids, versions)
     )
+    await conn.execute(_LOCK_DOC_NODES_SQL, customer_id, ids, _DOC_LABEL)
     gone_ids = {r["doc_id"] for r in await conn.fetch(_GONE_SQL, customer_id, ids)}
     gone = [d for d in docs if d.doc_id in gone_ids]
     if not gone:
@@ -905,6 +959,7 @@ async def run_once(
     max_seconds: float = TOMBSTONE_PURGE_MAX_SECONDS,
 ) -> int:
     deadline = time.monotonic() + max_seconds
+    _store.cache_clear()
     async with get_pool().acquire() as conn:
         # The database's clock, fixed once per run, so every batch agrees on
         # what "older than the window" means.
