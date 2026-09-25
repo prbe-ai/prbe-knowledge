@@ -173,11 +173,17 @@ def _patch_question(monkeypatch, part: str) -> None:
         monkeypatch.setattr(ext, "_TOOL_PARAMETERS", schema)
     elif part == "max_tokens":
         monkeypatch.setattr(ext, "_EXTRACT_MAX_TOKENS", 4000)
+    elif part == "description":
+        monkeypatch.setattr(ext, "_TOOL_DESCRIPTION", ext._TOOL_DESCRIPTION + " Be exhaustive.")
+    elif part == "part_template":
+        monkeypatch.setattr(ext, "_PART_TEMPLATE", " [segment {index}/{total}]")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "part", ["model", "revision", "system", "user_template", "schema", "max_tokens"]
+    "part",
+    ["model", "revision", "system", "user_template", "schema", "max_tokens", "description",
+     "part_template"],
 )
 async def test_any_change_to_the_question_is_a_new_key(model, store, monkeypatch, part):
     await _mine([_event(0, TEXT)], store)
@@ -367,3 +373,40 @@ async def test_without_a_cache_nothing_changes(model):
         )
         assert (bundle.calls, bundle.cache_hits) == (1, 0)
     assert model.calls["emit_units"] == 2
+
+
+@pytest.mark.asyncio
+async def test_a_changed_supersession_prompt_asks_again(model, store, monkeypatch):
+    decision = {"question": "API?", "options_considered": ["REST", "gRPC"], "rationale": "r"}
+    model.answers["emit_units"] = {
+        "decision": [{**decision, "chosen": "REST"}, {**decision, "chosen": "gRPC"}]
+    }
+    await _mine(_decisions_session(), store)
+    monkeypatch.setattr(ext, "_SUPERSEDE_DESCRIPTION", "Report reversed decisions.")
+    await _mine(_decisions_session(), store)
+    assert model.calls["emit_supersessions"] == 2
+
+
+@pytest.mark.asyncio
+async def test_an_empty_transcript_touches_neither_model_nor_cache(model, store):
+    bundle = await _mine([{"line_no": 0, "raw": {"type": "system"}}], store)
+    assert model.calls == {} and store.gets == 0 and store.puts == 0
+    assert bundle.calls == 0 and bundle.cache_hits == 0
+
+
+def test_the_cache_client_makes_exactly_one_short_attempt():
+    """botocore reads `max_attempts` as RETRIES: the client itself is the proof."""
+    cache_mod.reset_store_for_tests()
+    try:
+        config = cache_mod._cache_store()._client.meta.config
+        assert config.retries == {"mode": "standard", "total_max_attempts": 1}
+        assert (config.connect_timeout, config.read_timeout) == (2.0, 3.0)
+    finally:
+        cache_mod.reset_store_for_tests()
+
+
+def test_every_other_store_keeps_its_retries():
+    from engine.shared.storage import ObjectStore
+
+    config = ObjectStore()._client.meta.config
+    assert config.retries == {"mode": "standard", "total_max_attempts": 4}

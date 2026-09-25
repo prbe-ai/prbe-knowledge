@@ -1120,6 +1120,7 @@ _SUPERSEDE_MAX_DECISIONS = 120
 
 
 _SUPERSEDE_MAX_TOKENS = 2000
+_SUPERSEDE_DESCRIPTION = "Report decisions that a later decision reversed."
 
 
 async def _link_supersessions(
@@ -1170,6 +1171,7 @@ async def _link_supersessions(
             revision=get_settings().claude_code_extraction_cache_revision,
             system=_SUPERSEDE_SYSTEM,
             tool=_SUPERSEDE_TOOL,
+            description=_SUPERSEDE_DESCRIPTION,
             schema=_SUPERSEDE_SCHEMA,
             max_tokens=_SUPERSEDE_MAX_TOKENS,
         )
@@ -1188,7 +1190,7 @@ async def _link_supersessions(
                 {"role": "user", "content": listing},
             ],
             tool_name=_SUPERSEDE_TOOL,
-            tool_description="Report decisions that a later decision reversed.",
+            tool_description=_SUPERSEDE_DESCRIPTION,
             tool_schema=_SUPERSEDE_SCHEMA,
             max_tokens=_SUPERSEDE_MAX_TOKENS,
             **transport_kwargs,
@@ -1251,6 +1253,9 @@ _USER_TEMPLATE = (
     "cwd: {cwd}\n\n"
     "{transcript}"
 )
+#: The `where` in _USER_TEMPLATE. Its NUMBERS stay out of the key (a session
+#: that grows renumbers nothing it already had); its WORDING is fingerprinted.
+_PART_TEMPLATE = " (part {index} of {total})"
 
 
 async def _extract_one(
@@ -1271,7 +1276,7 @@ async def _extract_one(
     segment_hash = hashlib.sha256(transcript.encode("utf-8")).hexdigest()[:16]
 
     index, total = part
-    where = f" (part {index} of {total})" if total > 1 else ""
+    where = _PART_TEMPLATE.format(index=index, total=total) if total > 1 else ""
     system = _SYSTEM_TEMPLATE.format(agent=_AGENT_LABELS.get(agent, "coding agent"))
     model, transport_kwargs = _model_and_transport()
 
@@ -1283,6 +1288,7 @@ async def _extract_one(
             revision=get_settings().claude_code_extraction_cache_revision,
             system=system,
             user_template=_USER_TEMPLATE,
+            part_template=_PART_TEMPLATE,
             tool=_TOOL_NAME,
             description=_TOOL_DESCRIPTION,
             schema=_TOOL_PARAMETERS,

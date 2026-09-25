@@ -23,6 +23,42 @@ from engine.shared.claude_code_extraction import (
 )
 
 
+class _EmptyStore:
+    async def get(self, bucket, key):
+        from engine.shared.exceptions import StorageNotFound
+
+        raise StorageNotFound(key)
+
+    async def put(self, bucket, key, body):
+        return None
+
+
+@pytest.fixture(autouse=True, params=["no-cache", "empty-cache"])
+def _cache_variant(request, monkeypatch):
+    """Every test here runs twice: without a segment cache, and with an EMPTY one.
+
+    The miss path of engine/shared/extraction_cache.py must change nothing a
+    fresh extraction does. Tests that stub `get_settings` with a bare namespace
+    are marked `no_cache_variant`: the cache reads settings those stubs lack.
+    """
+    if request.param == "no-cache":
+        return
+    if request.node.get_closest_marker("no_cache_variant"):
+        pytest.skip("stubs settings the cache reads")
+    from engine.shared import claude_code_extraction as extraction
+    from engine.shared.extraction_cache import SegmentCache
+
+    real = extraction.extract_units_from_session
+
+    async def with_empty_cache(*args, **kwargs):
+        kwargs.setdefault(
+            "cache", SegmentCache(_EmptyStore(), "b", "raw/claude_code/c/s/extraction-cache/")
+        )
+        return await real(*args, **kwargs)
+
+    monkeypatch.setitem(globals(), "extract_units_from_session", with_empty_cache)
+
+
 def _litellm_tool_response(tool_name: str, payload: dict) -> SimpleNamespace:
     """Build a LiteLLM-shaped response carrying a single forced tool call.
 
@@ -101,6 +137,7 @@ async def test_extract_units_dispatches_via_litellm_and_parses_tool_call(
     assert kwargs["tools"][0]["function"]["name"] == "emit_units"
 
 
+@pytest.mark.no_cache_variant
 @pytest.mark.asyncio
 async def test_extract_units_gateway_preserves_alias_and_uses_openai_wire(
     monkeypatch,
@@ -122,6 +159,7 @@ async def test_extract_units_gateway_preserves_alias_and_uses_openai_wire(
     assert kwargs["custom_llm_provider"] == "openai"
 
 
+@pytest.mark.no_cache_variant
 @pytest.mark.asyncio
 async def test_extract_units_direct_prefixes_anthropic_without_wire_override(
     monkeypatch,

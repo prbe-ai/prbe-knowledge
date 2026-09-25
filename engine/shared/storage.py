@@ -81,8 +81,16 @@ def _make_client(
     *,
     connect_timeout: float | None = None,
     read_timeout: float | None = None,
-    max_attempts: int = 3,
+    total_max_attempts: int | None = None,
 ) -> Any:
+    # botocore reads `max_attempts` as RETRIES (3 -> 4 tries) and
+    # `total_max_attempts` as tries. The default keeps every existing caller's
+    # behaviour; a caller that needs "exactly N tries" says so.
+    retries: dict[str, Any] = (
+        {"max_attempts": 3, "mode": "standard"}
+        if total_max_attempts is None
+        else {"total_max_attempts": total_max_attempts, "mode": "standard"}
+    )
     timeouts: dict[str, float] = {}
     if connect_timeout is not None:
         timeouts["connect_timeout"] = connect_timeout
@@ -96,7 +104,7 @@ def _make_client(
         "region_name": settings.r2_region,
         "config": BotoConfig(
             signature_version="s3v4",
-            retries={"max_attempts": max_attempts, "mode": "standard"},
+            retries=retries,
             **timeouts,
         ),
     }
@@ -122,9 +130,9 @@ class ObjectStore:
         *,
         connect_timeout: float | None = None,
         read_timeout: float | None = None,
-        max_attempts: int = 3,
+        total_max_attempts: int | None = None,
     ) -> None:
-        """botocore's defaults (60 s timeouts, 3 attempts) suit payloads that must
+        """botocore's defaults (60 s timeouts, 3 retries) suit payloads that must
         land. An optional read -- a cache -- passes short ones, so a slow store
         costs it a miss instead of a stalled caller."""
         self._settings = settings or get_settings()
@@ -132,7 +140,7 @@ class ObjectStore:
             self._settings,
             connect_timeout=connect_timeout,
             read_timeout=read_timeout,
-            max_attempts=max_attempts,
+            total_max_attempts=total_max_attempts,
         )
 
     # ---- bucket ops ---------------------------------------------------------

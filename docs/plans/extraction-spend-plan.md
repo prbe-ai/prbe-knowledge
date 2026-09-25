@@ -395,10 +395,13 @@ Spec (accepted in §16; each line cites its record):
 - **Path** `raw/<source>/<customer>/<session_id>/extraction-cache/<key>.json` in the tenant
   bucket (`store.bucket_for`). Purge's `raw/<source>/<customer>/` prefix delete
   (`engine/ingest/purge.py:94,364`) removes it; no migration (R23).
-- **Body** `{"v": 1, "args", "segment_hash", "fingerprint", "created_at"}`; a body whose
-  `v`/fingerprint differs, or malformed JSON, is a miss.
+- **Body** `{"v": 1, "fingerprint", "answer", "created_at"}` (`answer` = the tool-call args,
+  or the supersession `links`); a body whose `v`/fingerprint differs, or malformed JSON, is
+  a miss. The fingerprint also covers the part-number wording and the supersession tool
+  description. An answer is stored under the model id REQUESTED; a gateway fallback to
+  another model would be cached under it (no fallback is configured today).
 - **Bounded storage** (R27, codex): cache GET/PUT use a dedicated client (connect 2 s,
-  read 3 s, 1 attempt), and the first storage failure in a pass disables the cache for
+  read 3 s, 1 attempt via botocore `total_max_attempts`), and the first storage failure in a pass disables the cache for
   the rest of that pass. A miss or error always falls back to the model; a PUT failure is
   logged and the pass continues.
 - **Supersession** cached the same way, keyed on the numbered decision listing + its own

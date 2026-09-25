@@ -65,7 +65,7 @@ def _cache_store() -> ObjectStore:
         _store = ObjectStore(
             connect_timeout=_CONNECT_TIMEOUT_S,
             read_timeout=_READ_TIMEOUT_S,
-            max_attempts=1,
+            total_max_attempts=1,
         )
     return _store
 
