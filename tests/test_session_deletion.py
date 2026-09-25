@@ -638,3 +638,36 @@ async def test_route_contract_dry_run_apply_and_status(env) -> None:
         assert missing.status_code == 404
     assert await session_rows(a, sid) == {}
     assert await session_rows(a, other) != {}
+
+
+@pytest.mark.asyncio
+async def test_the_coalesced_write_path_refuses_a_deleted_session_too(env) -> None:
+    """persist_batch (INGEST_CLAIM_COALESCE_MAX > 1) writes several sessions in
+    one transaction. One deleted session rolls the batch back with a TRANSIENT
+    error, so the worker returns the healthy siblings to pending."""
+    from engine.shared.models import WebhookEvent
+    from kb.handlers.claude_code import ClaudeCodeConnector
+
+    (a, _b), _store = env
+    deleted, healthy = _sid(), _sid()
+    await delete(a, [deleted])
+    connector = ClaudeCodeConnector(make_default_context())
+    results = []
+    for sid in (deleted, healthy):
+        payload = _v2_batches(sid, ALICE, ALICE_EMAIL)[0]
+        results.append(
+            await connector.normalize(
+                WebhookEvent(customer_id=a, source_system=CC, source_event_id=sid,
+                             received_at=datetime.now(UTC), payload_s3_key="",
+                             payload_s3_keys=[], raw_payload=payload, headers={}),
+                {"session_id": sid, "events": payload["events"], "session_complete": False,
+                 "cwd": "/w", "employee_id": ALICE},
+            )
+        )
+    before = await snapshot(a)
+    with pytest.raises(SessionDeleted) as refused:
+        await Normalizer(make_default_context()).persist_batch(
+            a, CC, [(results[0], None), (results[1], None)]
+        )
+    assert refused.value.transient
+    assert await snapshot(a) == before
