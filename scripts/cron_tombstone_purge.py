@@ -597,7 +597,10 @@ async def _gated(customer_id: str) -> AsyncIterator[asyncpg.Connection]:
         yield conn
         # Reached only when the block ended cleanly: with_tenant commits next,
         # under the same client timeout, and a stalled commit must not be
-        # logged as the batch's last statement.
+        # logged as the batch's last statement. A failure at this stage leaves
+        # the outcome UNKNOWN (the server may have committed before the client
+        # gave up): the run's counts miss that batch, and the next run's
+        # eligibility re-check finds whatever is still there.
         _at("commit")
 
 

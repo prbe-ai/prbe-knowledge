@@ -49,7 +49,12 @@ next research-os deploy for research. Check for long-lived transactions
 (`pg_stat_activity` ordered by `xact_start`) before EACH of those, and first
 if a deploy stalls here. The indexes can also be built by
 hand beforehand, after which this migration is a no-op -- the statements are
-_INDEXES below, each run as `CREATE INDEX CONCURRENTLY IF NOT EXISTS`.
+_INDEXES below, each run as `CREATE INDEX CONCURRENTLY IF NOT EXISTS`. Paste
+them exactly: `IF NOT EXISTS` and the INVALID guard both match on NAME only, so
+a valid hand-built index with another column list or predicate (`'document'`)
+is kept, 0141 is stamped applied, and the purge keeps scanning. Check afterwards
+that each `pg_get_indexdef(to_regclass('<name>'))` shows the columns and the
+`'Document'` predicate below.
 """
 
 import sqlalchemy as sa
