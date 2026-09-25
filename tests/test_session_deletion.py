@@ -1319,3 +1319,129 @@ async def test_receipts_read_deleted_as_soon_as_the_deletion_is_recorded(env) ->
                              reason="r", ticket=None, selector={"by": "id"})
     receipts = await sr.receipts(CC.value, sid, x_prbe_customer=a, after=-1, limit=10)
     assert receipts["state"] == "deleted" and receipts["receipts"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_late_sweep_keeps_what_a_legal_hold_now_covers(env, monkeypatch) -> None:
+    """A hold placed while the pass was extracting: the worker's late sweep is
+    as destructive as the deletion's own and must stop the same way."""
+    from engine.ingest.worker import Worker
+
+    (a, _b), store = env
+    sid, row = await _claimed_unmined_session(a)
+    bucket = await store.bucket_for(a)
+    late = f"raw/{CC.value}/{a}/{sid}/extraction-cache/{'8' * 64}.json"
+
+    async def deleted_then_held(*, session_id, events, cwd=None, agent="claude_code", cache=None):
+        await delete(a, [sid])
+        async with db_module.raw_conn() as conn:
+            await conn.execute(
+                "UPDATE customers SET metadata = '{\"legal_hold\": \"case-9\"}' WHERE customer_id = $1", a
+            )
+        await store.put(bucket, late, b"{}")
+        return ext.UnitBundle(qa=[ext.QA(prompt="p", outcome="o", tags=[])])
+
+    monkeypatch.setattr("kb.handlers.claude_code._ext.extract_units_from_session", deleted_then_held)
+    monkeypatch.setattr(sd, "_wait_for_in_flight", _no_wait)
+    ctx = make_default_context()
+    try:
+        await Worker(ctx)._process(row)
+    finally:
+        await ctx.http.aclose()
+
+    assert await store.exists(bucket, late)
+    async with db_module.with_tenant(a) as conn:
+        status, error = await conn.fetchrow("SELECT status, error FROM session_deletions")
+    assert status == "held" and "case-9" in error
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_pass_of_a_deleted_session_still_cleans_up(env, monkeypatch) -> None:
+    """A shutdown cancels the pass after it saved a late cache answer. No
+    error branch runs for a cancellation; the pass sweeps on its way out."""
+    import asyncio
+
+    from engine.ingest.worker import Worker
+
+    (a, _b), store = env
+    sid, row = await _claimed_unmined_session(a)
+    bucket = await store.bucket_for(a)
+    late = f"raw/{CC.value}/{a}/{sid}/extraction-cache/{'7' * 64}.json"
+
+    async def deleted_then_cancelled(*, session_id, events, cwd=None, agent="claude_code", cache=None):
+        await delete(a, [sid])
+        await store.put(bucket, late, b"{}")
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("kb.handlers.claude_code._ext.extract_units_from_session",
+                        deleted_then_cancelled)
+    monkeypatch.setattr(sd, "_wait_for_in_flight", _no_wait)
+    ctx = make_default_context()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await Worker(ctx)._process(row)
+    finally:
+        await ctx.http.aclose()
+
+    assert not await store.exists(bucket, late)
+
+
+@pytest.mark.asyncio
+async def test_clearing_the_journal_keeps_keys_this_attempt_did_not_delete(env) -> None:
+    """Two attempts on one session (a /resume beside a live run): one must
+    not wipe keys the other journaled after it read its snapshot."""
+    (a, _b), _store = env
+    sid = _sid()
+    ref = sd.SessionRef(CC.value, sid)
+    await sd.record_sessions(a, [ref], deletion_id=str(uuid.uuid4()), reason="r", ticket=None,
+                             selector={"by": "id"})
+    mine = f"raw/{CC.value}/{a}/2025/01/01/{sid}:0.json"
+    theirs = f"raw/{CC.value}/{a}/2025/01/01/{sid}:1.json"
+    await sd._journal_keys(a, ref, {mine, theirs})
+
+    await sd._clear_journal(a, ref, {mine})
+
+    async with db_module.with_tenant(a) as conn:
+        assert await conn.fetchval("SELECT pending_keys FROM session_deletions") == [theirs]
+
+
+@pytest.mark.asyncio
+async def test_the_inferred_edges_worker_fences_every_endpoint_not_only_the_anchor(
+    env, monkeypatch
+) -> None:
+    """The bundle holds neighbouring documents, so an edge anchored on a
+    surviving session can name one deleted during the call."""
+    from engine.ingest.inferred_edges import worker as iew
+    from engine.ingest.inferred_edges.extractor import ExtractionResult, InferredEdge
+
+    (a, _b), _store = env
+    kept, gone = _sid(), _sid()
+    await v2_session(a, kept)
+    await v2_session(a, gone)
+    gone_node = agent_session_canonical_id(CC.value, gone)
+    async with db_module.raw_conn() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, customer_id, anchor_doc_id, extractor_id, attempts FROM inferred_edges_queue "
+            "WHERE customer_id = $1 AND anchor_doc_id LIKE $2 ORDER BY id LIMIT 1",
+            a, f"{CC.value}:{a}:{kept}%",
+        )
+    assert row is not None
+
+    async def the_neighbour_is_deleted_during_the_call(bundle, conn, **_kw):
+        await delete(a, [gone])
+        edge = InferredEdge(
+            from_label="AgentSession", from_canonical_id=gone_node, to_label="Person",
+            to_canonical_id=ALICE, edge_type="DISCUSSES", confidence="INFERRED",
+            why="drawn from the deleted neighbour", extractor_id="inferred_edges:v1",
+            extracted_at=datetime.now(UTC),
+        )
+        return ExtractionResult(edges=[edge])
+
+    monkeypatch.setattr(iew, "extract_edges", the_neighbour_is_deleted_during_the_call)
+    await iew.InferredEdgesWorker(concurrency=1)._process(row)
+
+    async with db_module.with_tenant(a) as conn:
+        assert await conn.fetchval(
+            "SELECT count(*) FROM graph_nodes WHERE canonical_id = $1", gone_node
+        ) == 0
+    assert await session_rows(a, kept) != {}

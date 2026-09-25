@@ -44,8 +44,8 @@ from engine.shared.constants import NodeLabel
 from engine.shared.db import get_pool, with_tenant
 from engine.shared.logging import get_logger
 from engine.shared.metrics import counter, gauge
+from engine.shared.session_suppression import SessionDeleted, refuse_deleted_graph_refs
 from engine.shared.tenant_status import active_tenant_sql
-from engine.shared.session_suppression import SessionDeleted, refuse_deleted_anchor
 
 log = get_logger(__name__)
 
@@ -176,7 +176,15 @@ class InferredEdgesWorker:
                     # The bundle was read before an LLM call that can outlast
                     # a session deletion: fence the write the way every other
                     # writer of a session is fenced.
-                    await refuse_deleted_anchor(conn, customer_id, anchor_doc_id)
+                    await refuse_deleted_graph_refs(
+                        conn,
+                        customer_id,
+                        [
+                            ("Document", anchor_doc_id),
+                            *((e.from_label, e.from_canonical_id) for e in extraction.edges),
+                            *((e.to_label, e.to_canonical_id) for e in extraction.edges),
+                        ],
+                    )
                     await _upsert_inferred_edges(conn, customer_id, extraction.edges)
 
                 counter(

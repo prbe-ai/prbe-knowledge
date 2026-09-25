@@ -43,6 +43,7 @@ from engine.shared.session_suppression import (
     reopen_deletion,
     session_of_event_id,
     sweep_session_folders,
+    tenant_legal_hold,
 )
 from engine.shared.storage import get_store
 from engine.shared.tenant_status import active_tenant_sql
@@ -477,6 +478,18 @@ class Worker:
                     log.exception(
                         "worker.batch_finalize_failed", queue_id=row["queue_id"],
                     )
+        except asyncio.CancelledError:
+            # Shutdown mid-batch: as in `_process`, sweep any session deleted
+            # while this batch ran, bounded, then let the cancellation go on.
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(
+                    asyncio.gather(*(
+                        self._sweep_if_deleted(customer_id, source, r["source_event_id"])
+                        for r in rows
+                    )),
+                    timeout=10,
+                )
+            raise
         finally:
             for hb in heartbeats:
                 hb.cancel()
@@ -511,6 +524,14 @@ class Worker:
         """
         why = None
         try:
+            hold = await tenant_legal_hold(exc.customer_id)
+            if hold is not None:
+                # Evidence now: keep it, and say so where the deletion is read.
+                await reopen_deletion(
+                    exc, f"legal hold: {hold}; late objects kept, resume once released",
+                    status="held",
+                )
+                return
             removed, failed = await sweep_session_folders(get_store(), exc)
             log.info(
                 "worker.deleted_session_swept",
@@ -662,6 +683,15 @@ class Worker:
             if dead and source == SourceSystem.MANUAL_UPLOAD:
                 with contextlib.suppress(Exception):
                     await self._mark_manual_upload_failed_ingest(customer_id, event_id, str(exc))
+        except asyncio.CancelledError:
+            # Shutdown mid-pass: no error branch runs for a cancellation, and
+            # the pass may have saved cache answers for a session deleted
+            # while it ran. Bounded, then the cancellation goes on.
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(
+                    self._sweep_if_deleted(customer_id, source, event_id), timeout=10
+                )
+            raise
         except Exception as exc:  # pragma: no cover — last-resort
             # Unknown error: assume transient so we don't burn data on a single
             # network blip / OOM / unwrapped httpx error / asyncpg connection

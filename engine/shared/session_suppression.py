@@ -172,26 +172,34 @@ async def refuse_deleted_sessions(
         )
 
 
-async def refuse_deleted_anchor(conn: Any, customer_id: str, doc_id: str) -> None:
-    """The fence for a writer keyed by a DOCUMENT id: the inferred-edges
-    worker, which reads a session's documents, spends an LLM call on them, and
-    then upserts graph nodes and edges -- `upsert_nodes` would re-create a
-    session node the deletion removed meanwhile, and the edges would carry
-    `why` text drawn from the transcript. Same lock and check as every other
-    writer; a document of no coding-agent session passes untouched.
+async def refuse_deleted_graph_refs(
+    conn: Any, customer_id: str, refs: Iterable[tuple[str, str]]
+) -> None:
+    """The fence for a writer keyed by graph (label, canonical_id) pairs: the
+    inferred-edges worker, which reads documents, spends an LLM call on them,
+    and then upserts the nodes and edges it inferred -- `upsert_nodes` would
+    re-create a session node a deletion removed meanwhile, and the edges would
+    carry `why` text drawn from the transcript. Its anchor AND every edge
+    endpoint are checked: a bundle holds neighbouring documents, so an edge
+    can name a session other than the anchor's. Same lock and check as every
+    other writer; a ref of no coding-agent session passes untouched.
 
-    `<source>:<customer>:<session>` is a session document, `...:<kind>:<n>` one
-    of its units; both readings are locked and checked, since a protocol-1
-    session id may itself hold `:`.
+    A Document `<source>:<customer>:<session>` is a session document and
+    `...:<kind>:<n>` one of its units (both readings are checked, since a
+    protocol-1 id may hold `:`); an AgentSession is
+    `agent_session:<source>:<session>` (constants.agent_session_canonical_id).
     """
-    for source in sorted(s.value for s in AGENT_SESSION_SOURCES):
-        prefix = f"{source}:{customer_id}:"
-        if doc_id.startswith(prefix):
-            rest = doc_id[len(prefix):]
-            await refuse_deleted_sessions(
-                conn, customer_id, source, {rest, rest.rsplit(":", 2)[0]}
-            )
-            return
+    sources = sorted(s.value for s in AGENT_SESSION_SOURCES)
+    wanted: dict[str, set[str]] = {}
+    for label, canonical_id in refs:
+        for source in sources:
+            if label == "Document" and canonical_id.startswith(f"{source}:{customer_id}:"):
+                rest = canonical_id[len(f"{source}:{customer_id}:"):]
+                wanted.setdefault(source, set()).update({rest, rest.rsplit(":", 2)[0]})
+            elif label == "AgentSession" and canonical_id.startswith(f"agent_session:{source}:"):
+                wanted.setdefault(source, set()).add(canonical_id[len(f"agent_session:{source}:"):])
+    for source in sorted(wanted):
+        await refuse_deleted_sessions(conn, customer_id, source, wanted[source])
 
 
 async def is_session_deleted(customer_id: str, source: str, queue_event_id: str) -> bool:
@@ -235,19 +243,36 @@ async def own_folder_keys(store: Any, bucket: str, folder: str) -> list[str]:
     return [k for k in await store.list_keys(bucket, folder) if is_own_folder_key(k, folder)]
 
 
-async def reopen_deletion(exc: SessionDeleted, why: str) -> None:
-    """A late sweep did not finish: mark the recorded deletion `failed` so its
-    status says so and /resume sweeps again. Nothing else would -- the queue
-    row is gone and the deletion itself may already read `done`."""
+def as_legal_hold(value: str | None) -> str | None:
+    """`customers.metadata->>'legal_hold'` as a hold, or None. Anything but
+    absent, null, false or "" is a hold: deleting under an ambiguous hold is
+    the failure that cannot be undone."""
+    if value is None or value.strip().lower() in ("", "false", "null"):
+        return None
+    return value
+
+
+async def tenant_legal_hold(customer_id: str) -> str | None:
+    async with with_tenant(customer_id) as conn:
+        return as_legal_hold(await conn.fetchval(
+            "SELECT metadata->>'legal_hold' FROM customers WHERE customer_id = $1", customer_id
+        ))
+
+
+async def reopen_deletion(exc: SessionDeleted, why: str, *, status: str = "failed") -> None:
+    """A late sweep did not finish (or must not run, under a hold): mark the
+    recorded deletion so its status says so and /resume sweeps again. Nothing
+    else would -- the queue row is gone and the deletion may read `done`."""
     async with with_tenant(exc.customer_id) as conn:
         await conn.execute(
-            "UPDATE session_deletions SET status = 'failed', error = $4 "
+            "UPDATE session_deletions SET status = $5, error = $4 "
             "WHERE customer_id = $1 AND source_system = $2 "
             "AND session_id = ANY($3::text[]) AND status <> 'held'",
             exc.customer_id,
             exc.source,
             sorted(exc.session_ids),
             why[:2000],
+            status,
         )
 
 

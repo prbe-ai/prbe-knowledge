@@ -106,6 +106,7 @@ from engine.shared.exceptions import StorageNotFound, StorageUnavailable
 from engine.shared.session_signals import is_cron_marker_key, storage_id
 from engine.shared.session_suppression import (
     LEGACY_EVENT_SUFFIX_SQL,
+    as_legal_hold,
     lock_session,
     own_folder_keys,
     session_folder,
@@ -274,13 +275,7 @@ async def legal_hold(customer_id: str) -> str | None:
         )
     if row is None:
         raise SessionDeletionError(404, f"unknown customer {customer_id!r}")
-    return _as_hold(row["hold"])
-
-
-def _as_hold(hold: str | None) -> str | None:
-    if hold is None or hold.strip().lower() in ("", "false", "null"):
-        return None
-    return hold
+    return as_legal_hold(row["hold"])
 
 
 class _HoldPlaced(Exception):
@@ -832,7 +827,7 @@ async def _journal_and_delete_rows(
         # Re-read under the lock: the run's first check can be minutes old (a
         # wait on this lock, the in-flight grace), and a hold placed since must
         # stop the rows going.
-        hold = _as_hold(await conn.fetchval(
+        hold = as_legal_hold(await conn.fetchval(
             "SELECT metadata->>'legal_hold' FROM customers WHERE customer_id = $1", customer_id
         ))
         if hold is not None:
@@ -955,8 +950,7 @@ async def erase_session(
                 store, bucket, customer_id, ref, sorted(keys)
             )
             result["r2_objects_deleted"] += n
-            if not failed:
-                await _clear_journal(customer_id, ref)
+            await _clear_journal(customer_id, ref, set(keys) - set(failed))
             if not in_flight or round_ == 2:
                 break
             # A worker was mid-pass: its row writes are refused, but it can
@@ -1014,14 +1008,21 @@ async def _journal_keys(customer_id: str, ref: SessionRef, keys: set[str]) -> No
         )
 
 
-async def _clear_journal(customer_id: str, ref: SessionRef) -> None:
+async def _clear_journal(customer_id: str, ref: SessionRef, done: set[str]) -> None:
+    """Drop the keys THIS attempt saw deleted, and only those: a concurrent
+    attempt (a /resume beside a live run) may have journaled keys since, and a
+    failed key must stay for the next run."""
+    if not done:
+        return
     async with with_tenant(customer_id) as conn:
         await conn.execute(
-            "UPDATE session_deletions SET pending_keys = '{}' "
+            "UPDATE session_deletions SET pending_keys = ARRAY("
+            "SELECT k FROM unnest(pending_keys) AS k WHERE NOT (k = ANY($4::text[]))) "
             "WHERE customer_id = $1 AND source_system = $2 AND session_id = $3",
             customer_id,
             ref.source,
             ref.session_id,
+            sorted(done),
         )
 
 
