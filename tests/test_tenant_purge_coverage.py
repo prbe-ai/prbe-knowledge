@@ -22,6 +22,13 @@ with a `customer_id` column must be one of:
       (and it can only point at rows of the SAME tenant);
   (c) ALLOWED_UNLINKED below, with the reason and how research-os deletes it.
 
+Either FK must also be VALIDATED: a `NOT VALID` constraint never checked the
+rows that predate it, so rows pointing at a parent that no longer exists are
+reached by no cascade. And every column of a CHAINED FK must be NOT NULL: under
+the default MATCH SIMPLE a row with a NULL in any FK column is not constrained
+at all, so `(customer_id='t', installation_id=NULL)` has no parent whose
+deletion would cascade to it.
+
 WHEN ALLOWED_UNLINKED CHANGES, research-os's `_UNLINKED_TENANT_TABLES` must
 change with it -- a table added here and not there is exactly the leak this
 file exists to stop. research-os's three named tables are all chained here
@@ -64,6 +71,10 @@ _FOREIGN_KEYS_SQL = """
     SELECT con.conrelid::regclass::text AS child,
            con.confrelid::regclass::text AS parent,
            con.confdeltype::text AS on_delete,   -- "char": bytes to asyncpg otherwise
+           con.convalidated AS validated,
+           (SELECT bool_and(a.attnotnull) FROM unnest(con.conkey) k(num)
+              JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.num
+           ) AS child_not_null,
            ARRAY(SELECT a.attname FROM unnest(con.conkey) WITH ORDINALITY k(num, ord)
                  JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.num
                  ORDER BY k.ord)::text[] AS child_cols,
@@ -97,6 +108,7 @@ async def _coverage(conn) -> Coverage:
         for fk in fks
         if fk["parent"] == customers
         and fk["on_delete"] == _CASCADE
+        and fk["validated"]
         and list(fk["child_cols"]) == ["customer_id"]
         and list(fk["parent_cols"]) == ["customer_id"]
     }
@@ -108,6 +120,8 @@ async def _coverage(conn) -> Coverage:
             if fk["parent"] in covered
             and fk["child"] not in covered
             and fk["on_delete"] == _CASCADE
+            and fk["validated"]
+            and fk["child_not_null"]
             and "customer_id" in fk["child_cols"]
             and fk["parent_cols"][list(fk["child_cols"]).index("customer_id")] == "customer_id"
         }
@@ -136,7 +150,8 @@ async def test_every_tenant_table_is_reached_by_the_purge(live_db) -> None:
     assert not escaped, (
         f"{escaped} hold a customer_id but nothing deletes them when a tenant is purged. "
         "Give each an FK ON DELETE CASCADE -- `customer_id` to customers(customer_id), or "
-        "customer_id-to-customer_id to a tenant table that has one -- or add it to "
+        "customer_id-to-customer_id to a tenant table that has one, validated and with "
+        "every FK column NOT NULL -- or add it to "
         "ALLOWED_UNLINKED with its reason AND to research-os's `_UNLINKED_TENANT_TABLES`."
     )
     stale = sorted(ALLOWED_UNLINKED.keys() - coverage.uncovered)
@@ -167,7 +182,9 @@ async def test_the_check_sees_what_it_should(live_db) -> None:
 @pytest.mark.asyncio
 async def test_the_check_fails_on_a_table_that_escapes(live_db) -> None:
     """A negative control, rolled back: an unlinked tenant table is caught, a
-    non-cascading FK is caught, and a correctly chained table is not."""
+    non-cascading FK is caught, a chained FK a row can slip past (a nullable
+    FK column, or a NOT VALID constraint) is caught, and a correctly chained
+    table is not."""
     async with raw_conn() as conn:
         tx = conn.transaction()
         await tx.start()
@@ -182,12 +199,31 @@ async def test_the_check_fails_on_a_table_that_escapes(live_db) -> None:
                     FOREIGN KEY (customer_id, installation_id)
                       REFERENCES github_installations(customer_id, installation_id)
                       ON DELETE CASCADE);
+                -- MATCH SIMPLE: a NULL installation_id leaves the row unchecked,
+                -- with no parent to cascade from.
+                CREATE TABLE purge_probe_nullable (
+                    customer_id TEXT NOT NULL, installation_id TEXT,
+                    FOREIGN KEY (customer_id, installation_id)
+                      REFERENCES github_installations(customer_id, installation_id)
+                      ON DELETE CASCADE);
+                -- NOT VALID: rows older than the constraint were never checked.
+                CREATE TABLE purge_probe_not_valid (
+                    customer_id TEXT NOT NULL, installation_id TEXT NOT NULL);
+                ALTER TABLE purge_probe_not_valid
+                  ADD FOREIGN KEY (customer_id, installation_id)
+                  REFERENCES github_installations(customer_id, installation_id)
+                  ON DELETE CASCADE NOT VALID;
                 """
             )
             coverage = await _coverage(conn)
         finally:
             await tx.rollback()
 
-    assert {"purge_probe_orphan", "purge_probe_restrict"} <= coverage.uncovered
+    assert {
+        "purge_probe_orphan",
+        "purge_probe_restrict",
+        "purge_probe_nullable",
+        "purge_probe_not_valid",
+    } <= coverage.uncovered
     assert "purge_probe_chained" in coverage.chained
     assert any(b.startswith("purge_probe_restrict(") for b in coverage.blocking)
