@@ -20,6 +20,7 @@ from engine.ingest import queue_age
 from engine.ingest.handlers.base import ConnectorContext
 from engine.ingest.normalizer import Normalizer
 from engine.shared.constants import (
+    AGENT_SESSION_SOURCES,
     QUEUE_ERROR_BACKOFF_SECONDS,
     QUEUE_HEARTBEAT_INTERVAL_SECONDS,
     QUEUE_RECLAIM_THRESHOLD_SECONDS,
@@ -36,6 +37,11 @@ from engine.shared.exceptions import (
     UnsupportedEventType,
 )
 from engine.shared.logging import bind_trace, get_logger
+from engine.shared.session_suppression import (
+    SessionDeleted,
+    is_session_deleted,
+    sweep_session_folders,
+)
 from engine.shared.storage import get_store
 from engine.shared.tenant_status import active_tenant_sql
 
@@ -369,6 +375,12 @@ class Worker:
                 payload_key = payload_keys[0] if payload_keys else ""
                 captured_version = row["version"]
                 attempts = row["attempts"] + 1
+                if await self._deleted_session(customer_id, source, event_id):
+                    await self._mark_skipped(
+                        queue_id, customer_id, source, event_id, payload_key,
+                        "session deleted", captured_version,
+                    )
+                    continue
                 try:
                     result = await self._normalizer._normalize_only(
                         customer_id, source, payload_keys
@@ -416,6 +428,8 @@ class Worker:
                     [(result, row["queue_id"]) for (row, result) in normalized],
                 )
             except PrbeError as exc:
+                if isinstance(exc, SessionDeleted):
+                    await self._sweep_deleted(exc)
                 transient = getattr(exc, "transient", False)
                 for row, _ in normalized:
                     await self._fail_batch_row(
@@ -459,6 +473,39 @@ class Worker:
                 hb.cancel()
             for hb in heartbeats:
                 await self._stop_heartbeat(hb)
+
+    @staticmethod
+    async def _deleted_session(
+        customer_id: str, source: SourceSystem, event_id: str
+    ) -> bool:
+        """A coding-agent session deleted at the customer's request is not mined.
+
+        Best-effort: an error here must not stop the drain, and the write
+        fence in the normalizer still refuses the session under its lock.
+        """
+        if source not in AGENT_SESSION_SOURCES:
+            return False
+        try:
+            return await is_session_deleted(customer_id, source.value, event_id)
+        except Exception:
+            log.warning("worker.deleted_session_check_failed", exc_info=True)
+            return False
+
+    @staticmethod
+    async def _sweep_deleted(exc: SessionDeleted) -> None:
+        """This pass may have saved extraction-cache answers for a session that
+        was deleted while it ran, after the deletion's last sweep. Remove them."""
+        try:
+            removed = await sweep_session_folders(get_store(), exc)
+            log.info(
+                "worker.deleted_session_swept",
+                customer=exc.customer_id,
+                source=exc.source,
+                sessions=len(exc.session_ids),
+                objects=removed,
+            )
+        except Exception:
+            log.warning("worker.deleted_session_sweep_failed", exc_info=True)
 
     async def _fail_batch_row(
         self,
@@ -511,6 +558,12 @@ class Worker:
         attempts = row["attempts"] + 1
 
         bind_trace(f"queue-{queue_id}")
+        if await self._deleted_session(customer_id, source, event_id):
+            await self._mark_skipped(
+                queue_id, customer_id, source, event_id, payload_s3_key,
+                "session deleted", captured_version,
+            )
+            return
         heartbeat_task = asyncio.create_task(self._heartbeat(queue_id))
         try:
             outcome = await self._normalizer.process_queue_row(
@@ -533,6 +586,8 @@ class Worker:
             )
         except DuplicateEventIgnored as exc:
             log.info("worker.skipped", queue_id=queue_id, reason=str(exc))
+            if isinstance(exc, SessionDeleted):
+                await self._sweep_deleted(exc)
             await self._mark_skipped(
                 queue_id,
                 customer_id,

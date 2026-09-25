@@ -31,6 +31,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
+from engine.shared.db import with_tenant
 from engine.shared.exceptions import DuplicateEventIgnored
 
 #: The HTTP status and machine-readable reason an ingest door answers with for
@@ -46,11 +47,22 @@ class SessionDeleted(DuplicateEventIgnored):
 
     A DuplicateEventIgnored so the single-row worker path marks the row
     skipped instead of failing it. `transient` so the coalesced batch path,
-    which fails every sibling on any error, sends the healthy siblings back to
-    pending instead of burning an attempt on them.
+    which fails every sibling on any error, returns the healthy siblings to
+    pending rather than dead-lettering them. (They are re-claimed with an
+    attempt spent; the worker's pre-check then drops the deleted row, so this
+    happens at most once per race, never in a loop.)
+
+    Carries what the worker needs to clean up after its own pass: see
+    `sweep_session_folders`.
     """
 
     transient = True
+
+    def __init__(self, message: str, *, customer_id: str, source: str, session_ids: set[str]) -> None:
+        super().__init__(message)
+        self.customer_id = customer_id
+        self.source = source
+        self.session_ids = set(session_ids)
 
 
 def session_lock_key(customer_id: str, source: str, session_id: str) -> str:
@@ -117,5 +129,41 @@ async def refuse_deleted_sessions(
     deleted = await deleted_sessions(conn, customer_id, source, ids)
     if deleted:
         raise SessionDeleted(
-            f"{source} session deleted; nothing written ({len(deleted)} session(s))"
+            f"{source} session deleted; nothing written ({len(deleted)} session(s))",
+            customer_id=customer_id,
+            source=source,
+            session_ids=deleted,
         )
+
+
+async def is_session_deleted(customer_id: str, source: str, queue_event_id: str) -> bool:
+    """The worker's check BEFORE it reads and mines a session (no lock: a pass
+    that starts a moment before the deletion is caught by the write fence).
+
+    Saves the extraction a deleted session would otherwise pay for, and keeps a
+    re-pended row of a deleted session (the idle sweep's partial-pass retry
+    does not look at deletions) from being mined again.
+    """
+    session_id = queue_event_id.split(":", 1)[0]  # pre-0026 rows are `<session>:<batch>`
+    async with with_tenant(customer_id) as conn:
+        return bool(await deleted_sessions(conn, customer_id, source, [session_id]))
+
+
+async def sweep_session_folders(store: Any, exc: SessionDeleted) -> int:
+    """Delete `raw/<src>/<customer>/<session>/` for each deleted session a
+    refused pass belonged to. Returns objects deleted.
+
+    A worker already mining a session when it was deleted keeps saving
+    extraction-cache answers there until its write is refused, which can be
+    after the deletion's own last sweep. The worker is the last writer, so it
+    cleans up after itself. Only ids read back from `session_deletions` reach
+    here, and those passed the deletion's id-shape check.
+    """
+    bucket = await store.bucket_for(exc.customer_id)
+    deleted = 0
+    for session_id in sorted(exc.session_ids):
+        n, _errors = await store.delete_prefix(
+            bucket, f"raw/{exc.source}/{exc.customer_id}/{session_id}/"
+        )
+        deleted += n
+    return deleted

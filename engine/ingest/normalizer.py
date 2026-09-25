@@ -811,8 +811,9 @@ class Normalizer:
         async with with_tenant(customer_id) as conn:
             if source_system in _AGENT_SESSION_SOURCES:
                 # Same fence as _persist. SessionDeleted is transient, so the
-                # whole batch rolls back and the healthy siblings are re-claimed
-                # (the deleted session's queue row is gone by then).
+                # whole batch rolls back and the healthy siblings go back to
+                # pending; on the next claim the worker's pre-check skips the
+                # deleted row, so this costs them one attempt, once.
                 await refuse_deleted_sessions(
                     conn,
                     customer_id,

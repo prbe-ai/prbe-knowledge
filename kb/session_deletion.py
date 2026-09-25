@@ -28,9 +28,16 @@ X-Internal-Knowledge-Key header, tenant from X-Prbe-Customer, never the body)
         legal hold  -> 423 {"detail": {"reason": "legal_hold", "legal_hold": "<why>"}}
         no tenant   -> 404
     GET /api/session-deletions/{deletion_id}
-        -> 200 {"deletion_id", "status": running|done|failed|held, "sessions": [
+        -> 200 {"deletion_id", "status": running|stalled|done|failed|held, "sessions": [
                  {"source", "session_id", "status", "requested_at", "attempted_at",
                   "deleted_at", "result", "error"}]}
+       `stalled`: sessions still pending and nothing has moved for STALLED_AFTER_S
+       (the run died with its pod). Resume it:
+    POST /api/session-deletions/{deletion_id}/resume   {"deep_scan": false} (body optional)
+        -> 202 {"deletion_id", "status": "running", "sessions": [...]}  every session not `done`
+        -> 200 {"status": "nothing_to_resume"}; 404 unknown id; 423 legal hold
+       Resume by id, not by re-POSTing: an author request finds nothing once its
+       sessions' rows are gone, while their objects may still be there.
 
 An explicit id that matches nothing is still recorded, for every requested
 source: a session not uploaded yet must not be accepted later either.
@@ -61,10 +68,13 @@ engine/shared/session_suppression.py) -> remove rows (under the session lock,
 journaling keys in the same commit) -> remove objects -> verify. Rows go before
 objects so the idle sweep and the worker, which act on the queue row, have
 nothing left to act on while objects are removed. A crash anywhere leaves a
-`pending` row holding the key list; re-POSTing resumes. A worker already
+`pending` row holding the key list; /resume finishes it. A worker already
 mining the session when the deletion lands can still write extraction-cache
-objects until its pass ends (its row writes are refused), so a run that found
-the session in flight waits `IN_FLIGHT_GRACE_S` and sweeps again.
+objects until its pass ends: a run that found the session in flight waits
+`IN_FLIGHT_GRACE_S` and sweeps again, and a pass that outlasts even that has
+its write refused and deletes the session folder itself
+(engine/ingest/worker.py _sweep_deleted). The worker also skips a deleted
+session before mining it at all.
 
 NOT covered here (listed in every dry run as `not_covered`): see NOT_COVERED.
 """
@@ -106,21 +116,29 @@ router = APIRouter(
 
 AGENT_SOURCES: tuple[str, ...] = tuple(s.value for s in AGENT_SESSION_SOURCES)
 
-#: The shape research-os accepts for a session id (app/runs/agent_session.py),
-#: which is also what makes the raw prefixes below safe to delete under: no `/`,
-#: nothing short enough to be a date folder.
-_SESSION_ID_RE = re.compile(r"\A[A-Za-z0-9._:-]{8,200}\Z")
+#: research-os's session-id shape (app/runs/agent_session.py) minus `:`. It is
+#: what makes the raw prefixes below safe to delete under: no `/`, nothing short
+#: enough to be a date folder. `:` is refused because `<id>:` is how a
+#: session's children are matched (unit documents `<id>:<kind>:<n>`, pre-0026
+#: queue rows `<id>:<batch>`); deleting `X` must not take a session named `X:y`.
+#: Agents' session ids are UUIDs.
+_SESSION_ID_RE = re.compile(r"\A[A-Za-z0-9._-]{8,200}\Z")
 #: Names that sit at the session-folder level of `raw/<src>/<customer>/` and
 #: are NOT sessions. Deleting `raw/<src>/<customer>/sessions-v2/` would erase
 #: every protocol-2 session of the tenant.
 _RESERVED_IDS = frozenset({"sessions-v2"})
 
 #: How long a run waits before sweeping again when a worker was mid-pass on the
-#: session: a pass reclaims after 300 s without a heartbeat (worker.py), so by
-#: then it has either finished (and been refused) or been abandoned.
+#: session. Most passes end well within it. One that outlasts it (a long
+#: session's extraction) still cannot leave anything behind: its write is
+#: refused, and the worker then deletes the session folder its pass may have
+#: written extraction-cache answers into (engine/ingest/worker.py _sweep_deleted).
 IN_FLIGHT_GRACE_S = 360.0
 _R2_CONCURRENCY = 16
-_UNINDEXED_SCAN_LIMIT = 5000
+_UNINDEXED_PAGE = 1000
+#: Idle-free window after which a run with `pending` sessions counts as stalled
+#: (a pod restart): resume it with POST /{deletion_id}/resume.
+STALLED_AFTER_S = 900
 _UNINDEXED_KEYS_READ = 3
 
 #: Stores that can hold a trace of a deleted session and are NOT removed here.
@@ -343,23 +361,35 @@ async def select_by_author(
             employee_id,
             email,
         )
-        unindexed = await conn.fetch(
-            """
-            SELECT q.source_system, q.source_event_id, q.payload_s3_key, q.payload_s3_keys
-              FROM ingestion_queue q
-             WHERE q.customer_id = $1 AND q.source_system = ANY($2::text[])
-               AND NOT EXISTS (
-                     SELECT 1 FROM documents d
-                      WHERE d.customer_id = q.customer_id
-                        AND d.source_system = q.source_system
-                        AND d.source_id = split_part(q.source_event_id, ':', 1))
-             ORDER BY q.queue_id
-             LIMIT $3
-            """,
-            customer_id,
-            sources,
-            _UNINDEXED_SCAN_LIMIT,
-        )
+        # Every such row, paged: a truncated scan would drop this person's
+        # sessions without saying so.
+        unindexed: list[Any] = []
+        after = 0
+        while True:
+            page = await conn.fetch(
+                """
+                SELECT q.queue_id, q.source_system, q.source_event_id,
+                       q.payload_s3_key, q.payload_s3_keys
+                  FROM ingestion_queue q
+                 WHERE q.customer_id = $1 AND q.source_system = ANY($2::text[])
+                   AND q.queue_id > $3
+                   AND NOT EXISTS (
+                         SELECT 1 FROM documents d
+                          WHERE d.customer_id = q.customer_id
+                            AND d.source_system = q.source_system
+                            AND d.source_id = split_part(q.source_event_id, ':', 1))
+                 ORDER BY q.queue_id
+                 LIMIT $4
+                """,
+                customer_id,
+                sources,
+                after,
+                _UNINDEXED_PAGE,
+            )
+            unindexed.extend(page)
+            if len(page) < _UNINDEXED_PAGE:
+                break
+            after = page[-1]["queue_id"]
     refs: set[SessionRef] = set()
     for r in rows:
         if valid_session_id(r["session_id"]):
@@ -429,14 +459,25 @@ _ID_OR_CHILD = "({col} = $3 OR left({col}, length($3) + 1) = $3 || ':')"
 
 
 async def inventory(
-    conn: Any, customer_id: str, ref: SessionRef, *, with_counts: bool = True
+    conn: Any,
+    customer_id: str,
+    ref: SessionRef,
+    *,
+    with_counts: bool = True,
+    known_doc_ids: set[str] | frozenset[str] = frozenset(),
 ) -> Inventory:
     """Read every row of one session. Caller holds the session lock (or accepts a
     dry run's snapshot) and the tenant GUC. `with_counts=False` reads only what
-    a deletion needs to act on: ids and raw keys."""
+    a deletion needs to act on: ids and raw keys.
+
+    Document ids come from `documents`, so once those rows are gone the tables
+    keyed by document id (chunks, acl, the inferred-edges queue) would be looked
+    up by nothing. `known_doc_ids` carries the ids an earlier read found, and
+    the session document's id is always included.
+    """
     inv = Inventory()
     session_doc = ref.session_doc_id(customer_id)
-    inv.doc_ids = [
+    inv.doc_ids = sorted({session_doc, *known_doc_ids} | {
         r["doc_id"]
         for r in await conn.fetch(
             f"""
@@ -449,7 +490,7 @@ async def inventory(
             ref.session_id,
             session_doc,
         )
-    ]
+    })
     inv.canonical_ids = sorted({*inv.doc_ids, session_doc, ref.agent_node_id()})
     nodes = await conn.fetch(
         """
@@ -460,7 +501,7 @@ async def inventory(
         customer_id,
         NodeLabel.DOCUMENT.value,
         NodeLabel.AGENT_SESSION.value,
-        [*inv.doc_ids, session_doc],
+        inv.doc_ids,
         ref.agent_node_id(),
     )
     inv.node_ids = sorted(r["node_id"] for r in nodes)
@@ -717,13 +758,17 @@ async def record_sessions(
             )
 
 
-async def _journal_and_delete_rows(customer_id: str, ref: SessionRef) -> tuple[dict[str, int], list[str], bool]:
+async def _journal_and_delete_rows(
+    customer_id: str, ref: SessionRef, known_doc_ids: set[str]
+) -> tuple[dict[str, int], list[str], Inventory]:
     """Phase 2: under the lock, add any newly referenced keys to the journal and
     remove the rows -- one commit, so the keys are durable exactly when the rows
     that pointed at them are gone."""
     async with with_tenant(customer_id) as conn:
         await lock_session(conn, customer_id, ref.source, ref.session_id)
-        inv = await inventory(conn, customer_id, ref, with_counts=False)
+        inv = await inventory(
+            conn, customer_id, ref, with_counts=False, known_doc_ids=known_doc_ids
+        )
         keys = await conn.fetchval(
             """
             UPDATE session_deletions
@@ -740,7 +785,7 @@ async def _journal_and_delete_rows(customer_id: str, ref: SessionRef) -> tuple[d
         if keys is None:
             raise RuntimeError("session is not recorded as deleted; record it before erasing")
         deleted = await _delete_rows(conn, customer_id, ref, inv)
-    return deleted, list(keys), inv.in_flight
+    return deleted, list(keys), inv
 
 
 async def _deep_scan(
@@ -785,9 +830,9 @@ async def _delete_objects(
     return deleted, failed, remaining + errors
 
 
-async def _residue(customer_id: str, ref: SessionRef) -> dict[str, int]:
+async def _residue(customer_id: str, ref: SessionRef, known_doc_ids: set[str]) -> dict[str, int]:
     async with with_tenant(customer_id) as conn:
-        inv = await inventory(conn, customer_id, ref)
+        inv = await inventory(conn, customer_id, ref, known_doc_ids=known_doc_ids)
     return {k: v for k, v in inv.counts.items() if v}
 
 
@@ -813,8 +858,11 @@ async def erase_session(
         in_flight_seen = False
         failed: list[str] = []
         r2_left = 0
+        known: set[str] = set()
         for round_ in (1, 2):
-            deleted, keys, in_flight = await _journal_and_delete_rows(customer_id, ref)
+            deleted, keys, inv = await _journal_and_delete_rows(customer_id, ref, known)
+            known.update(inv.doc_ids)
+            in_flight = inv.in_flight
             in_flight_seen = in_flight_seen or in_flight
             for table, n in deleted.items():
                 result["rows_deleted"][table] = result["rows_deleted"].get(table, 0) + n
@@ -830,7 +878,7 @@ async def erase_session(
             # still save extraction-cache objects until its pass ends.
             log.info("session_deletion.in_flight_wait", customer=customer_id, **ref.as_dict(), wait_s=grace)
             await _wait_for_in_flight(grace)
-        residue = await _residue(customer_id, ref)
+        residue = await _residue(customer_id, ref, known)
         result.update(
             in_flight=in_flight_seen,
             residue=residue,
@@ -904,10 +952,25 @@ async def remove_orphaned_persons(customer_id: str, person_ids: set[str]) -> int
     if not person_ids:
         return 0
     async with with_tenant(customer_id) as conn:
+        # Lock first, decide second: the DELETE below then reads a snapshot
+        # taken after the lock, so a session by the same person that committed
+        # while we waited (its write upserts this node) is seen and the node kept.
+        candidates = [
+            r["node_id"]
+            for r in await conn.fetch(
+                "SELECT node_id FROM graph_nodes WHERE customer_id = $1 AND label = $2 "
+                "AND canonical_id = ANY($3::text[]) ORDER BY node_id FOR UPDATE",
+                customer_id,
+                NodeLabel.PERSON.value,
+                sorted(person_ids),
+            )
+        ]
+        if not candidates:
+            return 0
         rows = await conn.fetch(
             """
             DELETE FROM graph_nodes n
-             WHERE n.customer_id = $1 AND n.label = $2 AND n.canonical_id = ANY($3::text[])
+             WHERE n.customer_id = $1 AND n.label = $2 AND n.node_id = ANY($3::bigint[])
                AND NOT EXISTS (SELECT 1 FROM graph_edges e WHERE e.customer_id = $1
                                  AND (e.from_node_id = n.node_id OR e.to_node_id = n.node_id))
                AND NOT EXISTS (SELECT 1 FROM graph_node_provenance p
@@ -920,7 +983,7 @@ async def remove_orphaned_persons(customer_id: str, person_ids: set[str]) -> int
             """,
             customer_id,
             NodeLabel.PERSON.value,
-            sorted(person_ids),
+            candidates,
             list(AGENT_SOURCES),
         )
         ids = [r["node_id"] for r in rows]
@@ -1122,6 +1185,22 @@ async def _background(
         log.exception("session_deletion.run_failed", customer=customer_id, deletion_id=deletion_id)
 
 
+def _spawn(
+    customer_id: str,
+    deletion_id: str,
+    refs: list[SessionRef],
+    deep_scan: bool,
+    person_ids: set[str],
+) -> None:
+    # Strong reference: asyncio keeps only a weak one to a bare create_task,
+    # and a collected task would leave the run half done (kb/purge_routes.py).
+    task = asyncio.create_task(
+        _background(customer_id, deletion_id, refs, deep_scan, person_ids)
+    )
+    _INFLIGHT.add(task)
+    task.add_done_callback(_INFLIGHT.discard)
+
+
 @router.post("")
 async def delete_sessions(
     body: SessionDeletionRequest,
@@ -1147,7 +1226,8 @@ async def delete_sessions(
         raise HTTPException(exc.status, exc.detail) from exc
     if not selection.refs:
         return {"dry_run": False, "status": "nothing_to_delete", "sessions": [],
-                "unattributed_sessions": selection.unattributed}
+                "unattributed_sessions": selection.unattributed,
+                "skipped_invalid_ids": selection.skipped_invalid[:50]}
     deletion_id = str(uuid.uuid4())
     selector = {"by": "id" if body.session_ids is not None else "author"}
     assert body.reason is not None
@@ -1168,11 +1248,7 @@ async def delete_sessions(
         ticket=body.ticket,
     )
     person_ids = selection.person_ids if body.author is not None else set()
-    task = asyncio.create_task(
-        _background(customer_id, deletion_id, selection.refs, body.deep_scan, person_ids)
-    )
-    _INFLIGHT.add(task)
-    task.add_done_callback(_INFLIGHT.discard)
+    _spawn(customer_id, deletion_id, selection.refs, body.deep_scan, person_ids)
     return JSONResponse(
         status_code=202,
         content={
@@ -1181,6 +1257,73 @@ async def delete_sessions(
             "status": "running",
             "sessions": [r.as_dict() for r in selection.refs],
             "unattributed_sessions": selection.unattributed,
+            # Found but not deletable by id shape; a person should look at these.
+            "skipped_invalid_ids": selection.skipped_invalid[:50],
+        },
+    )
+
+
+class ResumeRequest(BaseModel):
+    deep_scan: bool = False
+
+
+def _parse_deletion_id(deletion_id: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(deletion_id)
+    except ValueError as exc:
+        raise HTTPException(422, "malformed deletion_id") from exc
+
+
+@router.post("/{deletion_id}/resume")
+async def resume_deletion(
+    deletion_id: str,
+    body: ResumeRequest | None = None,
+    customer_id: str = Depends(_require_customer),
+) -> Any:
+    """Run a request's unfinished sessions again: after a pod restart (status
+    `stalled`), a `failed` session, or a legal hold that has been released.
+
+    By session, from the rows recorded when the request was made, so it works
+    after the rows an AUTHOR selection was made from are already gone -- which
+    re-POSTing the author request would not (it would find nothing). An author
+    request's Person-node cleanup is not repeated.
+    """
+    wanted = _parse_deletion_id(deletion_id)
+    try:
+        hold = await legal_hold(customer_id)
+    except SessionDeletionError as exc:
+        raise HTTPException(exc.status, exc.detail) from exc
+    if hold is not None:
+        raise HTTPException(423, _held(hold).detail)
+    async with with_tenant(customer_id) as conn:
+        known = await conn.fetchval(
+            "SELECT count(*) FROM session_deletions WHERE customer_id = $1 AND deletion_id = $2",
+            customer_id,
+            wanted,
+        )
+        rows = await conn.fetch(
+            """
+            UPDATE session_deletions SET status = 'pending', error = NULL
+             WHERE customer_id = $1 AND deletion_id = $2 AND status <> 'done'
+         RETURNING source_system, session_id
+            """,
+            customer_id,
+            wanted,
+        )
+    if not known:
+        raise HTTPException(404, "unknown deletion_id")
+    refs = sorted(SessionRef(r["source_system"], r["session_id"]) for r in rows)
+    if not refs:
+        return {"deletion_id": deletion_id, "status": "nothing_to_resume", "sessions": []}
+    log.info("session_deletion.resumed", customer=customer_id, deletion_id=deletion_id,
+             sessions=len(refs))
+    _spawn(customer_id, deletion_id, refs, bool(body and body.deep_scan), set())
+    return JSONResponse(
+        status_code=202,
+        content={
+            "deletion_id": deletion_id,
+            "status": "running",
+            "sessions": [r.as_dict() for r in refs],
         },
     )
 
@@ -1190,11 +1333,9 @@ async def deletion_status(
     deletion_id: str,
     customer_id: str = Depends(_require_customer),
 ) -> dict[str, Any]:
-    try:
-        wanted = uuid.UUID(deletion_id)
-    except ValueError as exc:
-        raise HTTPException(422, "malformed deletion_id") from exc
+    wanted = _parse_deletion_id(deletion_id)
     async with with_tenant(customer_id) as conn:
+        now = await conn.fetchval("SELECT now()")
         rows = await conn.fetch(
             """
             SELECT source_system, session_id, status, requested_at, attempted_at, deleted_at,
@@ -1209,8 +1350,18 @@ async def deletion_status(
     if not rows:
         raise HTTPException(404, "unknown deletion_id")
     statuses = {r["status"] for r in rows}
+    # Progress stamps: requested (POST), attempted (a run started a session),
+    # deleted (a session finished). No stamp moving for STALLED_AFTER_S while
+    # sessions are still pending means the run died (pod restart).
+    last_activity = max(
+        stamp
+        for r in rows
+        for stamp in (r["requested_at"], r["attempted_at"], r["deleted_at"])
+        if stamp is not None
+    )
+    stalled = (now - last_activity).total_seconds() > STALLED_AFTER_S
     overall = (
-        "running" if "pending" in statuses
+        ("stalled" if stalled else "running") if "pending" in statuses
         else "held" if "held" in statuses
         else "failed" if "failed" in statuses
         else "done"

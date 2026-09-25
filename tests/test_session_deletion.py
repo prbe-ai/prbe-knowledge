@@ -291,7 +291,8 @@ async def delete(customer: str, sids: list[str], **kw) -> dict:
 
 def test_prefix_safety_rejects_ids_that_name_shared_folders() -> None:
     assert sd.valid_session_id(_sid())
-    for bad in ("sessions-v2", "2026", "a/b/c/d/e", "", "short", "x" * 201, "has space ok?"):
+    for bad in ("sessions-v2", "2026", "a/b/c/d/e", "", "short", "x" * 201, "has space ok?",
+                "abcdefgh:1"):
         assert not sd.valid_session_id(bad), bad
 
 
@@ -394,20 +395,24 @@ async def _degree(customer: str, node_id: int) -> int:
 
 
 @pytest.mark.asyncio
-async def test_delete_by_author_takes_every_capture_of_that_person_only(env) -> None:
+async def test_delete_by_author_takes_every_capture_of_that_person_only(env, monkeypatch) -> None:
     (a, _b), store = env
-    v1_alice, v2_alice, bob, unmined = _sid(), _sid(), _sid(), _sid()
+    v1_alice, v2_alice, bob, unmined, unmined2, bob_unmined = (_sid() for _ in range(6))
     await v1_session(a, v1_alice)          # author_id = alice
     await v2_session(a, v2_alice)          # uploader_id = alice, author_id NULL
     await v2_session(a, bob, BOB, BOB_EMAIL)
-    # Never processed: only raw batches say whose it is.
-    for payload in _v2_batches(unmined, ALICE, ALICE_EMAIL)[:1]:
-        await sr.accept(payload, a, CC, store)
+    # Never processed: only raw batches say whose it is. Paged one row at a
+    # time, so a scan that stopped at its first page would miss the second.
+    monkeypatch.setattr(sd, "_UNINDEXED_PAGE", 1)
+    for sid, who, mail in ((unmined, ALICE, ALICE_EMAIL), (bob_unmined, BOB, BOB_EMAIL),
+                           (unmined2, ALICE, ALICE_EMAIL)):
+        await sr.accept(_v2_batches(sid, who, mail)[0], a, CC, store)
     bob_before = await session_rows(a, bob)
+    bob_unmined_before = await session_rows(a, bob_unmined)
 
     by_email = await sd.select_by_author(a, [CC.value], employee_id=None, email=ALICE_EMAIL.upper())
     by_id = await sd.select_by_author(a, [CC.value], employee_id=ALICE, email=None)
-    expected = {sd.SessionRef(CC.value, s) for s in (v1_alice, v2_alice, unmined)}
+    expected = {sd.SessionRef(CC.value, s) for s in (v1_alice, v2_alice, unmined, unmined2)}
     assert set(by_email.refs) == expected
     assert set(by_id.refs) == expected
     assert ALICE in by_id.person_ids
@@ -417,9 +422,10 @@ async def test_delete_by_author_takes_every_capture_of_that_person_only(env) -> 
     outcome = await sd.run_deletion(a, by_id.refs, person_ids=by_id.person_ids, grace_s=0)
 
     assert all(o["verified"] for o in outcome["sessions"].values()), outcome
-    for sid in (v1_alice, v2_alice, unmined):
+    for sid in (v1_alice, v2_alice, unmined, unmined2):
         assert await session_rows(a, sid) == {}
     assert await session_rows(a, bob) == bob_before
+    assert await session_rows(a, bob_unmined) == bob_unmined_before
     async with db_module.with_tenant(a) as conn:
         persons = {
             r["canonical_id"]
@@ -558,12 +564,25 @@ async def test_a_session_mid_pass_is_swept_again_after_the_worker_finishes(env, 
         )
     bucket = await store.bucket_for(a)
     late = f"raw/{CC.value}/{a}/{sid}/extraction-cache/{'b' * 64}.json"
+    async with db_module.with_tenant(a) as conn:
+        unit_doc = await conn.fetchval(
+            "SELECT doc_id FROM documents WHERE parent_doc_id IS NOT NULL LIMIT 1"
+        )
+    assert unit_doc
 
     waits: list[float] = []
 
     async def worker_saves_cache_while_we_wait(seconds: float) -> None:
+        # The pass's post-commit steps: a cache answer and an inferred-edges
+        # enqueue naming a unit document whose row is already gone.
         waits.append(seconds)
         await store.put(bucket, late, b"{}")
+        async with db_module.raw_conn() as conn:
+            await conn.execute(
+                "INSERT INTO inferred_edges_queue (customer_id, anchor_doc_id, extractor_id) "
+                "VALUES ($1, $2, 'inferred_edges:v1')",
+                a, unit_doc,
+            )
 
     monkeypatch.setattr(sd, "_wait_for_in_flight", worker_saves_cache_while_we_wait)
     outcome = (await delete(a, [sid]))["sessions"][f"claude_code:{sid}"]
@@ -571,6 +590,86 @@ async def test_a_session_mid_pass_is_swept_again_after_the_worker_finishes(env, 
     assert waits == [0], "a session found mid-pass must be waited on and swept again"
     assert outcome["in_flight"] and outcome["verified"], outcome
     assert not await store.exists(bucket, late)
+    async with db_module.raw_conn() as conn:
+        assert await conn.fetchval(
+            "SELECT count(*) FROM inferred_edges_queue WHERE anchor_doc_id = $1", unit_doc
+        ) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_pass_that_outlives_the_deletion_cleans_up_after_itself(env, monkeypatch) -> None:
+    """The worker is mid-extraction when the deletion runs AND finishes; its
+    cache answer lands after the deletion's last sweep. Its write is refused,
+    and it deletes the session folder itself."""
+    from engine.ingest.worker import Worker
+
+    (a, _b), store = env
+    sid = _sid()
+    for payload in _v2_batches(sid, ALICE, ALICE_EMAIL):
+        await sr.accept(payload, a, CC, store)
+    async with db_module.raw_conn() as conn:
+        await conn.execute("UPDATE ingestion_queue SET status = 'processing' WHERE customer_id = $1", a)
+        row = await conn.fetchrow("SELECT * FROM ingestion_queue WHERE customer_id = $1", a)
+    bucket = await store.bucket_for(a)
+    late = f"raw/{CC.value}/{a}/{sid}/extraction-cache/{'c' * 64}.json"
+    outcomes: list = []
+
+    async def extraction_during_which_the_session_is_deleted(*, session_id, events, cwd=None,
+                                                              agent="claude_code", cache=None):
+        outcomes.append(await delete(a, [sid]))
+        await store.put(bucket, late, b"{}")  # SegmentCache.save, after the deletion
+        return ext.UnitBundle(qa=[ext.QA(prompt="p", outcome="o", tags=[])])
+
+    monkeypatch.setattr("kb.handlers.claude_code._ext.extract_units_from_session",
+                        extraction_during_which_the_session_is_deleted)
+    monkeypatch.setattr(sd, "_wait_for_in_flight", _no_wait)
+    ctx = make_default_context()
+    try:
+        await Worker(ctx)._process(row)
+    finally:
+        await ctx.http.aclose()
+
+    assert outcomes and outcomes[0]["sessions"][f"claude_code:{sid}"]["verified"]
+    assert not await store.exists(bucket, late)
+    assert await session_rows(a, sid) == {}
+
+
+async def _no_wait(seconds: float) -> None:
+    return None
+
+
+@pytest.mark.asyncio
+async def test_the_worker_does_not_mine_a_deleted_session(env, monkeypatch) -> None:
+    """A deleted session's row back in `pending` (the idle sweep's partial-pass
+    retry does not read deletions) is skipped before any extraction."""
+    from engine.ingest.worker import Worker
+
+    (a, _b), store = env
+    sid = _sid()
+    for payload in _v2_batches(sid, ALICE, ALICE_EMAIL):
+        await sr.accept(payload, a, CC, store)
+    await sd.record_sessions(a, [sd.SessionRef(CC.value, sid)], deletion_id=str(uuid.uuid4()),
+                             reason="r", ticket=None, selector={"by": "id"})
+    async with db_module.raw_conn() as conn:
+        await conn.execute("UPDATE ingestion_queue SET status = 'processing' WHERE customer_id = $1", a)
+        row = await conn.fetchrow("SELECT * FROM ingestion_queue WHERE customer_id = $1", a)
+    mined: list[str] = []
+
+    async def must_not_run(*, session_id, **_kw):
+        mined.append(session_id)
+        return ext.UnitBundle()
+
+    monkeypatch.setattr("kb.handlers.claude_code._ext.extract_units_from_session", must_not_run)
+    ctx = make_default_context()
+    try:
+        await Worker(ctx)._process(row)
+    finally:
+        await ctx.http.aclose()
+    assert mined == []
+    async with db_module.raw_conn() as conn:
+        status = await conn.fetchval("SELECT status FROM ingestion_queue WHERE customer_id = $1", a)
+        docs = await conn.fetchval("SELECT count(*) FROM documents WHERE customer_id = $1", a)
+    assert status == "done" and docs == 0
 
 
 # --- over HTTP ----------------------------------------------------------------------
@@ -695,3 +794,54 @@ async def test_recording_a_deletion_stops_a_pending_session_being_mined(env) -> 
     # The pending one is not worth an extraction; the one mid-pass is left for
     # the row phase to see (and wait out).
     assert status == {pending: "done", busy: "processing"}
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_run_is_reported_and_resumed_by_its_id(env, monkeypatch) -> None:
+    """A pod restart leaves sessions `pending`. The status says `stalled`, and
+    resuming by deletion_id finishes them -- including an AUTHOR request, whose
+    selection rows are gone once the row phase has run."""
+    import asyncio
+
+    (a, _b), store = env
+    sid = _sid()
+    await v2_session(a, sid)
+    ref = sd.SessionRef(CC.value, sid)
+    deletion_id = str(uuid.uuid4())
+    await sd.record_sessions(a, [ref], deletion_id=deletion_id, reason="r", ticket=None,
+                             selector={"by": "author"})
+    # The run died after the rows went and before the objects did.
+    await sd._journal_and_delete_rows(a, ref, set())
+    bucket = await store.bucket_for(a)
+    assert await store.list_keys(bucket, f"raw/{CC.value}/{a}/sessions-v2/{sid}/")
+    async with _client() as client:
+        fresh = (await client.get(f"/api/session-deletions/{deletion_id}", headers=_headers(a))).json()
+        assert fresh["status"] == "running"
+        monkeypatch.setattr(sd, "STALLED_AFTER_S", -1)
+        assert (await client.get(f"/api/session-deletions/{deletion_id}",
+                                 headers=_headers(a))).json()["status"] == "stalled"
+        # Re-POSTing the author request cannot find the session any more.
+        again = await client.post("/api/session-deletions", headers=_headers(a),
+                                  json={"author": {"employee_id": ALICE}, "dry_run": False,
+                                        "reason": "r"})
+        assert again.json()["status"] == "nothing_to_delete"
+        resumed = await client.post(f"/api/session-deletions/{deletion_id}/resume",
+                                    headers=_headers(a))
+        assert resumed.status_code == 202, resumed.text
+        for _ in range(200):
+            status = (await client.get(f"/api/session-deletions/{deletion_id}", headers=_headers(a))).json()
+            if status["status"] not in ("running", "stalled"):
+                break
+            await asyncio.sleep(0.05)
+        assert status["status"] == "done", status
+        assert (await client.post(f"/api/session-deletions/{deletion_id}/resume",
+                                  headers=_headers(a))).json()["status"] == "nothing_to_resume"
+        assert (await client.post(f"/api/session-deletions/{uuid.uuid4()}/resume",
+                                  headers=_headers(a))).status_code == 404
+        async with db_module.raw_conn() as conn:
+            await conn.execute(
+                "UPDATE customers SET metadata = '{\"legal_hold\": true}' WHERE customer_id = $1", a
+            )
+        held = await client.post(f"/api/session-deletions/{deletion_id}/resume", headers=_headers(a))
+        assert held.status_code == 423
+    assert not await store.list_keys(bucket, f"raw/{CC.value}/{a}/")
