@@ -369,6 +369,44 @@ class ObjectStore:
 
         return await asyncio.to_thread(_delete)
 
+    async def delete_named_keys(self, bucket: str, keys: list[str]) -> tuple[int, list[str]]:
+        """Delete exactly these keys, 1000 per request. Returns (deleted, failed keys).
+
+        `delete_keys` counts failures; this names them, so a caller that must
+        keep a failed key (a deletion's key journal) can.
+
+        For objects found by reference rather than by prefix (a protocol-1
+        transcript batch lives under a date folder shared with every other
+        session). S3 DeleteObjects reports a missing key as deleted, so a
+        re-run over keys already gone is clean. A missing bucket is "already
+        gone". Per-key failures come back by name so the caller can keep them.
+        """
+        def _delete() -> tuple[int, list[str]]:
+            deleted = 0
+            failed: list[str] = []
+            unique = list(dict.fromkeys(keys))
+            try:
+                for start in range(0, len(unique), 1000):
+                    batch = unique[start:start + 1000]
+                    response = self._client.delete_objects(
+                        Bucket=bucket,
+                        Delete={"Objects": [{"Key": k} for k in batch], "Quiet": False},
+                    )
+                    deleted += len(response.get("Deleted") or [])
+                    failed.extend(e.get("Key", "") for e in response.get("Errors") or [])
+            except ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code", "")
+                if code in {"NoSuchBucket", "404", "NotFound"}:
+                    return deleted, failed
+                raise StorageUnavailable(f"delete_objects failed: {exc}") from exc
+            except BotoCoreError as exc:
+                raise StorageUnavailable(f"delete_objects failed: {exc}") from exc
+            return deleted, failed
+
+        if not keys:
+            return 0, []
+        return await asyncio.to_thread(_delete)
+
     async def count_prefix(self, bucket: str, prefix: str) -> int:
         """Number of objects remaining under `prefix`. Postcondition check.
 
