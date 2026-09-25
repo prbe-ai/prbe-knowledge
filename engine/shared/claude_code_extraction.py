@@ -17,6 +17,7 @@ from dataclasses import dataclass, field, fields, replace
 from enum import StrEnum
 from typing import Any
 
+from engine.shared import extraction_cache as _cache
 from engine.shared.config import get_settings
 from engine.shared.llm import gateway_url
 from engine.shared.llm_tools import ToolCallParseError, forced_tool_call
@@ -270,6 +271,11 @@ class UnitBundle:
     #: in segment order. A hash that repeats across passes of one session is a
     #: segment a per-segment cache would have served without a model call.
     segment_hashes: list[str] = field(default_factory=list)
+    #: Segments answered from the cache (engine/shared/extraction_cache.py)
+    #: instead of a model call, and whether the supersession answer was too.
+    #: `calls` counts only real model calls.
+    cache_hits: int = 0
+    supersede_cached: bool = False
     #: Why the bundle is not authoritative (ExtractionProblem values).
     problems: list[str] = field(default_factory=list)
     qa: list[QA] = field(default_factory=list)
@@ -964,8 +970,13 @@ async def extract_units_from_session(
     events: list[dict[str, Any]],
     cwd: str | None = None,
     agent: str = "claude_code",
+    cache: _cache.SegmentCache | None = None,
 ) -> UnitBundle:
-    """Mine every part of the session, not just its tail."""
+    """Mine every part of the session, not just its tail.
+
+    With a `cache`, a segment this session already mined, unchanged, is answered
+    from it instead of the model (engine/shared/extraction_cache.py).
+    """
     segments, capped = _segment_session(events)
 
     # With the originals of every segment in hand, the compaction summaries are
@@ -1006,6 +1017,7 @@ async def extract_units_from_session(
                 agent=agent,
                 part=(ref.index, ref.total),
                 drop_summaries=drop_summaries,
+                cache=cache,
             )
         return _stamp(
             result,
@@ -1039,6 +1051,7 @@ async def extract_units_from_session(
         bundle.file_ref.extend(result.file_ref)
         bundle.directive.extend(result.directive)
         bundle.calls += result.calls
+        bundle.cache_hits += result.cache_hits
         bundle.segment_hashes.extend(result.segment_hashes)
         bundle.problems.extend(result.problems)
         if not result.authoritative:
@@ -1046,9 +1059,25 @@ async def extract_units_from_session(
 
     # Once, over the assembled bundle — the only place a cross-segment reversal
     # is visible at all.
-    if await _link_supersessions(bundle, session_id, agent):
+    if await _link_supersessions(bundle, session_id, agent, cache=cache):
         bundle.calls += 1
     return bundle
+
+
+def _model_and_transport() -> tuple[str, dict[str, Any]]:
+    """Gateway model ids are proxy-owned aliases and must pass through verbatim.
+
+    Force the OpenAI wire shape so LiteLLM calls the proxy's /chat/completions
+    endpoint instead of deriving a provider-native path from the model name.
+    Direct calls retain the legacy Anthropic prefix and native transport.
+    """
+    settings = get_settings()
+    if gateway_url() is not None:
+        return settings.claude_code_extraction_model, {"custom_llm_provider": "openai"}
+    return (
+        _ensure_provider_prefix(settings.claude_code_extraction_model, default_provider="anthropic"),
+        {},
+    )
 
 
 _SUPERSEDE_TOOL = "emit_supersessions"
@@ -1090,10 +1119,21 @@ _SUPERSEDE_SYSTEM = (
 _SUPERSEDE_MAX_DECISIONS = 120
 
 
-async def _link_supersessions(bundle: UnitBundle, session_id: str, agent: str) -> bool:
+_SUPERSEDE_MAX_TOKENS = 2000
+_SUPERSEDE_DESCRIPTION = "Report decisions that a later decision reversed."
+
+
+async def _link_supersessions(
+    bundle: UnitBundle,
+    session_id: str,
+    agent: str,
+    cache: _cache.SegmentCache | None = None,
+) -> bool:
     """Find decisions the session later reversed, across the whole bundle.
 
-    Returns whether a model call was made (for the per-pass cost line).
+    Returns whether a model call was made (for the per-pass cost line). An
+    identical numbered listing is answered from the cache: a session re-ended
+    with nothing new costs no call here either.
 
     Cannot be a per-decision field. Segments extract in SEPARATE CONCURRENT
     calls, so the model handling segment 7 has never seen segment 3 — and the
@@ -1122,16 +1162,25 @@ async def _link_supersessions(bundle: UnitBundle, session_id: str, agent: str) -
         f"-> CHOSE: {d.chosen}"
         for i, d in enumerate(considered)
     )
-    settings = get_settings()
-    gateway_enabled = gateway_url() is not None
-    if gateway_enabled:
-        model = settings.claude_code_extraction_model
-        transport_kwargs: dict[str, Any] = {"custom_llm_provider": "openai"}
-    else:
-        model = _ensure_provider_prefix(
-            settings.claude_code_extraction_model, default_provider="anthropic"
+    model, transport_kwargs = _model_and_transport()
+    fp = key = ""
+    if cache is not None:
+        fp = _cache.fingerprint(
+            kind="supersede",
+            model=model,
+            revision=get_settings().claude_code_extraction_cache_revision,
+            system=_SUPERSEDE_SYSTEM,
+            tool=_SUPERSEDE_TOOL,
+            description=_SUPERSEDE_DESCRIPTION,
+            schema=_SUPERSEDE_SCHEMA,
+            max_tokens=_SUPERSEDE_MAX_TOKENS,
         )
-        transport_kwargs = {}
+        key = _cache.content_key(listing, fp)
+        cached = await cache.load(key, fp)
+        if isinstance(cached, list):
+            _apply_links(considered, cached)
+            bundle.supersede_cached = True
+            return False
 
     try:
         args, _resp = await forced_tool_call(
@@ -1141,9 +1190,9 @@ async def _link_supersessions(bundle: UnitBundle, session_id: str, agent: str) -
                 {"role": "user", "content": listing},
             ],
             tool_name=_SUPERSEDE_TOOL,
-            tool_description="Report decisions that a later decision reversed.",
+            tool_description=_SUPERSEDE_DESCRIPTION,
             tool_schema=_SUPERSEDE_SCHEMA,
-            max_tokens=2000,
+            max_tokens=_SUPERSEDE_MAX_TOKENS,
             **transport_kwargs,
         )
         links = args.get("links")
@@ -1171,6 +1220,13 @@ async def _link_supersessions(bundle: UnitBundle, session_id: str, agent: str) -
         )
         return True
 
+    _apply_links(considered, links)
+    if cache is not None:
+        await cache.save(key, fp, links)
+    return True
+
+
+def _apply_links(considered: list[Decision], links: list[Any]) -> None:
     for link in links:
         if not isinstance(link, dict):
             continue
@@ -1183,7 +1239,23 @@ async def _link_supersessions(bundle: UnitBundle, session_id: str, agent: str) -
             continue
         considered[earlier].superseded_by = later
         considered[later].supersedes = earlier
-    return True
+
+
+_EXTRACT_MAX_TOKENS = 8000
+
+#: The user turn. A module constant because the cache fingerprints it: a change
+#: to these words is a change to the question, and must not reuse old answers.
+#: `where` (the part number) and `session_id` fill in per call and stay out of
+#: the fingerprint; `cwd` is fingerprinted separately.
+_USER_TEMPLATE = (
+    "Extract structured units from this session{where}.\n"
+    "session_id: {session_id}\n"
+    "cwd: {cwd}\n\n"
+    "{transcript}"
+)
+#: The `where` in _USER_TEMPLATE. Its NUMBERS stay out of the key (a session
+#: that grows renumbers nothing it already had); its WORDING is fingerprinted.
+_PART_TEMPLATE = " (part {index} of {total})"
 
 
 async def _extract_one(
@@ -1194,9 +1266,8 @@ async def _extract_one(
     agent: str,
     part: tuple[int, int],
     drop_summaries: bool,
+    cache: _cache.SegmentCache | None = None,
 ) -> UnitBundle:
-    settings = get_settings()
-
     if drop_summaries:
         events = [e for e in events if not _is_compact_summary(e)]
     transcript, spans = render_indexed(events)
@@ -1205,44 +1276,55 @@ async def _extract_one(
     segment_hash = hashlib.sha256(transcript.encode("utf-8")).hexdigest()[:16]
 
     index, total = part
-    where = f" (part {index} of {total})" if total > 1 else ""
-    user_content = (
-        f"Extract structured units from this session{where}.\n"
-        f"session_id: {session_id}\n"
-        f"cwd: {cwd or 'unknown'}\n\n"
-        f"{transcript}"
-    )
+    where = _PART_TEMPLATE.format(index=index, total=total) if total > 1 else ""
+    system = _SYSTEM_TEMPLATE.format(agent=_AGENT_LABELS.get(agent, "coding agent"))
+    model, transport_kwargs = _model_and_transport()
 
-    # Gateway model ids are proxy-owned aliases and must pass through verbatim.
-    # Force the OpenAI wire shape so LiteLLM calls the proxy's /chat/completions
-    # endpoint instead of deriving a provider-native path from the model name.
-    # Direct calls retain the legacy Anthropic prefix and native transport.
-    gateway_enabled = gateway_url() is not None
-    if gateway_enabled:
-        model = settings.claude_code_extraction_model
-        transport_kwargs: dict[str, Any] = {"custom_llm_provider": "openai"}
-    else:
-        model = _ensure_provider_prefix(
-            settings.claude_code_extraction_model, default_provider="anthropic"
+    fp = key = ""
+    if cache is not None:
+        fp = _cache.fingerprint(
+            kind="segment",
+            model=model,
+            revision=get_settings().claude_code_extraction_cache_revision,
+            system=system,
+            user_template=_USER_TEMPLATE,
+            part_template=_PART_TEMPLATE,
+            tool=_TOOL_NAME,
+            description=_TOOL_DESCRIPTION,
+            schema=_TOOL_PARAMETERS,
+            max_tokens=_EXTRACT_MAX_TOKENS,
+            cwd=cwd or "unknown",
         )
-        transport_kwargs = {}
+        key = _cache.content_key(transcript, fp)
+        cached = await cache.load(key, fp)
+        if isinstance(cached, dict):
+            try:
+                bundle = _bundle_from_answer(cached, transcript, spans, segment_hash, calls=0)
+            except Exception as exc:  # an answer that no longer builds is re-mined
+                log.warning(
+                    "claude_code_extraction.cache_unusable",
+                    session_id=session_id,
+                    part=index,
+                    error=_err(exc),
+                )
+            else:
+                bundle.cache_hits = 1
+                return bundle
 
+    user_content = _USER_TEMPLATE.format(
+        where=where, session_id=session_id, cwd=cwd or "unknown", transcript=transcript
+    )
     try:
         args, _resp = await forced_tool_call(
             model=model,
             messages=[
-                {
-                    "role": "system",
-                    "content": _SYSTEM_TEMPLATE.format(
-                        agent=_AGENT_LABELS.get(agent, "coding agent")
-                    ),
-                },
+                {"role": "system", "content": system},
                 {"role": "user", "content": user_content},
             ],
             tool_name=_TOOL_NAME,
             tool_description=_TOOL_DESCRIPTION,
             tool_schema=_TOOL_PARAMETERS,
-            max_tokens=8000,
+            max_tokens=_EXTRACT_MAX_TOKENS,
             **transport_kwargs,
         )
     except ToolCallParseError as exc:
@@ -1251,6 +1333,7 @@ async def _extract_one(
         # indistinguishable from here, and only one of them is safe to act on.
         # Logged, because it was the one non-authoritative exit that left no
         # trace: the session's old units simply stayed, with no reason given.
+        # Never cached: the next pass asks again.
         log.warning(
             "claude_code_extraction.tool_declined",
             session_id=session_id,
@@ -1265,11 +1348,31 @@ async def _extract_one(
             problems=[ExtractionProblem.TOOL_DECLINED],
         )
 
-    # Unknown keys are dropped rather than raising: a model that answers with a
-    # field the schema no longer has must not cost the whole segment its units.
+    bundle = _bundle_from_answer(args, transcript, spans, segment_hash, calls=1)
+    # Cached only AFTER the answer built and grounded: an answer that raises
+    # here costs this segment (segment_failed) and is never stored, so it
+    # cannot fail every later pass too.
+    if cache is not None:
+        await cache.save(key, fp, args)
+    return bundle
+
+
+def _bundle_from_answer(
+    args: dict[str, Any],
+    transcript: str,
+    spans: Any,
+    segment_hash: str,
+    *,
+    calls: int,
+) -> UnitBundle:
+    """Units from one segment's tool-call answer, fresh or cached.
+
+    Unknown keys are dropped rather than raising: a model that answers with a
+    field the schema no longer has must not cost the whole segment its units.
+    """
     goal = args.get("goal") if isinstance(args.get("goal"), dict) else {}
     return _ground_units(UnitBundle(
-        calls=1,
+        calls=calls,
         segment_hashes=[segment_hash],
         objective=str(goal.get("objective") or "").strip(),
         motivation=str(goal.get("motivation") or "").strip(),

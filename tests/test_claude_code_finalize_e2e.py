@@ -68,9 +68,10 @@ def stub_extractor(monkeypatch) -> dict:
 
     async def fake_extract(
         *, session_id: str, events: list, cwd: str | None = None,
-        agent: str = "claude_code",
+        agent: str = "claude_code", cache=None,
     ):
         seen["session_id"] = session_id
+        seen["cache"] = cache
         seen["events"] = events
         seen["cwd"] = cwd
         seen["agent"] = agent

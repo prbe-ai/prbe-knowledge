@@ -7,20 +7,13 @@ why it matters, and roughly what it takes.
 
 ## Transcript extraction — from the 2026-09-23 spend review (docs/plans/extraction-spend-plan.md)
 
-### Per-segment extraction cache (Phase 1 of the spend plan)
-**Where:** `engine/shared/claude_code_extraction.py` (`extract_units_from_session`, `_extract_one`).
-
-**What:** cache each segment's grounded `UnitBundle` in R2 keyed on
-`(customer, session, sha256(rendered segment text), agent, prompt+schema version)`; skip the
-model call on a hit. **Why:** a re-completed session re-reads every unchanged segment.
-**Context:** measured 2026-09-23, re-completions are 73 of 5,251 v2 sessions (30 d) and 461 of
-5,712 passes, so this is worth under $20/month once the sweep loop is fixed. The `(part i of n)`
-prompt text must stay out of the key; the cap keeps the LAST 16 segments so a capped session's
-earliest segments change identity (misses, not corruption); never cache a non-authoritative
-result. `claude_code_extraction.pass` logs per-segment hashes, which gives the hit rate before
-anything is built. **Effort:** M. **Priority:** P3.
-**Depends on:** the sweep-loop fix shipped and 1 week of pass logs showing repeated segment
-hashes >= 25 % of segment calls.
+### Per-segment extraction cache (Phase 1 of the spend plan): measure it
+**Built** 2026-09-25 (`engine/shared/extraction_cache.py`, plan §5 and §16). **What's left:**
+7 days after deploy, read `cache_hits / segments` and `calls` per pass from
+`claude_code_extraction.pass` on research, and compare with the 2026-09-24 baseline (159 of
+322 segment calls repeated, all from tap <= 0.7.1 false endings). If hits fall well under
+25 % once taps update, that is the tap fix working, not the cache failing; the cache stays as
+the guard for old taps. **Effort:** S. **Priority:** P3.
 
 ### Jev tail screen (Phase 2 of the spend plan), shadow first
 **Where:** `engine/shared/claude_code_extraction.py`, `engine/retrieval/agent/jev.py`.

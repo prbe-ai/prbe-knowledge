@@ -367,26 +367,53 @@ so this is a prbe-backend change); device-heartbeat-driven finalize (the sweep c
 
 ---
 
-## 5. Phase 1: per-segment cache (build-ready, deferred)
+## 5. Phase 1: per-segment cache (reviewed 2026-09-24, see §16)
 
-**Gate:** after Phase 0, `claude_code_extraction.pass` shows repeated segment hashes
-accounting for ≥ 25 % of segment calls over a week. Today's estimate is ≤ 8 %
-(461 of 5,712 v2 passes are re-completions; the tail segment is new each time).
+**Gate, measured 2026-09-24** (research, 10.6 h, 126 passes, the worker's
+`claude_code_extraction.pass` log): 159 of 322 segment calls (49.4 %) re-mined a segment
+whose rendered text the same session had already mined in the window. All 159 come from 6
+sessions re-ended every 60-80 min while adding few events (14,422 -> 14,429 events over 8
+passes); cause: tap <= 0.7.1 false endings, fixed in tap 0.7.2 (research-os #1901). The
+gate (>= 25 %) is met today; the value decays as clients update, and the cache is the
+server-side guard for taps that do not (min supported tap 0.6.0). Scope: R20 (§16).
 
-Spec (per the brief, with the two traps closed):
-- Key: `(customer_id, session_id, sha256(rendered segment text), agent, prompt+schema
-  version)`. `total`/`(part i of n)` are NOT in the key; drop the part text from the
-  prompt or re-stamp `SegmentRef.total` after a hit. Confirm with a test that appending
-  events leaves earlier boundaries unchanged (`_split_on_compaction` and `_split_to_budget`
-  are prefix-stable by construction: both only ever cut at events already present; the
-  cap keeps the LAST 16, so a capped session's earliest segments change identity — cache
-  misses, not corruption).
-- Store: R2, `raw/<src>/<cust>/<sid>/segments/<sha256>.json`, body = the grounded
-  `UnitBundle` for that segment plus `authoritative` and the prompt version. Never write a
-  non-authoritative result. No migration, tenant-bucketed, deleted with the session.
-- A bundle is authoritative only if every segment (hit or fresh) is.
-- `_link_supersessions` re-runs only when the ordered list of decisions changed.
-- Measure before/after on the same 20 long v2 sessions: calls per completion pass.
+Spec (accepted in §16; each line cites its record):
+- **Boundary `_extract_one`; cache the tool-call ARGS, not the grounded bundle** (R21).
+  A hit runs the same `_only` construction + `_ground_units` over the cached args with the
+  current transcript and spans, so grounding/schema code changes and shifted line numbers
+  always apply.
+- **Admit only after success** (R25, codex): write the args only after unit construction
+  and grounding succeeded. A hit whose processing raises is discarded and the segment is
+  mined fresh. Tool declined, exceptions and empty transcripts write nothing.
+- **Key** = sha256(full sha256 of the rendered segment transcript + fingerprint) (R22, R26).
+  Fingerprint = sha256 of: resolved model id, `claude_code_extraction_cache_revision`
+  (Settings, default "1": bump it when a gateway alias is repointed), rendered system
+  prompt for the agent, the user-prompt template with its variable parts blanked, tool
+  name, tool description, canonical JSON of the tool schema, `max_tokens`, and `cwd`.
+  `(part i of n)` and `session_id` are in the prompt but not the key; session and
+  customer are in the path.
+- **Path** `raw/<source>/<customer>/<session_id>/extraction-cache/<key>.json` in the tenant
+  bucket (`store.bucket_for`). Purge's `raw/<source>/<customer>/` prefix delete
+  (`engine/ingest/purge.py:94,364`) removes it; no migration (R23).
+- **Body** `{"v": 1, "fingerprint", "answer", "created_at"}` (`answer` = the tool-call args,
+  or the supersession `links`); a body whose `v`/fingerprint differs, or malformed JSON, is
+  a miss. The fingerprint also covers the part-number wording and the supersession tool
+  description. An answer is stored under the model id REQUESTED; a gateway fallback to
+  another model would be cached under it (no fallback is configured today).
+- **Bounded storage** (R27, codex): cache GET/PUT use a dedicated client (connect 2 s,
+  read 3 s, 1 attempt via botocore `total_max_attempts`), and the first storage failure in a pass disables the cache for
+  the rest of that pass. A miss or error always falls back to the model; a PUT failure is
+  logged and the pass continues.
+- **Supersession** cached the same way, keyed on the numbered decision listing + its own
+  fingerprint; caches `links`. A re-ended session with nothing new costs zero calls (R24).
+- **Kill switch** `claude_code_extraction_segment_cache: bool = True` in Settings (default
+  on in code: no Helm change on either plane) (R28). Off = no GET, no PUT.
+- **Pass log** adds `cache_hits` and `supersede_cached`; `calls` counts only real model
+  calls (R29).
+- New module `engine/shared/extraction_cache.py`; `_extract_one` and `_link_supersessions`
+  call it (R30).
+- Measure: `cache_hits / segments` per day for 7 days, and calls per pass for re-ended
+  sessions, from the pass log.
 
 ## 6. Phase 2: Jev tail screen (shadow-only, deferred behind Phase 1)
 
@@ -759,21 +786,227 @@ Ordering: T1 → (T2, T3, T5, T6, T8 in PR 1; T4's v1 half in PR 1) → T9 → m
 - Lake Score: 14/14 (R3-R10, R13, R15-R19 at 10/10; R1, R2, R11, R12, R14 differ in kind)
 - Issues found (all sections + outside voice): 6 + 6 + 24 + 3 + 5 = 44; all mapped to tasks or TODOs
 
+## 16. Phase 1 review (2026-09-24, `/plan-eng-review`)
+
+Target: §5 (per-segment cache) and its `TODOS.md` entry, at `a675d2b`, branch
+`segment-extraction-cache`. Review decisions were auto-taken on the recommended option
+(standing preference); the one that changes what Richard asked for is R20.
+
+### Scope Challenge
+1. **[P1] (9/10)** Gate: the plan's week-long >= 25 % gate is replaced by a 10.6 h
+   measurement (49.4 %), and every repeat traces to the tap false-ending bug already fixed
+   in 0.7.2. Value is real today and decays with client adoption. **R20 (pending: Richard).**
+2. **[P2] (8/10)** `engine/shared/claude_code_extraction.py:1271-1281`: the plan cached the
+   grounded `UnitBundle`; grounding and unit classes change, so cached bundles go stale.
+   Cache the raw args and re-run construction + grounding. **Accepted (R21).**
+3. **[P1] (9/10)** "prompt+schema version" is a hand-bumped constant nobody will bump. Derive
+   the fingerprint from the prompt, schema and model actually sent. **Accepted (R22).**
+4. **[P2] (8/10)** `:1212` puts `cwd` in the prompt; the plan's key omits it. **Accepted (R22).**
+5. **[P2] (8/10)** 40 of 362 calls in the window were the supersession call; unchanged
+   decisions re-ask it. **Accepted (R24).**
+- Complexity: 5 files (extraction module, new cache module, storage client option,
+  handler log line, config) + 1 test file + CI list; 1 new module. Below the gate.
+- Reuse: `store.bucket_for`/`get`/`put` (`engine/shared/storage.py`), the existing
+  segment hash (`:1205`), purge's prefix delete. Content-addressed memoization is Layer 1;
+  no web search needed (Aside is macOS-only; noted).
+
+### 1. Architecture
+1. **[P2] (9/10)** Storage under `raw/<source>/<customer>/...` is deleted by purge
+   (`purge.py:94` builds `f"raw/{s.value}/{customer_id}/"`, `:364` deletes it). No new
+   deletion code. **Accepted (R23).**
+2. **[P1] (9/10)** A cache failure must never fail or stall a pass. **Accepted (R27).**
+3. **[P2] (8/10)** Rollback needs a switch that does not need a Helm change on either plane
+   (env flags must render on every workload). Default-on Settings field. **Accepted (R28).**
+
+### 2. Code quality
+1. **[P2] (8/10)** The extraction module is 1,295 lines; key/fingerprint/load/store belong in
+   `engine/shared/extraction_cache.py`, unit-testable without a model. **Accepted (R30).**
+2. **[P2] (9/10)** `calls` must stay the cost line: served-from-cache segments are not calls.
+   Add `cache_hits`, `supersede_cached`. **Accepted (R29).**
+
+### 3. Tests
+```
+CODE PATHS (proposed)                                   TESTS (tests/test_extraction_segment_cache.py)
+extract_units_from_session
+ └── _extract_one(segment)
+     ├── empty transcript -> no call, no cache I/O          [GAP] -> add
+     ├── cache enabled?
+     │   ├── no  -> model call, no GET/PUT                 [GAP] -> add (kill switch)
+     │   └── yes -> GET key
+     │       ├── hit, body v/fingerprint ok
+     │       │   ├── construct + ground OK -> 0 calls      [GAP] -> add (identical units)
+     │       │   └── construct/ground raises -> fresh call [GAP] -> add (R25)
+     │       ├── miss (NotFound)       -> fresh call        [GAP] -> add
+     │       ├── malformed / other v   -> fresh call        [GAP] -> add
+     │       └── StorageUnavailable/timeout -> fresh call,
+     │           cache off for the rest of the pass         [GAP] -> add (R27)
+     ├── fresh call
+     │   ├── tool declined -> non-authoritative, NO PUT     [GAP] -> add
+     │   ├── raises        -> segment_failed, NO PUT        [GAP] -> add
+     │   └── ok + grounded -> PUT args                      [GAP] -> add
+     │       └── PUT fails -> logged, pass continues        [GAP] -> add
+     └── key changes on: text, model, revision, system/user
+         prompt, tool schema, max_tokens, cwd               [GAP] -> add (one per field)
+ └── _link_supersessions: same listing -> 0 calls;
+     changed listing -> call                                [GAP] -> add
+ prefix stability: appending events changes only the
+     tail segment's hash                                    [GAP] -> add
+ pass log: cache_hits / supersede_cached / calls            [GAP] -> add
+REGRESSION (CRITICAL): existing 29 tests in
+ tests/test_claude_code_extraction.py, cache off AND
+ on-but-empty                                                [★★★ existing] -> run both ways
+COVERAGE: 0/17 new paths tested today (all proposed) | LLM eval: none (no prompt change)
+```
+New file joins `.github/workflows/tests.yml`'s named list (prior learning
+prbe-knowledge-ci-omits-extraction-tests, 10/10, 2026-09-23).
+
+### 4. Performance
+1. **[P3] (8/10)** One GET per segment inside the existing 4-way semaphore: tens of ms
+   against a multi-second model call. Storage: a few KB per segment. No action.
+
+### Outside voice (codex, completed)
+```codex-review
+- **Parsable responses can permanently poison the cache.** `forced_tool_call` validates only that arguments are a dictionary; unit construction and grounding (engine/shared/claude_code_extraction.py:1268) can still throw on `{"qa": [{}]}` or incorrectly typed evidence. Caching before these succeed turns a transient model error into repeatable failure until the bounded retries (kb/session_completer.py:134) run out. Admit entries only after successful processing; unusable hits must fall through to fresh inference. Test recovery from valid JSON with invalid unit shapes.
+
+- **The evidence does not meet the plan's own investment gate.** The week-long threshold has been replaced by 10.6 hours dominated entirely by six sessions hitting an already-fixed client bug. That establishes temporary waste, not durable savings. Measure after tap adoption, separate affected clients, and quantify token cost—not just call counts—before adding a permanent cache enabled across both planes. Post-rollout hit rates cannot establish whether adoption alone would have eliminated the problem.
+
+- **"Storage errors become misses" does not bound the delay.** ObjectStore (engine/shared/storage.py:86) configures retries without cache-specific timeouts and runs blocking operations in shared executor threads. Slow GETs and PUTs can occupy extraction slots long before exceptions trigger fallback. The proposed immediate-exception tests miss this. Specify short transport deadlines and stop attempting cache operations for the pass after storage failure.
+
+- **The fingerprint cannot reliably invalidate inference changes.** The supposed resolved model is actually a proxy-owned alias (engine/shared/claude_code_extraction.py:1216). Repointing it leaves entries valid; changing the user-prompt instructions or `max_tokens` also leaves the specified fingerprint unchanged. Re-grounding cannot regenerate omitted or misinterpreted units. Include the stable user-prompt template and generation settings, plus an explicit inference revision for alias changes. The kill switch merely bypasses old entries; re-enabling restores them.
+
+Recommendation: defer implementation until post-fix measurements justify it, then revise cache admission, invalidation, and timeout contracts because the current plan can preserve failed extractions indefinitely while optimizing an unproven steady-state problem.
+```
+Cross-model tension: codex's three contract findings are accepted (R25, R26, R27; verified:
+`storage.py:88` sets `retries={"max_attempts": 3}` with botocore's default 60 s timeouts).
+Its strategic finding (defer) disagrees with the native recommendation (build now) and
+with Richard's request: R20.
+
+### Decision ledger (Phase 1)
+
+#### R20: build Phase 1 now, or defer behind a post-0.7.2 measurement
+Finding: Scope 1 [P1] (9/10), native + codex (strategic).
+Plan baseline: Richard, 2026-09-24: "lets build the segment extraction cache"; plan §5 gate
+(week, >= 25 %).
+Runtime evidence: 49.4 % repeated segment calls over 10.6 h, all from 6 sessions of the
+fixed tap bug (§5); tap adoption unmeasured; token cost per repeated segment unmeasured.
+Comparison grid:
+| Choice | Current | A | B | C | D |
+|---|---|---|---|---|---|
+| R20 Phase 1 disposition | requested: build | Include: build now with R21-R30 | Defer: 1 week of post-0.7.2 pass logs, build if >= 25 % holds | Cut | Hold for discussion |
+| R21-R30 design | approved (auto) | unchanged | unchanged, applied when built | dropped | unchanged |
+Question D1:
+D1 — Build the segment cache now, or measure after the tap fix first?
+Project/branch/task: prbe-knowledge, branch segment-extraction-cache, Phase 1 of the extraction spend plan.
+ELI10: Today about half of all segment mining repeats work already done, but all of it comes from 6 sessions that old tap versions keep ending and reopening, a bug tap 0.7.2 fixed yesterday. Codex says wait a week and measure once machines update; the native review says build now, because old taps cannot be forced to update and the cache caps the cost whatever clients do.
+Stakes if we pick wrong: build now and it may save little once clients update (a permanent cache for a shrinking problem); wait and we keep paying for the repeats, roughly 44 % of calls today, until machines update.
+Recommendation: A because the repeats are happening now, old taps linger for months (min supported 0.6.0), and R25-R27 close the correctness risks codex raised.
+Note: options differ in kind, not coverage — no completeness score.
+Header: Phase 1 scope
+Options:
+A) Include: build now (recommended)
+Build the cache now with every accepted review fix (args cached after success, full fingerprint with a revision knob, bounded storage, kill switch), then measure hit rate for 7 days. Human ~1 day / CC ~1-2 h. Guards against old taps immediately; adds one small module to maintain.
+B) Defer: measure first
+Leave extraction unchanged; after 7 days of post-0.7.2 pass logs, build only if repeated segment calls still reach 25 %. Human/CC ~10 min to re-run the probe. Keeps the code smaller if adoption fixes it; keeps paying for today's repeats meanwhile.
+C) Cut
+Drop Phase 1 (and so Phase 2). No code, no measurement. Accepts repeat mining from old taps indefinitely.
+D) Hold
+Stop and discuss before deciding. Nothing is built and the disposition stays open.
+State: approved
+Actual answer: A) Include: build now (recommended), Richard via AskUserQuestion D1, 2026-09-25.
+Accepted scope: build Phase 1 now as specified in §5 with R21-R30, then measure `cache_hits / segments` for 7 days.
+History: none.
+
+#### R21-R30: design contracts (auto-decided, recommended option)
+| ID | Choice | Accepted value | Source |
+|---|---|---|---|
+| R21 | What is cached | tool-call args; construction + grounding re-run on hit | native |
+| R22 | Key | full text hash + derived fingerprint (model, prompts, schema, max_tokens, cwd) | native |
+| R23 | Storage | tenant bucket, `raw/<src>/<cust>/<sid>/extraction-cache/`, purge-covered | native |
+| R24 | Supersession | cached on the decision listing | native |
+| R25 | Admission | after construction + grounding succeed; failed hits re-mined | codex |
+| R26 | Invalidation | `claude_code_extraction_cache_revision` in the fingerprint; user-prompt template and max_tokens included | codex |
+| R27 | Storage bounds | dedicated client 2 s/3 s/1 attempt; first failure disables the cache for the pass | codex |
+| R28 | Rollback | `claude_code_extraction_segment_cache` default True | native |
+| R29 | Cost line | `calls` = model calls only; `cache_hits`, `supersede_cached` added | native |
+| R30 | Module | `engine/shared/extraction_cache.py` | native |
+State: approved (authorized auto-decision, standing preference 2026-09-16); applies only if R20 is A.
+
+#### R31: TODO — record the tap client version on the pass log (codex: "separate affected clients")
+Auto-decided **B) Skip**: `cache_hits` already measures what the cache saves, and the engine
+does not receive the tap version per session today (it would need a wire change). Revisit
+only if the 7-day measurement is ambiguous.
+
+Approval readiness: PASS (R20: Richard, D1, 2026-09-25; R21-R31: authorized auto-decisions).
+
+### Failure modes (new paths)
+| Path | Realistic failure | Handled / tested | User sees |
+|---|---|---|---|
+| Cache GET | R2 slow or down | R27 short deadlines + per-pass breaker; test | nothing; pass mines fresh |
+| Cache hit | args from an older model or prompt | R22/R26 fingerprint + revision knob; tests per field | nothing |
+| Cache hit | args that no longer construct or ground | R25 falls back to a fresh call; test | nothing |
+| Cache PUT | write fails | logged, pass continues; test | nothing |
+| Supersession | stale links after decisions change | keyed on the listing text; test | nothing |
+| Purge | cache objects outlive a disconnected source | purge's prefix delete covers the path; existing purge test | nothing |
+No critical gap: every path has handling and a named test.
+
+### NOT in scope
+- TTL/eviction: objects are a few KB and die with the source purge.
+- Sharing cache entries across sessions: a segment is session-scoped by path.
+- A Postgres-backed store: R2 needs no migration.
+- Tap-version attribution on the pass log (R31).
+- Phase 2 (Jev tail screen): still behind its own gate in `TODOS.md`.
+
+### What already exists
+- Segment hash over the rendered transcript (`claude_code_extraction.py:1205`), logged per pass.
+- Object store `get`/`put`/`bucket_for` (`engine/shared/storage.py`); purge's prefix delete.
+- Prefix-stable segmentation (`_split_on_compaction`, `_split_to_budget`); the LAST 16 kept.
+- 29 extraction tests on the CI list; the new file joins them.
+
+### Worktree parallelization
+Sequential implementation, no parallelization opportunity (one module and its caller).
+
+### Implementation Tasks (Phase 1)
+- [ ] **P1-T1 (P1, human ~3h / CC ~20min)** — cache module: `engine/shared/extraction_cache.py` (fingerprint, key, load, store; bounded client; per-pass breaker). Surfaced by R21-R23, R26, R27. Verify: new unit tests.
+- [ ] **P1-T2 (P1, human ~3h / CC ~20min)** — `_extract_one` + `_link_supersessions` use it; admission after success (R24, R25); settings `claude_code_extraction_segment_cache`, `claude_code_extraction_cache_revision` (R26, R28). Verify: hit/miss/fallback tests.
+- [ ] **P1-T3 (P2, human ~1h / CC ~5min)** — pass log `cache_hits`, `supersede_cached` (R29). Verify: log test.
+- [ ] **P1-T4 (P1, human ~4h / CC ~20min)** — `tests/test_extraction_segment_cache.py` per the §16 diagram + CI list; regression run of the 29 extraction tests with the cache off and on-but-empty. Verify: `pytest tests/test_extraction_segment_cache.py tests/test_claude_code_extraction.py`.
+- [ ] **P1-T5 (P2, human ~30min / CC ~5min)** — CHANGELOG, `TODOS.md` Phase 1 entry marked built. Verify: read.
+
+### Unresolved decisions that may bite you later
+None in this review.
+
+### Completion summary (Phase 1 review)
+- Step 0: Scope Challenge — scope accepted as-is (R20 = build now)
+- Architecture Review: 3 issues found
+- Code Quality Review: 2 issues found
+- Test Review: diagram produced, 17 gaps identified (all proposed paths)
+- Performance Review: 1 issue found (no action)
+- NOT in scope: written
+- What already exists: written
+- TODOS.md updates: 1 item proposed (R31, skipped)
+- Failure modes: 0 critical gaps flagged
+- Unresolved decisions: 0 in this review
+- Outside voice: codex, completed, 4 findings (3 accepted as R25-R27, 1 strategic resolved by R20)
+- Parallelization: 1 lane, 0 parallel / 1 sequential
+- Lake Score: N/A (R20 differs in kind; R21-R30 auto-decided contracts)
+
+
 ## GSTACK REVIEW REPORT
 
-Target: the pasted brief "Plan (do not yet ship) cutting transcript-extraction spend", materialized as this file. Commit `2b540de`, branch `extraction-spend-plan`, 2026-09-23.
+Target: §5 Phase 1 (per-segment extraction cache) and its `TODOS.md` entry, reviewed in §16.
+Commit `a675d2b`, branch `segment-extraction-cache`, 2026-09-25. The Phase 0 review's
+results are recorded in §7-§15.
 
 | Review | Trigger | Why | Runs | Status | Findings |
 |--------|---------|-----|------|--------|----------|
 | CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | — |
-| Outside Review | codex (`gpt-6-astra`) via `/plan-eng-review` | Independent 2nd opinion | 1 | completed | 5 findings, 5 folded (R14-R19) |
-| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | ISSUES OPEN (mapped work) | 44 issues, 0 critical gaps |
+| Outside Review | codex (`gpt-6-astra`) via `/plan-eng-review` | Independent 2nd opinion | 2 | completed | 4 findings: 3 accepted (R25-R27), 1 resolved by R20 |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 2 | ISSUES OPEN (mapped work) | 13 issues, 0 critical gaps |
 | Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | — |
 | DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | — |
 
-- **OUTSIDE COVERAGE:** provider codex, model `gpt-6-astra`, phase plan-review, completed; 5 findings, all accepted (backfill evidence rule, v2 predicate loop, lock recheck, bounded retry, miss-rate metric) and one sequencing recommendation (PR split) adopted.
-- **CROSS-MODEL:** native review (this session's harness; model identity as reported by the host) and codex agree on the mechanism and the fix shape; codex supplied five corrections the native pass under-specified; no disagreement remains.
-- **VERDICT:** Eng Review ISSUES OPEN: every one of the 44 findings is mapped to a task (T1-T12) or a TODO and no critical failure gap remains, so this is mapped work, not a failed review; eng review required (re-run after PR 1 lands or if R2 changes the rollout order).
+- **OUTSIDE COVERAGE:** provider codex, model `gpt-6-astra`, phase plan-review, completed; 4 findings (cache admission, storage deadlines, fingerprint completeness, defer-vs-build).
+- **CROSS-MODEL:** native and codex agree on the cache's contracts after R25-R27; they disagreed on timing (codex: defer; native: build now). Richard chose build now (R20).
+- **VERDICT:** Eng Review ISSUES OPEN as mapped work: every finding maps to P1-T1..T5; no critical failure gap; ready to implement.
 
-**UNRESOLVED DECISIONS:**
-- R2 / D2: suspend `research-os-engine-session-completer` on `do-sfo3-probe-research` now (reversible, ~$90/day) or leave it until PR 1 deploys. Richard's call; nothing in the plan waits on it.
+NO UNRESOLVED DECISIONS

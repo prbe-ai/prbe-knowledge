@@ -154,6 +154,14 @@ class Settings(BaseSettings):
     #: (engine/shared/session_signals.py), so turning it back on does NOT
     #: re-mine it by itself -- that session is mined again when it next ends.
     claude_code_extraction_enabled: bool = Field(default=True)
+    #: Reuse a segment's extraction when the same session re-ends with that
+    #: segment unchanged (engine/shared/extraction_cache.py). Off = no cache
+    #: read or write; every segment is mined, as before.
+    claude_code_extraction_segment_cache: bool = Field(default=True)
+    #: Part of every cache key. Bump it when the model ALIAS is repointed at the
+    #: gateway: the alias name is all this process sees, so without a bump the
+    #: old model's answers would keep being served for unchanged segments.
+    claude_code_extraction_cache_revision: str = Field(default="1")
 
     #: Honour `QueryRequest.recall_floor_mode="conditional"`. OFF by default.
     #:

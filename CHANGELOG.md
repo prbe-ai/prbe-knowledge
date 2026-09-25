@@ -7,6 +7,18 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 ## [Unreleased]
 
 ### Changed
+- **A re-ended session pays only for what changed.** When a coding-agent session is resumed and
+  ended again, each segment the session already mined, unchanged, is answered from a cache of
+  that segment's earlier model answer instead of a new model call; so is the supersession
+  check when the session's decisions did not change. On research on 2026-09-24, 49 % of
+  segment calls were such repeats. The cache stores the model's answer, never the units built
+  from it, so construction and grounding always run on the current code; it keys on
+  everything the model was asked (text, model, prompts, tool schema, `max_tokens`, `cwd`, and
+  `claude_code_extraction_cache_revision`, to bump when a gateway alias is repointed); only
+  an answer that built and grounded is stored; and a slow or failing store costs a pass one
+  short timeout, never the pass. `claude_code_extraction_segment_cache` switches it off. The
+  per-pass log line gains `cache_hits` and `supersede_cached`; `calls` counts only real model
+  calls.
 - **Jev ranks with a source-kind preference.** The selector subtracts a per-tier penalty from
   Jev's probability before ordering documents: the records Probe owns (runs, projects, papers,
   team notes) first, authored GitHub records next, high-volume commits, files and code below

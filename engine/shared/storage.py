@@ -76,7 +76,26 @@ class ObjectLocation:
     key: str
 
 
-def _make_client(settings: Settings) -> Any:
+def _make_client(
+    settings: Settings,
+    *,
+    connect_timeout: float | None = None,
+    read_timeout: float | None = None,
+    total_max_attempts: int | None = None,
+) -> Any:
+    # botocore reads `max_attempts` as RETRIES (3 -> 4 tries) and
+    # `total_max_attempts` as tries. The default keeps every existing caller's
+    # behaviour; a caller that needs "exactly N tries" says so.
+    retries: dict[str, Any] = (
+        {"max_attempts": 3, "mode": "standard"}
+        if total_max_attempts is None
+        else {"total_max_attempts": total_max_attempts, "mode": "standard"}
+    )
+    timeouts: dict[str, float] = {}
+    if connect_timeout is not None:
+        timeouts["connect_timeout"] = connect_timeout
+    if read_timeout is not None:
+        timeouts["read_timeout"] = read_timeout
     kwargs: dict[str, Any] = {
         # Empty endpoint -> None so botocore resolves the AWS regional endpoint.
         "endpoint_url": settings.r2_endpoint_url or None,
@@ -85,7 +104,8 @@ def _make_client(settings: Settings) -> Any:
         "region_name": settings.r2_region,
         "config": BotoConfig(
             signature_version="s3v4",
-            retries={"max_attempts": 3, "mode": "standard"},
+            retries=retries,
+            **timeouts,
         ),
     }
     # Static creds when supplied (R2 always; S3 optionally). When absent, pass NOTHING
@@ -104,9 +124,24 @@ def _make_client(settings: Settings) -> Any:
 class ObjectStore:
     """Thin async wrapper so callers don't block the event loop on boto3 calls."""
 
-    def __init__(self, settings: Settings | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        *,
+        connect_timeout: float | None = None,
+        read_timeout: float | None = None,
+        total_max_attempts: int | None = None,
+    ) -> None:
+        """botocore's defaults (60 s timeouts, 3 retries) suit payloads that must
+        land. An optional read -- a cache -- passes short ones, so a slow store
+        costs it a miss instead of a stalled caller."""
         self._settings = settings or get_settings()
-        self._client = _make_client(self._settings)
+        self._client = _make_client(
+            self._settings,
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            total_max_attempts=total_max_attempts,
+        )
 
     # ---- bucket ops ---------------------------------------------------------
 
