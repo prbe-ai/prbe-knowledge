@@ -32,6 +32,8 @@ import re
 from collections.abc import Iterable
 from typing import Any
 
+import asyncpg
+
 from engine.shared.db import with_tenant
 from engine.shared.exceptions import DuplicateEventIgnored
 
@@ -85,17 +87,28 @@ async def lock_session(conn: Any, customer_id: str, source: str, session_id: str
 async def deleted_sessions(
     conn: Any, customer_id: str, source: str, session_ids: Iterable[str]
 ) -> set[str]:
-    """Which of `session_ids` are recorded as deleted. Caller holds their locks."""
+    """Which of `session_ids` are recorded as deleted. Caller holds their locks.
+
+    No table means nothing was ever recorded: code can reach a plane before
+    migration 0140 does (the research plane pulls `latest` and migrates on
+    research-os's deploy), and every session writer asks this -- an error here
+    would stop all session capture. Asked inside a savepoint so the caller's
+    transaction survives the miss.
+    """
     ids = sorted(set(session_ids))
     if not ids:
         return set()
-    rows = await conn.fetch(
-        "SELECT session_id FROM session_deletions "
-        "WHERE customer_id = $1 AND source_system = $2 AND session_id = ANY($3::text[])",
-        customer_id,
-        source,
-        ids,
-    )
+    try:
+        async with conn.transaction():
+            rows = await conn.fetch(
+                "SELECT session_id FROM session_deletions "
+                "WHERE customer_id = $1 AND source_system = $2 AND session_id = ANY($3::text[])",
+                customer_id,
+                source,
+                ids,
+            )
+    except asyncpg.UndefinedTableError:
+        return set()
     return {r["session_id"] for r in rows}
 
 

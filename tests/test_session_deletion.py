@@ -16,6 +16,7 @@ import hashlib
 import json
 import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 
 import httpx
 import orjson
@@ -29,7 +30,7 @@ from engine.shared import claude_code_extraction as ext
 from engine.shared import db as db_module
 from engine.shared.config import get_settings
 from engine.shared.constants import SourceSystem, agent_session_canonical_id
-from engine.shared.session_suppression import SessionDeleted, session_lock_key
+from engine.shared.session_suppression import SessionDeleted, deleted_sessions, session_lock_key
 from engine.shared.storage import _reset_bucket_cache_for_tests, get_store, reset_store
 from kb import session_deletion as sd
 from kb import session_receipts as sr
@@ -300,6 +301,59 @@ def test_every_writer_serializes_on_the_ingest_lock() -> None:
     # The ingest door, the idle sweep, the worker fence and the deletion all
     # take this one name. If it drifts they stop excluding each other.
     assert session_lock_key("c", "claude_code", "s") == "session-stream:c:claude_code:s"
+
+
+_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_the_bootstrap_schema_carries_the_migrations_ddl_verbatim() -> None:
+    # Prod runs migration 0140 (kb/session_deletions_schema.sql); CI and fresh
+    # installs build from db/schema.sql and never run it. They must not drift.
+    ddl = (_ROOT / "kb/session_deletions_schema.sql").read_text().strip()
+    assert ddl in (_ROOT / "db/schema.sql").read_text()
+
+
+@pytest.mark.asyncio
+async def test_the_app_role_reads_the_record_for_its_own_tenant_only(env) -> None:
+    """The tests connect as a superuser, which FORCE RLS never binds. The
+    production role is not one: it needs the grant, and it must see a
+    deletion only under that tenant's GUC."""
+    (a, b), _store = env
+    sid = _sid()
+    await delete(a, [sid])
+    async with db_module.raw_conn() as conn:
+        await conn.execute(
+            "DO $$ BEGIN CREATE ROLE app NOLOGIN; EXCEPTION WHEN duplicate_object THEN NULL; END $$"
+        )
+        await conn.execute((_ROOT / "kb/session_deletions_schema.sql").read_text())
+        for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE"):
+            assert await conn.fetchval(
+                "SELECT has_table_privilege('app', 'session_deletions', $1)", privilege
+            ), privilege
+    async with db_module.with_tenant(a) as conn:
+        await conn.execute("SET LOCAL ROLE app")
+        assert await deleted_sessions(conn, a, CC.value, [sid]) == {sid}
+    async with db_module.with_tenant(b) as conn:
+        await conn.execute("SET LOCAL ROLE app")
+        assert await deleted_sessions(conn, a, CC.value, [sid]) == set()
+
+
+class _RollBack(Exception):
+    pass
+
+
+@pytest.mark.asyncio
+async def test_a_plane_without_the_table_yet_keeps_capturing(env) -> None:
+    """Code can land before migration 0140 does. Every writer asks the record,
+    so a missing table must read as "nothing deleted", and the writer's
+    transaction must survive asking."""
+    (a, _b), _store = env
+    with pytest.raises(_RollBack):
+        async with db_module.with_tenant(a) as conn:
+            await conn.execute("ALTER TABLE session_deletions RENAME TO session_deletions_hidden")
+            assert await deleted_sessions(conn, a, CC.value, [_sid()]) == set()
+            assert await conn.fetchval("SELECT 1") == 1
+            raise _RollBack
 
 
 @pytest.mark.asyncio

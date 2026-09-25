@@ -2236,3 +2236,20 @@ DROP POLICY IF EXISTS tenant_isolation ON session_deletions;
 CREATE POLICY tenant_isolation ON session_deletions
     USING (customer_id = current_setting('app.current_customer_id', true))
     WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
+-- The app role is deployment-specific (`app` on research, `probe_app` on
+-- managed, neither on some self-hosts), so the grant is discovered rather than
+-- hardcoded -- same reason as migrations 0112 and 0129. Every writer of a
+-- session reads this table, so without it session capture stops outright.
+DO $$
+DECLARE role_name text;
+BEGIN
+    FOR role_name IN
+        SELECT rolname FROM pg_roles WHERE rolname IN ('app', 'probe_app', 'probe_admin')
+    LOOP
+        EXECUTE format(
+            'GRANT SELECT, INSERT, UPDATE, DELETE ON session_deletions TO %I',
+            role_name
+        );
+    END LOOP;
+END
+$$;
