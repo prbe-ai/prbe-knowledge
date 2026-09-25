@@ -22,8 +22,11 @@ timed out at the 300 s client command_timeout on two tenants:
     the whole table (every tenant) per batch. Now served by
     idx_inferred_edges_queue_anchor: (customer_id, anchor_doc_id).
 
-The queries changed with them (the old OR / IN-list shapes could not use an
-index even where one existed); the script's docstrings say how.
+The ACL query changed with them: its surviving-document check,
+`x.doc_id = a.resource_id OR x.source_id = a.resource_id`, probed the trigram
+index on documents.source_id for every matched row whether or not these
+indexes exist. pending_edges is deleted one side per statement, each restating
+its index's predicate. The script's docstrings say how.
 
 CONCURRENTLY, in alembic's autocommit block, one index at a time -- 0139's
 shape. This migration runs UNATTENDED on both planes (managed-migrate hook on
@@ -37,11 +40,14 @@ can be killed in that wait, leaving an INVALID index behind. Each index is
 guarded the way 0139 guards its one: an INVALID leftover of the same name is
 dropped (CONCURRENTLY) and rebuilt, because `IF NOT EXISTS` matches on NAME and
 would otherwise record the migration applied against a corpse the planner
-ignores. Nothing on the request path reads these indexes, so until they are
-valid only the purge is slower.
+ignores. No user-facing query needs these indexes: until they are valid only
+the purge and the per-document deletes (kb/session_deletion.py,
+engine/ingest/purge.py, kb/github_control_purge.py) are slower.
 
-If a deploy stalls here, look for a long-lived transaction first
-(`pg_stat_activity` ordered by `xact_start`). The indexes can also be built by
+It runs at a different time on each plane: on merge for managed, and on the
+next research-os deploy for research. Check for long-lived transactions
+(`pg_stat_activity` ordered by `xact_start`) before EACH of those, and first
+if a deploy stalls here. The indexes can also be built by
 hand beforehand, after which this migration is a no-op -- the statements are
 _INDEXES below, each run as `CREATE INDEX CONCURRENTLY IF NOT EXISTS`.
 """

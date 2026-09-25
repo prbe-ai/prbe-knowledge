@@ -99,7 +99,7 @@ per committed transaction, the tombstone version last, so a killed run leaves a
 still-eligible document for the next one. Documents are walked in
 (deleted_at, doc_id) order, each at most once per run, over the partial index
 idx_documents_tombstones (migration 0139). No new batch starts after
---max-seconds. The final batch's deletes on the big side tables
+--max-seconds. Each batch's closing deletes on the big side tables
 (acl_snapshots, pending_edges, inferred_edges_queue) are index lookups
 (migration 0141); before it, the first production run spent ~5 minutes per
 batch scanning them and timed out.
@@ -525,15 +525,18 @@ def _at(stage: str) -> None:
 
 def _error_text(exc: BaseException) -> str:
     """str(exc), never empty: a bare TimeoutError from asyncpg's client-side
-    command_timeout (db_statement_timeout_ms) stringifies to ''."""
+    timeouts stringifies to ''. Two raise it: command_timeout on a statement,
+    and the connect timeout when the pool opens a new connection."""
     text = str(exc)
     if text:
         return text
     if isinstance(exc, TimeoutError):
-        timeout_ms = get_settings().db_statement_timeout_ms
+        settings = get_settings()
         return (
-            f"no reply within the client command_timeout ({timeout_ms} ms, "
-            "db_statement_timeout_ms)"
+            "no reply within the client command_timeout "
+            f"({settings.db_statement_timeout_ms} ms, db_statement_timeout_ms), "
+            f"or no connection within {settings.db_connect_timeout_seconds} s "
+            "(db_connect_timeout_seconds)"
         )
     return repr(exc)
 
@@ -592,6 +595,10 @@ async def _gated(customer_id: str) -> AsyncIterator[asyncpg.Connection]:
         if reason is not None:
             raise _TenantBlocked(reason)
         yield conn
+        # Reached only when the block ended cleanly: with_tenant commits next,
+        # under the same client timeout, and a stalled commit must not be
+        # logged as the batch's last statement.
+        _at("commit")
 
 
 @functools.cache

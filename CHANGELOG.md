@@ -58,8 +58,9 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   53 s to 15 ms per batch and a whole batch from ~50 s to ~0.1 s; the 6,000-document backlog
   now clears in 88 s instead of timing out. `tombstone_purge.tenant_failed` now names the
   `stage` (the statement or storage call) and never logs an empty `error`. Migration 0141
-  builds all four indexes `CONCURRENTLY`; before merging, check for long-running transactions
-  on both planes (see the migration).
+  builds all four indexes `CONCURRENTLY`, on merge for the managed plane and on the next
+  research-os deploy for the research plane; check for long-running transactions before each
+  (see the migration).
 
 - **A tenant that is not active is held, not processed.** research-os keeps a terminated team's
   data for a hold before purging it, marking its kb `customers.status` `'terminated'` (then
