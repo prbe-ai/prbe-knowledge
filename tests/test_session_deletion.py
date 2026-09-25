@@ -1135,3 +1135,50 @@ async def test_resume_repeats_the_deep_scan_the_request_asked_for(env) -> None:
             await asyncio.sleep(0.05)
     assert status["status"] == "done", status
     assert not await store.exists(bucket, orphan)
+
+
+@pytest.mark.asyncio
+async def test_the_inferred_edges_worker_cannot_write_back_a_session_deleted_mid_call(
+    env, monkeypatch
+) -> None:
+    """The side worker reads a session's documents, then spends an LLM call on
+    them. A deletion that lands during the call must not be undone by the
+    write after it: no re-created session node, no edge whose `why` came from
+    the transcript."""
+    from engine.ingest.inferred_edges import worker as iew
+    from engine.ingest.inferred_edges.extractor import ExtractionResult, InferredEdge
+
+    (a, _b), _store = env
+    sid = _sid()
+    await v2_session(a, sid)
+    agent_node = agent_session_canonical_id(CC.value, sid)
+    async with db_module.raw_conn() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, customer_id, anchor_doc_id, extractor_id, attempts FROM inferred_edges_queue "
+            "WHERE customer_id = $1 ORDER BY id LIMIT 1",
+            a,
+        )
+    assert row is not None, "the finalized session must have enqueued inferred edges"
+
+    async def the_session_is_deleted_during_the_call(bundle, conn, **_kw):
+        assert bundle.docs
+        await delete(a, [sid])
+        edge = InferredEdge(
+            from_label="AgentSession", from_canonical_id=agent_node, to_label="Person",
+            to_canonical_id=ALICE, edge_type="DISCUSSES", confidence="INFERRED",
+            why="quoted from the transcript", extractor_id="inferred_edges:v1",
+            extracted_at=datetime.now(UTC),
+        )
+        return ExtractionResult(edges=[edge])
+
+    monkeypatch.setattr(iew, "extract_edges", the_session_is_deleted_during_the_call)
+    await iew.InferredEdgesWorker(concurrency=1)._process(row)
+
+    async with db_module.with_tenant(a) as conn:
+        assert await conn.fetchval(
+            "SELECT count(*) FROM graph_nodes WHERE canonical_id = $1", agent_node
+        ) == 0
+        assert await conn.fetchval(
+            "SELECT count(*) FROM graph_edges WHERE properties->>'why' = 'quoted from the transcript'"
+        ) == 0
+    assert await session_rows(a, sid) == {}

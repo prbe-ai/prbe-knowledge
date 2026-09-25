@@ -34,6 +34,7 @@ from typing import Any
 
 import asyncpg
 
+from engine.shared.constants import AGENT_SESSION_SOURCES
 from engine.shared.db import with_tenant
 from engine.shared.exceptions import DuplicateEventIgnored
 
@@ -167,6 +168,28 @@ async def refuse_deleted_sessions(
             source=source,
             session_ids=deleted,
         )
+
+
+async def refuse_deleted_anchor(conn: Any, customer_id: str, doc_id: str) -> None:
+    """The fence for a writer keyed by a DOCUMENT id: the inferred-edges
+    worker, which reads a session's documents, spends an LLM call on them, and
+    then upserts graph nodes and edges -- `upsert_nodes` would re-create a
+    session node the deletion removed meanwhile, and the edges would carry
+    `why` text drawn from the transcript. Same lock and check as every other
+    writer; a document of no coding-agent session passes untouched.
+
+    `<source>:<customer>:<session>` is a session document, `...:<kind>:<n>` one
+    of its units; both readings are locked and checked, since a protocol-1
+    session id may itself hold `:`.
+    """
+    for source in sorted(s.value for s in AGENT_SESSION_SOURCES):
+        prefix = f"{source}:{customer_id}:"
+        if doc_id.startswith(prefix):
+            rest = doc_id[len(prefix):]
+            await refuse_deleted_sessions(
+                conn, customer_id, source, {rest, rest.rsplit(":", 2)[0]}
+            )
+            return
 
 
 async def is_session_deleted(customer_id: str, source: str, queue_event_id: str) -> bool:
