@@ -6,6 +6,15 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Fixed
+
+- **A transcript holding one value too deeply encoded to scan is captured again.** The ingest
+  scrubber refuses text percent-encoded more than four levels deep, and that refusal failed the
+  whole request with a 500, which clients retry forever: every later batch of the session queued
+  behind it. Such a value now becomes `<redacted>` on its own (a multi-line value loses only the
+  lines concerned) and the rest of the payload is scrubbed and stored as usual. On research,
+  2026-09-25, 109 of 181 Claude Code batch uploads in 4 hours failed this way.
+
 ### Changed
 - **A re-ended session pays only for what changed.** When a coding-agent session is resumed and
   ended again, each segment the session already mined, unchanged, is answered from a cache of
