@@ -20,7 +20,7 @@ from pathlib import Path
 from alembic import op
 
 revision = "0140_session_deletions"
-down_revision = "0138_queue_extraction_outcome"
+down_revision = "0139_tombstone_purge_index"
 branch_labels = None
 depends_on = None
 
