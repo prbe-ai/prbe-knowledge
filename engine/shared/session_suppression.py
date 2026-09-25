@@ -37,6 +37,7 @@ import asyncpg
 from engine.shared.constants import AGENT_SESSION_SOURCES
 from engine.shared.db import with_tenant
 from engine.shared.exceptions import DuplicateEventIgnored
+from engine.shared.legal_hold import legal_hold_sql
 
 #: The HTTP status and machine-readable reason an ingest door answers with for
 #: a deleted session. 410 Gone: the resource existed and will not come back, so
@@ -243,20 +244,29 @@ async def own_folder_keys(store: Any, bucket: str, folder: str) -> list[str]:
     return [k for k in await store.list_keys(bucket, folder) if is_own_folder_key(k, folder)]
 
 
-def as_legal_hold(value: str | None) -> str | None:
-    """`customers.metadata->>'legal_hold'` as a hold, or None. Anything but
-    absent, null, false or "" is a hold: deleting under an ambiguous hold is
-    the failure that cannot be undone."""
-    if value is None or value.strip().lower() in ("", "false", "null"):
-        return None
-    return value
+#: The hold as text when there is one, else NULL, by engine/shared/legal_hold's
+#: rule (fail closed: any value but JSON null or an absent key is a hold). One
+#: definition for the tombstone purge and for session deletion.
+LEGAL_HOLD_VALUE_SQL = (
+    f"CASE WHEN {legal_hold_sql('c')} "
+    "THEN coalesce(nullif(c.metadata ->> 'legal_hold', ''), 'held') END"
+)
+
+
+async def read_legal_hold(conn: Any, customer_id: str, *, lock: bool = False) -> str | None:
+    """The tenant's hold, or None. `lock=True` takes FOR SHARE on the customers
+    row (engine/shared/legal_hold.purge_blocked_reason): a hold being set waits
+    for the caller's destructive transaction instead of landing mid-way."""
+    return await conn.fetchval(
+        f"SELECT {LEGAL_HOLD_VALUE_SQL} FROM customers c WHERE c.customer_id = $1"
+        + (" FOR SHARE" if lock else ""),
+        customer_id,
+    )
 
 
 async def tenant_legal_hold(customer_id: str) -> str | None:
     async with with_tenant(customer_id) as conn:
-        return as_legal_hold(await conn.fetchval(
-            "SELECT metadata->>'legal_hold' FROM customers WHERE customer_id = $1", customer_id
-        ))
+        return await read_legal_hold(conn, customer_id)
 
 
 async def reopen_deletion(exc: SessionDeleted, why: str, *, status: str = "failed") -> None:
@@ -290,7 +300,9 @@ async def sweep_session_folders(store: Any, exc: SessionDeleted) -> tuple[int, i
     deleted = failed = 0
     for session_id in sorted(exc.session_ids):
         folder = session_folder(exc.source, exc.customer_id, session_id)
-        n, bad = await store.delete_keys(bucket, await own_folder_keys(store, bucket, folder))
+        n, bad = await store.delete_named_keys(
+            bucket, await own_folder_keys(store, bucket, folder)
+        )
         deleted += n
         failed += len(bad)
     return deleted, failed

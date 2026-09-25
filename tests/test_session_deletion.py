@@ -735,15 +735,21 @@ async def test_a_hold_placed_mid_run_stops_the_next_destructive_step(env, monkey
     assert row["status"] == "held" and "case-7" in row["error"]
 
 
-@pytest.mark.parametrize("value", ["false", "null", '""'])
+@pytest.mark.parametrize(
+    ("value", "held"),
+    [("null", False), ("false", True), ('""', True), ('"case-1"', True), ("{}", True)],
+)
 @pytest.mark.asyncio
-async def test_a_cleared_hold_is_not_a_hold(env, value) -> None:
+async def test_only_null_or_an_absent_key_clears_a_hold(env, value, held) -> None:
+    """engine/shared/legal_hold.py's rule, shared with the tombstone purge:
+    fail closed on the hold's shape."""
     (a, _b), _store = env
+    assert await sd.legal_hold(a) is None
     async with db_module.raw_conn() as conn:
         await conn.execute(
             f"UPDATE customers SET metadata = '{{\"legal_hold\": {value}}}' WHERE customer_id = $1", a
         )
-    assert await sd.legal_hold(a) is None
+    assert (await sd.legal_hold(a) is not None) is held
 
 
 @pytest.mark.asyncio
@@ -1093,16 +1099,16 @@ async def test_an_object_only_a_deep_scan_found_is_journaled_before_its_delete(e
     bucket = await store.bucket_for(a)
     orphan = _legacy_key(a, sid, "2025/02/03", 9)
     await store.put(bucket, orphan, b"{}")
-    real = type(store).delete_keys
+    real = type(store).delete_named_keys
 
     async def orphan_fails(self, bucket, keys):
         deleted, failed = await real(self, bucket, [k for k in keys if k != orphan])
         return deleted, failed + ([orphan] if orphan in keys else [])
 
-    monkeypatch.setattr(type(store), "delete_keys", orphan_fails)
+    monkeypatch.setattr(type(store), "delete_named_keys", orphan_fails)
     first = (await delete(a, [sid], deep_scan=True))["sessions"][f"claude_code:{sid}"]
     assert not first["verified"] and first["r2_failed_key_count"] == 1, first
-    monkeypatch.setattr(type(store), "delete_keys", real)
+    monkeypatch.setattr(type(store), "delete_named_keys", real)
 
     again = await sd.erase_session(a, sd.SessionRef(CC.value, sid), grace_s=0)
 
@@ -1245,7 +1251,7 @@ async def test_a_late_sweep_that_fails_reopens_the_deletion(env, monkeypatch) ->
         await store.put(bucket, late, b"{}")
         return ext.UnitBundle(qa=[ext.QA(prompt="p", outcome="o", tags=[])])
 
-    real = type(store).delete_keys
+    real = type(store).delete_named_keys
 
     async def late_fails(self, bucket, keys):
         deleted, failed = await real(self, bucket, [k for k in keys if k != late])
@@ -1254,7 +1260,7 @@ async def test_a_late_sweep_that_fails_reopens_the_deletion(env, monkeypatch) ->
     monkeypatch.setattr("kb.handlers.claude_code._ext.extract_units_from_session",
                         deleted_during_extraction)
     monkeypatch.setattr(sd, "_wait_for_in_flight", _no_wait)
-    monkeypatch.setattr(type(store), "delete_keys", late_fails)
+    monkeypatch.setattr(type(store), "delete_named_keys", late_fails)
     ctx = make_default_context()
     try:
         await Worker(ctx)._process(row)
@@ -1265,7 +1271,7 @@ async def test_a_late_sweep_that_fails_reopens_the_deletion(env, monkeypatch) ->
     assert status == "failed" and "resume" in error
     assert await store.exists(bucket, late)
 
-    monkeypatch.setattr(type(store), "delete_keys", real)
+    monkeypatch.setattr(type(store), "delete_named_keys", real)
     outcome = await sd.erase_session(a, sd.SessionRef(CC.value, sid), grace_s=0)
     assert outcome["verified"], outcome
     assert not await store.exists(bucket, late)

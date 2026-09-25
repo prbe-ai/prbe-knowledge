@@ -106,9 +106,10 @@ from engine.shared.exceptions import StorageNotFound, StorageUnavailable
 from engine.shared.session_signals import is_cron_marker_key, storage_id
 from engine.shared.session_suppression import (
     LEGACY_EVENT_SUFFIX_SQL,
-    as_legal_hold,
+    LEGAL_HOLD_VALUE_SQL,
     lock_session,
     own_folder_keys,
+    read_legal_hold,
     session_folder,
     session_of_event_id,
 )
@@ -264,18 +265,19 @@ class Inventory:
 async def legal_hold(customer_id: str) -> str | None:
     """The tenant's legal-hold marker, or None. Raises 404 for an unknown tenant.
 
-    `customers.metadata.legal_hold` (retention plan T3). Any value but absent,
-    null, false or "" counts as held: deleting under an ambiguous hold is the
-    failure that cannot be undone.
+    `customers.metadata.legal_hold` (retention plan T3), read by the engine's
+    one rule (engine/shared/legal_hold.py): any value but JSON null or an
+    absent key is a hold -- `false` and "" included, because deleting under an
+    ambiguous hold is the failure that cannot be undone.
     """
     async with raw_conn() as conn:
         row = await conn.fetchrow(
-            "SELECT metadata->>'legal_hold' AS hold FROM customers WHERE customer_id = $1",
+            f"SELECT {LEGAL_HOLD_VALUE_SQL} AS hold FROM customers c WHERE c.customer_id = $1",
             customer_id,
         )
     if row is None:
         raise SessionDeletionError(404, f"unknown customer {customer_id!r}")
-    return as_legal_hold(row["hold"])
+    return row["hold"]
 
 
 class _HoldPlaced(Exception):
@@ -827,9 +829,7 @@ async def _journal_and_delete_rows(
         # Re-read under the lock: the run's first check can be minutes old (a
         # wait on this lock, the in-flight grace), and a hold placed since must
         # stop the rows going.
-        hold = as_legal_hold(await conn.fetchval(
-            "SELECT metadata->>'legal_hold' FROM customers WHERE customer_id = $1", customer_id
-        ))
+        hold = await read_legal_hold(conn, customer_id, lock=True)
         if hold is not None:
             raise _HoldPlaced(hold)
         inv = await inventory(
@@ -900,10 +900,12 @@ async def _delete_objects(
 ) -> tuple[int, list[str], int]:
     """Phase 3: journaled keys, then the session's own prefixes. Returns
     (objects deleted, keys that failed, own objects still there)."""
-    deleted, failed = await store.delete_keys(bucket, keys)
+    deleted, failed = await store.delete_named_keys(bucket, keys)
     d, _errors = await store.delete_prefix(bucket, ref.v2_prefix(customer_id))
     deleted += d
-    n, bad = await store.delete_keys(bucket, await own_folder_keys(store, bucket, ref.folder(customer_id)))
+    n, bad = await store.delete_named_keys(
+        bucket, await own_folder_keys(store, bucket, ref.folder(customer_id))
+    )
     deleted += n
     return deleted, [*failed, *bad], len(await ref.raw_keys(store, bucket, customer_id))
 
