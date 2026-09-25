@@ -40,8 +40,10 @@ from engine.shared.exceptions import DuplicateEventIgnored
 
 #: The HTTP status and machine-readable reason an ingest door answers with for
 #: a deleted session. 410 Gone: the resource existed and will not come back, so
-#: a client must stop re-sending it (research-os forwards engine 4xx; see the
-#: route contract in kb/session_deletion.py).
+#: a client must stop re-sending it. NOTE: research-os's gateway today forwards
+#: only 409 (and 422 for protocol 2) and turns every other engine 4xx into a
+#: 502, which the tap retries forever; the research-os half of this deletion
+#: must pass 410 through and have the tap drop the batch.
 DELETED_STATUS = 410
 DELETED_REASON = "session_deleted"
 
