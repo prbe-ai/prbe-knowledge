@@ -36,6 +36,7 @@ from engine.ingest.handlers.registry import (
 from engine.shared.constants import IntegrationStatus, SourceSystem
 from engine.shared.db import get_pool, raw_conn
 from engine.shared.logging import get_logger
+from engine.shared.tenant_status import active_tenant_sql
 from kb.backfill_runner import re_enqueue_for_polling
 
 log = get_logger(__name__)
@@ -162,11 +163,12 @@ class IntegrationPoller:
         an in-flight row would be a no-op anyway, but filtering in SQL avoids
         the round-trip. NULL last_progress_at means the initial backfill
         never recorded progress — include it so it gets re-attempted.
+        ACTIVE tenants only (shared.tenant_status).
         """
         status_values = [s.value for s in cfg.eligible_statuses]
         async with raw_conn() as conn:
             rows = await conn.fetch(
-                """
+                f"""
                 SELECT t.customer_id
                 FROM integration_tokens t
                 JOIN backfill_state b
@@ -175,6 +177,7 @@ class IntegrationPoller:
                 WHERE t.source_system = $1
                   AND t.status = $2
                   AND b.status = ANY($3::text[])
+                  AND {active_tenant_sql("t.customer_id")}
                   AND (
                     b.last_progress_at IS NULL
                     OR b.last_progress_at < NOW() - make_interval(secs => $4)

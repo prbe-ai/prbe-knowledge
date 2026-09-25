@@ -39,19 +39,23 @@ from engine.shared.constants import IntegrationStatus, SourceSystem
 from engine.shared.db import close_pool, get_pool, init_pool
 from engine.shared.logging import configure_logging, get_logger
 from engine.shared.metrics import counter
+from engine.shared.tenant_status import active_tenant_sql
 from engine.shared.tokens import load_token, mark_token_auth_failed
 
 log = get_logger(__name__)
 
 
 async def _list_active_tokens() -> list[tuple[str, SourceSystem]]:
+    """Active singleton tokens of ACTIVE tenants: a held tenant's upstream is
+    not called with its credentials (shared.tenant_status)."""
     async with get_pool().acquire() as conn:
         rows = await conn.fetch(
-            """
+            f"""
             SELECT customer_id, source_system
             FROM integration_tokens
             WHERE status = $1
               AND device_id IS NULL
+              AND {active_tenant_sql("integration_tokens.customer_id")}
             ORDER BY customer_id, source_system
             """,
             IntegrationStatus.ACTIVE.value,

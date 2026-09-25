@@ -27,6 +27,8 @@ def ignored_notion(monkeypatch):
         "get_ingestion_killswitch",
         AsyncMock(return_value=SimpleNamespace(enabled=True)),
     )
+    # An active tenant: the door's status check reads `customers`.
+    monkeypatch.setattr(ingestion_app, "refusal_for", AsyncMock(return_value=None))
     monkeypatch.setattr(ingestion_app, "get_connector_class", lambda source: NotionConnector)
     # The real parser needs no provider/database state for unknown event types.
     monkeypatch.setattr(

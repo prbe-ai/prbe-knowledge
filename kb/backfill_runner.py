@@ -36,6 +36,7 @@ from engine.shared.logging import get_logger
 from engine.shared.metrics import counter
 from engine.shared.models import IntegrationToken
 from engine.shared.storage import ObjectStore, get_store
+from engine.shared.tenant_status import active_tenant_sql
 
 log = get_logger(__name__)
 
@@ -1162,13 +1163,17 @@ async def _load_token(
 
 
 async def claim_pending_backfill() -> tuple[str, SourceSystem] | None:
-    """Pick up one pending backfill_state row atomically. SKIP LOCKED for concurrency."""
+    """Pick up one pending backfill_state row atomically. SKIP LOCKED for concurrency.
+
+    ACTIVE tenants only (shared.tenant_status): a held tenant's backfill stays
+    pending, and its source is never paged with its credentials."""
     async with get_pool().acquire() as conn, conn.transaction():
         row = await conn.fetchrow(
-            """
+            f"""
             SELECT customer_id, source_system
             FROM backfill_state
             WHERE status = 'pending'
+              AND {active_tenant_sql("backfill_state.customer_id")}
             ORDER BY customer_id, source_system
             FOR UPDATE SKIP LOCKED
             LIMIT 1

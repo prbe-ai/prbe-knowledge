@@ -44,6 +44,7 @@ from engine.shared.constants import NodeLabel
 from engine.shared.db import get_pool, with_tenant
 from engine.shared.logging import get_logger
 from engine.shared.metrics import counter, gauge
+from engine.shared.tenant_status import active_tenant_sql
 
 log = get_logger(__name__)
 
@@ -95,15 +96,19 @@ class InferredEdgesWorker:
             await self._process(claimed)
 
     async def _claim_one(self) -> asyncpg.Record | None:
-        """Atomically claim one pending row via FOR UPDATE SKIP LOCKED."""
+        """Atomically claim one pending row via FOR UPDATE SKIP LOCKED.
+
+        Only an ACTIVE tenant's rows (shared.tenant_status); a held tenant's
+        stay queued until its purge cascades them."""
         async with get_pool().acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
-                """
+                f"""
                 SELECT id, customer_id, anchor_doc_id, extractor_id, attempts
                 FROM inferred_edges_queue
                 WHERE processing_started_at IS NULL
                   AND done_at IS NULL
                   AND attempts < $1
+                  AND {active_tenant_sql("inferred_edges_queue.customer_id")}
                 ORDER BY enqueued_at ASC
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1

@@ -30,6 +30,7 @@ from engine.community.leiden import MIN_EDGES_FOR_LEIDEN, run_leiden_for_tenant
 from engine.shared.config import get_settings
 from engine.shared.db import close_pool, init_pool, with_tenant
 from engine.shared.logging import configure_logging, get_logger
+from engine.shared.tenant_status import ACTIVE_TENANTS_SQL
 
 log = get_logger(__name__)
 
@@ -111,7 +112,7 @@ def main() -> int:
             await _ip(_gs())
             try:
                 async with _rc() as c:
-                    rows = await c.fetch("SELECT customer_id FROM customers ORDER BY customer_id")
+                    rows = await c.fetch(ACTIVE_TENANTS_SQL)
                     return [r["customer_id"] for r in rows]
             finally:
                 await _cp()

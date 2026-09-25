@@ -42,6 +42,7 @@ from engine.shared.constants import IntegrationStatus, SourceSystem
 from engine.shared.db import get_pool
 from engine.shared.encryption import decrypt_token, encrypt_token
 from engine.shared.models import IntegrationToken
+from engine.shared.tenant_status import active_tenant_sql
 
 
 async def save_token(token: IntegrationToken) -> None:
@@ -193,16 +194,18 @@ async def list_tokens_expiring_within(
     """Return (customer_id, source_system) for *singleton* tokens expiring soon.
 
     Device-scoped rows are excluded; device tokens don't have OAuth-style expiry.
+    So are a held tenant's (shared.tenant_status): its grant is left to lapse.
     """
     async with get_pool().acquire() as conn:
         rows = await conn.fetch(
-            """
+            f"""
             SELECT customer_id, source_system
             FROM integration_tokens
             WHERE status = 'active'
               AND device_id IS NULL
               AND expires_at IS NOT NULL
               AND expires_at <= $1
+              AND {active_tenant_sql("integration_tokens.customer_id")}
             ORDER BY expires_at ASC
             """,
             window,

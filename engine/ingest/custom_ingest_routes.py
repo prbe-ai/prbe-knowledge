@@ -46,6 +46,7 @@ from engine.shared.exceptions import PrbeError
 from engine.shared.logging import bind_trace, get_logger
 from engine.shared.source_registry import ingestion_priority_for
 from engine.shared.storage import get_store
+from engine.shared.tenant_status import refusal_for
 from engine.system_settings import get_ingestion_killswitch
 
 router = APIRouter()
@@ -106,6 +107,13 @@ async def custom_ingest_documents(
             },
             headers={"Retry-After": "300"},
         )
+
+    # A held (terminated) tenant takes no new writes. 409, not 5xx: it is
+    # permanent, and research-os's relay dead-letters a 4xx row at once
+    # rather than retrying it (shared.tenant_status).
+    if (refusal := await refusal_for(customer_id)) is not None:
+        log.info("custom_ingest.tenant_not_active", customer=customer_id, **refusal)
+        raise HTTPException(status_code=409, detail=refusal)
 
     trace_id = await redact_payload_async(x_trace_id or f"custom-ingest-{int(datetime.now().timestamp() * 1000)}")
     bind_trace(trace_id)

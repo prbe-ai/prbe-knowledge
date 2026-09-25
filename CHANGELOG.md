@@ -8,6 +8,20 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Fixed
 
+- **A tenant that is not active is held, not processed.** research-os keeps a terminated team's
+  data for a hold before purging it, marking its kb `customers.status` `'terminated'` (then
+  `'deleted'`), and the engine never looked: the idle-session sweep enumerated every
+  `customers` row and re-mined held sessions with a paid model, and the ingestion queue claimed
+  any pending row. Now only `'active'` tenants are processed, everywhere work starts: the idle
+  sweep and its partial-pass retry, the ingestion, post-write, inferred-edge and backfill
+  claims, the GitHub control worker, both pollers, Leiden, token refresh and health checks,
+  and the all-tenant backfill scripts. A held tenant's queued rows stay pending, untouched,
+  until its purge cascades them; the published queue age no longer counts them. The ingest
+  doors (custom ingest, every webhook including session batches, manual upload) refuse a
+  held tenant's write with `409 {"reason": "tenant_not_active", "status": ...}`; research-os's
+  relay dead-letters such a row at once rather than retrying it. Purge, retention and index
+  maintenance still reach every tenant. `tests/test_inactive_tenants.py`.
+
 - **A transcript holding one value too deeply encoded to scan is captured again.** The ingest
   scrubber refuses text percent-encoded more than four levels deep, and that refusal failed the
   whole request with a 500, which clients retry forever: every later batch of the session queued

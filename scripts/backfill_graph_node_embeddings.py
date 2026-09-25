@@ -38,6 +38,7 @@ from engine.shared.config import get_settings
 from engine.shared.db import close_pool, init_pool
 from engine.shared.embeddings import DocItem, get_embedder_v2
 from engine.shared.logging import configure_logging, get_logger
+from engine.shared.tenant_status import active_tenant_sql
 
 log = get_logger(__name__)
 
@@ -79,10 +80,11 @@ async def _fetch_batch(
             batch_size,
         )
     return await conn.fetch(
-        """
+        f"""
         SELECT node_id, customer_id, label, canonical_id, properties
         FROM graph_nodes
         WHERE embedding IS NULL
+          AND {active_tenant_sql("graph_nodes.customer_id")}
         ORDER BY node_id
         LIMIT $1
         """,

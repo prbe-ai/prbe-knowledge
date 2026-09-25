@@ -64,6 +64,7 @@ from engine.shared.models import (
     Permission,
     PrincipalType,
 )
+from engine.shared.tenant_status import active_tenant_sql
 
 log = get_logger(__name__)
 
@@ -133,10 +134,12 @@ async def _list_live_agent_docs(
             source_system.value,
             DocType.CLAUDE_CODE_SESSION.value,
         ]
+        # ACTIVE tenants only: a held tenant's sessions are not re-embedded.
         where = (
             "source_system = $1 "
             "AND doc_type = $2 "
-            "AND valid_to IS NULL"
+            "AND valid_to IS NULL "
+            f"AND {active_tenant_sql('documents.customer_id')}"
         )
         if customer:
             params.append(customer)
