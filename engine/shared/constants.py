@@ -1928,58 +1928,6 @@ GRANOLA_REQUEST_INTERVAL_SECONDS = 0.25
 GRANOLA_REFRESH_DEBOUNCE_SECONDS = 30
 
 
-# Workflow-memory situation classifier, tie-break leg only. The classifier is
-# embedding-first and reaches a model ONLY when the top two situations score
-# within MARGIN of each other, so this is a rare call on a sub-second serving
-# path -- which is the argument for a flash-class model. The task is a
-# shortlist pick from 2-3 supplied options with a permitted "none": if this is
-# ever swapped, the thing to re-check is whether the replacement still answers
-# "none" honestly rather than always choosing from the menu, because a model
-# that never abstains turns off the `unknown` escape hatch without changing a
-# line of our code.
-WFMEM_CLASSIFIER_TIEBREAK_MODEL = "gemini/gemini-3.5-flash"
-
-# Workflow-memory structuring pass: declared prose -> a clause draft. This
-# rewrites free prose into a typed record ONCE per `/set-rule`, with a human
-# sitting there waiting for the echo, so cost and latency are not the binding
-# constraints -- volume is orders of magnitude lower than the tie-break above
-# and the flow is gated on a confirmation anyway. What IS binding is restraint:
-# the draft's `body` becomes authoritative only because the author recognises
-# their own rule in it, so the model has to rewrite conservatively and leave
-# `binding` empty rather than inventing a plausible script path. A polished
-# invention here is not caught downstream -- people approve what looks right.
-#
-# THIS WAS `anthropic/claude-sonnet-4-6` AND IT NEVER WORKED IN PRODUCTION.
-# Every `/procedures/preview` and `/procedures/declare` 502'd from the day the
-# feature shipped: the research-os cluster's LiteLLM gateway serves Fireworks,
-# Cerebras and `gemini-*` and NO Anthropic deployment at all, and that engine
-# has no ANTHROPIC_API_KEY to go direct with. Both spellings fail and they fail
-# differently -- the prefixed id 404s (an Anthropic-native request to an
-# OpenAI-shaped proxy) and the bare id gets "no healthy deployments for this
-# model" -- which is why the comment claiming a `claude-*` modelList entry was
-# believable: that entry exists on the PRBE-BACKEND proxy, a different
-# deployment. Checked against the live gateway, not inferred.
-#
-# So the constant now names a model that is actually reachable, and the reuse
-# check before picking a replacement is `GET <LLM_GATEWAY_URL>/models`, not the
-# constants in this file.
-#
-# The cost is real and worth stating: this is flash-class, and the original
-# note argued against exactly that, on the grounds that following a "do not add
-# anything the person did not say" instruction under pressure to be helpful is
-# where a frontier model earns its price. That tradeoff was accepted
-# deliberately (2026-08-20) to get the write path working, with the gateway
-# change tracked as follow-up -- and this is env-overridable, per the
-# SEARCH_AGENT_INFERENCE_MODEL convention, so restoring a frontier model once
-# the gateway serves one is a values change rather than a release.
-#
-# Whatever it is swapped to, re-check that the replacement still refuses to
-# embellish. That failure is invisible in the response shape.
-WFMEM_STRUCTURING_MODEL = os.getenv(
-    "WFMEM_STRUCTURING_MODEL",
-    "gemini/gemini-3.6-flash",
-)
-
 # --- DB pool init backoff ---------------------------------------------------
 # Connect-with-backoff knobs for shared.db.init_pool, kept here per the
 # RRF_K / RRF_BREADTH_ALPHA tuning-knob convention (feedback_prbe_knowledge_
