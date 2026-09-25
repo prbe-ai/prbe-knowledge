@@ -651,6 +651,36 @@ async def test_legal_hold_refuses_and_is_rechecked_at_execution(env) -> None:
     assert await snapshot(a) == before
 
 
+@pytest.mark.asyncio
+async def test_a_hold_placed_mid_run_stops_the_next_destructive_step(env, monkeypatch) -> None:
+    """The run checked the hold when it started. A hold placed while it waits
+    out a pass in flight must stop the second sweep: the object that pass
+    wrote meanwhile is evidence now, and stays."""
+    (a, _b), store = env
+    sid = _sid()
+    await v2_session(a, sid)
+    async with db_module.raw_conn() as conn:
+        await conn.execute("UPDATE ingestion_queue SET status = 'processing' WHERE customer_id = $1", a)
+    bucket = await store.bucket_for(a)
+    late = f"raw/{CC.value}/{a}/{sid}/extraction-cache/{'e' * 64}.json"
+
+    async def hold_placed_while_waiting(seconds: float) -> None:
+        await store.put(bucket, late, b"{}")
+        async with db_module.raw_conn() as conn:
+            await conn.execute(
+                "UPDATE customers SET metadata = '{\"legal_hold\": \"case-7\"}' WHERE customer_id = $1", a
+            )
+
+    monkeypatch.setattr(sd, "_wait_for_in_flight", hold_placed_while_waiting)
+    outcome = (await delete(a, [sid]))["sessions"][f"claude_code:{sid}"]
+
+    assert not outcome.get("verified")
+    assert await store.exists(bucket, late)
+    async with db_module.with_tenant(a) as conn:
+        row = await conn.fetchrow("SELECT status, error FROM session_deletions")
+    assert row["status"] == "held" and "case-7" in row["error"]
+
+
 @pytest.mark.parametrize("value", ["false", "null", '""'])
 @pytest.mark.asyncio
 async def test_a_cleared_hold_is_not_a_hold(env, value) -> None:

@@ -274,10 +274,22 @@ async def legal_hold(customer_id: str) -> str | None:
         )
     if row is None:
         raise SessionDeletionError(404, f"unknown customer {customer_id!r}")
-    hold: str | None = row["hold"]
+    return _as_hold(row["hold"])
+
+
+def _as_hold(hold: str | None) -> str | None:
     if hold is None or hold.strip().lower() in ("", "false", "null"):
         return None
     return hold
+
+
+class _HoldPlaced(Exception):
+    """A legal hold appeared while the run was under way: stop before the next
+    destructive step. The key journal is kept; /resume finishes once released."""
+
+    def __init__(self, hold: str) -> None:
+        super().__init__(hold)
+        self.hold = hold
 
 
 def _held(hold: str) -> SessionDeletionError:
@@ -814,6 +826,14 @@ async def _journal_and_delete_rows(
     that pointed at them are gone."""
     async with with_tenant(customer_id) as conn:
         await lock_session(conn, customer_id, ref.source, ref.session_id)
+        # Re-read under the lock: the run's first check can be minutes old (a
+        # wait on this lock, the in-flight grace), and a hold placed since must
+        # stop the rows going.
+        hold = _as_hold(await conn.fetchval(
+            "SELECT metadata->>'legal_hold' FROM customers WHERE customer_id = $1", customer_id
+        ))
+        if hold is not None:
+            raise _HoldPlaced(hold)
         inv = await inventory(
             conn, customer_id, ref, with_counts=False, known_doc_ids=known_doc_ids
         )
@@ -926,6 +946,9 @@ async def erase_session(
             in_flight_seen = in_flight_seen or in_flight
             for table, n in deleted.items():
                 result["rows_deleted"][table] = result["rows_deleted"].get(table, 0) + n
+            hold = await legal_hold(customer_id)
+            if hold is not None:
+                raise _HoldPlaced(hold)
             n, failed, r2_left = await _delete_objects(
                 store, bucket, customer_id, ref, sorted(set(keys) | (deep_keys or set()))
             )
@@ -950,6 +973,9 @@ async def erase_session(
         status = "done" if result["verified"] else "failed"
         if not result["verified"]:
             error = "residue remains; re-run the deletion"
+        return result
+    except _HoldPlaced as exc:
+        status, error = "held", f"legal hold: {exc.hold}"
         return result
     except asyncio.CancelledError:
         # Shutdown mid-run. The row keeps its key journal; a re-POST resumes.
@@ -1081,7 +1107,8 @@ async def run_deletion(
     persons = 0
     if person_ids:
         with contextlib.suppress(Exception):
-            persons = await remove_orphaned_persons(customer_id, person_ids)
+            if await legal_hold(customer_id) is None:
+                persons = await remove_orphaned_persons(customer_id, person_ids)
     return {"sessions": outcomes, "person_nodes_deleted": persons}
 
 
