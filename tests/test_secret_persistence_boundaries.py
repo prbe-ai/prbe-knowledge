@@ -416,3 +416,63 @@ async def test_one_encoded_finding_costs_its_line_not_the_whole_body(monkeypatch
     assert "Harbor7" not in joined
     # And only the encoded credential's own line was given up for it.
     assert stored.count("<redacted>") <= 2
+
+
+def _too_deep(text: str = "curl https://example.test/?q=a b", levels: int = 6) -> str:
+    """Text percent-encoded more levels deep than the scrubber will inspect."""
+    from urllib.parse import quote
+
+    for _ in range(levels):
+        text = quote(text)
+    return text
+
+
+def test_the_fixture_is_deeper_than_the_scrubber_inspects():
+    from engine.ingest._credential_redaction import default_scrub
+
+    with pytest.raises(ValueError, match="nesting limit"):
+        default_scrub({"text": _too_deep()})
+
+
+def test_a_value_too_deep_to_inspect_costs_only_itself():
+    """It failed the whole ingest request with a 500, retried forever by the tap:
+    every later batch of that session queued behind it, uncaptured."""
+    from engine.ingest.payload_redaction import redact_payload
+
+    token = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+    payload = {
+        "session_id": "s1",
+        "events": [
+            {"line_no": 0, "raw": {"message": {"content": _too_deep()}}},
+            {"line_no": 1, "raw": {"message": {"content": "plain words stay"}}},
+            {"line_no": 2, "raw": {"message": {"content": f"token {token}"}}},
+        ],
+    }
+    clean = redact_payload(payload)
+    assert clean["session_id"] == "s1"
+    assert clean["events"][0]["raw"]["message"]["content"] == "<redacted>"
+    assert clean["events"][1]["raw"]["message"]["content"] == "plain words stay"
+    assert token not in json.dumps(clean)
+
+
+def test_a_too_deep_line_costs_only_its_line():
+    from engine.ingest.payload_redaction import redact_payload, redact_texts
+
+    text = "first line\n" + _too_deep() + "\nlast line"
+    assert redact_payload({"body": text})["body"] == "first line\n<redacted>\nlast line"
+    assert redact_texts([text]) == ["first line\n<redacted>\nlast line"]
+
+
+def test_a_too_deep_key_is_replaced_and_its_value_kept():
+    from engine.ingest.payload_redaction import redact_payload
+
+    clean = redact_payload({_too_deep(): "value", "other": 1})
+    assert clean == {"<redacted>": "value", "other": 1}
+
+
+def test_a_credential_container_is_still_dropped_whole():
+    """The fallback walks only what `default_scrub` would have walked."""
+    from engine.ingest.payload_redaction import redact_payload
+
+    clean = redact_payload({"credentials": {"note": _too_deep()}, "text": _too_deep()})
+    assert clean == {"credentials": "<redacted>", "text": "<redacted>"}
