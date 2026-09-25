@@ -26,6 +26,19 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   there, look for a long-lived transaction (see the migration). The research-os chart
   schedules the job daily.
 
+- **Captured sessions can be deleted one at a time, or all of one person's.** `POST
+  /api/session-deletions` (internal key, tenant from `X-Prbe-Customer`) takes `session_ids` or
+  an `author` (`employee_id` and/or `email`), is a dry run unless `dry_run: false`, and then
+  returns a `deletion_id` to follow at `GET /api/session-deletions/{deletion_id}`. It removes
+  every document version, unit, chunk, graph node and edge, queue, receipt and event row of the
+  session, and every raw object: the `sessions-v2/` batches, the idle-sweep marker and extraction
+  cache, and the date-foldered protocol-1 batches, found through the rows that name them and
+  journaled before those rows go. A deleted session is recorded in the new `session_deletions`
+  table (migration 0140), and every writer of a session (both ingest doors, the idle sweep, the
+  worker's write) checks it under the session's lock: a re-upload is refused with `410
+  session_deleted`, and a worker mid-pass cannot write it back. A tenant under
+  `metadata.legal_hold` is refused with 423, re-checked when the run executes.
+
 ### Fixed
 
 - **A tenant that is not active is held, not processed.** research-os keeps a terminated team's

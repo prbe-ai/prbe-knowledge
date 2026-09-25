@@ -82,6 +82,7 @@ from kb.feature_nodes_routes import router as feature_nodes_router
 from kb.github_control_routes import router as github_control_router
 from kb.internal_devices import router as devices_router
 from kb.purge_routes import router as purge_router
+from kb.session_deletion import router as session_deletion_router
 from kb.session_receipts import router as session_receipts_router
 from kb.slack_lifecycle import handle_slack_lifecycle_event
 from kb.stats_routes import router as stats_router
@@ -128,6 +129,7 @@ app.include_router(feature_nodes_router)
 app.include_router(devices_router)
 app.include_router(custom_ingest_router)
 app.include_router(session_receipts_router)
+app.include_router(session_deletion_router)
 
 
 @app.get("/health")
