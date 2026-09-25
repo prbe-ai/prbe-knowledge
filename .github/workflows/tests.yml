@@ -176,6 +176,7 @@ jobs:
           tests/test_session_coalescing.py
           tests/test_claude_code_finalize_e2e.py
           tests/test_claude_code_extraction.py
+          tests/test_extraction_segment_cache.py
           tests/handlers/test_claude_code_parse_webhook_event.py
           tests/handlers/test_claude_code_fetch_supplementary.py
           tests/handlers/test_claude_code_normalize.py

@@ -751,14 +751,25 @@ async def test_every_mining_pass_logs_what_it_cost(monkeypatch) -> None:
 
     ext_mod = cc_mod._ext
 
+    handle = object()
+    received = {}
+
+    async def for_session(**kwargs):
+        received["for_session"] = kwargs
+        return handle
+
     async def mined(**kwargs):
+        received["cache"] = kwargs.get("cache")
         return ext_mod.UnitBundle(
             segments=2,
             calls=3,
+            cache_hits=1,
+            supersede_cached=True,
             segment_hashes=["aaaa", "bbbb"],
             qa=[ext_mod.QA(prompt="p", outcome="o")],
         )
 
+    monkeypatch.setattr(cc_mod._ext_cache.SegmentCache, "for_session", for_session)
     monkeypatch.setattr(cc_mod._ext, "extract_units_from_session", mined)
     with structlog.testing.capture_logs() as logs:
         await ClaudeCodeConnector(make_default_context()).normalize(
@@ -778,6 +789,11 @@ async def test_every_mining_pass_logs_what_it_cost(monkeypatch) -> None:
     )
     assert line["segment_hashes"] == ["aaaa", "bbbb"] and line["authoritative"] is True
     assert line["protocol_version"] == 1 and line["source"] == "claude_code"
+    # The session's cache handle reaches extraction, and what it saved is logged.
+    assert received["cache"] is handle
+    assert received["for_session"]["session_id"] == "s-log"
+    assert received["for_session"]["source"] == "claude_code"
+    assert (line["cache_hits"], line["supersede_cached"]) == (1, True)
 
 
 @pytest.mark.asyncio

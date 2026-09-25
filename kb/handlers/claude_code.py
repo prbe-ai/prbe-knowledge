@@ -31,6 +31,7 @@ import orjson
 from engine.ingest.handlers.base import Connector
 from engine.ingest.handlers.registry import register_connector
 from engine.shared import claude_code_extraction as _ext
+from engine.shared import extraction_cache as _ext_cache
 from engine.shared import session_signals as _signals
 from engine.shared.config import get_settings
 from engine.shared.constants import (
@@ -665,11 +666,19 @@ class ClaudeCodeConnector(Connector):
                 ),
             )
 
+        # A segment this session already mined, unchanged, is answered from
+        # its cache instead of the model (engine/shared/extraction_cache.py).
+        cache = await _ext_cache.SegmentCache.for_session(
+            customer_id=event.customer_id,
+            source=self.source_system.value,
+            session_id=session_id,
+        )
         bundle = await _ext.extract_units_from_session(
             session_id=session_id,
             events=events,
             cwd=cwd,
             agent=self._agent_label,
+            cache=cache,
         )
         # One line per mining pass: the only record of what a pass cost and
         # why it ran. `segment_hashes` repeat across passes of one session
@@ -685,6 +694,8 @@ class ClaudeCodeConnector(Connector):
             events=len(events),
             segments=bundle.segments,
             calls=bundle.calls,
+            cache_hits=bundle.cache_hits,
+            supersede_cached=bundle.supersede_cached,
             authoritative=bundle.authoritative,
             problems=sorted(set(bundle.problems)),
             units=len(_ext.all_units(bundle)),
