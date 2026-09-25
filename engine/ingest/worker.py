@@ -40,6 +40,8 @@ from engine.shared.logging import bind_trace, get_logger
 from engine.shared.session_suppression import (
     SessionDeleted,
     is_session_deleted,
+    reopen_deletion,
+    session_of_event_id,
     sweep_session_folders,
 )
 from engine.shared.storage import get_store
@@ -399,6 +401,7 @@ class Worker:
                         str(exc), captured_version,
                     )
                 except PrbeError as exc:
+                    await self._sweep_if_deleted(customer_id, source, event_id)
                     await self._fail_batch_row(
                         queue_id, attempts, str(exc), source, customer_id, event_id,
                         transient=getattr(exc, "transient", False),
@@ -406,6 +409,7 @@ class Worker:
                     )
                 except Exception as exc:  # pragma: no cover — last-resort
                     log.exception("worker.batch_normalize_unhandled", queue_id=queue_id)
+                    await self._sweep_if_deleted(customer_id, source, event_id)
                     await self._fail_batch_row(
                         queue_id, attempts, repr(exc), source, customer_id, event_id,
                         transient=True, captured_version=captured_version,
@@ -430,6 +434,9 @@ class Worker:
             except PrbeError as exc:
                 if isinstance(exc, SessionDeleted):
                     await self._sweep_deleted(exc)
+                else:
+                    for row, _ in normalized:
+                        await self._sweep_if_deleted(customer_id, source, row["source_event_id"])
                 transient = getattr(exc, "transient", False)
                 for row, _ in normalized:
                     await self._fail_batch_row(
@@ -440,6 +447,8 @@ class Worker:
                 return
             except Exception as exc:  # pragma: no cover
                 log.exception("worker.batch_persist_unhandled", customer=customer_id)
+                for row, _ in normalized:
+                    await self._sweep_if_deleted(customer_id, source, row["source_event_id"])
                 for row, _ in normalized:
                     await self._fail_batch_row(
                         row["queue_id"], row["attempts"] + 1, repr(exc),
@@ -494,7 +503,13 @@ class Worker:
     @staticmethod
     async def _sweep_deleted(exc: SessionDeleted) -> None:
         """This pass may have saved extraction-cache answers for a session that
-        was deleted while it ran, after the deletion's last sweep. Remove them."""
+        was deleted while it ran, after the deletion's last sweep. Remove them.
+
+        The worker is the last writer and nothing sweeps after it, so a sweep
+        that does not finish re-opens the deletion for /resume rather than
+        leaving the objects behind a `done` status.
+        """
+        why = None
         try:
             removed, failed = await sweep_session_folders(get_store(), exc)
             log.info(
@@ -505,8 +520,33 @@ class Worker:
                 objects=removed,
                 failed=failed,
             )
-        except Exception:
+            if failed:
+                why = f"{failed} late extraction-cache object(s) not deleted; resume the deletion"
+        except Exception as err:
             log.warning("worker.deleted_session_sweep_failed", exc_info=True)
+            why = f"late sweep failed ({type(err).__name__}); resume the deletion"
+        if why is not None:
+            try:
+                await reopen_deletion(exc, why)
+            except Exception:
+                log.warning("worker.deleted_session_reopen_failed", exc_info=True)
+
+    async def _sweep_if_deleted(
+        self, customer_id: str, source: SourceSystem, event_id: str
+    ) -> None:
+        """A pass that FAILED for another reason (an extraction or embedding
+        error, a cancelled pod) never reaches the write fence, yet may have
+        saved extraction-cache answers for a session deleted while it ran.
+        Its queue row is gone, so nothing retries it: sweep now."""
+        if await self._deleted_session(customer_id, source, event_id):
+            await self._sweep_deleted(
+                SessionDeleted(
+                    "session deleted during a failed pass",
+                    customer_id=customer_id,
+                    source=source.value,
+                    session_ids={session_of_event_id(event_id)},
+                )
+            )
 
     async def _fail_batch_row(
         self,
@@ -610,6 +650,7 @@ class Worker:
                 captured_version,
             )
         except PrbeError as exc:
+            await self._sweep_if_deleted(customer_id, source, event_id)
             transient = getattr(exc, "transient", False)
             dead = await self._on_error(
                 queue_id,
@@ -628,6 +669,7 @@ class Worker:
             # Anything that should permanently DLQ on first try must raise a
             # PrbeError subclass with `transient = False`.
             log.exception("worker.unhandled", queue_id=queue_id)
+            await self._sweep_if_deleted(customer_id, source, event_id)
             error = repr(exc)
             dead = await self._on_error(
                 queue_id,

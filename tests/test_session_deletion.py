@@ -1182,3 +1182,90 @@ async def test_the_inferred_edges_worker_cannot_write_back_a_session_deleted_mid
             "SELECT count(*) FROM graph_edges WHERE properties->>'why' = 'quoted from the transcript'"
         ) == 0
     assert await session_rows(a, sid) == {}
+
+
+async def _claimed_unmined_session(customer: str) -> tuple[str, dict]:
+    """A session uploaded and claimed by a worker, not yet mined."""
+    store = get_store()
+    sid = _sid()
+    for payload in _v2_batches(sid, ALICE, ALICE_EMAIL):
+        await sr.accept(payload, customer, CC, store)
+    async with db_module.raw_conn() as conn:
+        await conn.execute(
+            "UPDATE ingestion_queue SET status = 'processing' WHERE customer_id = $1", customer
+        )
+        row = await conn.fetchrow("SELECT * FROM ingestion_queue WHERE customer_id = $1", customer)
+    return sid, row
+
+
+@pytest.mark.asyncio
+async def test_a_pass_that_fails_after_the_deletion_still_cleans_up(env, monkeypatch) -> None:
+    """The pass saved a cache answer after the deletion's last sweep, then
+    failed (a model outage) before it reached the write fence. Its queue row
+    is gone, so nothing would ever retry it: it sweeps on the way out."""
+    from engine.ingest.worker import Worker
+
+    (a, _b), store = env
+    sid, row = await _claimed_unmined_session(a)
+    bucket = await store.bucket_for(a)
+    late = f"raw/{CC.value}/{a}/{sid}/extraction-cache/{'f' * 64}.json"
+
+    async def deleted_then_the_model_fails(*, session_id, events, cwd=None, agent="claude_code",
+                                           cache=None):
+        await delete(a, [sid])
+        await store.put(bucket, late, b"{}")
+        raise RuntimeError("model outage")
+
+    monkeypatch.setattr("kb.handlers.claude_code._ext.extract_units_from_session",
+                        deleted_then_the_model_fails)
+    monkeypatch.setattr(sd, "_wait_for_in_flight", _no_wait)
+    ctx = make_default_context()
+    try:
+        await Worker(ctx)._process(row)
+    finally:
+        await ctx.http.aclose()
+
+    assert not await store.exists(bucket, late)
+
+
+@pytest.mark.asyncio
+async def test_a_late_sweep_that_fails_reopens_the_deletion(env, monkeypatch) -> None:
+    """The worker's sweep is the last one. If it cannot delete what the pass
+    left, the deletion must stop reading `done`, and /resume must finish it."""
+    from engine.ingest.worker import Worker
+
+    (a, _b), store = env
+    sid, row = await _claimed_unmined_session(a)
+    bucket = await store.bucket_for(a)
+    late = f"raw/{CC.value}/{a}/{sid}/extraction-cache/{'9' * 64}.json"
+
+    async def deleted_during_extraction(*, session_id, events, cwd=None, agent="claude_code",
+                                        cache=None):
+        await delete(a, [sid])
+        await store.put(bucket, late, b"{}")
+        return ext.UnitBundle(qa=[ext.QA(prompt="p", outcome="o", tags=[])])
+
+    real = type(store).delete_keys
+
+    async def late_fails(self, bucket, keys):
+        deleted, failed = await real(self, bucket, [k for k in keys if k != late])
+        return deleted, failed + ([late] if late in keys else [])
+
+    monkeypatch.setattr("kb.handlers.claude_code._ext.extract_units_from_session",
+                        deleted_during_extraction)
+    monkeypatch.setattr(sd, "_wait_for_in_flight", _no_wait)
+    monkeypatch.setattr(type(store), "delete_keys", late_fails)
+    ctx = make_default_context()
+    try:
+        await Worker(ctx)._process(row)
+    finally:
+        await ctx.http.aclose()
+    async with db_module.with_tenant(a) as conn:
+        status, error = await conn.fetchrow("SELECT status, error FROM session_deletions")
+    assert status == "failed" and "resume" in error
+    assert await store.exists(bucket, late)
+
+    monkeypatch.setattr(type(store), "delete_keys", real)
+    outcome = await sd.erase_session(a, sd.SessionRef(CC.value, sid), grace_s=0)
+    assert outcome["verified"], outcome
+    assert not await store.exists(bucket, late)

@@ -233,6 +233,22 @@ async def own_folder_keys(store: Any, bucket: str, folder: str) -> list[str]:
     return [k for k in await store.list_keys(bucket, folder) if is_own_folder_key(k, folder)]
 
 
+async def reopen_deletion(exc: SessionDeleted, why: str) -> None:
+    """A late sweep did not finish: mark the recorded deletion `failed` so its
+    status says so and /resume sweeps again. Nothing else would -- the queue
+    row is gone and the deletion itself may already read `done`."""
+    async with with_tenant(exc.customer_id) as conn:
+        await conn.execute(
+            "UPDATE session_deletions SET status = 'failed', error = $4 "
+            "WHERE customer_id = $1 AND source_system = $2 "
+            "AND session_id = ANY($3::text[]) AND status <> 'held'",
+            exc.customer_id,
+            exc.source,
+            sorted(exc.session_ids),
+            why[:2000],
+        )
+
+
 async def sweep_session_folders(store: Any, exc: SessionDeleted) -> tuple[int, int]:
     """Delete each refused session's own objects under
     `raw/<src>/<customer>/<session>/`. Returns (deleted, failed).
