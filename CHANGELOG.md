@@ -90,6 +90,17 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   This is the Jev-ranking stage only: the RRF fuse behind the gatherer render and the
   recall-floor top-up keeps its own per-source `score_multiplier` (claude_code 0.5, code graph 0.3).
 
+### Removed
+- **Workflow memory (team rules) is gone from the engine.** The feature was never finished, and
+  research-os has removed every caller (`probe rule`, the `probe_procedures` MCP tool and its
+  `/v1/procedures/*` proxy). The `/procedures/{preview,declare,publish,query}` routes now answer
+  404, and `engine/shared/wfmem/` (structuring, classifier, declaring, serving, visibility, secret
+  scan, capabilities) and the `WFMEM_*` model constants are deleted with their tests. The tables
+  (`situations`, `clauses`, `clause_situation_edges`, `clause_evidence`, `serve_ledger`), their
+  migrations and the rows already stored are kept on purpose; dropping them is a separate
+  decision. `test_workflow_memory_isolation.py` stays on the CI list because it guards tenant
+  isolation on those kept tables.
+
 ### Fixed
 
 - The server-side credential scrub of ingested content (`engine/ingest/_credential_*.py`,

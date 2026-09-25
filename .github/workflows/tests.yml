@@ -211,20 +211,17 @@ jobs:
       # every PR red. This gate covers the object-store backend + blob/upload paths -- the
       # area #460 touched -- and can widen as the rest of the suite is repaired.
       #
-      # The ten `test_workflow_memory_*.py` files are on this list deliberately,
-      # and the reason is one this gate keeps re-learning: a hand-picked file
-      # list means new work ships with a green check and untested code unless
-      # somebody remembers this step. It happened with the wiki routes, and
-      # again with PR #476, whose `pytest` check went green without running a
-      # single one of the tests it added.
+      # A hand-picked file list means new work ships with a green check and
+      # untested code unless somebody remembers this step. It happened with the
+      # wiki routes, and again with PR #476, whose `pytest` check went green
+      # without running a single one of the tests it added.
       #
-      # Workflow memory is the whole procedure store -- tenant isolation on five
-      # tables, the RLS policies, the secret-scan-at-ingest guard, the
-      # single-author visibility rule, and the serve ledger. Every one of those
-      # is a security property whose failure is SILENT: a cross-tenant read
-      # returns rows, a missing scan stores a credential, a dropped visibility
-      # predicate publishes somebody's private note. None of them raise. The
-      # tests are the only thing that notices, so they have to actually run.
+      # `test_workflow_memory_isolation.py` stays although the workflow-memory
+      # feature and its endpoints are gone: its five tables and their stored
+      # rows are kept (dropping them is a separate decision), and this file is
+      # what proves tenant isolation, the RLS policies and the serve ledger's
+      # append-only rule still hold on them. A cross-tenant read returns rows
+      # rather than raising, so only the test notices.
       #
       # `tests/retrieval/agent/` is on the list for the same reason and costs
       # nothing: 273 tests, ~1.2s, no Postgres and no MinIO -- the LLM is
@@ -233,11 +230,6 @@ jobs:
       # schema drift and a user losing their whole answer (the enforcement it
       # replaced went away with the Cerebras swap, PR #320). A silent
       # regression there degrades every search and raises no error.
-      #
-      # They need Postgres (already provisioned above) and nothing else -- the
-      # embedder and both model calls are stubs, because conftest blanks the
-      # provider keys. The classifier's real-accuracy block skips itself without
-      # a key rather than failing.
       #
       # The vector-channel SQL-shape files (test_ann_order_by_shape,
       # test_vector_per_source_ann*, test_vector_recency_pool) pin the ORDER BY
@@ -267,7 +259,7 @@ jobs:
       # NEVER put a `#` comment INSIDE the folded `run: >-`
       # scalar below: YAML folds it into one line and the first `#` comments
       # out every path after it -- CI stays green and runs none of them.
-      - name: Tests (storage + workflow-memory suites)
+      - name: Tests (storage + workflow-memory isolation suites)
         run: >-
           .venv/bin/pytest -q
           tests/test_github_installation_controls.py
@@ -276,16 +268,7 @@ jobs:
           tests/handlers/test_github.py
           tests/test_backend_client.py
           tests/test_codegraph_github_branch_filter.py
-          tests/test_workflow_memory_capabilities.py
-          tests/test_workflow_memory_classifier.py
-          tests/test_workflow_memory_declaring.py
-          tests/test_workflow_memory_endpoints.py
           tests/test_workflow_memory_isolation.py
-          tests/test_workflow_memory_publication.py
-          tests/test_workflow_memory_secret_scan.py
-          tests/test_workflow_memory_serving.py
-          tests/test_workflow_memory_structuring.py
-          tests/test_workflow_memory_visibility.py
           tests/test_object_store_s3.py
           tests/test_storage_list_keys.py
           tests/test_persist_trace_blob_r2.py
