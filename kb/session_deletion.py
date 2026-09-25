@@ -102,7 +102,13 @@ from engine.shared.constants import (
 from engine.shared.db import raw_conn, with_tenant
 from engine.shared.exceptions import StorageNotFound, StorageUnavailable
 from engine.shared.session_signals import is_cron_marker_key, storage_id
-from engine.shared.session_suppression import lock_session
+from engine.shared.session_suppression import (
+    LEGACY_EVENT_SUFFIX_SQL,
+    lock_session,
+    own_folder_keys,
+    session_folder,
+    session_of_event_id,
+)
 from engine.shared.storage import get_store
 from kb.admin_routes import verify_internal_knowledge_key
 
@@ -118,10 +124,12 @@ AGENT_SOURCES: tuple[str, ...] = tuple(s.value for s in AGENT_SESSION_SOURCES)
 
 #: research-os's session-id shape (app/runs/agent_session.py) minus `:`. It is
 #: what makes the raw prefixes below safe to delete under: no `/`, nothing short
-#: enough to be a date folder. `:` is refused because `<id>:` is how a
-#: session's children are matched (unit documents `<id>:<kind>:<n>`, pre-0026
-#: queue rows `<id>:<batch>`); deleting `X` must not take a session named `X:y`.
-#: Agents' session ids are UUIDs.
+#: enough to be a date folder. `:` is refused because a deletion by id must name
+#: a session, never a unit (`<id>:<kind>:<n>`) or a pre-0026 queue row
+#: (`<id>:<batch>`). Protocol 1 still ACCEPTS `:` and `/` in an id, so a stored
+#: `X:y` or `X/y` is a session of its own: every match below is by structure
+#: (parent_doc_id, the two legacy event suffixes, the session's own folder
+#: shapes), never by the bare prefix `X:` or `X/`. Agents' session ids are UUIDs.
 _SESSION_ID_RE = re.compile(r"\A[A-Za-z0-9._-]{8,200}\Z")
 #: Names that sit at the session-folder level of `raw/<src>/<customer>/` and
 #: are NOT sessions. Deleting `raw/<src>/<customer>/sessions-v2/` would erase
@@ -212,14 +220,22 @@ class SessionRef:
     def agent_node_id(self) -> str:
         return agent_session_canonical_id(self.source, self.session_id)
 
-    def prefixes(self, customer_id: str) -> tuple[str, str]:
-        """Folders holding only this session's objects. Trailing `/` is load-bearing."""
-        return (
-            # kb/session_receipts.accept (protocol-2 batches)
-            f"raw/{self.source}/{customer_id}/sessions-v2/{self.session_id}/",
-            # session_signals.cron_marker_key + extraction_cache.SegmentCache
-            f"raw/{self.source}/{customer_id}/{self.session_id}/",
-        )
+    def v2_prefix(self, customer_id: str) -> str:
+        """kb/session_receipts.accept's protocol-2 batches. Only this session's:
+        protocol-2 ids are UUIDs. Trailing `/` is load-bearing."""
+        return f"raw/{self.source}/{customer_id}/sessions-v2/{self.session_id}/"
+
+    def folder(self, customer_id: str) -> str:
+        """The idle-sweep marker and extraction cache. NOT everything under it
+        is this session's (session_suppression.is_own_folder_key)."""
+        return session_folder(self.source, customer_id, self.session_id)
+
+    async def raw_keys(self, store: Any, bucket: str, customer_id: str) -> set[str]:
+        """Every object under this session's own prefixes that exists now."""
+        return {
+            *await store.list_keys(bucket, self.v2_prefix(customer_id)),
+            *await own_folder_keys(store, bucket, self.folder(customer_id)),
+        }
 
     def as_dict(self) -> dict[str, str]:
         return {"source": self.source, "session_id": self.session_id}
@@ -341,11 +357,17 @@ async def select_by_author(
     """
     selection = Selection(refs=[])
     async with with_tenant(customer_id) as conn:
+        # A unit names its session through parent_doc_id
+        # (`<source>:<customer>:<session>`, kb/handlers/claude_code.py), never
+        # by splitting its source_id at the first `:` -- that would turn the
+        # units of someone's session `X:y` into a deletion of session `X`.
         rows = await conn.fetch(
             """
             SELECT DISTINCT source_system,
                    CASE WHEN parent_doc_id IS NULL THEN source_id
-                        ELSE split_part(source_id, ':', 1) END AS session_id,
+                        WHEN starts_with(parent_doc_id, source_system || ':' || customer_id || ':')
+                        THEN substr(parent_doc_id, length(source_system || ':' || customer_id || ':') + 1)
+                        ELSE source_id END AS session_id,
                    COALESCE(author_id, metadata->>'uploader_id') AS person_id
               FROM documents
              WHERE customer_id = $1 AND source_system = ANY($2::text[])
@@ -377,7 +399,8 @@ async def select_by_author(
                          SELECT 1 FROM documents d
                           WHERE d.customer_id = q.customer_id
                             AND d.source_system = q.source_system
-                            AND d.source_id = split_part(q.source_event_id, ':', 1))
+                            AND d.source_id = regexp_replace(
+                                  q.source_event_id, ':([0-9]+|finalize)$', ''))
                  ORDER BY q.queue_id
                  LIMIT $4
                 """,
@@ -433,7 +456,12 @@ async def select_by_author(
 async def _batch_identity(
     store: Any, bucket: str, row: Any
 ) -> tuple[str, str | None, str | None] | None:
-    """(session_id, employee_id, employee_email) from a queue row's raw batches."""
+    """(session_id, employee_id, employee_email) from a queue row's raw batches.
+
+    The session is the ROW's, never the payload's: a deletion target must not
+    depend on what a client wrote inside a batch.
+    """
+    sid = session_of_event_id(row["source_event_id"])
     keys = [k for k in (row["payload_s3_keys"] or []) if not is_cron_marker_key(k)]
     if not keys and row["payload_s3_key"]:
         keys = [row["payload_s3_key"]]
@@ -445,7 +473,8 @@ async def _batch_identity(
         payload = envelope.get("payload", envelope) if isinstance(envelope, dict) else None
         if not isinstance(payload, dict):
             continue
-        sid = payload.get("session_id") or row["source_event_id"].split(":", 1)[0]
+        if payload.get("session_id") not in (None, sid):
+            continue
         emp = payload.get("employee_id")
         mail = payload.get("employee_email")
         if emp or mail:
@@ -455,7 +484,12 @@ async def _batch_identity(
 
 # --- inventory ------------------------------------------------------------------
 
-_ID_OR_CHILD = "({col} = $3 OR left({col}, length($3) + 1) = $3 || ':')"
+#: A queue / ingestion_events row of the session bound to $3: its bare id, or
+#: one of the two legacy suffixes (session_suppression.session_of_event_id).
+_OWN_EVENT_ROW = (
+    "({col} = $3 OR (starts_with({col}, $3 || ':') "
+    f"AND substr({{col}}, length($3) + 2) ~ '{LEGACY_EVENT_SUFFIX_SQL}'))"
+)
 
 
 async def inventory(
@@ -480,10 +514,14 @@ async def inventory(
     inv.doc_ids = sorted({session_doc, *known_doc_ids} | {
         r["doc_id"]
         for r in await conn.fetch(
-            f"""
+            """
             SELECT DISTINCT doc_id FROM documents
              WHERE customer_id = $1 AND source_system = $2
-               AND ({_ID_OR_CHILD.format(col="source_id")} OR parent_doc_id = $4 OR doc_id = $4)
+               AND (doc_id = $4 OR source_id = $3
+                    -- Units: `<session doc>:<kind>:<n>` AND parented by it. The
+                    -- prefix arm can use the primary key under C collation;
+                    -- parent_doc_id is what makes the unit this session's.
+                    OR (starts_with(doc_id, $4 || ':') AND parent_doc_id = $4))
             """,
             customer_id,
             ref.source,
@@ -508,7 +546,7 @@ async def inventory(
     queue = await conn.fetch(
         f"""
         SELECT queue_id, status, payload_s3_key, payload_s3_keys FROM ingestion_queue
-         WHERE customer_id = $1 AND source_system = $2 AND {_ID_OR_CHILD.format(col="source_event_id")}
+         WHERE customer_id = $1 AND source_system = $2 AND {_OWN_EVENT_ROW.format(col="source_event_id")}
         """,
         customer_id,
         ref.source,
@@ -523,7 +561,7 @@ async def inventory(
     events = await conn.fetch(
         f"""
         SELECT event_id, payload_s3_key FROM ingestion_events
-         WHERE customer_id = $1 AND source_system = $2 AND {_ID_OR_CHILD.format(col="source_event_id")}
+         WHERE customer_id = $1 AND source_system = $2 AND {_OWN_EVENT_ROW.format(col="source_event_id")}
         """,
         customer_id,
         ref.source,
@@ -793,8 +831,11 @@ async def _deep_scan(
 ) -> dict[str, set[str]]:
     """Protocol-1 objects of these sessions found by NAME in the date folders.
 
-    `raw/<src>/<customer>/YYYY/MM/DD/<storage id>[:<seq>...].json`. One listing
-    of the source folder, however many sessions are asked about.
+    `raw/<src>/<customer>/YYYY/MM/DD/<storage id>[:<seq>].json`. One listing
+    of the source folder, however many sessions are asked about. At most ONE
+    legacy suffix is stripped (`X:5:0` is batch 0 of session `X:5`, not of
+    `X`), and because a stored id's `/` is written as `_`, a wanted id holding
+    `_` is confirmed from the object's own payload before it is taken.
     """
     wanted = {storage_id(s): s for s in session_ids}
     found: dict[str, set[str]] = {}
@@ -806,28 +847,37 @@ async def _deep_scan(
         if not m:
             continue
         name = m.group("name")
-        while name not in wanted and ":" in name and name.rsplit(":", 1)[1].isdigit():
-            name = name.rsplit(":", 1)[0]
-        if name in wanted:
-            found.setdefault(wanted[name], set()).add(key)
+        if name not in wanted:
+            name = session_of_event_id(name)
+        if name not in wanted:
+            continue
+        sid = wanted[name]
+        if "_" in sid and not await _payload_names(store, bucket, key, sid):
+            continue
+        found.setdefault(sid, set()).add(key)
     return found
+
+
+async def _payload_names(store: Any, bucket: str, key: str, session_id: str) -> bool:
+    try:
+        envelope = json.loads(await store.get(bucket, key))
+    except (StorageNotFound, StorageUnavailable, ValueError):
+        return False
+    payload = envelope.get("payload", envelope) if isinstance(envelope, dict) else None
+    return isinstance(payload, dict) and payload.get("session_id") == session_id
 
 
 async def _delete_objects(
     store: Any, bucket: str, customer_id: str, ref: SessionRef, keys: list[str]
 ) -> tuple[int, list[str], int]:
-    """Phase 3: journaled keys, then the session's own folders. Returns
-    (objects deleted, keys that failed, objects still under the folders)."""
+    """Phase 3: journaled keys, then the session's own prefixes. Returns
+    (objects deleted, keys that failed, own objects still there)."""
     deleted, failed = await store.delete_keys(bucket, keys)
-    errors = 0
-    for prefix in ref.prefixes(customer_id):
-        d, e = await store.delete_prefix(bucket, prefix)
-        deleted += d
-        errors += e
-    remaining = 0
-    for prefix in ref.prefixes(customer_id):
-        remaining += await store.count_prefix(bucket, prefix)
-    return deleted, failed, remaining + errors
+    d, _errors = await store.delete_prefix(bucket, ref.v2_prefix(customer_id))
+    deleted += d
+    n, bad = await store.delete_keys(bucket, await own_folder_keys(store, bucket, ref.folder(customer_id)))
+    deleted += n
+    return deleted, [*failed, *bad], len(await ref.raw_keys(store, bucket, customer_id))
 
 
 async def _residue(customer_id: str, ref: SessionRef, known_doc_ids: set[str]) -> dict[str, int]:
@@ -1049,11 +1099,8 @@ async def plan(customer_id: str, refs: list[SessionRef], *, deep_scan: bool = Fa
     sem = asyncio.Semaphore(_R2_CONCURRENCY)
 
     async def listed(ref: SessionRef) -> set[str]:
-        keys: set[str] = set()
-        for prefix in ref.prefixes(customer_id):
-            async with sem:
-                keys.update(await store.list_keys(bucket, prefix))
-        return keys
+        async with sem:
+            return await ref.raw_keys(store, bucket, customer_id)
 
     folder_keys = await asyncio.gather(*(listed(ref) for ref, _ in inventories))
     totals: dict[str, int] = {}

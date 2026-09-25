@@ -28,6 +28,7 @@ check silently answers "not deleted".
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from typing import Any
 
@@ -98,21 +99,40 @@ async def deleted_sessions(
     return {r["session_id"] for r in rows}
 
 
+#: The only suffixes a session's OWN queue / ingestion_events rows carry:
+#: pre-0026 `<session>:<batch_seq>` and the old synthetic `<session>:finalize`.
+#: Nothing else may be stripped: protocol 1 accepts any session id, `:`
+#: included, so `X:branch` is a session of its own, not a child of `X`.
+LEGACY_EVENT_SUFFIX_SQL = "^([0-9]+|finalize)$"
+_LEGACY_EVENT_SUFFIX = re.compile(r":(?:[0-9]+|finalize)\Z")
+
+
+def session_of_event_id(event_id: str) -> str:
+    """The session a queue / ingestion_events `source_event_id` belongs to."""
+    return _LEGACY_EVENT_SUFFIX.sub("", event_id, count=1)
+
+
 def session_ids_of(documents: Iterable[Any]) -> set[str]:
     """The session ids a coding-agent NormalizationResult writes.
 
-    The session document's `source_id` is the session id; a unit document's is
-    `<session_id>:<kind>:<suffix>` and carries a `parent_doc_id`. Normalize
-    always emits the session document too, so an id holding `:` is still
-    covered through it.
+    The session document's `source_id` is the session id. A unit document
+    names its session through `parent_doc_id` (`<source>:<customer>:<session>`),
+    NOT by splitting its own `<session>:<kind>:<n>` source_id at the first `:`
+    -- that would read session `X:branch`'s units as session `X`'s.
     """
     ids: set[str] = set()
     for doc in documents:
         source_id = getattr(doc, "source_id", None)
         if not isinstance(source_id, str) or not source_id:
             continue
-        if getattr(doc, "parent_doc_id", None) is None:
+        parent = getattr(doc, "parent_doc_id", None)
+        if parent is None:
             ids.add(source_id)
+            continue
+        system = getattr(doc, "source_system", None)
+        prefix = f"{getattr(system, 'value', system)}:{getattr(doc, 'customer_id', '')}:"
+        if isinstance(parent, str) and parent.startswith(prefix):
+            ids.add(parent[len(prefix):])
         else:
             ids.add(source_id.split(":", 1)[0])
     return ids
@@ -144,14 +164,42 @@ async def is_session_deleted(customer_id: str, source: str, queue_event_id: str)
     re-pended row of a deleted session (the idle sweep's partial-pass retry
     does not look at deletions) from being mined again.
     """
-    session_id = queue_event_id.split(":", 1)[0]  # pre-0026 rows are `<session>:<batch>`
+    session_id = session_of_event_id(queue_event_id)
     async with with_tenant(customer_id) as conn:
         return bool(await deleted_sessions(conn, customer_id, source, [session_id]))
 
 
-async def sweep_session_folders(store: Any, exc: SessionDeleted) -> int:
-    """Delete `raw/<src>/<customer>/<session>/` for each deleted session a
-    refused pass belonged to. Returns objects deleted.
+def session_folder(source: str, customer_id: str, session_id: str) -> str:
+    """`raw/<src>/<customer>/<session>/`: the idle sweep's `finalize.marker`
+    (session_signals.cron_marker_key) and the extraction cache
+    (extraction_cache.SegmentCache). Trailing `/` is load-bearing."""
+    return f"raw/{source}/{customer_id}/{session_id}/"
+
+
+def is_own_folder_key(key: str, folder: str) -> bool:
+    """Is `key`, listed under `folder`, this session's own object?
+
+    Both writers build the folder from the RAW session id, and protocol 1
+    accepts `/` in one: session `X/y` keeps its marker and cache under
+    `raw/<src>/<customer>/X/y/`, which is inside session `X`'s folder. Only the
+    two shapes this session writes itself are its own.
+    """
+    if not key.startswith(folder):
+        return False
+    rest = key[len(folder):]
+    if rest == "finalize.marker":
+        return True
+    cache = rest.removeprefix("extraction-cache/")
+    return cache != rest and cache.endswith(".json") and "/" not in cache
+
+
+async def own_folder_keys(store: Any, bucket: str, folder: str) -> list[str]:
+    return [k for k in await store.list_keys(bucket, folder) if is_own_folder_key(k, folder)]
+
+
+async def sweep_session_folders(store: Any, exc: SessionDeleted) -> tuple[int, int]:
+    """Delete each refused session's own objects under
+    `raw/<src>/<customer>/<session>/`. Returns (deleted, failed).
 
     A worker already mining a session when it was deleted keeps saving
     extraction-cache answers there until its write is refused, which can be
@@ -160,10 +208,10 @@ async def sweep_session_folders(store: Any, exc: SessionDeleted) -> int:
     here, and those passed the deletion's id-shape check.
     """
     bucket = await store.bucket_for(exc.customer_id)
-    deleted = 0
+    deleted = failed = 0
     for session_id in sorted(exc.session_ids):
-        n, _errors = await store.delete_prefix(
-            bucket, f"raw/{exc.source}/{exc.customer_id}/{session_id}/"
-        )
+        folder = session_folder(exc.source, exc.customer_id, session_id)
+        n, bad = await store.delete_keys(bucket, await own_folder_keys(store, bucket, folder))
         deleted += n
-    return deleted
+        failed += len(bad)
+    return deleted, failed

@@ -435,6 +435,115 @@ async def test_delete_by_author_takes_every_capture_of_that_person_only(env, mon
     assert ALICE not in persons and BOB in persons
 
 
+def test_only_the_two_legacy_suffixes_name_a_sessions_own_rows() -> None:
+    from engine.shared.session_suppression import is_own_folder_key, session_of_event_id
+
+    assert session_of_event_id("s1") == "s1"
+    assert session_of_event_id("s1:7") == "s1"
+    assert session_of_event_id("s1:finalize") == "s1"
+    assert session_of_event_id("s1:branch") == "s1:branch"
+    assert session_of_event_id("s1:5:0") == "s1:5"
+    folder = "raw/claude_code/c/s1/"
+    assert is_own_folder_key(folder + "finalize.marker", folder)
+    assert is_own_folder_key(folder + "extraction-cache/" + "a" * 64 + ".json", folder)
+    assert not is_own_folder_key(folder + "sub/finalize.marker", folder)
+    assert not is_own_folder_key(folder + "sub/extraction-cache/" + "a" * 64 + ".json", folder)
+
+
+async def _finalize_by_marker(customer: str, sid: str) -> None:
+    """End a session the way the idle sweep does (a `:`-id cannot end by a
+    protocol-1 client finalize key), then mine it: its units get written."""
+    store = get_store()
+    marker = f"raw/{CC.value}/{customer}/{sid}/finalize.marker"
+    await store.put(await store.bucket_for(customer), marker, b"{}")
+    async with db_module.raw_conn() as conn:
+        await conn.execute(
+            "UPDATE ingestion_queue SET payload_s3_keys = payload_s3_keys || $3::text, "
+            "version = version + 1 WHERE customer_id = $1 AND source_event_id = $2",
+            customer, sid, marker,
+        )
+    await _mine(customer, CC, sid)
+
+
+async def _session_doc_count(customer: str, sid: str) -> int:
+    """Counted with plain SQL, not with the inventory under test."""
+    async with db_module.with_tenant(customer) as conn:
+        return await conn.fetchval(
+            "SELECT count(*) FROM documents WHERE source_id = $1 OR parent_doc_id = $2",
+            sid, f"{CC.value}:{customer}:{sid}",
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_session_whose_id_extends_the_deleted_one_is_left_alone(env) -> None:
+    """Protocol 1 accepts any session id, so `X:branch` and `X/sub` are
+    sessions of their own. Deleting X must not reach them: not their documents,
+    queue rows or batches, not the objects `X/sub` keeps inside X's folder, and
+    not their later uploads or passes."""
+    (a, _b), store = env
+    x = _sid()
+    colon, slash = f"{x}:branch", f"{x}/sub"
+    await v1_session(a, x)
+    colon_keys = await v1_session(a, colon, date="2025/04/01")
+    await _finalize_by_marker(a, colon)
+    bucket = await store.bucket_for(a)
+    x_marker = f"raw/{CC.value}/{a}/{x}/finalize.marker"
+    slash_objects = [f"raw/{CC.value}/{a}/{slash}/finalize.marker",
+                     f"raw/{CC.value}/{a}/{slash}/extraction-cache/{'d' * 64}.json"]
+    for key in (x_marker, *slash_objects):
+        await store.put(bucket, key, b"{}")
+    colon_docs = await _session_doc_count(a, colon)
+    assert colon_docs > 1, "the neighbour needs units for this to test anything"
+
+    outcome = (await delete(a, [x], deep_scan=True))["sessions"][f"claude_code:{x}"]
+
+    assert outcome["verified"], outcome
+    assert await _session_doc_count(a, x) == 0
+    assert not await store.exists(bucket, x_marker)
+    assert await _session_doc_count(a, colon) == colon_docs
+    for key in (*colon_keys, *slash_objects):
+        assert await store.exists(bucket, key), key
+    async with db_module.with_tenant(a) as conn:
+        assert await conn.fetchval(
+            "SELECT count(*) FROM ingestion_queue WHERE source_event_id = $1", colon
+        ) == 1
+    # Neither the door nor the worker's write fence mistakes it for X.
+    payload = {"session_id": colon, "batch_seq": 5, "events": [_event(5, "later")],
+               **_identity(ALICE, ALICE_EMAIL)}
+    assert await sr.accept_legacy(payload, orjson.dumps({"payload": payload}), a, CC, store,
+                                  _legacy_key(a, colon, "2026/09/25", 5), None)
+    await _mine(a, CC, colon)
+    assert await _session_doc_count(a, colon) >= colon_docs
+
+
+@pytest.mark.asyncio
+async def test_an_author_deletion_cannot_reach_a_session_another_id_extends(env) -> None:
+    """Bob's protocol-1 session named `<Alice's session>:x` has units whose
+    source_id starts with Alice's id. Deleting everything Bob captured must not
+    select Alice's session through them."""
+    (a, _b), _store = env
+    alice = _sid()
+    await v2_session(a, alice)
+    await v1_session(a, f"{alice}:x", BOB, BOB_EMAIL)
+    await _finalize_by_marker(a, f"{alice}:x")
+    assert await _session_doc_count(a, f"{alice}:x") > 1, "Bob's session needs units"
+
+    selection = await sd.select_by_author(a, [CC.value], employee_id=BOB, email=None)
+
+    assert sd.SessionRef(CC.value, alice) not in selection.refs
+    assert f"{alice}:x" in selection.skipped_invalid
+
+
+@pytest.mark.asyncio
+async def test_deleting_an_id_in_one_tenant_does_not_refuse_it_in_another(env) -> None:
+    (a, b), store = env
+    sid = _sid()
+    await delete(a, [sid])
+    assert (await sr.accept(_v2_batches(sid, BOB, BOB_EMAIL)[0], b, CC, store))["status"] == "accepted"
+    receipts = await sr.receipts(CC.value, sid, x_prbe_customer=b, after=-1, limit=10)
+    assert receipts["state"] != "deleted"
+
+
 @pytest.mark.asyncio
 async def test_a_deleted_session_cannot_come_back(env, monkeypatch) -> None:
     (a, _b), store = env

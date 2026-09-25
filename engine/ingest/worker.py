@@ -496,13 +496,14 @@ class Worker:
         """This pass may have saved extraction-cache answers for a session that
         was deleted while it ran, after the deletion's last sweep. Remove them."""
         try:
-            removed = await sweep_session_folders(get_store(), exc)
+            removed, failed = await sweep_session_folders(get_store(), exc)
             log.info(
                 "worker.deleted_session_swept",
                 customer=exc.customer_id,
                 source=exc.source,
                 sessions=len(exc.session_ids),
                 objects=removed,
+                failed=failed,
             )
         except Exception:
             log.warning("worker.deleted_session_sweep_failed", exc_info=True)
