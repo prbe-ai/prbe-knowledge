@@ -337,6 +337,38 @@ class ObjectStore:
 
         return await asyncio.to_thread(_delete)
 
+    async def delete_keys(self, bucket: str, keys: list[str]) -> tuple[int, int]:
+        """Delete exactly these keys. Returns (deleted, errors).
+
+        For a caller that listed first and must not delete what landed after
+        its listing -- `delete_prefix` would. S3 reports an absent key as
+        deleted, so a retry after a partial run converges; per-key failures are
+        counted rather than raised, like `delete_prefix`. A missing bucket is
+        "already gone" (0, 0).
+        """
+        def _delete() -> tuple[int, int]:
+            deleted = 0
+            errors = 0
+            try:
+                # delete_objects caps at 1000 keys per request.
+                for start in range(0, len(keys), 1000):
+                    response = self._client.delete_objects(
+                        Bucket=bucket,
+                        Delete={"Objects": [{"Key": k} for k in keys[start:start + 1000]]},
+                    )
+                    deleted += len(response.get("Deleted") or [])
+                    errors += len(response.get("Errors") or [])
+            except ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code", "")
+                if code in {"NoSuchBucket", "404", "NotFound"}:
+                    return deleted, errors
+                raise StorageUnavailable(f"delete_keys failed: {exc}") from exc
+            except BotoCoreError as exc:
+                raise StorageUnavailable(f"delete_keys failed: {exc}") from exc
+            return deleted, errors
+
+        return await asyncio.to_thread(_delete)
+
     async def count_prefix(self, bucket: str, prefix: str) -> int:
         """Number of objects remaining under `prefix`. Postcondition check.
 

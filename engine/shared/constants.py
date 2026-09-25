@@ -1301,6 +1301,42 @@ CHUNK_RETENTION_DAYS = max(1, _env_int("CHUNK_RETENTION_DAYS", 30))
 # which replication absorbs without falling behind.
 CHUNK_RETENTION_BATCH_SIZE = max(100, _env_int("CHUNK_RETENTION_BATCH_SIZE", 5000))
 
+# ---- Tombstone purge (scripts/cron_tombstone_purge.py) ----------------------
+# Probe's retention policy: once a customer deletes something, every copy of
+# it is gone within DELETION_DEADLINE_DAYS -- backups included. Postgres
+# backups keep a deleted row for BACKUP_TAIL_DAYS after the primary drops it
+# (the 7-day barman window plus the base backup older than it). research-os
+# uses the same two numbers for whole-tenant deletion.
+DELETION_DEADLINE_DAYS = 30
+BACKUP_TAIL_DAYS = 8
+
+# How long a deleted document's tombstone stays before the purge hard-deletes
+# every version of it, its chunks and its raw payloads. POLICY, NOT TUNING:
+# deliberately not env-overridable. The arithmetic it has to satisfy, run
+# daily: eligible at day 7, deleted by day 8, last backup copy gone by day 16,
+# inside the 30-day deadline with 14 days to spare for missed runs, an outage
+# or a backlog that takes several runs (tests/test_tombstone_purge.py pins
+# the sum). Why wait at all rather than delete with the tombstone: for a week
+# the tombstone is what keeps a late or replayed event for the same item (a
+# webhook retry, a reconciler pass, an out-of-order queue row) from quietly
+# resurrecting it.
+TOMBSTONE_PURGE_DAYS = 7
+
+# Rows per committed transaction. Same bound and same reason as chunk
+# retention: lock hold time and the WAL burst the standby replays.
+TOMBSTONE_PURGE_BATCH_SIZE = max(100, _env_int("TOMBSTONE_PURGE_BATCH_SIZE", 5000))
+
+# Documents taken per group. A group's raw payloads are deleted before any of
+# its rows (the rows are the retry handle), then its rows go in batches of
+# TOMBSTONE_PURGE_BATCH_SIZE. The final batch deletes a handful of rows per
+# document, so this also bounds that batch.
+TOMBSTONE_PURGE_DOCS_PER_GROUP = 200
+
+# Default wall-clock budget for one run. Under the chart's 30-minute
+# activeDeadlineSeconds so a long backlog stops cleanly between batches and
+# resumes next run, instead of being killed mid-batch.
+TOMBSTONE_PURGE_MAX_SECONDS = 1500
+
 # Env-overridable because it is the first dial to reach for if recall
 # regresses: `kubectl set env DEPLOY SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET=40000`
 # restores the old behaviour without a release.

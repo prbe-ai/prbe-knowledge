@@ -33,7 +33,11 @@ _TEST_ENV = {
         "PRBE_TEST_DATABASE_URL",
         "postgresql://prbe:prbe@localhost:5432/prbe_knowledge",
     ),
-    "R2_ENDPOINT_URL": "http://localhost:9000",
+    # Same reason as the DB override: a worktree running its own MinIO. Pinned
+    # to localhost below, since these tests create and delete buckets.
+    "R2_ENDPOINT_URL": os.environ.get(
+        "PRBE_TEST_R2_ENDPOINT_URL", "http://localhost:9000"
+    ),
     "R2_ACCESS_KEY_ID": "minioadmin",
     "R2_SECRET_ACCESS_KEY": "minioadmin",
     "R2_BUCKET_PREFIX": "prbe-test",
@@ -49,6 +53,12 @@ if _TEST_DB_HOST not in ("localhost", "127.0.0.1", "::1"):
     raise RuntimeError(
         "PRBE_TEST_DATABASE_URL must point at localhost — refusing to run "
         f"destructive test fixtures against host {_TEST_DB_HOST!r}"
+    )
+_TEST_R2_HOST = _TEST_ENV["R2_ENDPOINT_URL"].split("://", 1)[-1].split("/", 1)[0].rsplit(":", 1)[0]
+if _TEST_R2_HOST not in ("localhost", "127.0.0.1", "[::1]"):
+    raise RuntimeError(
+        "PRBE_TEST_R2_ENDPOINT_URL must point at localhost — refusing to run "
+        f"destructive storage tests against host {_TEST_R2_HOST!r}"
     )
 
 for _k, _v in _TEST_ENV.items():

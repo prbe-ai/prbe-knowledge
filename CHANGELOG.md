@@ -6,6 +6,25 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Added
+
+- **What a customer deletes now leaves the engine completely, a week later.** A deleted item
+  (a research-os run, project or note, or a Slack/Linear/Notion/GitHub/code-graph delete)
+  used to become a tombstone and stay: every `documents` version (title, body preview,
+  metadata, author) and every raw payload in R2 was kept forever, and only the chunks aged
+  out. `scripts/cron_tombstone_purge.py` hard-deletes a document once its current version has
+  been a tombstone for 7 days (`TOMBSTONE_PURGE_DAYS`, sized so the deletion, backups
+  included, finishes inside the 30-day policy): every version, its chunks, the side rows that
+  name it by id, its graph node and the entity nodes only it held, and its document-addressed
+  raw payloads (`raw/custom_ingest/<customer>/<source_key>/<doc_hash>/`, manual-upload
+  objects). Event-addressed payloads (webhook batches) cannot be attributed to one document
+  and stay until the source or tenant is purged. Live documents keep their history. Tenants
+  that are not `active`, or carry `customers.metadata.legal_hold`
+  (`engine/shared/legal_hold.py`), are skipped, re-checked before every committed batch.
+  Migration 0139 adds the partial index `idx_documents_tombstones`; build it `CONCURRENTLY`
+  on large planes before deploying (see the migration). The research-os chart schedules the
+  job daily.
+
 ### Fixed
 
 - **A transcript holding one value too deeply encoded to scan is captured again.** The ingest

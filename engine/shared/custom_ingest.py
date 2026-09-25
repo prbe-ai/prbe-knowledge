@@ -342,14 +342,24 @@ def _iso_or_none(value: datetime | None) -> str | None:
     return value.isoformat() if value else None
 
 
+def document_payload_prefix(customer_id: str, source_key: str, document_id: str) -> str:
+    """The R2 prefix holding every raw payload ever pushed for ONE document.
+
+    One object per distinct content hash lands under it, so it is also what a
+    per-document delete has to clear (scripts/cron_tombstone_purge.py). The
+    trailing slash keeps a prefix listing from matching a longer hash.
+    """
+    return f"raw/custom_ingest/{customer_id}/{source_key}/{_document_hash(document_id)}/"
+
+
 def document_payload_key(
     customer_id: str,
     source_key: str,
     document_id: str,
     content_hash: str,
 ) -> str:
-    doc_hash = hashlib.sha256(document_id.encode("utf-8")).hexdigest()[:16]
-    return f"raw/custom_ingest/{customer_id}/{source_key}/{doc_hash}/{content_hash}.json"
+    prefix = document_payload_prefix(customer_id, source_key, document_id)
+    return f"{prefix}{content_hash}.json"
 
 
 def source_event_id(
@@ -365,6 +375,15 @@ def source_event_id(
     raw payload but deliberately excluded from this key: a customer changing
     batch ids should not force duplicate queue rows for identical content.
     """
-    doc_hash = hashlib.sha256(document.id.encode("utf-8")).hexdigest()[:16]
-    return f"{envelope.source_key}:{doc_hash}:{content_hash[:16]}"
+    return f"{document_event_prefix(envelope.source_key, document.id)}{content_hash[:16]}"
+
+
+def document_event_prefix(source_key: str, document_id: str) -> str:
+    """Every queue row ever enqueued for ONE document has a `source_event_id`
+    starting with this, whatever its content hash."""
+    return f"{source_key}:{_document_hash(document_id)}:"
+
+
+def _document_hash(document_id: str) -> str:
+    return hashlib.sha256(document_id.encode("utf-8")).hexdigest()[:16]
 

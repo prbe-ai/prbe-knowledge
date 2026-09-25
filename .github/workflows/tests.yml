@@ -243,6 +243,10 @@ jobs:
       # test_backfill_custom_doc_types cover the custom.<type> doc_type mapping
       # and its backfill; test_retire_experiment_nodes covers folding the retired
       # Experiment graph nodes into their Project nodes (T6).
+      # test_tombstone_purge covers the retention job that hard-deletes a
+      # customer's deleted documents (rows, graph, raw payloads in MinIO) and
+      # must leave held, inactive and other tenants alone; it runs the purge as
+      # a non-superuser role, because a superuser bypasses the RLS it relies on.
       #
       # The three test_auto_merge_* files cover entity auto-merge, which on the
       # managed plane EXECUTES real merges: the Jev judge's request and verdict
@@ -302,6 +306,7 @@ jobs:
           tests/retrieval/test_helpers_expand_to_cluster_members.py
           tests/test_bm25_index_generations.py
           tests/test_custom_ingest.py
+          tests/test_tombstone_purge.py
           tests/test_backfill_custom_doc_types.py
           tests/test_retire_experiment_nodes.py
           tests/test_auto_merge_analyzer.py
