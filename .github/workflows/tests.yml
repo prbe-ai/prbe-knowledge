@@ -250,6 +250,9 @@ jobs:
       # customer's deleted documents (rows, graph, raw payloads in MinIO) and
       # must leave held, inactive and other tenants alone; it runs the purge as
       # a non-superuser role, because a superuser bypasses the RLS it relies on.
+      # test_migration_chain is here because this job never replays the chain
+      # (it applies schema.sql and stamps head): without it two migrations off
+      # one parent, or a revision id too long for alembic_version, merge green.
       #
       # The three test_auto_merge_* files cover entity auto-merge, which on the
       # managed plane EXECUTES real merges: the Jev judge's request and verdict
@@ -310,6 +313,7 @@ jobs:
           tests/test_bm25_index_generations.py
           tests/test_custom_ingest.py
           tests/test_tombstone_purge.py
+          tests/test_migration_chain.py
           tests/test_backfill_custom_doc_types.py
           tests/test_retire_experiment_nodes.py
           tests/test_auto_merge_analyzer.py
