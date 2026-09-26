@@ -26,6 +26,7 @@ from engine.ingest.auto_merge.models import AutoMergeVerdict
 from engine.retrieval.agent import jev
 from engine.retrieval.agent.jev import (
     JevBreakerOpen,
+    JevBudgetExhausted,
     JevError,
     JevRequestRejected,
     JevRequestTooLarge,
@@ -541,6 +542,19 @@ async def test_jev_outage_defers(monkeypatch):
     result = await a.analyze(FakeConn(), "acme-test", 7)
     assert result.action == "deferred"
     assert result.retry_after_seconds == AUTO_MERGE_RETRY_SECONDS
+    assert merges == []
+
+
+async def test_jev_budget_exhaustion_is_terminal(monkeypatch):
+    a, merges = _analyzer(
+        monkeypatch,
+        PR_NODE,
+        PR_CANDS,
+        raises=JevBudgetExhausted("http_429:budget_exhausted"),
+    )
+    result = await a.analyze(FakeConn(), "acme-test", 7)
+    assert result.action == "error"
+    assert result.retry_after_seconds is None
     assert merges == []
 
 

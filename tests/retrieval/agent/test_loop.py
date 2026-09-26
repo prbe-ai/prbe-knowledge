@@ -2628,6 +2628,15 @@ def test_is_transient_provider_error_requires_typed_statusless_cause() -> None:
     assert is_transient_provider_error(typed) is True
 
 
+def test_budget_refusal_is_not_a_transient_provider_error() -> None:
+    assert (
+        is_transient_provider_error(
+            LLMError("ExceededBudget", status_code=429)
+        )
+        is False
+    )
+
+
 def test_non_transient_http_status_overrides_connection_cause() -> None:
     auth_error = LLMError("authentication rejected", status_code=401)
     auth_error.__cause__ = ConnectionError("connection closed after response")

@@ -44,6 +44,7 @@ from engine.shared.constants import (
     EdgeType,
 )
 from engine.shared.llm import LLMError, acompletion, gateway_url
+from engine.shared.llm_errors import is_budget_exhausted_error
 from engine.shared.llm_tools import usage_tokens
 from engine.shared.logging import get_logger
 
@@ -337,6 +338,12 @@ def _is_gemini_rate_limit_error(exc: BaseException) -> bool:
     still raise a fake google-genai `ClientError` (or any class
     named like one of these) continue to trigger the backoff path.
     """
+    if (
+        isinstance(exc, LLMError)
+        and exc.status_code in {400, 429}
+        and is_budget_exhausted_error(exc)
+    ):
+        return False
     if isinstance(exc, LLMError) and exc.status_code == 429:
         return True
     name = type(exc).__name__

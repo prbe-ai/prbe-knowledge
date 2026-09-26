@@ -32,10 +32,12 @@ from engine.shared.constants import (
 )
 from engine.shared.exceptions import (
     EmbeddingBatchRejected,
+    EmbeddingBudgetExhausted,
     EmbeddingContextLengthExceeded,
     EmbeddingProviderUnavailable,
     EmbeddingRateLimited,
 )
+from engine.shared.llm_errors import is_budget_exhausted_error
 from engine.shared.logging import get_logger
 
 log = get_logger(__name__)
@@ -472,6 +474,8 @@ def _translate_gateway_embedding_error(exc: Any) -> Exception:
     (``_translate_gemini_error`` + the OpenAI inline branches above)."""
     status = getattr(exc, "status_code", None)
     msg = str(exc).lower()
+    if status in {400, 429} and is_budget_exhausted_error(exc):
+        return EmbeddingBudgetExhausted(str(exc))
     if isinstance(status, int):
         if status == 429:
             return EmbeddingRateLimited(str(exc))
@@ -520,6 +524,8 @@ def _translate_gemini_error(exc: BaseException) -> Exception:
     if isinstance(status, str) and status.isdigit():
         status = int(status)
 
+    if status in {400, 429} and is_budget_exhausted_error(exc):
+        return EmbeddingBudgetExhausted(str(exc))
     if ("rate" in msg and "limit" in msg) or status == 429 or "ResourceExhausted" in name:
         return EmbeddingRateLimited(str(exc))
     if "deadline" in msg or "timeout" in msg or "DeadlineExceeded" in name:

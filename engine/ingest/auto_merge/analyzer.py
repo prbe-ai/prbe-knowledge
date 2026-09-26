@@ -36,6 +36,7 @@ from engine.ingest.entity_clusters_routes import (
 from engine.retrieval.agent.jev import (
     MERGE_BREAKER,
     JevBreakerOpen,
+    JevBudgetExhausted,
     JevError,
     JevRequestRejected,
     JevRequestTooLarge,
@@ -360,9 +361,15 @@ class AutoMergeAnalyzer:
                 retry_after_seconds=_breaker_wait_seconds(),
                 judge_called=False,
             )
-        except (JevRequestTooLarge, JevRequestRejected, LLMError, ValidationError) as exc:
-            # Permanent for this input (an oversize or refused request, an LLM
-            # failure, an unparseable verdict): retrying would send the same.
+        except (
+            JevBudgetExhausted,
+            JevRequestTooLarge,
+            JevRequestRejected,
+            LLMError,
+            ValidationError,
+        ) as exc:
+            # Terminal for this queue item: repeating the same rejected call
+            # cannot produce a usable verdict.
             log.warning(
                 "auto_merge.judge_failed",
                 customer=customer_id,

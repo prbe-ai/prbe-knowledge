@@ -133,6 +133,22 @@ async def test_a_usage_error_echoing_the_overflow_text_is_still_an_outage():
     assert b.failures == 1
 
 
+@pytest.mark.parametrize(
+    ("status", "message"),
+    [(400, "ExceededBudget"), (429, "Budget has been exceeded")],
+)
+async def test_budget_refusal_is_terminal_without_leaking_the_response_body(status, message):
+    b = jev.Breaker()
+
+    def handler(req):
+        return httpx.Response(status, json={"detail": message})
+
+    with pytest.raises(jev.JevBudgetExhausted, match="budget_exhausted") as err:
+        await _ask(handler, breaker=b)
+    assert message not in str(err.value)
+    assert b.failures == 0
+
+
 async def test_an_unknown_model_is_an_outage_not_a_refusal_of_this_input():
     # What Jev answers for a retired model (checked 2026-09-23).
     b = jev.Breaker()

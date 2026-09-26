@@ -72,6 +72,7 @@ from engine.shared.constants import (
     LOG_ERROR_MAX_CHARS,
     SEARCH_REWRITE_BELOW_SCORE,
 )
+from engine.shared.llm_errors import is_budget_exhausted_error
 
 #: Channels whose hits are content passages. Order matters for provenance
 #: only: it is the order a chunk's `matched_via` lists them in.
@@ -112,6 +113,10 @@ class JevError(RuntimeError):
 
 class JevBreakerOpen(JevError):
     """The breaker is open: nothing was sent. Retrying later is the whole remedy."""
+
+
+class JevBudgetExhausted(JevError):
+    """The provider budget is exhausted; repeating this judgment cannot help."""
 
 
 class JevRequestTooLarge(JevError):
@@ -883,6 +888,8 @@ async def post_choice(
         breaker.failure()
         raise JevError(_err(exc)) from exc
     error_type = _error_type(resp) if resp.status_code != 200 else ""
+    if resp.status_code in {400, 429} and is_budget_exhausted_error(resp.text):
+        raise JevBudgetExhausted(f"http_{resp.status_code}:budget_exhausted")
     if resp.status_code in _PER_REQUEST_REJECTIONS and error_type != _USAGE_ERROR_TYPE:
         if _is_token_overflow(resp):
             # The input's fault, not an outage: do not trip the breaker.

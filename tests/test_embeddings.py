@@ -32,6 +32,7 @@ from engine.shared.embeddings import (
 )
 from engine.shared.exceptions import (
     EmbeddingBatchRejected,
+    EmbeddingBudgetExhausted,
     EmbeddingContextLengthExceeded,
     EmbeddingProviderUnavailable,
     EmbeddingRateLimited,
@@ -164,6 +165,11 @@ class _FakeStatusError(Exception):
     [
         (Exception("Rate limit reached"), EmbeddingRateLimited),
         (_FakeStatusError("rate limited", 429), EmbeddingRateLimited),
+        (_FakeStatusError("ExceededBudget", 429), EmbeddingBudgetExhausted),
+        (
+            _FakeStatusError("Budget has been exceeded", 400),
+            EmbeddingBudgetExhausted,
+        ),
         (Exception("Deadline exceeded"), EmbeddingProviderUnavailable),
         (_FakeStatusError("Internal", 500), EmbeddingProviderUnavailable),
         (_FakeStatusError("Bad gateway", 502), EmbeddingProviderUnavailable),
@@ -351,6 +357,50 @@ async def test_gemini_embedder_routes_through_shared_llm_aembedding_in_gateway_m
     get_settings.cache_clear()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "message"),
+    [(400, "ExceededBudget"), (429, "Budget has been exceeded")],
+)
+async def test_gateway_budget_refusal_is_terminal_without_retry_or_split(
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+    message: str,
+) -> None:
+    from engine.shared.config import get_settings
+    from engine.shared.exceptions import EmbeddingBudgetExhausted
+    from engine.shared.llm import LLMError
+
+    monkeypatch.setenv("LLM_GATEWAY_URL", "http://litellm.litellm.svc:4000")
+    monkeypatch.setenv("LLM_GATEWAY_KEY", "sk-virtual")
+    get_settings.cache_clear()
+    try:
+        embedder = GeminiEmbedder(settings=get_settings(), model="gemini-embedding-2")
+        calls = 0
+
+        async def reject_budget(
+            *, model: str, input: list[str], **kwargs: object
+        ) -> object:
+            nonlocal calls
+            calls += 1
+            raise LLMError(message, status_code=status)
+
+        async def unexpected_sleep(delay: float) -> None:
+            pytest.fail("budget exhaustion must not back off")
+
+        import engine.shared.llm as shared_llm
+
+        monkeypatch.setattr(shared_llm, "aembedding", reject_budget)
+        monkeypatch.setattr("engine.shared.embeddings.asyncio.sleep", unexpected_sleep)
+
+        with pytest.raises(EmbeddingBudgetExhausted):
+            await embedder.embed_many(["first document", "second document"])
+
+        assert calls == 1
+    finally:
+        get_settings.cache_clear()
+
+
 def test_gateway_embedding_error_translation_covers_taxonomy() -> None:
     """LLMError → embedding error taxonomy mapping. Mirrors the direct-SDK
     translations so the recursive half-split treats both transports the same.
@@ -362,6 +412,18 @@ def test_gateway_embedding_error_translation_covers_taxonomy() -> None:
     assert isinstance(
         _translate_gateway_embedding_error(LLMError("rl", status_code=429)),
         EmbeddingRateLimited,
+    )
+    assert isinstance(
+        _translate_gateway_embedding_error(
+            LLMError("ExceededBudget", status_code=429)
+        ),
+        EmbeddingBudgetExhausted,
+    )
+    assert isinstance(
+        _translate_gateway_embedding_error(
+            LLMError("Budget has been exceeded", status_code=400)
+        ),
+        EmbeddingBudgetExhausted,
     )
     assert isinstance(
         _translate_gateway_embedding_error(LLMError("oops", status_code=503)),

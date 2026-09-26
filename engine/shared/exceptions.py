@@ -184,6 +184,10 @@ class EmbeddingError(PrbeError): ...
 class EmbeddingBatchRejected(EmbeddingError): ...
 
 
+class EmbeddingBudgetExhausted(EmbeddingError):
+    """The provider key, customer, or team budget is exhausted."""
+
+
 class EmbeddingContextLengthExceeded(EmbeddingError): ...
 
 
@@ -261,6 +265,7 @@ __all__ = [
     "DatabaseUnavailable",
     "DuplicateEventIgnored",
     "EmbeddingBatchRejected",
+    "EmbeddingBudgetExhausted",
     "EmbeddingContextLengthExceeded",
     "EmbeddingError",
     "EmbeddingProviderUnavailable",

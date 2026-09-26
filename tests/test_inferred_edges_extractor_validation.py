@@ -27,6 +27,7 @@ from engine.ingest.inferred_edges.extractor import (
     extract_edges,
 )
 from engine.shared.constants import HAIKU_MODEL
+from engine.shared.llm import LLMError
 
 
 @pytest.fixture(autouse=True)
@@ -960,6 +961,33 @@ def _mock_gemini_response(edges: list[dict]) -> SimpleNamespace:
     (no `[` prefill trick — structured-output mode returns a complete
     array)."""
     return _litellm_text_response(json.dumps(edges))
+
+
+@pytest.mark.asyncio
+async def test_gemini_budget_refusal_does_not_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "engine.ingest.inferred_edges.extractor.INFERRED_EDGES_MODEL",
+        "gemini-3.1-flash-lite",
+    )
+    bundle = _make_bundle()
+    conn = _make_mock_conn()
+    budget_refused = AsyncMock(
+        side_effect=LLMError("ExceededBudget", status_code=429)
+    )
+
+    with (
+        patch.dict("os.environ", {"GOOGLE_API_KEY": "test-key"}, clear=False),
+        _patch_acompletion(budget_refused),
+        patch(
+            "engine.ingest.inferred_edges.extractor.asyncio.sleep",
+            new_callable=AsyncMock,
+        ) as mock_sleep,
+    ):
+        result = await extract_edges(bundle, conn)
+
+    assert result.bundle_failed
+    assert budget_refused.call_count == 1
+    mock_sleep.assert_not_awaited()
 
 
 @pytest.mark.asyncio
