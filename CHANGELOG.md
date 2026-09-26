@@ -113,11 +113,16 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   research-os has removed every caller (`probe rule`, the `probe_procedures` MCP tool and its
   `/v1/procedures/*` proxy). The `/procedures/{preview,declare,publish,query}` routes now answer
   404, and `engine/shared/wfmem/` (structuring, classifier, declaring, serving, visibility, secret
-  scan, capabilities) and the `WFMEM_*` model constants are deleted with their tests. The tables
-  (`situations`, `clauses`, `clause_situation_edges`, `clause_evidence`, `serve_ledger`), their
-  migrations and the rows already stored are kept on purpose; dropping them is a separate
-  decision. `test_workflow_memory_isolation.py` stays on the CI list because it guards tenant
-  isolation on those kept tables.
+  scan, capabilities) and the `WFMEM_*` model constants are deleted with their tests.
+- **Workflow memory's stored data is deleted, irreversibly.** Migration 0142 drops its five
+  tables (`situations`, `clauses`, `clause_situation_edges`, `clause_evidence`, `serve_ledger`)
+  with every row in them, its two trigger functions, and the six `wfmem_*` keys in
+  `customers.preferences`, by owner decision (2026-09-26). Only the research plane's `probe`
+  tenant had rows (13 situations, 2 rules, 71 serve-log rows); managed had none. Nothing is
+  exported and `downgrade` refuses. On the managed plane it runs on merge; on the research
+  plane with the next research-os deploy. `test_workflow_memory_isolation.py` goes with the
+  tables; `test_workflow_memory_dropped.py` checks that the migration removes every object and
+  that `db/schema.sql` creates none.
 
 ### Fixed
 

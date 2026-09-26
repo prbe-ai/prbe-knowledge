@@ -70,8 +70,8 @@ WHAT IS NOT DELETED, and why:
     document as deleted, so a later re-push of the same item is accepted.
   * INFERRED edges between two SURVIVING entities: their `why` text came from a
     bundle that may have included this document, and nothing records which.
-  * clause_evidence (pointers, no text, by design), query_traces, usage_events,
-    retrieve_pages (self-cleaning within a day) and entity-merge history.
+  * query_traces, usage_events, retrieve_pages (self-cleaning within a day) and
+    entity-merge history.
 
 LEGAL HOLD AND TENANT STATE. Only tenants whose status is 'active' and that have
 no `metadata.legal_hold` are considered (engine/shared/legal_hold.py), and both
