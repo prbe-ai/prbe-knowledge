@@ -44,6 +44,24 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Fixed
 
+- **The tombstone purge no longer times out on large tenants.** Its first attended run on the
+  research plane purged 458 documents and then failed on `probe` and `anthrogen` with an empty
+  `TimeoutError`: each 200-document batch spent about 5 minutes deleting side rows by scanning
+  the tenant's whole share of `acl_snapshots` (the ACL check also ran a trigram-index lookup per
+  row) and `pending_edges`, against a 300 s client timeout. Those deletes are now written as
+  equality lookups -- per-id rows for the ACL delete and two `NOT EXISTS` instead of an `OR`,
+  one `pending_edges` statement per side -- and migration 0141 adds the indexes they use:
+  `idx_acl_snapshots_resource`, `idx_pending_edges_from_document`,
+  `idx_pending_edges_to_document` (partial on `'Document'`) and
+  `idx_inferred_edges_queue_anchor`. Same rows deleted as before. On a local copy seeded at
+  `probe`'s size (761k ACL rows, 517k pending edges, 552k documents) the ACL delete went from
+  53 s to 15 ms per batch and a whole batch from ~50 s to ~0.1 s; the 6,000-document backlog
+  now clears in 88 s instead of timing out. `tombstone_purge.tenant_failed` now names the
+  `stage` (the statement or storage call) and never logs an empty `error`. Migration 0141
+  builds all four indexes `CONCURRENTLY`, on merge for the managed plane and on the next
+  research-os deploy for the research plane; check for long-running transactions before each
+  (see the migration).
+
 - **A tenant that is not active is held, not processed.** research-os keeps a terminated team's
   data for a hold before purging it, marking its kb `customers.status` `'terminated'` (then
   `'deleted'`), and the engine never looked: the idle-session sweep enumerated every

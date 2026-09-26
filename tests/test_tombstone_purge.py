@@ -20,16 +20,19 @@ The boundaries pinned:
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 from collections import Counter
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 import asyncpg
 import pytest
 import pytest_asyncio
+from structlog.testing import capture_logs
 
 import scripts.cron_tombstone_purge as purge
 from engine.shared import db as db_module
@@ -1016,6 +1019,360 @@ async def test_acl_shared_with_a_live_document_is_kept(app_settings, settings) -
         " AND resource_id = 'slack:C1:gone'",
         cid,
     ) == 0
+
+
+# The side deletes as #593 merged them, kept as the oracle for the index-shaped
+# rewrites (migration 0141): the rewrite must delete exactly these rows. Both
+# read the tenant's whole share of the table per batch in production.
+_OR_FORM_ACL_SQL = """
+    DELETE FROM acl_snapshots a
+    USING unnest($2::text[], $3::text[], $4::text[]) AS g(doc_id, source_system, source_id)
+    WHERE a.customer_id = $1
+      AND a.source_system = g.source_system
+      AND a.resource_id IN (g.doc_id, g.source_id)
+      AND NOT EXISTS (
+          SELECT 1 FROM documents x
+          WHERE x.customer_id = $1
+            AND x.source_system = a.source_system
+            AND (x.doc_id = a.resource_id OR x.source_id = a.resource_id)
+      )
+"""
+_OR_FORM_PENDING_SQL = """
+    DELETE FROM pending_edges
+    WHERE customer_id = $1
+      AND ((from_label = 'Document' AND from_canonical_id = ANY($2::text[]))
+        OR (to_label = 'Document' AND to_canonical_id = ANY($2::text[])))
+"""
+
+
+async def _deleted_by(statements: list[tuple[str, tuple]], table: str, key: str) -> set:
+    """The `key`s of `table` rows the statements delete, rolled back after.
+
+    The WHOLE table, every tenant, read as the superuser (no RLS): a statement
+    that lost its customer_id predicate shows up here as another tenant's key,
+    which a count taken after the rollback could never see."""
+    async with db_module.raw_conn() as conn:
+        tx = conn.transaction()
+        await tx.start()
+        try:
+            sql = f"SELECT {key} FROM {table}"
+            before = {r[0] for r in await conn.fetch(sql)}
+            for statement, args in statements:
+                await conn.execute(statement, *args)
+            after = {r[0] for r in await conn.fetch(sql)}
+        finally:
+            await tx.rollback()
+    return before - after
+
+
+async def _acl(cid: str, source_system: str, resource_id: str) -> int:
+    async with db_module.raw_conn() as conn:
+        return await conn.fetchval(
+            """
+            INSERT INTO acl_snapshots (customer_id, source_system, principal_type,
+                                       principal_id, resource_type, resource_id,
+                                       permission, valid_from)
+            VALUES ($1, $2, 'workspace', $1, 'x', $3, 'read', now())
+            RETURNING snapshot_id
+            """,
+            cid,
+            source_system,
+            resource_id,
+        )
+
+
+async def test_acl_delete_matches_the_or_form_it_replaced(live_db) -> None:
+    """Each id of a purged document is its own lookup, and the survivor check
+    is two NOT EXISTS (by doc_id, by source_id): the same rows as the OR form,
+    on both arms, only within the document's own source."""
+    cid = "t-acl-forms"
+    await _tenant(cid)
+    await _tenant("t-acl-other")
+    # Survivors: two Slack documents, and a Linear one sharing gone-1's source_id.
+    await _doc(cid, "slack:C1:live", versions=1, tombstone_days=None, source_id="C1:live")
+    await _doc(cid, "slack:C9:live", versions=1, tombstone_days=None, source_id="C9")
+    await _doc(cid, "linear:ISS-1", versions=1, tombstone_days=None,
+               source_system=SourceSystem.LINEAR.value, source_id="C1:gone")
+    # Purged (already gone from documents, as they are when the delete runs):
+    # gone-2's source_id happens to be a live Slack document's doc_id, and
+    # gone-3's is a container id (a channel) a live Slack document also has.
+    gone = [
+        ("slack:C1:gone", "slack", "C1:gone"),
+        ("slack:C2:gone", "slack", "slack:C1:live"),
+        ("slack:C9:gone", "slack", "C9"),
+    ]
+    rows = {
+        "gone-1 by doc_id": await _acl(cid, "slack", "slack:C1:gone"),
+        "gone-1 by source_id, a Linear doc shares it": await _acl(cid, "slack", "C1:gone"),
+        "same id, another source": await _acl(cid, "linear", "C1:gone"),
+        "gone-2 by source_id, a live doc's doc_id": await _acl(cid, "slack", "slack:C1:live"),
+        "gone-2 by doc_id": await _acl(cid, "slack", "slack:C2:gone"),
+        "gone-3 by source_id, a live doc's source_id": await _acl(cid, "slack", "C9"),
+        "gone-3 by doc_id": await _acl(cid, "slack", "slack:C9:gone"),
+        "a live doc's own id": await _acl(cid, "slack", "C1:live"),
+    }
+    other_tenant = await _acl("t-acl-other", "slack", "slack:C1:gone")
+    args = (cid, [g[0] for g in gone], [g[1] for g in gone], [g[2] for g in gone])
+
+    rewritten = await _deleted_by([(purge._DELETE_ACL_SQL, args)], "acl_snapshots",
+                                  "snapshot_id")
+    or_form = await _deleted_by([(_OR_FORM_ACL_SQL, args)], "acl_snapshots",
+                                "snapshot_id")
+
+    # Read across every tenant, so the same-named row of another tenant would
+    # appear here if either form reached it.
+    assert other_tenant not in rewritten | or_form
+    assert rewritten == or_form == {
+        rows["gone-1 by doc_id"],
+        rows["gone-1 by source_id, a Linear doc shares it"],
+        rows["gone-2 by doc_id"],
+        rows["gone-3 by doc_id"],
+    }
+
+
+async def test_pending_edges_delete_matches_the_or_form_it_replaced(live_db) -> None:
+    """Split per side for the per-side partial indexes: still every row with a
+    purged Document on EITHER end (both ends once), and nothing that merely
+    shares the id under another label."""
+    cid = "t-pending-forms"
+    await _tenant(cid)
+    await _tenant("t-pending-other")
+    doc, other = "custom_ingest:t:k:gone", "custom_ingest:t:k:live"
+    shapes = [
+        ("from", cid, "Document", doc, "Run", "run:1"),
+        ("to", cid, "Run", "run:2", "Document", doc),
+        ("both", cid, "Document", doc, "Document", doc),
+        ("other doc", cid, "Run", "run:3", "Document", other),
+        ("same id, not a Document", cid, "Run", doc, "Project", doc),
+        ("same id, another tenant", "t-pending-other", "Document", doc, "Document", doc),
+    ]
+    ids = {}
+    async with db_module.raw_conn() as conn:
+        for name, tenant, from_label, from_id, to_label, to_id in shapes:
+            ids[name] = await conn.fetchval(
+                """
+                INSERT INTO pending_edges (customer_id, missing_label, missing_canonical_id,
+                                           edge_type, from_label, from_canonical_id,
+                                           to_label, to_canonical_id, source_system)
+                VALUES ($1, $2, $3, 'TOUCHES', $2, $3, $4, $5, 'custom_ingest')
+                RETURNING id
+                """,
+                tenant,
+                from_label,
+                from_id,
+                to_label,
+                to_id,
+            )
+    split = [(sql, (cid, [doc])) for _stage, table, sql in purge._BY_DOC_ID
+             if table == "pending_edges"]
+    assert len(split) == 2
+
+    rewritten = await _deleted_by(split, "pending_edges", "id")
+    or_form = await _deleted_by([(_OR_FORM_PENDING_SQL, (cid, [doc]))], "pending_edges", "id")
+
+    assert rewritten == or_form == {ids["from"], ids["to"], ids["both"]}
+
+
+async def test_side_deletes_can_use_their_indexes(app_settings) -> None:
+    """Every per-document side delete on a big table must be SERVABLE by its
+    index: the first production run timed out because three could not be (an
+    OR, an IN list, a partial index whose predicate the query did not restate)
+    and the ACL check fell back to the trigram index for every row.
+
+    `enable_seqscan = off` makes this ask "can an index serve it", not "is a
+    scan wrong here" -- on a test-sized table a scan is the right plan
+    (engine/retrieval/index_contracts.py says why a plain EXPLAIN test would be
+    wrong). A few thousand analyzed rows, because on EMPTY tables the planner
+    picks index scans on customer_id alone and filters the rest, which would
+    prove nothing. Run as the app role, under the tenant GUC, as the purge
+    runs: FORCE RLS adds a security qual that must not keep the index out."""
+    cid = "t-plans"
+    await _tenant(cid)
+    async with db_module.raw_conn() as conn:
+        await conn.execute(
+            """
+            INSERT INTO documents (customer_id, doc_id, version, source_system, source_id,
+                                   source_url, doc_type, content_hash, created_at,
+                                   updated_at, valid_from, acl)
+            SELECT $1, 'custom_ingest:t-plans:k:' || i, 1, 'custom_ingest', 'k:' || i,
+                   'https://x', 't', 'h', now(), now(), now(), '{}'::jsonb
+            FROM generate_series(1, 2000) i
+            """,
+            cid,
+        )
+        await conn.execute(
+            """
+            INSERT INTO acl_snapshots (customer_id, source_system, principal_type,
+                                       principal_id, resource_type, resource_id,
+                                       permission, valid_from)
+            SELECT $1, 'custom_ingest', 'workspace', $1, 'custom.document', 'k:' || i,
+                   'read', now()
+            FROM generate_series(1, 2000) i
+            """,
+            cid,
+        )
+        await conn.execute(
+            """
+            INSERT INTO pending_edges (customer_id, missing_label, missing_canonical_id,
+                                       edge_type, from_label, from_canonical_id,
+                                       to_label, to_canonical_id, source_system)
+            SELECT $1, 'Run', 'run:' || i, 'TOUCHES', 'Run', 'run:' || i, 'Document',
+                   'custom_ingest:t-plans:k:' || i, 'custom_ingest'
+            FROM generate_series(1, 2000) i
+            """,
+            cid,
+        )
+        await conn.execute(
+            """
+            INSERT INTO inferred_edges_queue (customer_id, anchor_doc_id, extractor_id,
+                                              done_at)
+            SELECT $1, 'custom_ingest:t-plans:k:' || i, 'inferred_edges:v1', now()
+            FROM generate_series(1, 2000) i
+            """,
+            cid,
+        )
+        await conn.execute(
+            """
+            INSERT INTO manual_uploads (upload_id, customer_id, filename, file_sha256,
+                                        status, doc_id)
+            SELECT 'u' || i, $1, 'f', 'h', 'indexed', 'custom_ingest:t-plans:k:' || i
+            FROM generate_series(1, 2000) i
+            """,
+            cid,
+        )
+        for table in ("documents", "acl_snapshots", "pending_edges", "inferred_edges_queue",
+                      "manual_uploads"):
+            await conn.execute(f"ANALYZE {table}")
+    ids = ["custom_ingest:t-plans:k:1"]
+    conn = await asyncpg.connect(app_settings.database_url)
+    try:
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.current_customer_id', $1, true)", cid)
+            await conn.execute("SET LOCAL enable_seqscan = off")
+
+            async def plan(sql: str, *args) -> str:
+                return "\n".join(r[0] for r in await conn.fetch("EXPLAIN " + sql, *args))
+
+            plans = {stage: await plan(sql, cid, ids) for stage, _t, sql in purge._BY_DOC_ID}
+            acl_args = (cid, ids, [SourceSystem.CUSTOM_INGEST.value], ["k:1"])
+            plans["acl_snapshots"] = await plan(purge._DELETE_ACL_SQL, *acl_args)
+            or_form_acl = await plan(_OR_FORM_ACL_SQL, *acl_args)
+    finally:
+        await conn.close()
+
+    assert "idx_inferred_edges_queue_anchor" in plans["inferred_edges_queue"]
+    assert "idx_pending_edges_from_document" in plans["pending_edges.from"]
+    assert "idx_pending_edges_to_document" in plans["pending_edges.to"]
+    assert "idx_manual_uploads_doc" in plans["manual_uploads"]
+    # github_document_bindings is left unasserted on purpose: GitHub documents
+    # only, and its primary key has doc_id third.
+    # The control: the OR form that timed out does show the trigram probe, so
+    # its absence below is a finding, not a blind spot.
+    assert "trgm" in or_form_acl, or_form_acl
+    acl = plans["acl_snapshots"]
+    # Each lookup keyed on the id itself, not on customer_id with a filter.
+    assert "idx_acl_snapshots_resource" in acl, acl
+    assert "(resource_id = " in acl, acl
+    assert "documents_pkey" in acl, acl
+    assert "(doc_id = a.resource_id)" in acl, acl
+    assert "idx_documents_customer_source" in acl, acl
+    assert "(source_id = a.resource_id)" in acl, acl
+    assert "trgm" not in acl, acl
+
+
+_MIGRATION_0141 = (
+    Path(__file__).resolve().parents[1]
+    / "db/migrations/versions/20260925_0141_tombstone_purge_side_indexes.py"
+)
+
+
+async def test_migration_0141_builds_the_indexes_schema_sql_declares(live_db) -> None:
+    """CI builds its database from db/schema.sql and stamps alembic head, so the
+    migration that ships these indexes to both planes never runs here, and the
+    plan test above proves only schema.sql's copies. A drifted migration -- a
+    column, or the literal 'Document' a partial predicate must restate -- would
+    pass every test and give production an index the purge cannot use. So each
+    index is rebuilt from the migration's own definition, in a transaction that
+    is rolled back, and Postgres's rendering of the two must be identical."""
+    spec = importlib.util.spec_from_file_location("migration_0141", _MIGRATION_0141)
+    assert spec is not None and spec.loader is not None
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    indexdef = "SELECT pg_get_indexdef(to_regclass($1)::oid)"
+
+    async with db_module.raw_conn() as conn:
+        tx = conn.transaction()
+        await tx.start()
+        try:
+            for name, definition in migration._INDEXES:
+                from_schema = await conn.fetchval(indexdef, name)
+                assert from_schema is not None, f"db/schema.sql does not declare {name}"
+                await conn.execute(f"DROP INDEX {name}")
+                await conn.execute(f"CREATE INDEX {name} {definition}")
+                assert await conn.fetchval(indexdef, name) == from_schema
+        finally:
+            await tx.rollback()
+
+
+async def test_a_statement_timeout_names_its_stage(app_settings, settings, monkeypatch) -> None:
+    """asyncpg's client command_timeout raises a TimeoutError whose message is
+    empty; the first production failure logged `error=""` and no statement.
+    The failure names the stage it was in and says what timed out."""
+    cid = "t-timeout"
+    await _tenant(cid)
+    await _doc(cid, "slack:C1:1.0", versions=1, tombstone_days=9)
+    monkeypatch.setattr(
+        purge,
+        "_DELETE_ACL_SQL",
+        "SELECT pg_sleep(30), $1::text, $2::text[], $3::text[], $4::text[]",
+    )
+    # 2 s, not less: the timeout covers every statement of the run, and a slow
+    # CI runner must not time out an earlier one and fail on the wrong stage.
+    impatient = app_settings.model_copy(update={"db_statement_timeout_ms": 2000})
+    # In production one Settings builds the pool and names its timeout; the
+    # test pool is built from `impatient`, so the message must read it too.
+    monkeypatch.setattr(purge, "get_settings", lambda: impatient)
+
+    with capture_logs() as logs:
+        assert await _run(impatient, settings) == purge.EXIT_FAILED
+
+    failed = [r for r in logs if r["event"] == "tombstone_purge.tenant_failed"]
+    assert len(failed) == 1, logs
+    assert failed[0]["stage"] == "acl_snapshots"
+    assert failed[0]["error_type"] == "TimeoutError"
+    assert "command_timeout (2000 ms" in failed[0]["error"]
+    assert await _doc_rows(cid, "slack:C1:1.0") == 1  # the batch rolled back
+
+
+async def test_a_lock_wait_names_its_stage(app_settings, settings, monkeypatch) -> None:
+    """A group given up on a lock wait (a hold being placed holds the customers
+    row) is logged contended with the stage it was waiting in, and keeps its
+    rows for the next run."""
+    cid = "t-contended"
+    await _tenant(cid)
+    await _doc(cid, "slack:C1:1.0", versions=1, tombstone_days=9)
+    monkeypatch.setattr(purge, "_LOCK_TIMEOUT", "200ms")
+    # Its own connection, not the fixture pool: _run closes that pool.
+    holder = await asyncpg.connect(settings.database_url)
+    try:
+        async with holder.transaction():
+            await holder.execute(
+                "SELECT 1 FROM customers WHERE customer_id = $1 FOR UPDATE", cid
+            )
+            with capture_logs() as logs:
+                await _run(app_settings, settings)
+    finally:
+        await holder.close()
+
+    contended = [r for r in logs if r["event"] == "tombstone_purge.group_contended"]
+    assert [r["stage"] for r in contended] == ["gate"], logs
+    assert contended[0]["error"] == "LockNotAvailableError"
+    assert await _doc_rows(cid, "slack:C1:1.0") == 1
+
+
+def test_an_error_without_a_message_is_still_named() -> None:
+    assert purge._error_text(ValueError("bad row")) == "bad row"
+    assert purge._error_text(RuntimeError()) == "RuntimeError()"
 
 
 async def test_tombstone_a_writer_holds_waits_for_the_next_run(app_settings, settings) -> None:

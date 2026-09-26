@@ -658,6 +658,13 @@ CREATE TABLE acl_snapshots (
 
 CREATE INDEX idx_acl_principal ON acl_snapshots (customer_id, principal_id, valid_from DESC);
 CREATE INDEX idx_acl_resource ON acl_snapshots (customer_id, resource_type, resource_id, valid_from DESC);
+-- By resource id alone, for scripts/cron_tombstone_purge.py: it deletes a
+-- purged document's rows by its doc_id / source_id without knowing the
+-- resource_type, which idx_acl_resource needs first. Without this the delete
+-- read the tenant's whole share of the table per batch (53 s at 761k rows).
+-- Migration 0141 builds it CONCURRENTLY on existing planes.
+CREATE INDEX IF NOT EXISTS idx_acl_snapshots_resource
+    ON acl_snapshots (customer_id, resource_id);
 
 -- ---------------------------------------------------------------------------
 -- ingestion_queue: backpressure buffer between webhook handler and worker.
@@ -1435,6 +1442,13 @@ CREATE UNIQUE INDEX idx_inferred_edges_queue_outstanding
     ON inferred_edges_queue (customer_id, anchor_doc_id, extractor_id)
     WHERE done_at IS NULL;
 
+-- Every row by anchor document, done or not, for the per-document deletes
+-- (scripts/cron_tombstone_purge.py, kb/session_deletion.py). The index above
+-- holds only outstanding rows, and done rows are never pruned, so without this
+-- each delete read the whole table -- every tenant's rows (migration 0141).
+CREATE INDEX IF NOT EXISTS idx_inferred_edges_queue_anchor
+    ON inferred_edges_queue (customer_id, anchor_doc_id);
+
 -- inferred_edges_queue is an internal queue table drained CROSS-tenant by
 -- the inferred-edges side-worker (services/ingestion/inferred_edges/
 -- worker.py:_claim_one). Under FORCE RLS that drain SELECT silently
@@ -1629,6 +1643,18 @@ CREATE INDEX idx_pending_edges_missing
 CREATE INDEX idx_pending_edges_created
     ON pending_edges (created_at)
     WHERE locked_until IS NULL;
+-- A Document endpoint by canonical id, one index per side, for
+-- scripts/cron_tombstone_purge.py: a purged document's parked edges are found
+-- by the endpoint that is PRESENT (a Run -> Document edge waiting for its Run),
+-- which idx_pending_edges_missing does not key. Partial on the label because
+-- the purge asks only about 'Document' and restates that predicate literally
+-- (migration 0141).
+CREATE INDEX IF NOT EXISTS idx_pending_edges_from_document
+    ON pending_edges (customer_id, from_canonical_id)
+    WHERE from_label = 'Document';
+CREATE INDEX IF NOT EXISTS idx_pending_edges_to_document
+    ON pending_edges (customer_id, to_canonical_id)
+    WHERE to_label = 'Document';
 ALTER TABLE pending_edges ENABLE ROW LEVEL SECURITY;
 ALTER TABLE pending_edges FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON pending_edges
