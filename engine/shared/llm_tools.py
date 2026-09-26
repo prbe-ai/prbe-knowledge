@@ -81,6 +81,7 @@ from typing import Any
 import orjson
 
 from engine.shared.llm import LLMError, acompletion
+from engine.shared.llm_errors import is_budget_exhausted_error
 
 __all__ = [
     "ToolCallParseError",
@@ -546,6 +547,8 @@ def is_transient_provider_error(exc: BaseException) -> bool:
     if not isinstance(exc, LLMError):
         return False
     status = exc.status_code
+    if status in {400, 429} and is_budget_exhausted_error(exc):
+        return False
     # A concrete HTTP status is authoritative. In particular, never let a
     # nested connection-ish cause turn an auth/config/validation 4xx into a
     # recoverable outage.
