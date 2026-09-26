@@ -86,11 +86,6 @@ def settings() -> Settings:
 
 TRUNCATE_SQL = """
     TRUNCATE TABLE
-        serve_ledger,
-        clause_evidence,
-        clause_situation_edges,
-        clauses,
-        situations,
         graph_edges,
         graph_nodes,
         audit_log,
@@ -115,7 +110,9 @@ TRUNCATE_SQL = """
 # tables -- and it was the only one of the four this list ever named.
 # TRUNCATE takes the whole list or none, so a correctly migrated
 # database failed EVERY live-DB test at fixture setup with
-# `UndefinedTableError`, before a single assertion ran.
+# `UndefinedTableError`, before a single assertion ran. The five
+# workflow-memory tables left the list for the same reason when migration
+# 0142 dropped them.
 
 
 #: TRUNCATE empties a partitioned table but leaves its PARTITIONS in place, so

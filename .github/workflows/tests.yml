@@ -216,16 +216,10 @@ jobs:
       # wiki routes, and again with PR #476, whose `pytest` check went green
       # without running a single one of the tests it added.
       #
-      # `test_workflow_memory_isolation.py` stays although the workflow-memory
-      # feature and its endpoints are gone: its five tables and their stored
-      # rows are kept (dropping them is a separate decision), and this file is
-      # what proves tenant isolation, the RLS policies and the serve ledger's
-      # append-only rule still hold on them. A cross-tenant read returns rows
-      # rather than raising, so only the test notices.
-      #
-      # `tests/retrieval/agent/` is on the list for the same reason and costs
-      # nothing: 273 tests, ~1.2s, no Postgres and no MinIO -- the LLM is
-      # mocked throughout. It guards the gatherer's terminal-args coercer,
+      # `tests/retrieval/agent/` is on the list because what it guards breaks
+      # silently, and it costs nothing: 273 tests, ~1.2s, no Postgres and no
+      # MinIO -- the LLM is mocked throughout. It guards the gatherer's
+      # terminal-args coercer,
       # which is the ONLY thing standing between a non-strict provider's
       # schema drift and a user losing their whole answer (the enforcement it
       # replaced went away with the Cerebras swap, PR #320). A silent
@@ -245,6 +239,9 @@ jobs:
       # test_migration_chain is here because this job never replays the chain
       # (it applies schema.sql and stamps head): without it two migrations off
       # one parent, or a revision id too long for alembic_version, merge green.
+      # test_workflow_memory_dropped is here for the same reason: it proves
+      # migration 0142 removes every workflow-memory table, function and
+      # preference key 0114-0118 created, and that schema.sql creates none.
       #
       # The three test_auto_merge_* files cover entity auto-merge, which on the
       # managed plane EXECUTES real merges: the Jev judge's request and verdict
@@ -262,7 +259,7 @@ jobs:
       # NEVER put a `#` comment INSIDE the folded `run: >-`
       # scalar below: YAML folds it into one line and the first `#` comments
       # out every path after it -- CI stays green and runs none of them.
-      - name: Tests (storage + workflow-memory isolation suites)
+      - name: Tests (storage + migration suites)
         run: >-
           .venv/bin/pytest -q
           tests/test_github_installation_controls.py
@@ -271,7 +268,6 @@ jobs:
           tests/handlers/test_github.py
           tests/test_backend_client.py
           tests/test_codegraph_github_branch_filter.py
-          tests/test_workflow_memory_isolation.py
           tests/test_object_store_s3.py
           tests/test_storage_list_keys.py
           tests/test_persist_trace_blob_r2.py
@@ -297,6 +293,7 @@ jobs:
           tests/test_custom_ingest.py
           tests/test_tombstone_purge.py
           tests/test_migration_chain.py
+          tests/test_workflow_memory_dropped.py
           tests/test_backfill_custom_doc_types.py
           tests/test_retire_experiment_nodes.py
           tests/test_auto_merge_analyzer.py

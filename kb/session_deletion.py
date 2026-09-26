@@ -175,10 +175,6 @@ NOT_COVERED: tuple[dict[str, str], ...] = (
         "why": "merge-undo snapshots of node properties; not keyed by document",
     },
     {
-        "store": "serve_ledger.session_id",
-        "why": "append-only exposure log (session id + clause ids, no content); RLS denies DELETE by design",
-    },
-    {
         "store": "Person graph node (by-id deletions)",
         "why": "a person is shared by their other sessions; removed only by an author deletion, "
         "and only when nothing else asserts it",
