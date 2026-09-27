@@ -270,9 +270,13 @@ _ANCHOR_START = r"(?:(?<![A-Za-z0-9])|(?-i:(?<=[a-z0-9])(?=[A-Z]))|(?-i:(?<=[A-Z
 #: (`_ANCHORED`, never the short-value rules): `encryption_key`, `signing_key`,
 #: and an environment-style `*_KEY` (`AZURE_OPENAI_KEY`, `SIGNING_KEY`). The
 #: capitals are case-sensitive, so `sort_key = 3` never qualifies, and the
-#: length is bounded so a long `A_A_A...` run stays linear.
+#: length is bounded so a long `A_A_A...` run stays linear. A `*_KEY` ending in
+#: an ordinary anchor (`OPENAI_API_KEY`, `DJANGO_SECRET_KEY`) is left to that
+#: anchor, which has no digit rule: matched here first, the whole name was
+#: dropped for a value with no digit and the `API_KEY` inside it never read.
 _LONG_VALUE_ANCHOR_WORDS = (
-    "encryption[_ -]?key", "signing[_ -]?key", r"(?-i:[A-Z][A-Z0-9_]{0,40}_KEY)",
+    "encryption[_ -]?key", "signing[_ -]?key",
+    r"(?-i:[A-Z][A-Z0-9_]{0,40}(?<!API)(?<!ACCESS)(?<!SECRET)(?<!PRIVATE)_KEY)",
 )
 #: A lower-case `*_key` name or a camelCase `...Key` (`azure_openai_key`,
 #: `openaiKey`, `azureOpenAIKey`). Far more of these are NOT credentials
@@ -400,6 +404,9 @@ _NETRC_PASSWORD = re.compile(
     r"\s+password\s+(?P<value>\S{1,512})"
 )
 _NETRC_VALUE_END = re.compile(r"\\[nrt]|[\"'`]")
+#: A netrc entry with no `login` field needs a value with a digit or a symbol:
+#: without one, `machine gpu01 password reset` is a sentence.
+_NETRC_LOGIN = re.compile(r"(?i)\slogin\s")
 #: `<password>...</password>` (Maven `settings.xml`, many XML configs).
 _XML_PASSWORD = re.compile(r"(?i)<password>\s*(?P<value>[^<\s][^<]{0,510})</password>")
 #: A registry `auth` value in a docker config: base64 of `user:password`. JSON,
@@ -454,10 +461,12 @@ _DOTTED_CODE = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+(?:\(.*)?|[A-Za-z_][\
 #: A value that is a template slot, not a value (the code snapshot's
 #: `_PLACEHOLDER`, plus Jinja/Helm `{{ }}`): `{password}`, `{{ .Values.pw }}`,
 #: `${VAR}`, `$GH_TOKEN`, `$1`, `%s`, `%(name)s`, `<TOKEN>`, `***`, `...`,
-#: `:name`.
+#: `:name`. A lower-case variable too (Gradle `password "$mavenPassword"`, a
+#: shell `password $github_token`), but only in letters and `_`: a password
+#: that starts with `$` (`$ecretPa55`) has a digit or a symbol.
 _SLOT = re.compile(
-    r"\{\{[^{}]*\}\}|\{[^{}]*\}|\$\{[^{}]*\}|\$\d+(?:::\w+)?|\$[A-Z_][A-Z0-9_]*|\$\([^()]*\)"
-    r"|%s|%\(\w+\)s|<[^<>]*>|\*{3,}|\.{3}|\u2026|:[A-Za-z_]\w*"
+    r"\{\{[^{}]*\}\}|\{[^{}]*\}|\$\{[^{}]*\}|\$\d+(?:::\w+)?|\$[A-Z_][A-Z0-9_]*|\$[a-z_][A-Za-z_]*"
+    r"|\$\([^()]*\)|%s|%\(\w+\)s|<[^<>]*>|\*{3,}|\.{3}|\u2026|:[A-Za-z_]\w*"
 )
 #: Punctuation around a value that is not part of it.
 _VALUE_EDGES = "\"'`.,;:)]}"
@@ -545,7 +554,12 @@ def _loose_value_ok(value: str) -> bool:
 
 def _generated(value: str) -> bool:
     """A digit or a symbol in it (`a8Kd93jLm2Qx`, `Tr0ub4dor&3xQ`), as a
-    generated secret has and a name (`master_user_password`) does not."""
+    generated secret has and a name (`master_user_password`) does not. A value
+    with a space in it needs a digit: its punctuation is a sentence's
+    (`"Forgot password?"`, `"Passwort vergessen?"`, `"Must match!"` are UI
+    labels), and a space is not a symbol (`"Confirm password"`)."""
+    if any(c.isspace() for c in value):
+        return any(c.isdigit() for c in value)
     return any(c.isdigit() or not (c.isalnum() or c == "_") for c in value)
 
 
@@ -568,7 +582,7 @@ def _bare_token(value: str, after: str) -> str | None:
     token = first.rstrip(_VALUE_EDGES)
     if not token or _DOTTED_CODE.fullmatch(token) or _is_slot(token):
         return None
-    if len(token) < 6 or not _generated(token):
+    if len(token) < _CAMEL_MIN_LEN or not _generated(token):
         return None  # `retryPassword = 3`, `userPassword = hunter` are not generated
     return token
 
@@ -599,6 +613,34 @@ def _raw_regex(text: str, value_start: int, value: str) -> bool:
     return "r" in text[max(0, value_start - 3):value_start - 1].lower() and bool(_REGEX_SHAPE.search(value))
 
 
+#: How much of a line past a camelCase key's value `_camel_value` reads: enough
+#: for a typed field's literal (`: string = "..."`) or to see that a bare token
+#: ends its line. Reading to the line's real end cost one pass over the rest of
+#: the line PER MATCH: a 2 MB one-line file of `dbPassword=a8Kd93jLm2Qx,` took
+#: 37 s in code capture. Past the reach the line counts as ended, so a token
+#: followed by a KB of spaces and then more text counts (the safe direction).
+_CAMEL_LINE_REACH = 1024
+#: The word before `Secret` in a camelCase key whose value NAMES a secret object
+#: rather than holding one: Helm's `existingSecret: pg-auth-v2`,
+#: `imagePullSecret: regcred-v1`, `tlsSecret`, `certSecret`.
+_SECRET_REFERENCE_WORDS = frozenset({"existing", "pull", "tls", "cert"})
+#: Shortest value after a camelCase key that counts, quoted or not. A generated
+#: secret is longer; `"n/a"`, `"-"`, `"TBD"` are not secrets.
+_CAMEL_MIN_LEN = 6
+
+
+def _names_a_secret(text: str, key_end: int) -> bool:
+    """Whether the camelCase key ending at ``key_end`` names a secret object
+    (see `_SECRET_REFERENCE_WORDS`). Reads at most 64 characters back."""
+    if text[max(0, key_end - 6):key_end].lower() != "secret":
+        return False
+    lo, floor = key_end, max(0, key_end - 64)
+    while lo > floor and (text[lo - 1].isalnum() or text[lo - 1] == "_"):
+        lo -= 1
+    words = [w.lower() for w in _NAME_WORDS.findall(text[lo:key_end])]
+    return len(words) > 1 and words[-1] == "secret" and words[-2] in _SECRET_REFERENCE_WORDS
+
+
 def _camel_value(
     text: str, key_end: int, gap: str, start: int, value: str, quoted: bool
 ) -> tuple[int, str] | None:
@@ -607,23 +649,31 @@ def _camel_value(
     A camelCase key (`postgresPassword`, `jwtSecret`) is a field in code, a
     generated API client or prose far more often than a credential's name, so
     its value must look like one: on the key's line, after the key's own
-    separator (`_CAMEL_GAP`); quoted, with a digit or a symbol and fewer than
-    three words (`"S3cr3tPassw0rd"`, not `"dataStoreTestQuery"` or `"Private
-    key password 1"`); unquoted, a `_bare_token`. Slots, references and UUIDs
-    never count.
+    separator (`_CAMEL_GAP`); quoted, 6+ characters with a digit or a symbol
+    (a digit if it has a space) and fewer than three words (`"S3cr3tPassw0rd"`,
+    not `"dataStoreTestQuery"`, `"Forgot password?"` or `"Private key password
+    1"`); unquoted, a `_bare_token`. Slots, references, UUIDs and the name of a
+    secret object (`existingSecret: pg-auth-v2`) never count.
     """
     if not _CAMEL_GAP.fullmatch(gap) or text.find("\n", key_end, start) != -1:
         return None
+    found = _camel_literal(text, start, value, quoted)
+    return None if found is None or _names_a_secret(text, key_end) else found
+
+
+def _camel_literal(text: str, start: int, value: str, quoted: bool) -> tuple[int, str] | None:
+    """`_camel_value` past the key checks: the value, if it looks generated."""
 
     def literal(at: int, lit: str) -> tuple[int, str] | None:
         if _is_slot(lit) or _is_indirect(lit) or _UUID.fullmatch(lit) or len(lit.split()) >= 3:
             return None
-        return (at, lit) if _generated(lit) else None
+        return (at, lit) if len(lit) >= _CAMEL_MIN_LEN and _generated(lit) else None
 
     if quoted:
         return literal(start, value)
-    line_end = text.find("\n", start)
-    line_end = len(text) if line_end < 0 else line_end
+    reach = start + len(value) + _CAMEL_LINE_REACH
+    line_end = text.find("\n", start, reach)
+    line_end = min(len(text), reach) if line_end < 0 else line_end
     token = _bare_token(value, text[start + len(value):line_end])
     if token is not None:
         return None if _is_indirect(token) or _UUID.fullmatch(token) else (start, token)
@@ -1028,8 +1078,13 @@ def scan(
             # Written by a `printf`/`echo`, the entry ends at the closing
             # quote or a `\n` escape: `password $GH_TOKEN\n" > ~/.netrc`.
             value = _NETRC_VALUE_END.split(match.group("value"), maxsplit=1)[0]
-            if value and not _is_indirect(value) and not _is_slot(value):
-                findings.append(Finding("netrc-password", match.start("value"), match.start("value") + len(value)))
+            if not value or _is_indirect(value) or _is_slot(value):
+                continue
+            if not _NETRC_LOGIN.search(text, match.start(), match.start("value")) and not _generated(
+                value.rstrip(_VALUE_EDGES + "!?")
+            ):
+                continue  # prose: "the machine gpu01 password reset flow."
+            findings.append(Finding("netrc-password", match.start("value"), match.start("value") + len(value)))
     if present(("<password>",), _XML_PASSWORD):
         for match in _unmarked(_XML_PASSWORD, text, windows):
             value = match.group("value").rstrip()
@@ -1285,8 +1340,12 @@ _ASCII_LOWER = {c: c + 32 for c in range(ord("A"), ord("Z") + 1)}
 @functools.lru_cache(maxsize=1)
 def _quick_reach() -> dict[re.Pattern[str], tuple[tuple[str, ...], int]]:
     """Each quick-check pattern: its keywords and how far past one to read."""
-    from re import _constants as sre_constants  # type: ignore[attr-defined]
-    from re import _parser as sre_parse  # type: ignore[attr-defined]
+    try:  # Python 3.11+ names
+        from re import _constants as sre_constants  # type: ignore[attr-defined]
+        from re import _parser as sre_parse  # type: ignore[attr-defined]
+    except ImportError:  # Python 3.10 (plan 2.11): only the top-level modules exist
+        import sre_constants
+        import sre_parse
 
     def tail(pattern: re.Pattern[str]) -> int:
         width = sre_parse.parse(pattern.pattern, pattern.flags).getwidth()[1]

@@ -85,7 +85,79 @@ def _plain_word_key(key: str) -> bool:
     return _normalize_key(key) in _PLAIN_WORD_KEYS
 
 
+# ---------------------------------------------------------------------------
+# The scrub cache (plan items (k) and 1.3)
+# ---------------------------------------------------------------------------
+# `scrub_string` and `is_sensitive_key` are pure functions of their argument, and
+# the SDK asks them the same questions over and over: every journaled op is
+# scrubbed more than once on its way to disk (the body, then the whole op), and
+# the same dictionary keys, hostnames and timestamps recur in every row -- a
+# 10k-row read list made ~200k scrub_string calls and took ~3.9 s, nearly all of
+# it in the scanner. A bounded LRU turns every repeat into a dict lookup.
+#
+# Only strings up to SCRUB_CACHE_MAX_CHARS are cached: short strings are the
+# repeated ones (keys, hosts, paths), and a cap on length is what bounds the
+# memory (at most SCRUB_CACHE_SIZE x ~2 x 256 characters, a few MB).
+# SCRUB_CACHE_SIZE covers a whole read list (inputs.MAX_PATHS = 10k distinct
+# paths) plus the keys: an LRU smaller than one sequential pass evicts every
+# entry before its second use and hits nothing. A read row's other fields --
+# hash, fingerprint, timestamp, each distinct per row -- never reach the
+# scrubber (`stamp_scrub` lifts them, shape-checked), or 10k rows would be ~40k
+# distinct strings and thrash it.
+#
+# OFF UNLESS A RESEARCHER'S RUN TURNS IT ON (`enable_scrub_cache`). Importing
+# this module is not enough: the hosted MCP server, the API's W&B import worker
+# and the vendored server copy all import it and serve many tenants, and there
+# one cache would hold raw credentials for the process lifetime and a hit (a
+# dict lookup) against a miss (a full scan) would say whether another tenant
+# sent that string. So the cache is enabled only by `Client.run` and
+# `probe.init`, in the process doing a researcher's run; `forbid_scrub_cache`
+# keeps it off for good in a multi-tenant process (the hosted MCP app), and the
+# vendored copies can never enable it (their module is not `probe.*`).
+#
+# Plan item 1.3 (the cheaper `log()` append) reuses this cache; it is the one
+# scrubber cache, not a per-caller one.
+_CACHE_ENABLED = False
+_CACHE_FORBIDDEN = False
+SCRUB_CACHE_MAX_CHARS = 256
+SCRUB_CACHE_SIZE = 16_384
+
+
+def enable_scrub_cache() -> bool:
+    """Turn the scrub cache on for this process; returns whether it is on.
+
+    Called where a researcher's process opens a run (`Client.run`,
+    `probe.init`). A no-op in a vendored copy and after `forbid_scrub_cache`."""
+    global _CACHE_ENABLED
+    if not _CACHE_FORBIDDEN and __name__.startswith("probe."):
+        _CACHE_ENABLED = True
+    return _CACHE_ENABLED
+
+
+def forbid_scrub_cache() -> None:
+    """Keep the scrub cache off in this process for good, and empty it. For a
+    process that serves many tenants (the hosted MCP server)."""
+    global _CACHE_ENABLED, _CACHE_FORBIDDEN
+    _CACHE_FORBIDDEN = True
+    _CACHE_ENABLED = False
+    clear_caches()
+
+
+def clear_caches() -> None:
+    """Forget every cached scrub. For tests that swap a scanner rule out; the
+    rules never change under a running process otherwise."""
+    _scrub_string_cached.cache_clear()
+    _is_sensitive_key_cached.cache_clear()
+
+
 def is_sensitive_key(key: str) -> bool:
+    """Whether a field NAME marks its value as a credential. Cached (see above)."""
+    if _CACHE_ENABLED and isinstance(key, str) and len(key) <= SCRUB_CACHE_MAX_CHARS:
+        return _is_sensitive_key_cached(key)
+    return _is_sensitive_key(key)
+
+
+def _is_sensitive_key(key: str) -> bool:
     # Generated dictionary-key placeholders are labels, not credential fields.
     # Re-scrubbing them must not erase their already-scrubbed sibling values.
     if re.fullmatch(r"<redacted(?::[a-z0-9-]+)?>(?::[0-9]+)?", key):
@@ -143,7 +215,17 @@ def _scrub_url(url: str) -> str:
 
 
 def scrub_string(value: str, *, _depth: int = 0) -> str:
-    """Scrub secrets in prose without removing ordinary paths or identifiers."""
+    """Scrub secrets in prose without removing ordinary paths or identifiers.
+
+    Cached for strings up to SCRUB_CACHE_MAX_CHARS (see "The scrub cache"): the
+    answer is a pure function of the string, so a repeat is a dict lookup."""
+    if _depth == 0 and _CACHE_ENABLED and isinstance(value, str) and len(value) <= SCRUB_CACHE_MAX_CHARS:
+        return _scrub_string_cached(value)
+    return _scrub_string(value, _depth=_depth)
+
+
+def _scrub_string(value: str, *, _depth: int = 0) -> str:
+    """`scrub_string` without the cache."""
     from ._credential_secrets import redact
 
     # Inspect the original credential before ordinary scrubbing can remove
@@ -182,6 +264,10 @@ def scrub_string(value: str, *, _depth: int = 0) -> str:
     # credentials. Never use a global entropy sweep: UUIDs and model vocabulary
     # are content, not evidence of a secret.
     return _TOKEN_PREFIXED.sub("<redacted>", scrubbed)
+
+
+_scrub_string_cached = functools.lru_cache(maxsize=SCRUB_CACHE_SIZE)(lambda value: _scrub_string(value))
+_is_sensitive_key_cached = functools.lru_cache(maxsize=SCRUB_CACHE_SIZE)(lambda key: _is_sensitive_key(key))
 
 
 def default_scrub(value: Any, *, key: str = "") -> Any:
