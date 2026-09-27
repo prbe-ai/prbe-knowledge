@@ -6,6 +6,27 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Security
+
+- **The vendored credential scanner is back in sync with research-os, with the #2000 rules.**
+  `engine/ingest/_credential_{secrets,redaction,gate}.py` are regenerated from research-os
+  (`scripts/sync_credential_scrubber.py --knowledge-root`); they had drifted ~1,000 lines. New
+  shapes found and redacted: camelCase and acronym key names (including letters-and-digits
+  passwords), vendor `*_key`/`...Key` names, `f"..."`-prefixed literals, environment and
+  command-line defaults and fallbacks, Kubernetes env pairs, Dockerfile `ENV` lines, `*_KEY`
+  names with a key-shaped value, netrc, `<password>` and Gradle password entries, docker
+  `auth`/`identitytoken` and `.npmrc` `_auth` values, and URL passwords over 64 characters made
+  of token characters (so JSON holding an `https://` value and a later email address is not
+  rewritten). Template slots, shell variables (`$GH_TOKEN`, `$mavenPassword`), UUIDs,
+  pagination tokens, public keys, UI labels (`"forgotPassword": "Forgot password?"`), names of
+  secret objects (`existingSecret: pg-auth-v2`) and netrc words in prose stay clean. A value
+  after a camelCase key is read in a bounded stretch of its line, so a scan of one long line
+  is linear (a 2 MB one took 18-29 s, now ~1 s), and `OPENAI_API_KEY = "<letters>"` is found
+  again. `_credential_redaction.py` carries research-os #2040's scrub cache, which cannot
+  switch on in a vendored copy (its module is not `probe.*`). The gate's `CredentialBlocked`
+  stays a plain `Exception` here (the engine has no SDK error tree), and the manual upload
+  still refuses on findings (`test_manual_upload_secret_boundary.py`).
+
 ### Added
 
 - **What a customer deletes now leaves the engine completely, a week later.** A deleted item
