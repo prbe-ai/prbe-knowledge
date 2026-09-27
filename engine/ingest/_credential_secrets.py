@@ -205,7 +205,7 @@ _RULES: tuple[_Rule, ...] = (
     _r("npm-token", r"\bnpm_[A-Za-z0-9]{36}\b", ("npm_",)),
     # Weights & Biases keys are 40 hex with no prefix, so they are ONLY safe to
     # match next to the literal `wandb` — a bare 40-hex rule is a git-sha rule.
-    _r("wandb-key", r"(?i)\bwandb(?:[_ -]api[_ -]key\s*[:=]\s*|\s+login\s+|\s*[:=]\s*|\.login\(\s*key\s*=\s*)[\"']?[0-9a-f]{40}\b", ("wandb",)),
+    _r("wandb-key", r"(?i)\bwandb(?:[_ -]?(?:api[_ -]?)?key[\"']?\s*[:=]\s*|\s+login\s+|\s*[:=]\s*|\.login\(\s*key\s*=\s*)[\"']?[0-9a-f]{40}\b", ("wandb",)),
     # A private key block. The body requirement stops a bare header comment
     # from matching.
     _r("private-key-block",
@@ -219,11 +219,15 @@ _RULES: tuple[_Rule, ...] = (
        ("authorization",)),
     _r("basic-auth", r"(?i)authorization[\"']?\s*[:=]\s*[\"']?basic\s+[A-Za-z0-9+/=]{8,4096}",
        ("authorization",)),
-    # user:password@host in a URI.
-    # The password part reaches 2,048 characters: AWS CodeArtifact and GCP
-    # Artifact Registry (`oauth2accesstoken:ya29...`) index URLs carry a
-    # 1 KB-class token there. Linear: the class stops at every `/` and `@`.
-    _r("credential-uri", r"\b[a-z][a-z0-9+.\-]{1,20}://[^/@\s:]{1,64}:[^/@\s]{3,2048}@",
+    # user:password@host in a URI. Up to 64 characters the password may hold
+    # anything but `/`, `@` and whitespace, as before. Longer ones -- AWS
+    # CodeArtifact and GCP Artifact Registry (`oauth2accesstoken:ya29...`) index
+    # URLs carry a 1 KB-class token there -- only in TOKEN characters: with `"`,
+    # `,` and `:` allowed that far, ordinary JSON matched from a
+    # `"https://..."` value to the `@` of an email address keys later
+    # (`{"source":"https://huggingface.co",...,"reviewer":"alice@lab.org"}`).
+    _r("credential-uri",
+       r"\b[a-z][a-z0-9+.\-]{1,20}://[^/@\s:]{1,64}:(?:[^/@\s]{3,64}|[A-Za-z0-9._~+=%\-]{65,2048})@",
        ("://",)),
 )
 
@@ -256,10 +260,12 @@ _ANCHOR_WORDS = (
 #: `... secret configuration. BEFORE:` (prose about credentials, followed by a
 #: CLI flag) — which was 6 of the 7 entropy-based false positives in that sample.
 #: Where an anchor may start: after a non-alphanumeric character, or at a
-#: camelCase hump (`postgresPassword`, `openaiApiKey`, `wandbApiKey`) -- a
-#: lowercase letter or digit, then the anchor's capital. Case-sensitive inside
-#: the otherwise case-insensitive patterns, so `bypassword` stays one word.
-_ANCHOR_START = r"(?:(?<![A-Za-z0-9])|(?-i:(?<=[a-z0-9])(?=[A-Z])))"
+#: camelCase hump -- a lowercase letter or digit, then the anchor's capital
+#: (`postgresPassword`, `openaiApiKey`), or the last capital of an acronym
+#: before a capitalized word (`DBPassword`, `SMTPPassword`, `JWTSecret`).
+#: Case-sensitive inside the otherwise case-insensitive patterns, so
+#: `bypassword` and `PASSWORDS` stay one word.
+_ANCHOR_START = r"(?:(?<![A-Za-z0-9])|(?-i:(?<=[a-z0-9])(?=[A-Z]))|(?-i:(?<=[A-Z])(?=[A-Z][a-z])))"
 #: Key names that mark a credential only when a LONG, high-entropy value follows
 #: (`_ANCHORED`, never the short-value rules): `encryption_key`, `signing_key`,
 #: and an environment-style `*_KEY` (`AZURE_OPENAI_KEY`, `SIGNING_KEY`). The
@@ -268,13 +274,25 @@ _ANCHOR_START = r"(?:(?<![A-Za-z0-9])|(?-i:(?<=[a-z0-9])(?=[A-Z])))"
 _LONG_VALUE_ANCHOR_WORDS = (
     "encryption[_ -]?key", "signing[_ -]?key", r"(?-i:[A-Z][A-Z0-9_]{0,40}_KEY)",
 )
+#: A lower-case `*_key` name or a camelCase `...Key` (`azure_openai_key`,
+#: `openaiKey`, `azureOpenAIKey`). Far more of these are NOT credentials
+#: (`cache_key`, `sortKey`, `publicKey`, `partition_key`), so they count only
+#: when the name also names who issued the key (`_owned_key_name`), and like
+#: the other widened anchors only before a long value with a digit in it.
+_VENDOR_KEY_WORDS = (r"(?-i:[a-z][a-z0-9_]{0,40}_key)", r"(?-i:(?<=[A-Za-z0-9])Key)")
+#: The same two, as anchors that start AT the final `key` / `Key` (the name
+#: before them is read with `_identifier_at`): a literal is cheap to look for,
+#: where `[a-z][a-z0-9_]{0,40}_key` had to be tried from every word's first
+#: letter. After `_ANCHOR_START`: `key` follows `_`, `Key` a camelCase hump.
+_VENDOR_KEY_ANCHOR = r"(?-i:(?<=[a-z0-9]_)key|(?<=[A-Za-z0-9])Key)"
 #: A Python/JS string prefix before the opening quote: `f"..."`, `rb'...'`.
 _STRING_PREFIX = r"(?:[rbuf]{1,2}(?=[\"']))?"
 _ANCHORED = re.compile(
     r"(?i)" + _ANCHOR_START + r"(?:" + "|".join(_ANCHOR_WORDS)
-    + r"|(?P<keyname>" + "|".join(_LONG_VALUE_ANCHOR_WORDS) + r"))"
+    + r"|(?P<keyname>" + "|".join(_LONG_VALUE_ANCHOR_WORDS) + r")"
+    + r"|(?P<vendorkey>" + _VENDOR_KEY_ANCHOR + r"))"
     r"(?![A-Za-z0-9])"
-    r"[^\n.!?]{0,24}?[:=]\s*" + _STRING_PREFIX +
+    r"(?P<gap>[^\n.!?]{0,24}?)[:=]\s*" + _STRING_PREFIX +
     r"[\"']?(?P<value>[" + _SECRET_CHARS + r"]{" + str(_ENTROPY_MIN_LEN) + r",512})",
 )
 
@@ -304,15 +322,15 @@ _ANCHOR_KEYWORDS = ("secret", "password", "passwd", "api key", "api_key", "apike
 # They still require an anchor, entropy, and mixed character classes: prose and
 # references must not become the bare-entropy gate this module replaced.
 _SHORT_ANCHORED = re.compile(
-    r"(?i)(?<![A-Za-z0-9])(?P<anchor>" + "|".join(_ANCHOR_WORDS) + r")(?![A-Za-z0-9])"
-    r"[^\n.!?]{0,24}?[:=]\s*" + _STRING_PREFIX + r"(?:\"(?P<double>[^\"\n]{1,512})\"|"
+    r"(?i)" + _ANCHOR_START + r"(?P<anchor>" + "|".join(_ANCHOR_WORDS) + r")(?![A-Za-z0-9])"
+    r"(?P<gap>[^\n.!?]{0,24}?)[:=]\s*" + _STRING_PREFIX + r"(?:\"(?P<double>[^\"\n]{1,512})\"|"
     r"'(?P<single>[^'\n]{1,512})'|(?P<bare>[^\s\"'`,;]{1,512}))"
 )
 # Password assignments carry context even when the value is a short word or
 # a human passphrase. Quoting ends at its matching quote; an unquoted value
 # continues through spaces until a statement delimiter, never just word one.
 _PASSWORD_ASSIGNMENT = re.compile(
-    r"(?i)" + _ANCHOR_START + r"(?:password|passwd)(?![A-Za-z0-9])[\"']?\s*[:=]\s*" + _STRING_PREFIX +
+    r"(?i)" + _ANCHOR_START + r"(?:password|passwd)(?![A-Za-z0-9])(?P<gap>[\"']?\s*)[:=]\s*" + _STRING_PREFIX +
     r"(?:\"(?P<double>(?:\\.|[^\"\\])*)\"|'(?P<single>(?:\\.|[^'\\])*)'|"
     r"(?P<bare>[^\r\n,;)}\]\"'`]+))"
 )
@@ -326,24 +344,78 @@ _PASSWORD_ASSIGNMENT = re.compile(
 #: (`_CREDENTIAL_NAME`) and the value passes the short-value checks.
 _ENV_DEFAULT = re.compile(
     r"(?i)(?:setdefault|getenv|\.get)\(\s*[\"'](?P<name>[A-Za-z0-9_.\-]{1,80})[\"']\s*,\s*"
-    + _STRING_PREFIX + r"[\"'](?P<value>[^\"'\n]{1,512})[\"']"
+    r"(?:default\s*=\s*)?" + _STRING_PREFIX + r"[\"'](?P<value>[^\"'\n]{1,512})[\"']"
 )
-#: A credential-shaped variable name: any anchor word (camelCase or not), or an
-#: environment-style `*_KEY`.
+#: The same default written as a fallback after the lookup:
+#: `os.environ.get("OPENAI_API_KEY") or "..."`, `process.env.AZURE_OPENAI_KEY || "..."`,
+#: `process.env["OPENAI_API_KEY"] ?? "..."`.
+_ENV_FALLBACK = re.compile(
+    r"(?:(?:getenv|environ\.get)\(\s*[\"'](?P<name>[A-Za-z0-9_.\-]{1,80})[\"']\s*\)"
+    r"|process\.env(?:\.(?P<jsname>[A-Za-z_][A-Za-z0-9_]{0,79})"
+    r"|\[\s*[\"'](?P<jsquoted>[A-Za-z0-9_]{1,80})[\"']\s*\]))"
+    r"\s*(?:\bor\b|\|\||\?\?)\s*" + _STRING_PREFIX + r"[\"'`](?P<value>[^\"'`\n]{1,512})[\"'`]"
+)
+#: A command-line option's default: `parser.add_argument("--wandb-api-key",
+#: default="...")`, `@click.option("--token", default="...")`.
+_CLI_DEFAULT = re.compile(
+    r"(?:add_argument|option)\(\s*[\"'](?P<name>-{1,2}[A-Za-z0-9][A-Za-z0-9_\-]{0,79})[\"']"
+    r"[^()]{0,300}?\bdefault\s*=\s*" + _STRING_PREFIX + r"[\"'](?P<value>[^\"'\n]{1,512})[\"']"
+)
+#: A Kubernetes (or compose / Helm) env list entry: `- name: AZURE_OPENAI_KEY`,
+#: then `value: ...` on the next line.
+_ENV_PAIR = re.compile(
+    r"(?m)^[ \t]*-[ \t]?name[ \t]*:[ \t]*[\"']?(?P<name>[A-Za-z_][A-Za-z0-9_.\-]{0,79})[\"']?[ \t]*\r?\n"
+    r"[ \t]*value[ \t]*:[ \t]*[\"']?(?P<value>[^\"'\s]{1,512})"
+)
+#: Keywords (lower-cased text) for the rules below. Each is one pass over the
+#: text and one window per hit, so each is as narrow as its pattern allows:
+#: `env ` rather than `env`, `default login` rather than `default`.
+_DOCKERFILE_ENV_KEYWORDS = ("env ", "env\t")
+_NETRC_KEYWORDS = ("machine", "default login")
+_DOCKER_AUTH_KEYWORDS = ('auth":', "auth':", "auth:")
+#: A Dockerfile `ENV NAME value` (the form without `=`).
+_DOCKERFILE_ENV = re.compile(
+    r"(?m)^[ \t]*ENV[ \t]+(?P<name>[A-Za-z_][A-Za-z0-9_]{0,79})[ \t]+[\"']?(?P<value>[^\"'\s]{1,512})"
+)
+#: A build-DSL line holding only `password "..."` (Gradle / Groovy `credentials {}`).
+_DSL_PASSWORD = re.compile(
+    r"(?im)^[ \t]*password[ \t]+[\"'](?P<value>[^\"'\n]{1,512})[\"'][ \t]*$"
+)
+#: A credential-shaped variable NAME, for the shapes above: its LAST word is an
+#: anchor (`WANDB_API_KEY`, `HF_TOKEN`, `DB_PASSWORD`, `dbPassword`), with at most
+#: a number or `_BASE` after it (`API_KEY_2`, `SECRET_KEY_BASE`). Not a name
+#: that is ABOUT a credential: `secret_name`, `TOKEN_URL`,
+#: `id_token_encrypted_response_enc`.
 _CREDENTIAL_NAME = re.compile(
-    r"(?i)" + _ANCHOR_START + r"(?:" + "|".join(_ANCHOR_WORDS + _LONG_VALUE_ANCHOR_WORDS) + r")"
-    r"(?![A-Za-z0-9])"
+    r"(?i)" + _ANCHOR_START + r"(?:" + "|".join(_ANCHOR_WORDS + _LONG_VALUE_ANCHOR_WORDS)
+    + r"|(?P<vendorkey>" + "|".join(_VENDOR_KEY_WORDS) + r"))"
+    r"(?:[_\-.]?(?:[0-9]{1,3}|base))?$"
 )
 #: A netrc entry: `machine <host> [login <u>] [account <a>] [port <p>] password <x>`,
-#: across any whitespace (netrc allows one entry over several lines).
+#: or the `default login <u> password <x>` entry, across any whitespace (netrc
+#: allows one entry over several lines).
 _NETRC_PASSWORD = re.compile(
-    r"(?i)(?<![A-Za-z0-9_])machine\s+\S{1,253}(?:\s+(?:login|account|port)\s+\S{1,256}){0,3}"
+    r"(?i)(?<![A-Za-z0-9_])(?:machine\s+\S{1,253}|default(?=\s+login\s))"
+    r"(?:\s+(?:login|account|port)\s+\S{1,256}){0,3}"
     r"\s+password\s+(?P<value>\S{1,512})"
 )
+_NETRC_VALUE_END = re.compile(r"\\[nrt]|[\"'`]")
 #: `<password>...</password>` (Maven `settings.xml`, many XML configs).
 _XML_PASSWORD = re.compile(r"(?i)<password>\s*(?P<value>[^<\s][^<]{0,510})</password>")
-#: A registry `"auth"` value in a docker config: base64 of `user:password`.
-_DOCKER_AUTH = re.compile(r"\"auth\"\s*:\s*\"(?P<value>[A-Za-z0-9+/]{8,4096}={0,2})\"")
+#: A registry `auth` value in a docker config: base64 of `user:password`. JSON,
+#: single-quoted (a Python dict), or a bare YAML key.
+_DOCKER_AUTH = re.compile(
+    r"(?<![A-Za-z0-9_])[\"']?auth[\"']?:[ \t]*[\"']?(?P<value>[A-Za-z0-9+/]{8,4096}={0,2})(?![A-Za-z0-9+/=])"
+)
+#: A registry `identitytoken` (docker `config.json`, an ACR / ECR login).
+_DOCKER_IDENTITY_TOKEN = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])[\"']?identitytoken[\"']?[ \t]*:[ \t]*[\"'](?P<value>[A-Za-z0-9._~+/=\-]{20,4096})[\"']"
+)
+#: An npm `_auth=` line (`.npmrc`, optionally scoped to a registry): base64 of
+#: `user:password`.
+_NPMRC_AUTH = re.compile(
+    r"(?m)^[ \t]*(?://\S{1,253}:)?_auth[ \t]*=[ \t]*[\"']?(?P<value>[A-Za-z0-9+/]{8,4096}={0,2})(?![A-Za-z0-9+/=])"
+)
 #: A 40-hex `key:` line under a `wandb:` block (Hydra / Lightning configs):
 #: the key is formless, so the block it sits in is the anchor.
 _YAML_WANDB_KEY = re.compile(
@@ -353,14 +425,21 @@ _YAML_WANDB_KEY = re.compile(
 _WANDB_BLOCK_REACH = 400
 
 
+#: A docker `auth` secret that only names what goes there (`username:password`).
+_AUTH_PLACEHOLDERS = frozenset({"password", "pass", "passwd", "pwd", "secret", "token", "pat"})
+
+
 def _docker_auth_decodes(value: str) -> bool:
-    """Whether a docker `auth` value is base64 of printable `user:password`."""
+    """Whether a docker `auth` value is base64 of printable `user:password`,
+    with a password that is not a placeholder."""
     try:
         decoded = base64.b64decode(value + "=" * (-len(value) % 4), validate=True).decode("utf-8")
     except (ValueError, UnicodeDecodeError, binascii.Error):
         return False
     user, sep, secret = decoded.partition(":")
-    return bool(sep and user and secret and decoded.isprintable())
+    if not (sep and user and secret and decoded.isprintable()):
+        return False
+    return secret.lower() not in _AUTH_PLACEHOLDERS and not _is_indirect(secret) and not _is_slot(secret)
 
 
 #: Keys a vendor documents as safe to publish (they ship inside client code).
@@ -368,8 +447,188 @@ _PUBLISHABLE_KEY_PREFIXES = ("phc_", "pk_live_", "pk_test_")
 #: An f-string's interpolation. A quoted value that holds one is a template
 #: (`f"Bearer {key}"`), never a literal credential.
 _INTERPOLATION = re.compile(r"\{[^{}\n]*\}")
-#: A value that is an expression: a dotted name, optionally called.
-_CODE_VALUE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]*(?:\([^()\n]*\))?")
+#: An unquoted value that is CODE: a dotted name (`form.password.value`), maybe
+#: called, or a call (`getPassword(`, `_messages.StringField(1`). NOT a plain
+#: word: `a8Kd93jLm2Qx` is how a generated password looks.
+_DOTTED_CODE = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+(?:\(.*)?|[A-Za-z_][\w.]*\(.*")
+#: A value that is a template slot, not a value (the code snapshot's
+#: `_PLACEHOLDER`, plus Jinja/Helm `{{ }}`): `{password}`, `{{ .Values.pw }}`,
+#: `${VAR}`, `$GH_TOKEN`, `$1`, `%s`, `%(name)s`, `<TOKEN>`, `***`, `...`,
+#: `:name`.
+_SLOT = re.compile(
+    r"\{\{[^{}]*\}\}|\{[^{}]*\}|\$\{[^{}]*\}|\$\d+(?:::\w+)?|\$[A-Z_][A-Z0-9_]*|\$\([^()]*\)"
+    r"|%s|%\(\w+\)s|<[^<>]*>|\*{3,}|\.{3}|\u2026|:[A-Za-z_]\w*"
+)
+#: Punctuation around a value that is not part of it.
+_VALUE_EDGES = "\"'`.,;:)]}"
+#: The same, minus `}`, which closes a slot (`{password}"]`).
+_SLOT_EDGES = "\"'`.,;:)]"
+#: A UUID. A widened anchor meets identifiers far more often than credentials:
+#: `"ClientRequestToken": "<uuid>"`, `WS_KEY = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"`.
+_UUID = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")
+#: Who issues a key, for `_owned_key_name`: whole words of the name...
+_KEY_OWNER_WORDS = frozenset({
+    "api", "aws", "gcp", "hf", "xai", "ngc", "exa", "jwt", "hmac", "secret", "private", "access",
+    "auth", "master", "admin", "license", "consumer", "client", "service", "account", "signing",
+    "encryption", "webhook", "app", "bot", "openai", "azure", "cohere", "groq", "jina",
+})
+#: ...or a vendor anywhere in it (`azureOpenAIKey` splits into `open`, `ai`).
+_KEY_OWNERS = (
+    "openai", "azure", "anthropic", "claude", "cohere", "mistral", "gemini", "google", "stripe",
+    "twilio", "sendgrid", "mailgun", "github", "gitlab", "slack", "discord", "telegram",
+    "huggingface", "wandb", "firebase", "supabase", "pinecone", "replicate", "fireworks",
+    "deepseek", "perplexity", "elevenlabs", "voyage", "tavily", "serper", "serpapi", "openrouter",
+    "nvidia", "databricks", "cloudflare", "sentry", "datadog", "mapbox", "runpod", "langsmith",
+    "langchain", "together", "anyscale",
+)
+_NAME_WORDS = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+")
+#: `_ANCHORED` also reads a camelCase `...Key` (`openaiKey`), which counts only
+#: when its name holds an owner (`_owned_key_name`). The prefilter looks for the
+#: most common VENDORS a few characters before `Key` -- not `key` itself, which
+#: nearly every source file has (reading around each doubled the scan), nor
+#: every owner (each keyword is one more pass over the text). Any other owner
+#: (`masterKey`, `cloudflareKey`) is read where another anchor keyword is near.
+_CAMEL_KEY_KEYWORDS = (
+    "openai", "azure", "anthropic", "cohere", "mistral", "gemini", "google", "stripe",
+    "wandb", "huggingface", "groq", "deepseek",
+)
+_LONG_ANCHOR_KEYWORDS = (*_ANCHOR_KEYWORDS, *_CAMEL_KEY_KEYWORDS)
+#: A camelCase `...Token` that pages, deduplicates or orders requests, not one
+#: that authenticates: `NextToken`, `nextPageToken`, `NextContinuationToken`,
+#: `ClientRequestToken`, `PurchaseToken`. Their values are opaque base64, the
+#: same shape as a credential, so only the name tells them apart.
+_NOT_AUTH_TOKEN_WORDS = frozenset({
+    "next", "page", "continuation", "pagination", "cursor", "resume", "sync", "purchase",
+    "request", "idempotency", "cancel", "cancellation", "marker", "verification", "change",
+    "batch", "query", "result", "results", "start", "end", "last", "prev", "previous",
+    "iterator", "scroll", "grant", "upload", "part", "stream", "shard", "offset", "lock",
+    "lease", "fencing", "watermark", "seek", "position",
+})
+
+
+def _is_slot(value: str) -> bool:
+    """Whether a value is a template slot or a shell variable (see `_SLOT`),
+    with or without the punctuation around it (`$GH_TOKEN"`, `{password},`)."""
+    value = value.strip()
+    return bool(_SLOT.fullmatch(value) or _SLOT.fullmatch(value.strip(_SLOT_EDGES)))
+
+
+def _identifier_at(text: str, start: int, end: int) -> str:
+    """The whole identifier that ends at ``end`` and holds ``start``."""
+    while start and (text[start - 1].isalnum() or text[start - 1] == "_"):
+        start -= 1
+    return text[start:end]
+
+
+def _owned_key_name(name: str) -> bool:
+    """Whether a `*_key` / `...Key` name says who issued the key
+    (`azure_openai_key`, `openaiKey`), which `cache_key` and `sortKey` do not."""
+    lowered = name.lower()
+    if any(owner in lowered for owner in _KEY_OWNERS):
+        return True
+    return any(word.lower() in _KEY_OWNER_WORDS for word in _NAME_WORDS.findall(name)[:-1])
+
+
+def _credential_name(name: str) -> bool:
+    """A name whose value is a credential (see `_CREDENTIAL_NAME`)."""
+    match = _CREDENTIAL_NAME.search(name)
+    if match is None:
+        return False
+    return not match.group("vendorkey") or _owned_key_name(name)
+
+
+def _loose_value_ok(value: str) -> bool:
+    """A value for a shape with no strong anchor of its own: not a slot, a
+    reference or a UUID, and it passes the short-value checks."""
+    return not _is_slot(value) and not _UUID.fullmatch(value) and _short_value_ok(value)
+
+
+def _generated(value: str) -> bool:
+    """A digit or a symbol in it (`a8Kd93jLm2Qx`, `Tr0ub4dor&3xQ`), as a
+    generated secret has and a name (`master_user_password`) does not."""
+    return any(c.isdigit() or not (c.isalnum() or c == "_") for c in value)
+
+
+def _bare_token(value: str, after: str) -> str | None:
+    """An unquoted value as ONE token that looks like a generated secret, or
+    None. ``after`` is the rest of its line past ``value``. The token must end
+    the line (only punctuation or a comment after it): after a camelCase key the
+    rest of a line is often prose (`postgresPassword: see 1Password`,
+    `oauth2ClientSecret: OAuth2 client secret to use`). Never code
+    (`_DOTTED_CODE`) or a slot."""
+    words = value.split()
+    if not words:
+        return None
+    first, tail = words[0], (value[value.index(words[0]) + len(words[0]):] + after)
+    tail = tail.lstrip(_VALUE_EDGES + " \t")
+    if tail and not tail.startswith(("#", "//")):
+        return None
+    if _is_slot(first) or first.startswith(("{", "<", "%", "${", "$(")):
+        return None  # template syntax, cut by the value's delimiters: `{password` of `{password}"]`
+    token = first.rstrip(_VALUE_EDGES)
+    if not token or _DOTTED_CODE.fullmatch(token) or _is_slot(token):
+        return None
+    if len(token) < 6 or not _generated(token):
+        return None  # `retryPassword = 3`, `userPassword = hunter` are not generated
+    return token
+
+
+def _after_hump(text: str, start: int) -> bool:
+    """Whether a match at ``start`` began at a camelCase hump (an ASCII letter
+    or digit before it), not after a separator. `\u0120password` in a GPT-2
+    vocabulary starts after a separator: `_ANCHOR_START` is ASCII-only."""
+    return start > 0 and text[start - 1].isascii() and text[start - 1].isalnum()
+
+
+#: The gap between a camelCase key and its separator: a closing quote or
+#: bracket, or a type (`const openaiKey: string =`). Anything else and the
+#: separator is someone else's: `challengePassword['type'] =`,
+#: `X25519PrivateKey(metaclass=`, `getBearerToken(): Promise`.
+_CAMEL_GAP = re.compile(r"[\"'\]]?\s*(?::\s*[A-Za-z_][\w.\[\], |<>]{0,30}?\s*)?")
+#: A typed field's literal later on the line: `string = "..."` after
+#: `dbPassword:`.
+_TYPED_LITERAL = re.compile(
+    r"[A-Za-z_][\w.\[\]|<>, ]{0,30}?\s*=\s*" + _STRING_PREFIX + r"[\"'](?P<lit>[^\"'\n]{1,512})[\"']"
+)
+#: A raw string that is a regular expression, not a value:
+#: `_SECRET_NAME_PARTIAL = r'(?P<secret>[a-zA-Z0-9-_]{1,255})'`.
+_REGEX_SHAPE = re.compile(r"\(\?[:P<=!]|\[\^|\\[dswDSW]|\{\d+,\d*\}|\[[^\]\n]{0,40}[a-zA-Z0-9]-[a-zA-Z0-9]")
+
+
+def _raw_regex(text: str, value_start: int, value: str) -> bool:
+    return "r" in text[max(0, value_start - 3):value_start - 1].lower() and bool(_REGEX_SHAPE.search(value))
+
+
+def _camel_value(
+    text: str, key_end: int, gap: str, start: int, value: str, quoted: bool
+) -> tuple[int, str] | None:
+    """``(start, value)`` to report for a value after a camelCase key, or None.
+
+    A camelCase key (`postgresPassword`, `jwtSecret`) is a field in code, a
+    generated API client or prose far more often than a credential's name, so
+    its value must look like one: on the key's line, after the key's own
+    separator (`_CAMEL_GAP`); quoted, with a digit or a symbol and fewer than
+    three words (`"S3cr3tPassw0rd"`, not `"dataStoreTestQuery"` or `"Private
+    key password 1"`); unquoted, a `_bare_token`. Slots, references and UUIDs
+    never count.
+    """
+    if not _CAMEL_GAP.fullmatch(gap) or text.find("\n", key_end, start) != -1:
+        return None
+
+    def literal(at: int, lit: str) -> tuple[int, str] | None:
+        if _is_slot(lit) or _is_indirect(lit) or _UUID.fullmatch(lit) or len(lit.split()) >= 3:
+            return None
+        return (at, lit) if _generated(lit) else None
+
+    if quoted:
+        return literal(start, value)
+    line_end = text.find("\n", start)
+    line_end = len(text) if line_end < 0 else line_end
+    token = _bare_token(value, text[start + len(value):line_end])
+    if token is not None:
+        return None if _is_indirect(token) or _UUID.fullmatch(token) else (start, token)
+    typed = _TYPED_LITERAL.match(text, start, line_end)
+    return literal(typed.start("lit"), typed.group("lit")) if typed else None
 
 
 def _is_template(text: str, value_start: int, value: str) -> bool:
@@ -607,7 +866,11 @@ def scan(
         if windows is not None and all(windows(p) == [] for p in patterns):
             return False
         if not lowered:
+            # ASCII-only when `str.lower` would change the length (`İ`):
+            # `lowered` offsets are used as `text` offsets below.
             lowered = text.lower()
+            if len(lowered) != len(text):
+                lowered = text.translate(_ASCII_LOWER)
         return any(k in lowered for k in keywords)
 
     # [1] + [2] keyword prefilter, then the structured rules that survive it.
@@ -631,12 +894,21 @@ def scan(
                 continue
             if group != "bare" and _is_template(text, match.start(group), value):
                 continue
-            if match.start() > 0 and text[match.start() - 1].isalnum() and _CODE_VALUE.fullmatch(value):
-                continue  # a camelCase field set from code: `userPassword = form.password.value`
-            findings.append(Finding("anchored-secret", match.start(group), match.start(group) + len(value)))
+            start = match.start(group)
+            if group != "bare" and _raw_regex(text, start, value):
+                continue
+            if _after_hump(text, match.start()):
+                # A camelCase key: not `form.password.value`,
+                # `_messages.StringField(1)` or `see 1Password`, but
+                # `a8Kd93jLm2Qx`, `e3b0c44298fc1c14`, `"S3cr3tPassw0rd"`.
+                camel = _camel_value(text, match.start("gap"), match.group("gap"), start, value, group != "bare")
+                if camel is None:
+                    continue
+                start, value = camel
+            findings.append(Finding("anchored-secret", start, start + len(value)))
 
     # [3] anchored entropy: a credential-shaped key name introduces the value.
-    if present(_ANCHOR_KEYWORDS, _ANCHORED, _SHORT_ANCHORED):
+    if present(_LONG_ANCHOR_KEYWORDS, _ANCHORED):
         for match in _unmarked(_ANCHORED, text, windows):
             if _model_token_anchor(text, match.start()):
                 continue
@@ -650,14 +922,34 @@ def scan(
             # The two widened anchors -- a camelCase hump and a `*_KEY` name --
             # also meet identifiers and header names (`ENGINE_INTERNAL_KEY:
             # X-Internal-Knowledge-Key`); a key value carries a digit.
-            camel = match.start() > 0 and text[match.start() - 1].isalnum()
-            if (camel or match.group("keyname")) and not any(c.isdigit() for c in value):
+            camel = _after_hump(text, match.start())
+            widened = camel or match.group("keyname") or match.group("vendorkey")
+            if widened and (not any(c.isdigit() for c in value) or _UUID.fullmatch(value)):
+                continue
+            if match.group("vendorkey") and not _owned_key_name(
+                _identifier_at(text, match.start(), match.end("vendorkey"))
+            ):
+                continue  # `cache_key`, `sortKey`: nobody issued this key
+            if widened:
+                name = _identifier_at(text, match.start(), match.start("gap"))
+                words = [w.lower() for w in _NAME_WORDS.findall(name)]
+                if "public" in words or "publishable" in words:
+                    continue  # `LANGFUSE_PUBLIC_KEY`: published by design
+                if camel and words[-1:] == ["token"] and len(words) > 1 and words[-2] in _NOT_AUTH_TOKEN_WORDS:
+                    continue
+            start = match.start("value")
+            if _raw_regex(text, start, value):
+                continue
+            if camel and _camel_value(
+                text, match.start("gap"), match.group("gap"), start, value, text[start - 1] in "\"'"
+            ) is None:
                 continue
             if value.startswith(_PUBLISHABLE_KEY_PREFIXES):
                 continue  # published by design: PostHog project keys, Stripe publishable keys
             findings.append(
                 Finding("anchored-secret", match.start("value"), match.end("value"))
             )
+    if present(_ANCHOR_KEYWORDS, _SHORT_ANCHORED):
         for match in _unmarked(_SHORT_ANCHORED, text, windows):
             if _model_token_anchor(text, match.start()):
                 continue
@@ -685,30 +977,74 @@ def scan(
                 continue
             if group != "bare" and _is_template(text, match.start(group), value):
                 continue
+            start = match.start(group)
+            if group != "bare" and _raw_regex(text, start, value):
+                continue
+            if _after_hump(text, match.start()):
+                # After a camelCase hump (`jwtSecret`): never a bare `...Token`
+                # (`nextPageToken`, `csrfToken`, `cancelToken` are code), and
+                # the value must look like a secret (`_camel_value`).
+                if match.group("anchor").lower() == "token":
+                    continue
+                camel = _camel_value(text, match.start("gap"), match.group("gap"), start, value, group != "bare")
+                if camel is None:
+                    continue
+                start, value = camel
+                if "\\" in value or not value.isascii():
+                    continue
             if (_is_word_like(value) or _character_classes(value) < 2
                     or shannon_entropy(value) < 2.5):
                 continue
-            findings.append(Finding("anchored-secret", match.start(group), match.end(group)))
+            findings.append(Finding("anchored-secret", start, start + len(value)))
 
-    # [3b] field shapes with no `key = value` separator.
+    # [3b] field shapes with no `key = value` separator. Each names its
+    # credential (`_credential_name`) or has a fixed shape, and every value
+    # passes `_loose_value_ok` or a decode check.
+    def named(pattern: re.Pattern[str], rule: str, *names: str) -> None:
+        for match in _unmarked(pattern, text, windows):
+            name = next((match.group(n) for n in names if match.group(n)), "")
+            # `--wandb-api-key` is the option for `wandb_api_key`.
+            name = name.lstrip("-").replace("-", "_")
+            if _credential_name(name) and _loose_value_ok(match.group("value")):
+                findings.append(Finding(rule, match.start("value"), match.end("value")))
+
     if present(("setdefault", "getenv", ".get("), _ENV_DEFAULT):
-        for match in _unmarked(_ENV_DEFAULT, text, windows):
-            if _CREDENTIAL_NAME.search(match.group("name")) and _short_value_ok(match.group("value")):
-                findings.append(Finding("env-default", match.start("value"), match.end("value")))
-    if present(("machine",), _NETRC_PASSWORD):
+        named(_ENV_DEFAULT, "env-default", "name")
+    if present(("getenv", "environ.get", "process.env"), _ENV_FALLBACK):
+        named(_ENV_FALLBACK, "env-default", "name", "jsname", "jsquoted")
+    if present(("default",), _CLI_DEFAULT):
+        named(_CLI_DEFAULT, "cli-default", "name")
+    if present(("- name",), _ENV_PAIR):
+        named(_ENV_PAIR, "env-pair", "name")
+    if present(_DOCKERFILE_ENV_KEYWORDS, _DOCKERFILE_ENV):
+        named(_DOCKERFILE_ENV, "dockerfile-env", "name")
+    if present(("password",), _DSL_PASSWORD):
+        for match in _unmarked(_DSL_PASSWORD, text, windows):
+            value = match.group("value")
+            if not _is_indirect(value) and not _is_slot(value) and not _is_template(text, match.start("value"), value):
+                findings.append(Finding("anchored-secret", match.start("value"), match.end("value")))
+    if present(_NETRC_KEYWORDS, _NETRC_PASSWORD):
         for match in _unmarked(_NETRC_PASSWORD, text, windows):
-            if not _is_indirect(match.group("value")):
-                findings.append(Finding("netrc-password", match.start("value"), match.end("value")))
+            # Written by a `printf`/`echo`, the entry ends at the closing
+            # quote or a `\n` escape: `password $GH_TOKEN\n" > ~/.netrc`.
+            value = _NETRC_VALUE_END.split(match.group("value"), maxsplit=1)[0]
+            if value and not _is_indirect(value) and not _is_slot(value):
+                findings.append(Finding("netrc-password", match.start("value"), match.start("value") + len(value)))
     if present(("<password>",), _XML_PASSWORD):
         for match in _unmarked(_XML_PASSWORD, text, windows):
             value = match.group("value").rstrip()
-            if value and not _is_indirect(value):
+            if value and not _is_indirect(value) and not _is_slot(value):
                 findings.append(
                     Finding("xml-password", match.start("value"), match.start("value") + len(value))
                 )
-    if present(('"auth"',), _DOCKER_AUTH):
-        for match in _unmarked(_DOCKER_AUTH, text, windows):
-            if _docker_auth_decodes(match.group("value")):
+    for pattern, keywords in ((_DOCKER_AUTH, _DOCKER_AUTH_KEYWORDS), (_NPMRC_AUTH, ("_auth",))):
+        if present(keywords, pattern):
+            for match in _unmarked(pattern, text, windows):
+                if _docker_auth_decodes(match.group("value")):
+                    findings.append(Finding("docker-auth", match.start("value"), match.end("value")))
+    if present(("identitytoken",), _DOCKER_IDENTITY_TOKEN):
+        for match in _unmarked(_DOCKER_IDENTITY_TOKEN, text, windows):
+            if shannon_entropy(match.group("value")) >= _ENTROPY_MIN:
                 findings.append(Finding("docker-auth", match.start("value"), match.end("value")))
     if present(("wandb",), _YAML_WANDB_KEY):
         for match in _unmarked(_YAML_WANDB_KEY, text, windows):
@@ -958,12 +1294,19 @@ def _quick_reach() -> dict[re.Pattern[str], tuple[tuple[str, ...], int]]:
 
     reach = {rule.pattern: (rule.keywords, tail(rule.pattern)) for rule in _RULES if rule.keywords}
     reach[_PASSWORD_ASSIGNMENT] = (("password", "passwd"), _QUICK_TAIL)
-    reach[_ANCHORED] = (_ANCHOR_KEYWORDS, _QUICK_TAIL)
+    reach[_ANCHORED] = (_LONG_ANCHOR_KEYWORDS, _QUICK_TAIL)
     reach[_SHORT_ANCHORED] = (_ANCHOR_KEYWORDS, _QUICK_TAIL)
     reach[_ENV_DEFAULT] = (("setdefault", "getenv", ".get("), _QUICK_TAIL)
-    reach[_NETRC_PASSWORD] = (("machine",), tail(_NETRC_PASSWORD))
+    reach[_ENV_FALLBACK] = (("getenv", "environ.get", "process.env"), _QUICK_TAIL)
+    reach[_CLI_DEFAULT] = (("add_argument", "option("), tail(_CLI_DEFAULT))
+    reach[_ENV_PAIR] = (("- name",), _QUICK_TAIL)
+    reach[_DOCKERFILE_ENV] = (_DOCKERFILE_ENV_KEYWORDS, tail(_DOCKERFILE_ENV))
+    reach[_DSL_PASSWORD] = (("password",), tail(_DSL_PASSWORD))
+    reach[_NETRC_PASSWORD] = (_NETRC_KEYWORDS, tail(_NETRC_PASSWORD))
     reach[_XML_PASSWORD] = (("<password>",), tail(_XML_PASSWORD))
-    reach[_DOCKER_AUTH] = (('"auth"',), tail(_DOCKER_AUTH))
+    reach[_DOCKER_AUTH] = (_DOCKER_AUTH_KEYWORDS, tail(_DOCKER_AUTH))
+    reach[_NPMRC_AUTH] = (("_auth",), tail(_NPMRC_AUTH))
+    reach[_DOCKER_IDENTITY_TOKEN] = (("identitytoken",), tail(_DOCKER_IDENTITY_TOKEN))
     # The match holds "key", not "wandb" (the block opens above it).
     reach[_YAML_WANDB_KEY] = (("key",), tail(_YAML_WANDB_KEY))
     return reach

@@ -11,9 +11,14 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - **The vendored credential scanner is back in sync with research-os, with the #2000 rules.**
   `engine/ingest/_credential_{secrets,redaction,gate}.py` are regenerated from research-os
   (`scripts/sync_credential_scrubber.py --knowledge-root`); they had drifted ~1,000 lines. New
-  shapes found and redacted: camelCase key names, `f"..."`-prefixed literals, environment
-  defaults (`os.environ.setdefault(...)`), `*_KEY` names with a key-shaped value, netrc and
-  `<password>` entries, docker `"auth"` values and URL passwords over 64 characters. The gate's
+  shapes found and redacted: camelCase and acronym key names (including letters-and-digits
+  passwords), vendor `*_key`/`...Key` names, `f"..."`-prefixed literals, environment and
+  command-line defaults and fallbacks, Kubernetes env pairs, Dockerfile `ENV` lines, `*_KEY`
+  names with a key-shaped value, netrc, `<password>` and Gradle password entries, docker
+  `auth`/`identitytoken` and `.npmrc` `_auth` values, and URL passwords over 64 characters made
+  of token characters (so JSON holding an `https://` value and a later email address is not
+  rewritten). Template slots, shell variables, UUIDs, pagination tokens and public keys stay
+  clean. The gate's
   `CredentialBlocked` stays a plain `Exception` here (the engine has no SDK error tree), and the
   manual upload still refuses on findings (`test_manual_upload_secret_boundary.py`).
 
