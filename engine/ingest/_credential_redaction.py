@@ -8,10 +8,12 @@ pass through this module. Failures propagate so callers cannot send raw data.
 
 from __future__ import annotations
 
+import bisect
+import functools
 import json
 import re
 from typing import Any
-from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 _CREDENTIAL_URI = re.compile(r"(?<![A-Za-z0-9+.-])(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)[^/@\s]+@")
 _SENSITIVE_KEYS = {
@@ -155,8 +157,7 @@ def scrub_string(value: str, *, _depth: int = 0) -> str:
     if _ENCODED_ESCAPE.search(value):
         if _depth >= 4:
             raise ValueError("encoded content exceeds scrubber nesting limit")
-        decoded = unquote(value)
-        decoded = _UNICODE_ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), decoded)
+        decoded = _decode_escapes(value)
         if decoded != value and scrub_string(decoded, _depth=_depth + 1) != decoded:
             # Preserve benign encoded strings byte-for-byte; a changed decoded
             # view proves this entire encoded value contains a credential.
@@ -236,6 +237,278 @@ def default_scrub(value: Any, *, key: str = "") -> Any:
     except (TypeError, ValueError):
         return scrub_string(repr(value))
     return value
+
+
+# ---------------------------------------------------------------------------
+# "Would scrubbing change this?" -- the question the artifact gate asks
+# ---------------------------------------------------------------------------
+# The gate never uses the scrubbed text: it only records whether the key-name
+# tier WOULD change something (`secret_gate._findings`). On a 20 MB file that
+# question cost as much as a full scrub, because `_KEYED_VALUE` matches every
+# `key: value` pair and re-scrubs each value. The server can say where a change
+# is even possible (an accelerator, see `probe.tap_core.secrets.Windows`), and
+# `scrub_changes` reads only there.
+
+#: A key `is_sensitive_key` could accept, up to its separator. Case-insensitive
+#: and a SUPERSET: every sensitive spelling (`apiKey`, `X-Amz-Signature`,
+#: `hub_token`, `AWS_ACCESS_KEY_ID`) contains one of these stems, and the exact
+#: test runs on whatever this finds.
+_SENSITIVE_KEY_HINT = re.compile(
+    r"(?i)(?:token|secret|passw|pwd|credential|cookie|authorization|sig"
+    r"|api[^a-z0-9]*key|private[^a-z0-9]*key|aws[^a-z0-9]*access|wandb)"
+    r"[A-Za-z0-9_.-]*[\"']?\s*[:=]"
+)
+
+#: How far before its separator a sensitive key can start, and how far past it
+#: a value can run, for the exact `_KEYED_VALUE` test around a hint. Accepted
+#: limits, like the server's `fast_scan._CAP` (also 8K): a key name over 256
+#: characters or a value over 8K is read by the plain path only.
+_KEY_REACH = 256
+_VALUE_REACH = 8_192
+
+
+@functools.lru_cache(maxsize=1)
+def scrub_hint() -> re.Pattern[str]:
+    """Anything in ONE string that `scrub_string` could act on -- a superset.
+
+    Built from the scanner's own keyword lists so the two cannot drift: a new
+    rule's keyword is a new hint. Escapes, NUL, brackets (a nested JSON value)
+    and URLs are the non-keyword ways a string changes.
+    """
+    from ._credential_secrets import _ANCHOR_KEYWORDS, _RULES
+
+    literals = sorted(
+        {keyword for rule in _RULES for keyword in rule.keywords}
+        | set(_ANCHOR_KEYWORDS)
+        | {"password", "passwd", "pwd", "credential", "cookie", "authorization", "sig",
+           "wandb", "bearer", "basic", "://", "sk-", "pk-", "rk-", "ros_", "probe_", "xox"},
+        key=len,
+        reverse=True,
+    )
+    return re.compile(
+        "(?i)" + "|".join(re.escape(literal) for literal in literals)
+        + r"|gh[pousr]_|api[^a-z0-9]*key|private[^a-z0-9]*key|aws[^a-z0-9]*access"
+        + r"|%[0-9a-f]{2}|\\u[0-9a-f]{4}|\\x[0-9a-f]{2}|\x1b|[\u200b-\u200d\ufeff]|\x00|[{\[]"
+    )
+
+
+_sensitive_key = functools.lru_cache(maxsize=65_536)(lambda key: is_sensitive_key(key))
+
+
+def scrub_changes(
+    value: str, *, accel: Any = None, _depth: int = 0, _scanned: bool = False
+) -> bool:
+    """`scrub_string(value) != value`, reading only where a change is possible.
+
+    Without an accelerator (every researcher's machine) this IS that
+    comparison. With the server's it mirrors `scrub_string` step for step --
+    NUL view, escape view, JSON document, then the regex passes -- but each
+    regex pass reads only the stretches the accelerator names, and a JSON
+    document is walked once, re-scrubbing only sensitive keys and strings that
+    carry a hint. `_scanned` is the caller saying `scan(value)` already found
+    nothing, so the `redact` step could change nothing either.
+    """
+    from ._credential_secrets import _ACCEL_MIN_CHARS, _ESCAPE_REACH, _matches, _snap, scan
+
+    if accel is None or len(value) < _ACCEL_MIN_CHARS:
+        return scrub_string(value, _depth=_depth) != value
+    windows = accel(value)
+    if windows is None:
+        return scrub_string(value, _depth=_depth) != value
+    if "\x00" in value and scrub_changes(value.replace("\x00", ""), accel=accel, _depth=_depth):
+        return True
+    escapes = list(_matches(_ENCODED_ESCAPE, value, windows))
+    if escapes:
+        if _depth >= 4:
+            raise ValueError("encoded content exceeds scrubber nesting limit")
+        # Each escape's neighbourhood, not the whole text: text far from every
+        # escape decodes to itself, and the passes below read it as-is. The
+        # accepted limit is `secrets._ESCAPE_REACH`'s.
+        for lo, hi in _merge(
+            [(max(0, m.start() - _ESCAPE_REACH), min(len(value), m.end() + _ESCAPE_REACH)) for m in escapes]
+        ):
+            lo, hi, _, _ = _snap(value, lo, hi)
+            region = value[lo:hi]
+            decoded = _decode_escapes(region)
+            if decoded != region and scrub_changes(decoded, accel=accel, _depth=_depth + 1):
+                return True
+    if value.lstrip().startswith(("{", "[")):
+        try:
+            document = json.loads(value)
+        except (ValueError, TypeError):
+            pass
+        else:
+            return _json_changes(document, accel, scanned=_scanned)
+    for match in _matches(_EMBEDDED_URL, value, windows):
+        if _scrub_url(match.group(0)) != match.group(0):
+            return True
+    if next(_matches(_AUTH_VALUE, value, windows), None) is not None:
+        return True
+    if not _scanned and scan(value, _accel=accel):
+        return True
+    hints = windows(_SENSITIVE_KEY_HINT)
+    if hints is None:
+        keyed = None
+    else:
+        spans = _merge(
+            [(max(0, lo - _KEY_REACH), min(len(value), hi + _VALUE_REACH)) for lo, hi in hints]
+        )
+
+        def keyed(_pattern: re.Pattern[str]) -> list[tuple[int, int]]:
+            return spans
+    for match in _matches(_KEYED_VALUE, value, keyed):
+        # A sensitive key can change here, and so can a plain key whose value
+        # holds a sensitive `key=value` of its own: `_keyed` scrubs a plain
+        # key's value recursively, and this match CONSUMED the nested pair, so
+        # nothing else in this loop reads it (`config='api_key=abc'`).
+        # Everything else that recursion could act on -- a URL, an auth header,
+        # a scanner finding, an escape, a NUL -- is in this same text, and the
+        # passes above (or `_TOKEN_PREFIXED` below) already read it.
+        if not is_sensitive_key(match.group("key")):
+            nested = match.group("value")
+            # `in` first: a C scan, where most values (numbers, words) end it.
+            if not (("=" in nested or ":" in nested) and _SENSITIVE_KEY_HINT.search(nested)):
+                continue
+        if _keyed(match) != match.group(0):
+            return True
+    return next(_matches(_TOKEN_PREFIXED, value, windows), None) is not None
+
+
+_PERCENT_RUN = re.compile(r"(?:%[0-9A-Fa-f]{2})+")
+
+
+def _unquote(value: str) -> str:
+    """`urllib.parse.unquote`, in one regex pass.
+
+    Same answer: each run of `%XX` bytes decodes as UTF-8 with `replace`, and
+    anything else is left alone. `unquote` first splits its input at every
+    non-ASCII character, which on the `errors="replace"` view of binary data --
+    a U+FFFD every few bytes -- meant millions of pieces per megabyte.
+    """
+    if "%" not in value:
+        return value
+    return _PERCENT_RUN.sub(
+        lambda m: bytes.fromhex(m.group().replace("%", "")).decode("utf-8", "replace"), value
+    )
+
+
+def _decode_escapes(value: str) -> str:
+    """The escape view `scrub_string` inspects: `%XX` runs, then `\\uXXXX`."""
+    return _UNICODE_ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), _unquote(value))
+
+
+def _merge(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    merged: list[tuple[int, int]] = []
+    for lo, hi in sorted(spans):
+        if merged and lo <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+        else:
+            merged.append((lo, hi))
+    return merged
+
+
+#: What can change a string that has no `:` or `=`: every rule a plain word
+#: triggers (`token`, `secret`, `authorization`...) needs a separator after
+#: it, so only these can act without one -- vendor prefixes, escapes, control
+#: characters, a nested document, a PEM or JWT.
+_UNSEPARATED = re.compile(
+    r"(?i)-----begin|eyj|akia|asia|abia|acca|sk-|pk-|rk-|gh[pousr]_|github_pat_|ros_|probe_|xox"
+    r"|hf_|aiza|_live_|glpat-|npm_|wandb|t3blbkfj|hooks\.slack\.com|%[0-9a-f]{2}|\\[ux][0-9a-f]{2}"
+    r"|[\x00\x1b\u200b-\u200d\ufeff]|^\s*[{\[]",
+    re.MULTILINE,
+)
+#: A run `_BASE64` could decode into a credential.
+_BASE64_RUN = re.compile(r"[A-Za-z0-9+/_-]{24}")
+
+
+def _string_could_change(text: str, unseparated: bool, base64_run: bool, *, scanned: bool) -> bool:
+    """A cheap necessary condition for `scrub_string(text) != text`, given
+    whether `_UNSEPARATED` and `_BASE64_RUN` occur in it.
+
+    With `scanned`, the document these strings came from was scanned as raw
+    JSON and found clean, so a base64 run in a string was already decoded and
+    read there -- unless JSON escaping changed its characters.
+    """
+    if ":" in text or "=" in text or unseparated:
+        return True
+    if scanned and text.isascii() and text.isprintable() and '"' not in text and "\\" not in text:
+        return False
+    return base64_run
+
+
+def _json_changes(document: Any, accel: Any, *, scanned: bool = False) -> bool:
+    """`default_scrub(document) != document` without scrubbing every string.
+
+    A value under a sensitive key is judged exactly, subtree and all. Every
+    other change is a STRING change -- a key or a leaf that `scrub_string`
+    rewrites -- and a string can only change if it carries a hint. So: collect
+    the strings, find the hinted ones in one accelerated pass over all of them,
+    and scrub only those.
+    """
+    strings: list[str] = []
+
+    def walk(value: Any, key: str) -> bool:
+        if value is None or isinstance(value, bool):
+            return False
+        if _sensitive_key(key.replace("\x00", "")):
+            return default_scrub(value, key=key) != value
+        if isinstance(value, (int, float)):
+            return False
+        if isinstance(value, str):
+            strings.append(value)
+            return False
+        if isinstance(value, dict):
+            for item_key, item in value.items():
+                original = str(item_key)
+                strings.append(original)
+                if walk(item, original):
+                    return True
+            return False
+        if isinstance(value, list):
+            return any(walk(item, key) for item in value)
+        return default_scrub(value, key=key) != value
+
+    if walk(document, ""):
+        return True
+    if not strings:
+        return False
+    # "\n" cannot extend a hint across two strings: no hint spans a newline
+    # except by way of `[^a-z0-9]?`, and a spurious hit only costs one exact
+    # scrub of an innocent string.
+    joined = "\n".join(strings)
+    windows = accel(joined)
+    spans = windows(scrub_hint()) if windows is not None else None
+    if spans is None:
+        return any(scrub_string(text) != text for text in strings)
+    starts: list[int] = []
+    offset = 0
+    for text in strings:
+        starts.append(offset)
+        offset += len(text) + 1
+    def containing(found: list[tuple[int, int]] | None, pattern: re.Pattern[str]) -> set[int]:
+        if found is None:  # an accelerator that does not index it: ask each string
+            return {i for i, text in enumerate(strings) if pattern.search(text)}
+        indices: set[int] = set()
+        for lo, hi in found:
+            first = max(bisect.bisect_right(starts, lo) - 1, 0)
+            indices.update(range(first, bisect.bisect_left(starts, hi)))
+        return indices
+
+    hinted = containing(spans, scrub_hint())
+    if not hinted:
+        return False
+    unseparated = containing(windows(_UNSEPARATED), _UNSEPARATED)
+    base64_runs = containing(windows(_BASE64_RUN), _BASE64_RUN)
+    # Each hinted string once -- a 160 KB base64 image spells `sig` or `aws` by
+    # chance dozens of times -- and through `scrub_changes`, so a long one is
+    # itself read only where it could change.
+    return any(
+        scrub_changes(strings[index], accel=accel)
+        for index in sorted(hinted)
+        if _string_could_change(
+            strings[index], index in unseparated, index in base64_runs, scanned=scanned
+        )
+    )
 
 
 # ---------------------------------------------------------------------------

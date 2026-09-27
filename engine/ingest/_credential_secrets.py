@@ -59,8 +59,12 @@ from __future__ import annotations
 
 import base64
 import binascii
+import bisect
+import functools
 import math
 import re
+from collections import Counter
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -106,6 +110,25 @@ MAX_SCAN_CHARS = 64_000
 #: rule can match (the private-key block, at ~33K) plus the pair window, so a
 #: credential straddling a seam is still seen whole in one window.
 _WINDOW_OVERLAP = 34_000
+
+#: Where in one text a pattern is worth running: the `(lo, hi)` stretches that
+#: may hold a match, `[]` for "nowhere", or None for "no idea, read it all".
+#:
+#: THE CONTRACT an accelerator must keep, because correctness rests on it: every
+#: match the pattern has in the WHOLE text lies inside one returned stretch, with
+#: `hi` strictly past the match's end unless `hi` is the end of the text. `lo`
+#: needs no margin -- a search starting at `lo` still lets lookbehinds and `\b`
+#: read the characters before it. Stretches are sorted and do not overlap.
+Windows = Callable[[re.Pattern[str]], "list[tuple[int, int]] | None"]
+#: Given a text, its `Windows` -- or None when this accelerator cannot index it,
+#: in which case the text is scanned exactly as if there were no accelerator.
+#: The server supplies a Hyperscan-backed one (`app/security/fast_scan.py`);
+#: nothing on a researcher's machine does, so there every pattern reads every
+#: character, as it always has.
+Accelerator = Callable[[str], "Windows | None"]
+
+#: Below this length an accelerator costs more than it saves.
+_ACCEL_MIN_CHARS = 4_096
 
 
 @dataclass(frozen=True)
@@ -197,7 +220,10 @@ _RULES: tuple[_Rule, ...] = (
     _r("basic-auth", r"(?i)authorization[\"']?\s*[:=]\s*[\"']?basic\s+[A-Za-z0-9+/=]{8,4096}",
        ("authorization",)),
     # user:password@host in a URI.
-    _r("credential-uri", r"\b[a-z][a-z0-9+.\-]{1,20}://[^/@\s:]{1,64}:[^/@\s]{3,64}@",
+    # The password part reaches 2,048 characters: AWS CodeArtifact and GCP
+    # Artifact Registry (`oauth2accesstoken:ya29...`) index URLs carry a
+    # 1 KB-class token there. Linear: the class stops at every `/` and `@`.
+    _r("credential-uri", r"\b[a-z][a-z0-9+.\-]{1,20}://[^/@\s:]{1,64}:[^/@\s]{3,2048}@",
        ("://",)),
 )
 
@@ -229,9 +255,26 @@ _ANCHOR_WORDS = (
 #: `AWS Secret Access Key [None]:` (a credential) and
 #: `... secret configuration. BEFORE:` (prose about credentials, followed by a
 #: CLI flag) — which was 6 of the 7 entropy-based false positives in that sample.
+#: Where an anchor may start: after a non-alphanumeric character, or at a
+#: camelCase hump (`postgresPassword`, `openaiApiKey`, `wandbApiKey`) -- a
+#: lowercase letter or digit, then the anchor's capital. Case-sensitive inside
+#: the otherwise case-insensitive patterns, so `bypassword` stays one word.
+_ANCHOR_START = r"(?:(?<![A-Za-z0-9])|(?-i:(?<=[a-z0-9])(?=[A-Z])))"
+#: Key names that mark a credential only when a LONG, high-entropy value follows
+#: (`_ANCHORED`, never the short-value rules): `encryption_key`, `signing_key`,
+#: and an environment-style `*_KEY` (`AZURE_OPENAI_KEY`, `SIGNING_KEY`). The
+#: capitals are case-sensitive, so `sort_key = 3` never qualifies, and the
+#: length is bounded so a long `A_A_A...` run stays linear.
+_LONG_VALUE_ANCHOR_WORDS = (
+    "encryption[_ -]?key", "signing[_ -]?key", r"(?-i:[A-Z][A-Z0-9_]{0,40}_KEY)",
+)
+#: A Python/JS string prefix before the opening quote: `f"..."`, `rb'...'`.
+_STRING_PREFIX = r"(?:[rbuf]{1,2}(?=[\"']))?"
 _ANCHORED = re.compile(
-    r"(?i)(?<![A-Za-z0-9])(?:" + "|".join(_ANCHOR_WORDS) + r")(?![A-Za-z0-9])"
-    r"[^\n.!?]{0,24}?[:=]\s*"
+    r"(?i)" + _ANCHOR_START + r"(?:" + "|".join(_ANCHOR_WORDS)
+    + r"|(?P<keyname>" + "|".join(_LONG_VALUE_ANCHOR_WORDS) + r"))"
+    r"(?![A-Za-z0-9])"
+    r"[^\n.!?]{0,24}?[:=]\s*" + _STRING_PREFIX +
     r"[\"']?(?P<value>[" + _SECRET_CHARS + r"]{" + str(_ENTROPY_MIN_LEN) + r",512})",
 )
 
@@ -253,24 +296,96 @@ _ANCHOR_KEYWORDS = ("secret", "password", "passwd", "api key", "api_key", "apike
                     "auth token", "auth_token", "access token", "access_token",
                     "credential", "client secret", "client_secret", "bearer",
                     "api-key", "access-key", "private-key", "auth-token", "access-token",
-                    "refresh_token", "refresh-token", "refresh token", "token")
+                    "accesskey", "privatekey",
+                    "refresh_token", "refresh-token", "refresh token", "token",
+                    "_key", "encryption", "signing")
 
 # Explicit assignments allow short, mixed-class passwords and quoted spaces.
 # They still require an anchor, entropy, and mixed character classes: prose and
 # references must not become the bare-entropy gate this module replaced.
 _SHORT_ANCHORED = re.compile(
     r"(?i)(?<![A-Za-z0-9])(?P<anchor>" + "|".join(_ANCHOR_WORDS) + r")(?![A-Za-z0-9])"
-    r"[^\n.!?]{0,24}?[:=]\s*(?:\"(?P<double>[^\"\n]{1,512})\"|"
+    r"[^\n.!?]{0,24}?[:=]\s*" + _STRING_PREFIX + r"(?:\"(?P<double>[^\"\n]{1,512})\"|"
     r"'(?P<single>[^'\n]{1,512})'|(?P<bare>[^\s\"'`,;]{1,512}))"
 )
 # Password assignments carry context even when the value is a short word or
 # a human passphrase. Quoting ends at its matching quote; an unquoted value
 # continues through spaces until a statement delimiter, never just word one.
 _PASSWORD_ASSIGNMENT = re.compile(
-    r"(?i)(?<![A-Za-z0-9])(?:password|passwd)(?![A-Za-z0-9])[\"']?\s*[:=]\s*"
+    r"(?i)" + _ANCHOR_START + r"(?:password|passwd)(?![A-Za-z0-9])[\"']?\s*[:=]\s*" + _STRING_PREFIX +
     r"(?:\"(?P<double>(?:\\.|[^\"\\])*)\"|'(?P<single>(?:\\.|[^'\\])*)'|"
     r"(?P<bare>[^\r\n,;)}\]\"'`]+))"
 )
+# ---------------------------------------------------------------------------
+# Field shapes with no `key = value` separator (#2000 re-review)
+# ---------------------------------------------------------------------------
+
+#: A default a program falls back to when the environment has none:
+#: `os.environ.setdefault("WANDB_API_KEY", "...")`, `os.getenv("HF_TOKEN", "...")`,
+#: `settings.get("api_key", "...")`. The NAME must be credential-shaped
+#: (`_CREDENTIAL_NAME`) and the value passes the short-value checks.
+_ENV_DEFAULT = re.compile(
+    r"(?i)(?:setdefault|getenv|\.get)\(\s*[\"'](?P<name>[A-Za-z0-9_.\-]{1,80})[\"']\s*,\s*"
+    + _STRING_PREFIX + r"[\"'](?P<value>[^\"'\n]{1,512})[\"']"
+)
+#: A credential-shaped variable name: any anchor word (camelCase or not), or an
+#: environment-style `*_KEY`.
+_CREDENTIAL_NAME = re.compile(
+    r"(?i)" + _ANCHOR_START + r"(?:" + "|".join(_ANCHOR_WORDS + _LONG_VALUE_ANCHOR_WORDS) + r")"
+    r"(?![A-Za-z0-9])"
+)
+#: A netrc entry: `machine <host> [login <u>] [account <a>] [port <p>] password <x>`,
+#: across any whitespace (netrc allows one entry over several lines).
+_NETRC_PASSWORD = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])machine\s+\S{1,253}(?:\s+(?:login|account|port)\s+\S{1,256}){0,3}"
+    r"\s+password\s+(?P<value>\S{1,512})"
+)
+#: `<password>...</password>` (Maven `settings.xml`, many XML configs).
+_XML_PASSWORD = re.compile(r"(?i)<password>\s*(?P<value>[^<\s][^<]{0,510})</password>")
+#: A registry `"auth"` value in a docker config: base64 of `user:password`.
+_DOCKER_AUTH = re.compile(r"\"auth\"\s*:\s*\"(?P<value>[A-Za-z0-9+/]{8,4096}={0,2})\"")
+#: A 40-hex `key:` line under a `wandb:` block (Hydra / Lightning configs):
+#: the key is formless, so the block it sits in is the anchor.
+_YAML_WANDB_KEY = re.compile(
+    r"(?im)^[ \t]*(?:api[_-]?)?key[ \t]*:[ \t]*[\"']?(?P<value>[0-9a-f]{40})(?![0-9A-Za-z])"
+)
+#: How far above a `key:` line its `wandb:` block may open.
+_WANDB_BLOCK_REACH = 400
+
+
+def _docker_auth_decodes(value: str) -> bool:
+    """Whether a docker `auth` value is base64 of printable `user:password`."""
+    try:
+        decoded = base64.b64decode(value + "=" * (-len(value) % 4), validate=True).decode("utf-8")
+    except (ValueError, UnicodeDecodeError, binascii.Error):
+        return False
+    user, sep, secret = decoded.partition(":")
+    return bool(sep and user and secret and decoded.isprintable())
+
+
+#: Keys a vendor documents as safe to publish (they ship inside client code).
+_PUBLISHABLE_KEY_PREFIXES = ("phc_", "pk_live_", "pk_test_")
+#: An f-string's interpolation. A quoted value that holds one is a template
+#: (`f"Bearer {key}"`), never a literal credential.
+_INTERPOLATION = re.compile(r"\{[^{}\n]*\}")
+#: A value that is an expression: a dotted name, optionally called.
+_CODE_VALUE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]*(?:\([^()\n]*\))?")
+
+
+def _is_template(text: str, value_start: int, value: str) -> bool:
+    """Whether a quoted value is an f-string template: an `f` prefix before its
+    quote and an interpolation inside it."""
+    prefix = text[max(0, value_start - 3):value_start - 1].lower()
+    return "f" in prefix and bool(_INTERPOLATION.search(value))
+
+
+def _short_value_ok(value: str) -> bool:
+    """The short-value checks `_SHORT_ANCHORED` applies (see there)."""
+    if not value or _is_indirect(value) or "\\" in value or not value.isascii():
+        return False
+    return not (_is_word_like(value) or _character_classes(value) < 2 or shannon_entropy(value) < 2.5)
+
+
 _MODEL_TOKEN_KEYS = frozenset({
     "bos_token", "cls_token", "eos_token", "mask_token", "pad_token",
     "sep_token", "stop_token", "unk_token",
@@ -299,17 +414,12 @@ def shannon_entropy(value: str) -> float:
         return 0.0
     length = len(value)
     total = 0.0
-    for count in _counts(value).values():
+    # Counter keeps first-occurrence order, so the float sum is summed in the
+    # same order as the per-character loop it replaced: identical results.
+    for count in Counter(value).values():
         p = count / length
         total -= p * math.log2(p)
     return total
-
-
-def _counts(value: str) -> dict[str, int]:
-    out: dict[str, int] = {}
-    for ch in value:
-        out[ch] = out.get(ch, 0) + 1
-    return out
 
 
 #: Fewest DISTINCT characters a base64-shaped run must use before it is worth
@@ -337,7 +447,7 @@ def low_diversity(value: str) -> bool:
     Shared with the artifact gate (`probe.sdk.secret_gate`) so both halves of
     the boundary agree about what is not even worth calling a candidate.
     """
-    return len(_counts(value)) < _MIN_CANDIDATE_DISTINCT
+    return len(set(value)) < _MIN_CANDIDATE_DISTINCT
 
 
 #: A value is WORD-LIKE when `-`/`_` split it into three or more parts and at
@@ -384,33 +494,76 @@ def _character_classes(value: str) -> int:
 _MARKER = re.compile(r"<redacted:[a-z0-9_-]+>")
 
 
-def _unmarked(pattern: re.Pattern[str], text: str) -> Any:
-    """`pattern.finditer(text)`, minus any match that touches a redaction marker.
+def _matches(
+    pattern: re.Pattern[str],
+    text: str,
+    windows: Windows | None = None,
+    *,
+    skip_markers: bool = False,
+) -> Iterator[re.Match[str]]:
+    """`pattern.finditer(text)`, read only where `windows` says to look.
 
-    Without this, scanning already-redacted text is not stable: the "secret" in
+    With no windows (and no markers to skip) this IS `finditer`. With windows,
+    each stretch is searched separately. A match that reaches a stretch's end
+    before the text's end may be a truncation (`endpos` reads as end-of-text to
+    lookaheads and `\\b`), so its start is matched again against the whole
+    text and that answer is the one kept. Under the `Windows` contract every
+    real match is strictly inside a stretch and this never fires; the quick
+    check's keyword windows are not that exact, and a long bearer token is
+    exactly what it would otherwise cut. Like `finditer`, a stretch resumes
+    after the previous match, never inside it.
+
+    `skip_markers` drops any match that touches a redaction marker. Without it,
+    scanning already-redacted text is not stable: the "secret" in
     `<redacted:anchored-secret>` anchors the next value, whose own marker then
     anchors the one after, one more value per pass. A skipped match resumes the
     search just past the marker, so a real key name that the skipped match's
     gap covered is still seen.
     """
-    if "<redacted:" not in text:
+    spans = windows(pattern) if windows is not None else None
+    if spans and sum(hi - lo for lo, hi in spans) * 2 >= len(text):
+        # Stretches covering half the text are cheaper read as one: a search
+        # per stretch costs more than the C loop they would skip.
+        spans = None
+    markers = (
+        [(m.start(), m.end()) for m in _MARKER.finditer(text)]
+        if skip_markers and "<redacted:" in text
+        else []
+    )
+    if spans is None and not markers:
         yield from pattern.finditer(text)
         return
-    markers = [(m.start(), m.end()) for m in _MARKER.finditer(text)]
-    pos = 0
-    while pos <= len(text):
-        match = pattern.search(text, pos)
-        if match is None:
-            return
-        crossed = next(
-            (end for start, end in markers if start < match.end() and end > match.start()),
-            None,
-        )
-        if crossed is None:
-            yield match
-            pos = max(match.end(), match.start() + 1)
-        else:
-            pos = max(crossed, match.start() + 1)
+    end = len(text)
+    resume = 0
+    for lo, hi in spans if spans is not None else [(0, end)]:
+        pos = max(lo, resume)
+        while pos <= hi:
+            match = pattern.search(text, pos, hi)
+            if match is None:
+                break
+            if hi < end and match.end() >= hi:
+                start = match.start()
+                match = pattern.match(text, start)
+                if match is None:
+                    pos = start + 1
+                    continue
+            crossed = next(
+                (stop for start, stop in markers if start < match.end() and stop > match.start()),
+                None,
+            )
+            if crossed is None:
+                yield match
+                pos = max(match.end(), match.start() + 1)
+            else:
+                pos = max(crossed, match.start() + 1)
+            resume = pos
+
+
+def _unmarked(
+    pattern: re.Pattern[str], text: str, windows: Windows | None = None
+) -> Iterator[re.Match[str]]:
+    """`_matches` minus any match touching a redaction marker. See there."""
+    return _matches(pattern, text, windows, skip_markers=True)
 
 
 def _is_indirect(value: str) -> bool:
@@ -418,7 +571,9 @@ def _is_indirect(value: str) -> bool:
     return bool(_INDIRECT.match(value))
 
 
-def scan(text: str, *, _decode: bool = True) -> list[Finding]:
+def scan(
+    text: str, *, _decode: bool = True, _accel: Accelerator | None = None
+) -> list[Finding]:
     """Every credential-shaped span in `text`, ordered by position.
 
     Never raises on ordinary input: a non-string, an empty string and a
@@ -429,38 +584,60 @@ def scan(text: str, *, _decode: bool = True) -> list[Finding]:
     at offset 64_001 would simply not be looked at — which is the wrong trade
     for a redactor. The overlap is `_WINDOW_OVERLAP`, comfortably wider than
     the longest span any rule can match, so nothing is missed at a seam.
+
+    `_accel` is the server's: it names the stretches of `text` each pattern is
+    worth reading (see `Windows`). Given one that can index the text, the whole
+    text is scanned in one pass, reading only those stretches; the answer is the
+    same set of credentials, found without reading the rest.
     """
     if not isinstance(text, str) or not text:
         return []
-    if len(text) > MAX_SCAN_CHARS:
-        return _scan_windowed(text)
+    windows = _accel(text) if _accel is not None and len(text) >= _ACCEL_MIN_CHARS else None
+    if windows is None and len(text) > MAX_SCAN_CHARS:
+        return _scan_windowed(text, _decode=_decode)
 
-    lowered = text.lower()
+    lowered = ""
     findings: list[Finding] = []
     pair_anchors: list[tuple[int, int]] = []
 
+    def present(keywords: tuple[str, ...], *patterns: re.Pattern[str]) -> bool:
+        # An accelerator that found no candidate for any of these patterns has
+        # already answered; skip the keyword sweep of the whole text.
+        nonlocal lowered
+        if windows is not None and all(windows(p) == [] for p in patterns):
+            return False
+        if not lowered:
+            lowered = text.lower()
+        return any(k in lowered for k in keywords)
+
     # [1] + [2] keyword prefilter, then the structured rules that survive it.
     for rule in _RULES:
-        if rule.keywords and not any(k in lowered for k in rule.keywords):
+        if rule.keywords and not present(rule.keywords, rule.pattern):
             continue
-        for match in rule.pattern.finditer(text):
+        if windows is not None and windows(rule.pattern) == []:
+            continue
+        for match in _matches(rule.pattern, text, windows):
             findings.append(Finding(rule.name, match.start(), match.end()))
             if rule.pairs_with_entropy:
                 pair_anchors.append((match.start(), match.end()))
 
-    if "password" in lowered or "passwd" in lowered:
-        for match in _unmarked(_PASSWORD_ASSIGNMENT, text):
+    if present(("password", "passwd"), _PASSWORD_ASSIGNMENT):
+        for match in _unmarked(_PASSWORD_ASSIGNMENT, text, windows):
             group = next(name for name in ("double", "single", "bare") if match.group(name) is not None)
             value = match.group(group).rstrip()
             if not value or _is_indirect(value):
                 continue
             if _is_word_like(value) and ("/" in value or value.startswith("--")):
                 continue
+            if group != "bare" and _is_template(text, match.start(group), value):
+                continue
+            if match.start() > 0 and text[match.start() - 1].isalnum() and _CODE_VALUE.fullmatch(value):
+                continue  # a camelCase field set from code: `userPassword = form.password.value`
             findings.append(Finding("anchored-secret", match.start(group), match.start(group) + len(value)))
 
     # [3] anchored entropy: a credential-shaped key name introduces the value.
-    if any(k in lowered for k in _ANCHOR_KEYWORDS):
-        for match in _unmarked(_ANCHORED, text):
+    if present(_ANCHOR_KEYWORDS, _ANCHORED, _SHORT_ANCHORED):
+        for match in _unmarked(_ANCHORED, text, windows):
             if _model_token_anchor(text, match.start()):
                 continue
             value = match.group("value")
@@ -468,10 +645,20 @@ def scan(text: str, *, _decode: bool = True) -> list[Finding]:
                 continue
             if shannon_entropy(value) < _ENTROPY_MIN:
                 continue
+            if text[match.end("value"):match.end("value") + 1] == "(":
+                continue  # a function call: `cliToken = readProbeConfigMcpToken(env)`
+            # The two widened anchors -- a camelCase hump and a `*_KEY` name --
+            # also meet identifiers and header names (`ENGINE_INTERNAL_KEY:
+            # X-Internal-Knowledge-Key`); a key value carries a digit.
+            camel = match.start() > 0 and text[match.start() - 1].isalnum()
+            if (camel or match.group("keyname")) and not any(c.isdigit() for c in value):
+                continue
+            if value.startswith(_PUBLISHABLE_KEY_PREFIXES):
+                continue  # published by design: PostHog project keys, Stripe publishable keys
             findings.append(
                 Finding("anchored-secret", match.start("value"), match.end("value"))
             )
-        for match in _unmarked(_SHORT_ANCHORED, text):
+        for match in _unmarked(_SHORT_ANCHORED, text, windows):
             if _model_token_anchor(text, match.start()):
                 continue
             group = next(name for name in ("double", "single", "bare") if match.group(name) is not None)
@@ -496,10 +683,38 @@ def scan(text: str, *, _decode: bool = True) -> list[Finding]:
             # back, which is the entire purpose of that pass.
             if "\\" in value or not value.isascii():
                 continue
+            if group != "bare" and _is_template(text, match.start(group), value):
+                continue
             if (_is_word_like(value) or _character_classes(value) < 2
                     or shannon_entropy(value) < 2.5):
                 continue
             findings.append(Finding("anchored-secret", match.start(group), match.end(group)))
+
+    # [3b] field shapes with no `key = value` separator.
+    if present(("setdefault", "getenv", ".get("), _ENV_DEFAULT):
+        for match in _unmarked(_ENV_DEFAULT, text, windows):
+            if _CREDENTIAL_NAME.search(match.group("name")) and _short_value_ok(match.group("value")):
+                findings.append(Finding("env-default", match.start("value"), match.end("value")))
+    if present(("machine",), _NETRC_PASSWORD):
+        for match in _unmarked(_NETRC_PASSWORD, text, windows):
+            if not _is_indirect(match.group("value")):
+                findings.append(Finding("netrc-password", match.start("value"), match.end("value")))
+    if present(("<password>",), _XML_PASSWORD):
+        for match in _unmarked(_XML_PASSWORD, text, windows):
+            value = match.group("value").rstrip()
+            if value and not _is_indirect(value):
+                findings.append(
+                    Finding("xml-password", match.start("value"), match.start("value") + len(value))
+                )
+    if present(('"auth"',), _DOCKER_AUTH):
+        for match in _unmarked(_DOCKER_AUTH, text, windows):
+            if _docker_auth_decodes(match.group("value")):
+                findings.append(Finding("docker-auth", match.start("value"), match.end("value")))
+    if present(("wandb",), _YAML_WANDB_KEY):
+        for match in _unmarked(_YAML_WANDB_KEY, text, windows):
+            start = match.start()
+            if lowered.rfind("wandb", max(0, start - _WANDB_BLOCK_REACH), start) >= 0:
+                findings.append(Finding("wandb-key", match.start("value"), match.end("value")))
 
     # [4] pair promotion: the formless half of a structured credential.
     for anchor_start, anchor_end in pair_anchors:
@@ -518,43 +733,85 @@ def scan(text: str, *, _decode: bool = True) -> list[Finding]:
             findings.append(Finding("paired-secret", match.start(), match.end()))
 
     if _decode:
-        findings.extend(_encoded_findings(text))
+        findings.extend(_encoded_findings(text, windows, _accel))
     return _dedupe(findings)
 
 
-def _encoded_findings(text: str) -> list[Finding]:
+#: How far a decoded credential can reach from an escape that hid part of it,
+#: when an accelerator limits decoding to escapes' neighbourhoods. A credential
+#: ENCODED as a whole (a URL-encoded PEM: `%2B`, `%2F`, `%0A` every line) is
+#: covered end to end by the merged neighbourhoods; one isolated escape only has
+#: to reach across a token, and the longest structured one short of a PEM or
+#: JWT is ~250 characters. Accepted: a PEM or JWT longer than this whose ONLY
+#: escape sits far from its ends is found by the plain path and not here.
+#: Decoding the whole text instead re-indexes every nested view of a binary
+#: file (random bytes carry an accidental `%xx` every ~30 KB): 5.6 s became
+#: 95 s on a 32 MB checkpoint.
+_ESCAPE_REACH = 2_048
+#: How far a neighbourhood's edge moves to reach whitespace (`_snap`).
+_SNAP = 256
+_SPACE = re.compile(r"\s")
+_LAST_SPACE = re.compile(r".*\s", re.DOTALL)
+
+
+def _snap(text: str, lo: int, hi: int) -> tuple[int, int, bool, bool]:
+    """`(lo, hi, lo_cut, hi_cut)`: a neighbourhood's edges moved out to the
+    nearest whitespace, so `\\b` and lookbehinds at an edge see what they see
+    in `text`. Cut in the middle of a word, `AKIA...` inside a longer run reads
+    as a key on its own. `*_cut` says an edge found no whitespace in `_SNAP`
+    characters and still splits the text."""
+    if lo > 0:
+        before = text[max(0, lo - _SNAP):lo]
+        found = _LAST_SPACE.match(before)
+        if found is not None:
+            lo -= len(before) - found.end()
+    if hi < len(text):
+        found = _SPACE.search(text, hi, min(len(text), hi + _SNAP))
+        if found is not None:
+            hi = found.start()
+    lo_cut = lo > 0 and not text[lo - 1].isspace()
+    hi_cut = hi < len(text) and not text[hi].isspace()
+    return lo, hi, lo_cut, hi_cut
+
+
+def _encoded_findings(
+    text: str, windows: Windows | None = None, accel: Accelerator | None = None
+) -> list[Finding]:
     """One bounded decoding layer; offsets always refer to original text.
 
     Only a positive credential rule on the decoded view permits replacement.
     Opaque blobs, source escapes and hashes alone are never findings.
+
+    Without windows the whole text is decoded and rescanned, as it always was.
+    With them only the neighbourhood of each escape is (`_ESCAPE_REACH`): text
+    far from every escape decodes to itself, and the plain pass already read it.
     """
     found: list[Finding] = []
-    matches = list(_ENCODED_CHAR.finditer(text))
+    matches = list(_matches(_ENCODED_CHAR, text, windows))
     if matches:
-        chars: list[str] = []
-        offsets: list[tuple[int, int]] = []
-        cursor = 0
-        for match in matches:
-            for index in range(cursor, match.start()):
-                chars.append(text[index])
-                offsets.append((index, index + 1))
-            value = match.group()
-            if value.startswith('%'):
-                decoded = chr(int(value[1:], 16))
-            elif value.startswith('\\'):
-                decoded = chr(int(value[2:], 16))
-            else:
-                decoded = ''  # ANSI formatting and zero-width separators
-            if decoded:
-                chars.append(decoded)
-                offsets.append((match.start(), match.end()))
-            cursor = match.end()
-        for index in range(cursor, len(text)):
-            chars.append(text[index])
-            offsets.append((index, index + 1))
-        for finding in scan(''.join(chars), _decode=False):
-            found.append(Finding(finding.rule, offsets[finding.start][0], offsets[finding.end-1][1]))
-    for match in _BASE64.finditer(text):
+        regions: list[tuple[int, int, list[re.Match[str]]]] = []
+        if windows is None:
+            regions.append((0, len(text), matches))
+        else:
+            for match in matches:
+                lo = max(0, match.start() - _ESCAPE_REACH)
+                hi = min(len(text), match.end() + _ESCAPE_REACH)
+                if regions and lo <= regions[-1][1]:
+                    start, _, inside = regions[-1]
+                    inside.append(match)  # in place: a copy per escape was quadratic
+                    regions[-1] = (start, max(regions[-1][1], hi), inside)
+                else:
+                    regions.append((lo, hi, [match]))
+        for lo, hi, inside in regions:
+            lo, hi, lo_cut, hi_cut = (lo, hi, False, False) if windows is None else _snap(text, lo, hi)
+            decoded, original = _decoded_view(text, inside, lo, hi)
+            for finding in scan(decoded, _decode=False, _accel=accel):
+                if (lo_cut and finding.start == 0) or (hi_cut and finding.end == len(decoded)):
+                    continue  # read against a cut edge, not against the text
+                found.append(
+                    Finding(finding.rule, original(finding.start)[0], original(finding.end - 1)[1])
+                )
+    for match in _matches(_BASE64, text, windows):
         value = match.group()
         if low_diversity(value):
             continue
@@ -567,15 +824,67 @@ def _encoded_findings(text: str) -> list[Finding]:
     return found
 
 
-def _scan_windowed(text: str) -> list[Finding]:
+def _decoded_view(
+    text: str, matches: list[re.Match[str]], lo: int, hi: int
+) -> tuple[str, Callable[[int], tuple[int, int]]]:
+    """`text[lo:hi]` with each escape in `matches` decoded, and a map from a
+    decoded index back to the original characters behind it.
+
+    Built from slices, one per run of plain text, so the cost follows the number
+    of escapes rather than the length of the text.
+    """
+    parts: list[str] = []
+    starts: list[int] = []  # decoded offset where each part begins
+    sources: list[tuple[int, int | None]] = []  # (original start, original end | None=plain)
+    cursor, length = lo, 0
+    for match in matches:
+        if match.start() > cursor:
+            parts.append(text[cursor:match.start()])
+            starts.append(length)
+            sources.append((cursor, None))
+            length += match.start() - cursor
+        value = match.group()
+        if value.startswith('%'):
+            decoded = chr(int(value[1:], 16))
+        elif value.startswith('\\'):
+            decoded = chr(int(value[2:], 16))
+        else:
+            decoded = ''  # ANSI formatting and zero-width separators
+        if decoded:
+            parts.append(decoded)
+            starts.append(length)
+            sources.append((match.start(), match.end()))
+            length += 1
+        cursor = match.end()
+    if hi > cursor:
+        parts.append(text[cursor:hi])
+        starts.append(length)
+        sources.append((cursor, None))
+
+    def original(index: int) -> tuple[int, int]:
+        part = bisect.bisect_right(starts, index) - 1
+        start, end = sources[part]
+        if end is None:
+            position = start + index - starts[part]
+            return position, position + 1
+        return start, end
+
+    return "".join(parts), original
+
+
+def _scan_windowed(text: str, *, _decode: bool = True) -> list[Finding]:
     """`scan` over overlapping windows, with spans mapped back to absolute
-    offsets. Linear in input length; one 64K window costs a few milliseconds."""
+    offsets. Linear in input length; one 64K window costs a few milliseconds.
+
+    `_decode` passes through: a decoded view longer than one window used to be
+    decoded AGAIN here, so a doubly-escaped credential was found or missed
+    depending on whether its decoded neighbourhood crossed 64K characters."""
     findings: list[Finding] = []
     step = MAX_SCAN_CHARS - _WINDOW_OVERLAP
     for base in range(0, len(text), step):
         window = text[base:base + MAX_SCAN_CHARS]
         findings.extend(
-            Finding(f.rule, f.start + base, f.end + base) for f in scan(window)
+            Finding(f.rule, f.start + base, f.end + base) for f in scan(window, _decode=_decode)
         )
         if base + MAX_SCAN_CHARS >= len(text):
             break
@@ -611,7 +920,115 @@ def redact(text: str) -> tuple[str, list[str]]:
     Returns the input unchanged when nothing matched, so callers can test
     identity cheaply.
     """
-    findings = scan(text)
+    return _replaced(text, scan(text))
+
+
+# ---------------------------------------------------------------------------
+# The quick check -- what the artifact gate runs on a researcher's machine
+# ---------------------------------------------------------------------------
+# The full scan above decodes escapes and base64 and reads whole texts rule by
+# rule; on a 20 MB file that is tens of seconds of pure Python. A researcher's
+# upload only needs the OBVIOUS credentials replaced before it leaves the
+# machine -- the server reads every upload again in full (Hyperscan) and records
+# what it finds. So the quick check runs the same rules and the same filters,
+# with no decoding layer, and reads each rule only next to its own keywords,
+# found with `str.find`. Standard library only.
+
+#: How far before a keyword a match can start. Every rule's keyword sits within
+#: its first ~25 characters (`sk-...T3BlbkFJ`, `https://hooks.slack.com`).
+_KEYWORD_LEAD = 64
+#: How far past a keyword to read for a rule whose width has no bound -- the
+#: anchored values: anchor, a 24-character gap, separator, quote, up to 512
+#: characters, and room for some spaces. Longer is not "obvious".
+_QUICK_TAIL = 640
+#: ASCII-only lowering: `str.lower` changes the length of a few Unicode
+#: characters (`İ`), which would misalign keyword offsets.
+_ASCII_LOWER = {c: c + 32 for c in range(ord("A"), ord("Z") + 1)}
+
+
+@functools.lru_cache(maxsize=1)
+def _quick_reach() -> dict[re.Pattern[str], tuple[tuple[str, ...], int]]:
+    """Each quick-check pattern: its keywords and how far past one to read."""
+    from re import _constants as sre_constants  # type: ignore[attr-defined]
+    from re import _parser as sre_parse  # type: ignore[attr-defined]
+
+    def tail(pattern: re.Pattern[str]) -> int:
+        width = sre_parse.parse(pattern.pattern, pattern.flags).getwidth()[1]
+        return (_QUICK_TAIL if width >= sre_constants.MAXREPEAT else width) + 2
+
+    reach = {rule.pattern: (rule.keywords, tail(rule.pattern)) for rule in _RULES if rule.keywords}
+    reach[_PASSWORD_ASSIGNMENT] = (("password", "passwd"), _QUICK_TAIL)
+    reach[_ANCHORED] = (_ANCHOR_KEYWORDS, _QUICK_TAIL)
+    reach[_SHORT_ANCHORED] = (_ANCHOR_KEYWORDS, _QUICK_TAIL)
+    reach[_ENV_DEFAULT] = (("setdefault", "getenv", ".get("), _QUICK_TAIL)
+    reach[_NETRC_PASSWORD] = (("machine",), tail(_NETRC_PASSWORD))
+    reach[_XML_PASSWORD] = (("<password>",), tail(_XML_PASSWORD))
+    reach[_DOCKER_AUTH] = (('"auth"',), tail(_DOCKER_AUTH))
+    # The match holds "key", not "wandb" (the block opens above it).
+    reach[_YAML_WANDB_KEY] = (("key",), tail(_YAML_WANDB_KEY))
+    return reach
+
+
+def _keyword_windows(text: str) -> Windows:
+    """`Windows` from `str.find`: a stretch around every keyword occurrence.
+
+    A rule's match always contains one of its keywords, so these stretches
+    hold every match the rule has. `_QUICK_TAIL` bounds the unbounded ones.
+    """
+    reach = _quick_reach()
+    lowered = text.lower()
+    if len(lowered) != len(text):
+        lowered = text.translate(_ASCII_LOWER)
+    found: dict[str, list[int]] = {}
+    cache: dict[re.Pattern[str], list[tuple[int, int]] | None] = {}
+
+    def positions(keyword: str) -> list[int]:
+        if keyword not in found:
+            hits: list[int] = []
+            at = lowered.find(keyword)
+            while at != -1:
+                hits.append(at)
+                at = lowered.find(keyword, at + 1)
+            found[keyword] = hits
+        return found[keyword]
+
+    def windows(pattern: re.Pattern[str]) -> list[tuple[int, int]] | None:
+        if pattern not in cache:
+            spec = reach.get(pattern)
+            if spec is None:
+                cache[pattern] = None
+            else:
+                keywords, tail = spec
+                spans: list[tuple[int, int]] = []
+                for lo, hi in sorted(
+                    (max(0, at - _KEYWORD_LEAD), min(len(text), at + tail))
+                    for keyword in keywords
+                    for at in positions(keyword)
+                ):
+                    if spans and lo <= spans[-1][1]:
+                        spans[-1] = (spans[-1][0], max(spans[-1][1], hi))
+                    else:
+                        spans.append((lo, hi))
+                cache[pattern] = spans
+        return cache[pattern]
+
+    return windows
+
+
+def scan_quick(text: str) -> list[Finding]:
+    """The researcher-side check: `scan`'s rules and filters, no decoding
+    layer, each rule read only near its keywords. What it does not look for --
+    escaped or base64-encoded credentials, the key-name flag -- the server's
+    full inspection still records."""
+    return scan(text, _decode=False, _accel=_keyword_windows)
+
+
+def redact_quick(text: str) -> tuple[str, list[str]]:
+    """`redact`, with `scan_quick`."""
+    return _replaced(text, scan_quick(text))
+
+
+def _replaced(text: str, findings: list[Finding]) -> tuple[str, list[str]]:
     if not findings:
         return text, []
     out: list[str] = []
