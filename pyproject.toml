@@ -14,7 +14,7 @@ dependencies = [
     "pydantic-settings>=2.6.0",
 
     # MCP server (services/mcp, vendored from prbe-knowledge-mcp).
-    "mcp==1.27.0",
+    "mcp==1.28.1",
     "PyJWT[crypto]>=2.10.0",
 
     "sqlalchemy>=2.0.35",
