@@ -321,7 +321,15 @@ CREATE POLICY tenant_isolation ON documents
 --   valid_from          — when this chunk first appeared in any version of the doc
 --   valid_to            — when it stopped being in the live version (NULL = still live)
 --   first_seen_version  — document version that first introduced this chunk
---   last_seen_version   — most recent document version that still contained it
+--   last_seen_version   — while live: 2147483647 (LIVE_CHUNK_LAST_SEEN, the int4
+--                         max), an open end, so `d.version BETWEEN first_seen AND
+--                         last_seen` admits every version from first_seen on and
+--                         a re-ingest never rewrites an unchanged chunk. Once
+--                         closed: the most recent document version that still
+--                         contained it (every writer that sets valid_to caps it).
+--                         Rows written before the sentinel carry the exact live
+--                         version until their next reuse moves them onto it.
+--                         Never add to it: +1 overflows int4.
 -- ---------------------------------------------------------------------------
 CREATE TABLE chunks (
     chunk_id             TEXT NOT NULL,

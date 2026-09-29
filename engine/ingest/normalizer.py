@@ -12,9 +12,11 @@ Persistence is content-addressable + bitemporal:
   `_upsert_document` detects no-op (content_hash match, not a delete)
   and returns False without bumping version.
 - Chunks live at identity `(doc_id, content_hash)`. On re-ingest we diff
-  (live chunks ⟵ new chunks) — reused chunks just have `last_seen_version`
-  bumped (no embedding call), new chunks are embedded + inserted,
-  removed chunks get `valid_to = NOW()`.
+  (live chunks ⟵ new chunks) — reused chunks are left alone (no embedding
+  call, and no write: a live chunk's `last_seen_version` is the open-ended
+  LIVE_CHUNK_LAST_SEEN), new chunks are embedded + inserted, and every live
+  chunk the new version does not contain gets `valid_to = NOW()` with its
+  version range capped.
 
 That's the bit that keeps embedding cost proportional to actual content
 change rather than the size of the document.
@@ -51,6 +53,7 @@ from engine.shared.constants import (
     CHUNKER_VERSION,
     EMBEDDING_V2_DIM,
     EMBEDDING_V2_MODEL,
+    LIVE_CHUNK_LAST_SEEN,
     NORMALIZER_VERSION,
     SourceSystem,
 )
@@ -1191,8 +1194,8 @@ class Normalizer:
         }
 
         # The metadata chunk participates in the same hash-based reuse machinery
-        # as content chunks: same content_hash across versions → just bump
-        # last_seen_version, no re-embed. Its `kind='metadata'` is what
+        # as content chunks: same content_hash across versions → the live row
+        # is kept as-is, no re-embed. Its `kind='metadata'` is what
         # distinguishes it at insert + read time. Tracked separately so we can
         # filter live_rows by kind to avoid colliding with content hashes.
         metadata_hash: str | None = _chunk_hash(metadata_piece.content) if metadata_piece else None
@@ -1365,7 +1368,8 @@ class _ChunkPlan:
     See incident 2026-04-29.
     """
 
-    # Content-chunk hashes that already exist live → just bump last_seen_version.
+    # Content-chunk hashes that already exist live → kept live. No write once
+    # the row's last_seen_version is LIVE_CHUNK_LAST_SEEN.
     reused_content_hashes: set[str] = field(default_factory=set)
     # Metadata chunk's hash if it already exists live (singleton). None if no
     # metadata chunk in the plan or if it's being added/changed.
@@ -1379,7 +1383,11 @@ class _ChunkPlan:
     # (piece_or_None, failed_record) tuples from embedding failures. Goes to
     # failed_chunks. Phase B writes these inside the per-doc savepoint.
     failed_pieces: list[tuple[ChunkPiece | None, Any]] = field(default_factory=list)
-    # All hashes that should be marked valid_to=NOW() — content + metadata stale.
+    # Live hashes Phase A saw that the new version lacks — content + metadata
+    # stale. Feeds `removed_count` and callers' consistency checks. Phase B
+    # does NOT retire by this set: it retires every live chunk outside the
+    # new version's content (see `_apply_chunk_plan`, step 3), which also
+    # covers live chunks written after this plan was read.
     removed_hashes: set[str] = field(default_factory=set)
     # Pre-computed counts for the outcome (computed in Phase A so Phase B's
     # `_apply_chunk_plan` is purely SQL — no derived bookkeeping).
@@ -1606,7 +1614,7 @@ async def _upsert_document(conn: asyncpg.Connection, doc: Document) -> bool:
         # asks for coalescing, UPDATE the live row in place. Same version,
         # refreshed content_hash + metadata + body_preview + token counts.
         # Chunk writes (called after this returns True) then diff against the
-        # same version, so reused chunks just bump last_seen_version.
+        # same version, so reused chunks are left as they are.
         if existing is not None and doc.coalesce_into_live and doc.deleted_at is None:
             existing_meta = _coerce_jsonb(existing["metadata"])
             prior_complete = bool(existing_meta.get("session_complete"))
@@ -1782,10 +1790,16 @@ async def _upsert_document(conn: asyncpg.Connection, doc: Document) -> bool:
 #: `customer_id` cannot admit a row the old key rejected.
 #: Migration 0134 creates the index; the write switch rides the same release
 #: because kb-migrate is a `pre-upgrade` hook and completes first.
+#:
+#: A revived row reopens with the INSERT's LIVE_CHUNK_LAST_SEEN. It also takes
+#: the INSERT's `chunker_version`: the row now holds the current chunker's
+#: embedding, and a row left on an old chunker_version reads as stale to every
+#: later plan -- re-embedded on every ingest of its document.
 _CHUNK_UPSERT_ON_CONFLICT = """
         ON CONFLICT (customer_id, doc_id, content_hash) DO UPDATE
             SET last_seen_version = EXCLUDED.last_seen_version,
                 valid_to = NULL,
+                chunker_version = EXCLUDED.chunker_version,
                 embedding_v2 = EXCLUDED.embedding_v2,
                 embedding_v2_model = EXCLUDED.embedding_v2_model,
                 embedding_v2_dim = EXCLUDED.embedding_v2_dim,
@@ -1816,11 +1830,15 @@ async def _insert_chunk(
     prefix = "m_" if kind == "metadata" else "c_"
     chunk_id = f"{doc.doc_id}:{prefix}{content_hash[:16]}"
     # `title` is carried on the upsert branch too, and that is not redundant
-    # with the documents-title trigger from 0100. On a retitle+reingest the
-    # trigger fires while this chunk's range still ends at the PREVIOUS
-    # version, so it matches nothing; the row then has its last_seen_version
-    # extended here and would keep the stale title forever. Setting it on both
-    # branches closes that window. See _CHUNK_UPSERT_ON_CONFLICT.
+    # with the documents-title trigger from 0100. A row this upsert revives was
+    # CLOSED, its range capped below the version whose title the trigger
+    # propagates, so the trigger matched nothing for it; the upsert then
+    # reopens it (last_seen_version back to LIVE_CHUNK_LAST_SEEN) and it would
+    # keep the stale title forever. Setting it on both branches closes that
+    # window. See _CHUNK_UPSERT_ON_CONFLICT.
+    #
+    # first_seen = this version, last_seen = LIVE_CHUNK_LAST_SEEN: a live
+    # chunk's range is open-ended, so no later reuse has to write it.
     await conn.execute(
         """
         INSERT INTO chunks (
@@ -1835,7 +1853,7 @@ async def _insert_chunk(
             $1, $2, $3,
             $4, $5, $6, $7,
             $8,
-            $9, $9, $10,
+            $9, $16, $10,
             $11::halfvec, $12, $13,
             $14, $15
         )
@@ -1856,6 +1874,7 @@ async def _insert_chunk(
         EMBEDDING_V2_DIM,
         doc.visibility.value,
         doc.title or "",
+        LIVE_CHUNK_LAST_SEEN,
     )
 
 
@@ -1863,8 +1882,11 @@ async def _insert_chunks_batch(
     conn: asyncpg.Connection,
     doc: Document,
     added_pieces: list[tuple[ChunkPiece, list[float], str]],
-) -> None:
+) -> set[str]:
     """Batched counterpart to `_insert_chunk` — one INSERT for all pieces.
+
+    Returns the content hashes written (inserted or revived), which
+    `_apply_chunk_plan` keeps out of its removal step.
 
     Dedupes by content_hash before insert: the unique constraint is
     (customer_id, doc_id, content_hash) and every row in one batch shares a
@@ -1908,8 +1930,10 @@ async def _insert_chunks_batch(
         kinds.append(kind)
 
     if not chunk_ids:
-        return
+        return seen_hashes
 
+    # first_seen = this version, last_seen = LIVE_CHUNK_LAST_SEEN ($16): see
+    # _insert_chunk.
     await conn.execute(
         """
         INSERT INTO chunks (
@@ -1924,7 +1948,7 @@ async def _insert_chunks_batch(
             chunk_id, $2, $3,
             chunk_index, content, content_hash, token_count,
             $9,
-            $10, $10, kind,
+            $10, $16, kind,
             embedding_v2::halfvec, $12, $13,
             $14, $15
         FROM unnest(
@@ -1949,7 +1973,9 @@ async def _insert_chunks_batch(
         EMBEDDING_V2_DIM,
         doc.visibility.value,
         doc.title or "",
+        LIVE_CHUNK_LAST_SEEN,
     )
+    return seen_hashes
 
 
 async def _insert_failed_chunk(
@@ -1976,41 +2002,68 @@ async def _apply_chunk_plan(
 ) -> _ChunkSyncOutcome:
     """Phase B: apply a pre-computed `_ChunkPlan` inside the write txn.
 
-    No external I/O. Pure SQL: bump last_seen_version on reused, INSERT
-    new chunks (with embeddings already computed in Phase A), record
-    embedding failures, mark removed chunks stale.
+    No external I/O. Pure SQL: move any reused chunk still carrying an exact
+    version onto the open-ended LIVE_CHUNK_LAST_SEEN, INSERT new chunks (with
+    embeddings already computed in Phase A), record embedding failures, then
+    retire every live chunk the new version does not contain.
 
     Counts are pre-computed in Phase A and passed through verbatim — the
     caller's outcome accumulators don't notice the split.
     """
-    # 1) Reuse: bump last_seen_version. Combined: content reused + metadata reused.
-    reused_for_bump: set[str] = set(plan.reused_content_hashes)
+    # 1) Reuse. Content reused + metadata reused. A live chunk's range is
+    #    open-ended (LIVE_CHUNK_LAST_SEEN), so a reused chunk needs NO write:
+    #    the version join already admits this version. The UPDATE only moves
+    #    rows still carrying an exact version -- written before the sentinel,
+    #    or by an older pod during a rollout or after a rollback -- onto it,
+    #    and `last_seen_version <> $1` skips everything else. Each such row is
+    #    written once, on its first reuse, and never again; previously EVERY
+    #    reused row was rewritten on EVERY re-ingest (~3,500 non-HOT updates
+    #    per append for a big live session: the column is in the bm25 index).
+    reused: set[str] = set(plan.reused_content_hashes)
     if plan.reused_metadata_hash is not None:
-        reused_for_bump.add(plan.reused_metadata_hash)
-    if reused_for_bump:
+        reused.add(plan.reused_metadata_hash)
+    if reused:
         await conn.execute(
             """
             UPDATE chunks
             SET last_seen_version = $1
             WHERE customer_id = $2 AND doc_id = $3
               AND content_hash = ANY($4::text[]) AND valid_to IS NULL
+              AND last_seen_version <> $1
             """,
-            doc.version,
+            LIVE_CHUNK_LAST_SEEN,
             doc.customer_id,
             doc.doc_id,
-            list(reused_for_bump),
+            list(reused),
         )
 
     # 2) Added: insert with pre-computed embeddings. One INSERT for all
     #    chunks regardless of count — per-chunk round-trips inside Phase B
     #    were the next contention layer behind the per-node loop in
     #    upsert_nodes.
+    kept: set[str] = set(reused)
     if plan.added_pieces:
-        await _insert_chunks_batch(conn, doc, plan.added_pieces)
+        kept |= await _insert_chunks_batch(conn, doc, plan.added_pieces)
     for piece, fail in plan.failed_pieces:
         await _insert_failed_chunk(conn, doc, fail, piece)
+        # Content of this version that only lacks a vector. Not retired if
+        # another writer holds it live.
+        if piece is not None:
+            kept.add(_chunk_hash(piece.content))
 
-    # 3) Removed: mark stale at NOW() -- and cap the VERSION range to match,
+    # 3) Removed: retire every live chunk of the document that this version
+    #    does not contain -- the plan is authoritative, NOT the removed set
+    #    Phase A computed. With open-ended live ranges the version join can no
+    #    longer hide a live chunk the plan never saw: one another worker
+    #    inserted between this plan's read and this write (research runs two
+    #    worker replicas), or the same document planned twice in one batch.
+    #    Such a chunk would otherwise stay live at LIVE_CHUNK_LAST_SEEN and be
+    #    served as part of this version. Retiring by the KEPT set also settles
+    #    a CHUNKER_VERSION change: a same-content chunk is in both the stale
+    #    (removed) set and the added set, and removing by hash used to retire
+    #    it again right after step 2 revived it.
+    #
+    #    Mark stale at NOW() -- and cap the VERSION range to match,
     #    because the two liveness markers used to disagree and the version
     #    join believed the wrong one. On the in-place resync path (incomplete
     #    docs update at the SAME version; see the `return True` branch in
@@ -2022,28 +2075,57 @@ async def _apply_chunk_plan(
     #    down to minutes -- an ongoing property of live-session re-chunking,
     #    not debris. Backfilled by migration 0125.
     #
-    #    LEAST(), not an unconditional set: on the version-BUMP path the doc
-    #    is already at N+1 when removal runs and last_seen correctly reads N
-    #    == doc.version - 1, so LEAST is a no-op there; on the same-version
-    #    path it caps N -> N-1. A chunk born and removed inside one version
-    #    ends with first_seen > last_seen: an empty range that joins nothing,
-    #    which is the truthful description of content no completed version
-    #    state ever carried. Resurrection stays symmetric -- the add path's
-    #    ON CONFLICT already restores BOTH markers (last_seen_version and
-    #    valid_to = NULL) together.
-    if plan.removed_hashes:
-        await conn.execute(
-            """
-            UPDATE chunks
-            SET valid_to = NOW(),
-                last_seen_version = LEAST(last_seen_version, $4 - 1)
-            WHERE customer_id = $1 AND doc_id = $2
-              AND content_hash = ANY($3::text[]) AND valid_to IS NULL
-            """,
-            doc.customer_id,
-            doc.doc_id,
-            list(plan.removed_hashes),
-            doc.version,
+    #    The cap is what turns an open-ended range back into a real one: a
+    #    live chunk reads LIVE_CHUNK_LAST_SEEN, and on the version-BUMP path
+    #    (doc already at N+1 here) it becomes N, the last version that
+    #    contained it; on the same-version path it becomes N-1. LEAST(), not
+    #    an unconditional set, because a row still carrying an exact version
+    #    (an older pod's write) may already be lower. A chunk born and removed
+    #    inside one version ends with first_seen > last_seen: an empty range
+    #    that joins nothing, which is the truthful description of content no
+    #    completed version state ever carried. Resurrection stays symmetric --
+    #    the add path's ON CONFLICT restores BOTH markers (last_seen_version =
+    #    LIVE_CHUNK_LAST_SEEN and valid_to = NULL) together.
+    #
+    #    Runs even when Phase A planned no removal: that is exactly when an
+    #    unseen chunk would otherwise survive. It reads the document's live
+    #    rows and writes only the ones it retires.
+    #
+    #    NOT EXISTS over unnest, not `content_hash <> ALL($3)`: under a generic
+    #    plan (asyncpg prepares statements) `<> ALL` compares every row against
+    #    the whole array -- measured 92 ms for 3,500 live chunks against a
+    #    3,500-hash kept set, on every append -- while this plans as a hash
+    #    anti join, 2.6 ms for the same rows.
+    status = await conn.execute(
+        """
+        UPDATE chunks c
+        SET valid_to = NOW(),
+            last_seen_version = LEAST(c.last_seen_version, $4 - 1)
+        WHERE c.customer_id = $1 AND c.doc_id = $2 AND c.valid_to IS NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM unnest($3::text[]) AS k(content_hash)
+              WHERE k.content_hash = c.content_hash
+          )
+        """,
+        doc.customer_id,
+        doc.doc_id,
+        list(kept),
+        doc.version,
+    )
+    retired = (
+        int(status.split()[-1])
+        if isinstance(status, str) and status.startswith("UPDATE ")
+        else 0
+    )
+    if retired > plan.removed_count:
+        # Only a live chunk Phase A never saw can push the count past the
+        # plan's: without one, what step 3 retires is a subset of it.
+        log.info(
+            "normalizer.retired_unplanned_chunks",
+            customer=doc.customer_id,
+            doc_id=doc.doc_id,
+            version=doc.version,
+            unplanned=retired - plan.removed_count,
         )
 
     return _ChunkSyncOutcome(

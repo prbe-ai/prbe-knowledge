@@ -100,9 +100,18 @@ async def retire_unrepresented_documents(
     retired = [row["doc_id"] for row in rows]
     if not retired:
         return []
+    # Cap the version range with the close: a live chunk's last_seen_version
+    # is the open-ended LIVE_CHUNK_LAST_SEEN, and a closed chunk left there
+    # joins every later version of a re-created document and never meets the
+    # tombstone purge's `last_seen_version <= version` bound. Runs before the
+    # documents UPDATE below, which closes the row without adding a version,
+    # so the highest version is the one these chunks were last part of.
     await conn.execute(
-        """UPDATE chunks SET valid_to=coalesce(valid_to,now())
-        WHERE customer_id=$1 AND doc_id=ANY($2::text[]) AND valid_to IS NULL""",
+        """UPDATE chunks c SET valid_to=coalesce(c.valid_to,now()),
+            last_seen_version=LEAST(c.last_seen_version,
+                COALESCE((SELECT max(d.version) FROM documents d
+                 WHERE d.customer_id=c.customer_id AND d.doc_id=c.doc_id), 0))
+        WHERE c.customer_id=$1 AND c.doc_id=ANY($2::text[]) AND c.valid_to IS NULL""",
         customer_id,
         retired,
     )

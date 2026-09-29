@@ -41,6 +41,7 @@ from engine.shared.config import Settings
 from engine.shared.constants import (
     BACKUP_TAIL_DAYS,
     DELETION_DEADLINE_DAYS,
+    LIVE_CHUNK_LAST_SEEN,
     TOMBSTONE_PURGE_DAYS,
     EdgeType,
     NodeLabel,
@@ -559,6 +560,147 @@ async def test_code_graph_disconnect_shape_is_purged(app_settings, settings) -> 
     assert await _chunk_rows(cid, doc_id) == 0
 
 
+async def _as_app(app: Settings, settings: Settings, fn):
+    """Run `fn()` through the app-role pool (FORCE RLS applies), as `_run` does."""
+    await db_module.close_pool()
+    await db_module.init_pool(app)
+    try:
+        return await fn()
+    finally:
+        await db_module.close_pool()
+        await db_module.init_pool(settings)
+
+
+async def _chunk_range(customer_id: str, chunk_id: str):
+    async with db_module.raw_conn() as conn:
+        return await conn.fetchrow(
+            "SELECT last_seen_version, valid_to FROM chunks"
+            " WHERE customer_id = $1 AND chunk_id = $2",
+            customer_id,
+            chunk_id,
+        )
+
+
+async def test_real_code_graph_disconnect_caps_live_chunks_for_the_purge(
+    app_settings, settings
+) -> None:
+    """The disconnect SQL itself, not a seeded capped range (the test above
+    seeds one). A live chunk's last_seen_version is the open-ended
+    LIVE_CHUNK_LAST_SEEN; a close that left it there would sit outside the
+    purge's `last_seen_version <= tombstone.version` bound forever."""
+    import httpx
+
+    from engine.ingest.handlers.base import ConnectorContext
+    from engine.shared.models import WebhookEvent
+    from kb.handlers.codegraph import KIND_DISCONNECT, CodeGraphConnector
+
+    cid = "t-codegraph-real"
+    await _tenant(cid)
+    doc_id = "code_graph:acme/app:src/x.py:f"
+    await _doc(cid, doc_id, versions=2, tombstone_days=None,
+               source_system=SourceSystem.CODE_GRAPH.value)
+    await _chunk(cid, doc_id, "cg-live", 1, LIVE_CHUNK_LAST_SEEN, live=True)
+    await _chunk(cid, doc_id, "cg-gone", 1, 1, live=False)
+
+    async def disconnect() -> None:
+        async with httpx.AsyncClient() as http:
+            connector = CodeGraphConnector(ConnectorContext(settings=settings, http=http))
+            await connector._normalize_disconnect(
+                WebhookEvent(
+                    customer_id=cid,
+                    source_system=SourceSystem.CODE_GRAPH,
+                    source_event_id="code_graph:disconnect:acme/app:t",
+                    received_at=NOW,
+                    payload_s3_key="raw/code_graph/x.json",
+                    payload_s3_keys=["raw/code_graph/x.json"],
+                    raw_payload={"kind": KIND_DISCONNECT, "repos": ["acme/app"]},
+                    headers={},
+                )
+            )
+
+    await _as_app(app_settings, settings, disconnect)
+
+    live = await _chunk_range(cid, "cg-live")
+    assert live["valid_to"] is not None
+    assert live["last_seen_version"] == 2, "capped to the version it was last part of"
+
+    # The disconnect stamps the tombstone NOW; age it past the window.
+    async with db_module.raw_conn() as conn:
+        await conn.execute(
+            "UPDATE documents SET deleted_at = deleted_at - make_interval(days => $3),"
+            " valid_to = valid_to - make_interval(days => $3)"
+            " WHERE customer_id = $1 AND doc_id = $2 AND deleted_at IS NOT NULL",
+            cid,
+            doc_id,
+            TOMBSTONE_PURGE_DAYS + 1,
+        )
+
+    assert await _run(app_settings, settings) == purge.EXIT_OK
+
+    assert await _doc_rows(cid, doc_id) == 0
+    assert await _chunk_rows(cid, doc_id) == 0
+
+
+async def test_real_github_retirement_caps_live_chunks_for_a_later_tombstone(
+    app_settings, settings
+) -> None:
+    """`retire_unrepresented_documents` closes a document without adding a
+    version. Its chunks must end capped to that version: open-ended, they would
+    join a re-created document's later versions and outlive a later tombstone."""
+    from engine.shared.db import with_tenant
+    from kb.github_control import retire_unrepresented_documents
+
+    cid = "t-github-real"
+    await _tenant(cid)
+    doc_id = "github:acme/app:pull:7"
+    await _doc(cid, doc_id, versions=2, tombstone_days=None,
+               source_system=SourceSystem.GITHUB.value)
+    await _chunk(cid, doc_id, "gh-live", 1, LIVE_CHUNK_LAST_SEEN, live=True)
+
+    async def retire() -> list[str]:
+        async with with_tenant(cid) as conn:
+            return await retire_unrepresented_documents(conn, cid, [doc_id])
+
+    assert await _as_app(app_settings, settings, retire) == [doc_id]
+
+    live = await _chunk_range(cid, "gh-live")
+    assert live["valid_to"] is not None
+    assert live["last_seen_version"] == 2, "capped to the version it was last part of"
+
+    # Later the source deletes it: the normalizer writes the tombstone as
+    # MAX(version) + 1, since no live row remains. Aged past the window.
+    async with db_module.raw_conn() as conn:
+        await conn.execute(
+            """
+            INSERT INTO documents (customer_id, doc_id, version, source_system, source_id,
+                                   source_url, doc_type, content_hash, created_at,
+                                   updated_at, valid_from, deleted_at, acl, metadata)
+            VALUES ($1, $2, 3, $3, $2, 'https://x', 't', 'h-tomb', $4, $4, $4, $4,
+                    '{}'::jsonb, '{}'::jsonb)
+            """,
+            cid,
+            doc_id,
+            SourceSystem.GITHUB.value,
+            NOW - timedelta(days=TOMBSTONE_PURGE_DAYS + 1),
+        )
+        joined = await conn.fetchval(
+            """
+            SELECT count(*) FROM chunks c
+            JOIN documents d ON d.customer_id = c.customer_id AND d.doc_id = c.doc_id
+            WHERE c.customer_id = $1 AND c.doc_id = $2 AND d.version = 3
+              AND d.version BETWEEN c.first_seen_version AND c.last_seen_version
+            """,
+            cid,
+            doc_id,
+        )
+    assert joined == 0, "a retired chunk joined a version created after it closed"
+
+    assert await _run(app_settings, settings) == purge.EXIT_OK
+
+    assert await _doc_rows(cid, doc_id) == 0
+    assert await _chunk_rows(cid, doc_id) == 0
+
+
 async def test_other_tenants_same_ids_are_untouched(app_settings, settings) -> None:
     """Connector doc ids carry no tenant, so two tenants can hold the same one.
     Only the tenant whose copy is an old tombstone loses it."""
@@ -858,7 +1000,9 @@ async def test_revived_chunk_survives_a_racing_delete(live_db) -> None:
 
         async def delete():
             async with db_module.with_tenant(cid) as conn:
-                return await conn.fetchrow(purge._DELETE_CHUNKS_SQL, cid, [doc_id], [2], 100)
+                return await conn.fetchrow(
+                    purge._DELETE_CHUNKS_SQL, cid, [doc_id], [2], 100, LIVE_CHUNK_LAST_SEEN
+                )
 
         task = asyncio.create_task(delete())
         await _wait_for_lock_wait("DELETE FROM chunks")

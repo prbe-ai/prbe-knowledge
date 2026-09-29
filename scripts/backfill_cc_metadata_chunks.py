@@ -8,7 +8,8 @@ chunk for each so retrieval queries see the new identity-bearing text
 
 Each doc's chunk swap is atomic: inside one transaction we INSERT the new
 chunk row (kind='metadata', valid_from=NOW()) and UPDATE the prior live
-row's valid_to=NOW() for the matching doc. There is no observable gap
+row's valid_to=NOW() for the matching doc, capping its last_seen_version
+(see LIVE_CHUNK_LAST_SEEN in engine/shared/constants.py). There is no observable gap
 where the metadata chunk is missing.
 
 Usage:
@@ -46,6 +47,7 @@ from engine.shared.constants import (
     CHUNKER_VERSION,
     EMBEDDING_V2_DIM,
     EMBEDDING_V2_MODEL,
+    LIVE_CHUNK_LAST_SEEN,
     DocClass,
     DocType,
     SourceSystem,
@@ -254,6 +256,7 @@ async def _process_doc(
             now = datetime.now(UTC)
             # Insert new row first; identity is (doc_id, content_hash)
             # so a redelivery with the same text is a no-op via ON CONFLICT.
+            # Live, so open-ended: last_seen_version = LIVE_CHUNK_LAST_SEEN.
             new_chunk_id = f"{doc_id}:m_{new_hash[:16]}"
             await conn.execute(
                 """
@@ -269,7 +272,7 @@ async def _process_doc(
                     $1, $2, $3,
                     $4, $5, $6, $7,
                     $8,
-                    $9, $9, 'metadata',
+                    $9, $14, 'metadata',
                     $10,
                     $11::halfvec, $12, $13
                 )
@@ -293,14 +296,20 @@ async def _process_doc(
                 _pg_vector(embedding_v2),
                 EMBEDDING_V2_MODEL,
                 EMBEDDING_V2_DIM,
+                LIVE_CHUNK_LAST_SEEN,
             )
             # Close out the prior live metadata row, if it exists and
-            # differs from the one we just inserted.
+            # differs from the one we just inserted. Cap its version range as
+            # the normalizer's same-version removal does (version - 1): the
+            # document stays at this version, whose metadata is now the new
+            # row's, and a closed row left at LIVE_CHUNK_LAST_SEEN would keep
+            # joining this and every later version.
             if existing is not None and existing["content_hash"] != new_hash:
                 await conn.execute(
                     """
                     UPDATE chunks
-                    SET valid_to = $4
+                    SET valid_to = $4,
+                        last_seen_version = LEAST(last_seen_version, $5 - 1)
                     WHERE customer_id = $1 AND doc_id = $2
                       AND content_hash = $3 AND kind = 'metadata'
                       AND valid_to IS NULL
@@ -309,6 +318,7 @@ async def _process_doc(
                     doc_id,
                     existing["content_hash"],
                     now,
+                    doc_row["version"],
                 )
         return "updated"
     except Exception as exc:
