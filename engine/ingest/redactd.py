@@ -70,6 +70,15 @@ PING_TIMEOUT_SECONDS = 10.0
 #: not become a fork bomb inside the worker.
 RESTART_BACKOFF_START_SECONDS = 0.5
 RESTART_BACKOFF_CAP_SECONDS = 30.0
+#: Requests at least this large still take turns, one at a time. Below it a
+#: scan runs beside whatever else is in flight (the daemon serves 4 at once).
+#: Until 2026-09-29 EVERY scan took turns: the supervisor held one lock across
+#: the whole round trip, so a 5.5 MB session's ~15 s scan made each small
+#: document in the process wait for it -- measured 31.5 s for a document whose
+#: scan costs 4 ms. Large scans stay serial because redactd's 30 s deadline is
+#: per request: two multi-MB scans sharing the pod's 2 CPUs could each run past
+#: it, where one at a time neither does.
+SERIAL_SCAN_BYTES = 256 * 1024
 
 
 def binary_path() -> str | None:
@@ -101,7 +110,16 @@ class RedactdSupervisor:
         self._proc: subprocess.Popen | None = None
         self._dir: str | None = None
         self._socket: str | None = None
+        # Guards the child's lifecycle (spawn, kill, restart) -- NOT a scan.
         self._lock = threading.Lock()
+        # Bumped on every spawn, so concurrent scans that fail on the same dead
+        # daemon restart it once between them, not once each.
+        self._generation = 0
+        # Scans between send and response. A timed-out scan restarts the
+        # daemon only when it is the last one in flight (see _scan_request).
+        self._in_flight = 0
+        # One large scan at a time; see SERIAL_SCAN_BYTES.
+        self._large_scans = threading.Lock()
         self._backoff = RESTART_BACKOFF_START_SECONDS
         self._stopped = False
 
@@ -162,6 +180,7 @@ class RedactdSupervisor:
             # raises here, and a bare OSError out of a credential gate is an
             # unhandled exception somewhere upstream rather than a retry.
             raise ScanUnavailable("redactd would not start", error=str(exc)) from exc
+        self._generation += 1
         self._await_ready_locked()
         self._backoff = RESTART_BACKOFF_START_SECONDS
 
@@ -177,7 +196,7 @@ class RedactdSupervisor:
                     "redactd exited during startup", returncode=self._proc.returncode
                 )
             try:
-                if self._request_locked({"op": "ping"}).get("ok") is True:
+                if self._request({"op": "ping"}).get("ok") is True:
                     return
             except Exception as exc:
                 last = exc
@@ -194,12 +213,17 @@ class RedactdSupervisor:
         self._spawn_locked()
 
     # ---- transport ------------------------------------------------------
-    def _request_locked(self, payload: dict) -> dict:
-        assert self._socket is not None
+    def _request(self, payload: dict) -> dict:
+        """One round trip on its own connection, so concurrent callers need
+        no lock. A daemon mid-restart has no socket; that is a failed
+        request, which `scan` answers by waiting for the restart."""
+        path = self._socket
+        if path is None:
+            raise ConnectionError("redactd has no socket")
         body = json.dumps(payload).encode("utf-8")
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.settimeout(REQUEST_TIMEOUT_SECONDS)
-            sock.connect(self._socket)
+            sock.connect(path)
             sock.sendall(struct.pack(">I", len(body)) + body)
             header = _recv_exactly(sock, 4)
             (length,) = struct.unpack(">I", header)
@@ -225,20 +249,9 @@ class RedactdSupervisor:
         if total > MAX_REQUEST_BYTES:
             raise ScanUnavailable("scan request too large", bytes=total, ceiling=MAX_REQUEST_BYTES)
 
-        with self._lock:
-            try:
-                out = self._request_locked({"op": "scan", "texts": texts})
-            except ScanUnavailable:
-                raise
-            except Exception:
-                # One restart, then one retry. A wedged or crashed daemon
-                # recovers without the caller knowing; a broken one fails.
-                log.warning("redactd.request_failed")
-                self._restart_locked()
-                try:
-                    out = self._request_locked({"op": "scan", "texts": texts})
-                except Exception:
-                    raise ScanUnavailable("redactd unreachable") from None
+        gate = self._large_scans if total >= SERIAL_SCAN_BYTES else contextlib.nullcontext()
+        with gate:
+            out = self._scan_request({"op": "scan", "texts": texts})
 
         if out.get("ok") is not True:
             raise ScanUnavailable("redactd refused the scan")
@@ -265,13 +278,53 @@ class RedactdSupervisor:
             parsed.append(rows)
         return parsed
 
+    def _scan_request(self, payload: dict) -> dict:
+        """One restart, then one retry. A wedged or crashed daemon recovers
+        without the caller knowing; a broken one fails."""
+        with self._lock:
+            # Not held across the round trip: waiting here is only ever for a
+            # restart in progress, never for another caller's scan.
+            generation = self._generation
+            self._in_flight += 1
+        timed_out = False
+        try:
+            return self._request(payload)
+        except ScanUnavailable:
+            raise
+        except TimeoutError:
+            timed_out = True
+            log.warning("redactd.request_timed_out")
+        except Exception:
+            log.warning("redactd.request_failed")
+        finally:
+            with self._lock:
+                self._in_flight -= 1
+        with self._lock:
+            # Scans that failed on the same dead daemon restart it once
+            # between them: the first here restarts, the rest find it done.
+            if self._generation == generation:
+                alive = self._proc is not None and self._proc.poll() is None
+                if timed_out and alive and self._in_flight > 0:
+                    # Slow, not dead, and still answering other scans: a
+                    # restart would drop their connections mid-response. Fail
+                    # this one (the row retries); if the daemon is truly
+                    # wedged, the last scan to time out restarts it.
+                    raise ScanUnavailable("redactd timed out", in_flight=self._in_flight)
+                self._restart_locked()
+        try:
+            return self._request(payload)
+        except Exception:
+            raise ScanUnavailable("redactd unreachable") from None
+
 
 def _recv_exactly(sock: socket.socket, n: int) -> bytes:
     buf = bytearray()
     while len(buf) < n:
         chunk = sock.recv(n - len(buf))
         if not chunk:
-            raise ScanUnavailable("redactd closed the connection mid-response")
+            # A connection error, not a verdict: the daemon was restarted under
+            # this scan or died, and `_scan_request` retries it once.
+            raise ConnectionError("redactd closed the connection mid-response")
         buf.extend(chunk)
     return bytes(buf)
 

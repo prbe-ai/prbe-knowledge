@@ -128,6 +128,14 @@ class ScanUnavailable(IngestionError):
     transient = True
 
 
+class CpuPoolUnavailable(IngestionError):
+    """A process in the ingestion CPU pool died mid-task (an OOM kill, say),
+    which breaks the whole executor. The pool is rebuilt for the next call;
+    this row retries rather than going on without the work it needed."""
+
+    transient = True
+
+
 class SourceAPIError(IngestionError):
     transient = True
 

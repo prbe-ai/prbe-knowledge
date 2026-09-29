@@ -65,6 +65,18 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Fixed
 
+- **A large live session no longer stalls every other ingest on its worker.** Re-planning a
+  5.5 MB session (21.5k events, re-run on every append) took ~50 s, of which ~26 s was the
+  pure-Python credential scrub and ~31 s the redactd scans. The scrub ran on a thread but held
+  the GIL, so the event loop behind every claim loop waited on it; and the redactd client held
+  one lock across every scan, so each small document waited for the session's ~15 s scans.
+  Measured on the real session: one-document plans at up to 31.5 s (4 ms idle), 200 loopback
+  round trips at 5.6 s (5 ms idle), 597 ms max heartbeat lag. The scrub of any text over 32K
+  characters now runs in a process pool (`engine/ingest/cpu_pool.py`,
+  `INGEST_CPU_POOL_WORKERS`, default 2, 0 = old behavior), `chunk_text` moves to a thread
+  (tiktoken releases the GIL), and redactd scans under 256 KiB no longer wait for another scan
+  (larger ones still take turns). Same session after: 128 ms, 114 ms and 195 ms. Output is
+  unchanged (`test_normalizer_cpu_offload.py` compares the plans).
 - **The tombstone purge no longer times out on large tenants.** Its first attended run on the
   research plane purged 458 documents and then failed on `probe` and `anthrogen` with an empty
   `TimeoutError`: each 200-document batch spent about 5 minutes deleting side rows by scanning

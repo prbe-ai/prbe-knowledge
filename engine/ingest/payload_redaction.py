@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from engine.ingest import cpu_pool
 from engine.ingest._credential_redaction import default_scrub
 from engine.ingest._credential_secrets import redact as redact_spans
 from engine.ingest.secret_redaction import redact_documents
@@ -123,6 +124,12 @@ def _scrub_free_text(text: str) -> str:
     return "\n".join(_scrub(line) for line in spans_redacted.split("\n"))
 
 
+def _scrub_free_texts(texts: list[str]) -> list[str]:
+    """The stdlib pass of `redact_texts`, alone. Module-level and plain-data in
+    and out, so it can run in `cpu_pool`'s processes."""
+    return [_scrub_free_text(text) for text in texts]
+
+
 def redact_texts(texts: list[str]) -> list[str]:
     """Scrub free-text bodies (a document body, pre-chunked pieces).
 
@@ -131,9 +138,22 @@ def redact_texts(texts: list[str]) -> list[str]:
     body is not a field: `redact_payload` once returned a 1.4 MB session as the
     placeholder alone, and the chunk diff then retired every chunk it had.
     """
-    redacted, _ = redact_documents([_scrub_free_text(text) for text in texts])
+    redacted, _ = redact_documents(_scrub_free_texts(texts))
     return redacted
 
 
 async def redact_texts_async(texts: list[str]) -> list[str]:
-    return await asyncio.to_thread(redact_texts, texts)
+    """`redact_texts`, with each pass where it does not stall the event loop.
+
+    The stdlib pass is pure-Python regex -- ~26 s for a 5.5 MB session -- and
+    holds the GIL throughout, so a thread still starved every other claim loop;
+    large inputs go to `cpu_pool`'s processes instead. The gitleaks pass waits
+    on redactd's socket with the GIL released, and uses this process's one
+    daemon, so it stays on a thread. Same two passes, same order, same output
+    as `redact_texts`.
+    """
+    scrubbed = await cpu_pool.run_cpu(
+        _scrub_free_texts, texts, size=sum(len(text) for text in texts)
+    )
+    redacted, _ = await asyncio.to_thread(redact_documents, scrubbed)
+    return redacted
