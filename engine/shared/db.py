@@ -78,6 +78,13 @@ async def apply_connection_setup(conn: asyncpg.Connection) -> None:
 # public name is preferred for new call sites.
 _setup_connection = apply_connection_setup
 
+#: What with_tenant runs first in its transaction. Both values are LOCAL
+#: (is_local = true): they end with the transaction. See with_tenant.
+TENANT_BIND_SQL = (
+    "SELECT set_config('app.current_customer_id', $1, true),"
+    " set_config('client_min_messages', 'warning', true)"
+)
+
 
 async def init_pool(settings: Settings | None = None) -> asyncpg.Pool:
     """Initialize the module-level pool. Call once at process start."""
@@ -286,11 +293,18 @@ async def with_tenant(customer_id: str) -> AsyncIterator[asyncpg.Connection]:
             )
 
     async with get_pool().acquire() as conn, conn.transaction():
-        # set_config with is_local=true scopes the GUC to this tx only.
-        await conn.execute(
-            "SELECT set_config('app.current_customer_id', $1, true)",
-            customer_id,
-        )
+        # set_config with is_local=true scopes both to this tx only.
+        #
+        # client_min_messages: NOTICEs never reach the client. A stopword probe
+        # ("does") makes plainto_tsquery raise "text-search query contains only
+        # stop words or doesn't contain lexemes, ignored" once PER ROW it is
+        # evaluated against: 74,234 notices for one multi-probe title match on
+        # the research plane (2026-09-29), +1.6-2.1 s the engine never reads.
+        # Per transaction, in the same round trip, rather than a startup
+        # parameter: a pooler such as PgBouncer refuses unknown startup
+        # parameters, and a plain SET in the pool's `init` is undone by the
+        # RESET ALL the pool runs on release. WARNING and above still arrive.
+        await conn.execute(TENANT_BIND_SQL, customer_id)
         yield conn
 
 

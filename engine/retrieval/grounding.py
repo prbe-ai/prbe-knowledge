@@ -201,7 +201,8 @@ async def _fuzzy_match_entities(
                         ELSE 0.0
                     END
                 ) DESC,
-                (properties->>'last_seen_at')::timestamptz DESC NULLS LAST
+                (properties->>'last_seen_at')::timestamptz DESC NULLS LAST,
+                canonical_id
             ) AS rn
         FROM graph_nodes
         WHERE customer_id = $1
@@ -228,7 +229,10 @@ async def _fuzzy_match_entities(
     SELECT label, canonical_id, kind, display_name, last_seen_at_raw, rel
     FROM ranked
     WHERE rn <= $5
-    ORDER BY rel DESC, last_seen_at_raw DESC NULLS LAST
+    -- (label, canonical_id) last: unique per tenant, so entities tied on
+    -- score and recency (every full-text-only match scores exactly 0.5, and
+    -- last_seen_at is often NULL) cross the cap the same way every run.
+    ORDER BY rel DESC, last_seen_at_raw DESC NULLS LAST, label, canonical_id
     LIMIT $6
     """
 
@@ -530,7 +534,10 @@ async def _fuzzy_match_document_titles(
     SELECT doc_id, source_system, title, updated_at, trgm_sim, fts_hit
     FROM ranked
     WHERE trgm_sim >= $4 OR fts_hit = 1
-    ORDER BY fts_hit DESC, trgm_sim DESC, updated_at DESC NULLS LAST
+    -- doc_id last: without a unique tie-breaker, documents tied on every
+    -- other key crossed the LIMIT in scan order, so the same query could
+    -- ground on different documents run to run.
+    ORDER BY fts_hit DESC, trgm_sim DESC, updated_at DESC NULLS LAST, doc_id
     LIMIT $5
     """
 
@@ -639,7 +646,8 @@ async def _fuzzy_match_entities_multi(
                         ELSE 0.0
                     END
                 ) DESC,
-                (properties->>'last_seen_at')::timestamptz DESC NULLS LAST
+                (properties->>'last_seen_at')::timestamptz DESC NULLS LAST,
+                canonical_id
             ) AS rn
         FROM graph_nodes
         CROSS JOIN probe
@@ -655,7 +663,8 @@ async def _fuzzy_match_entities_multi(
         SELECT *,
                ROW_NUMBER() OVER (
                    PARTITION BY ord
-                   ORDER BY rel DESC, last_seen_at_raw DESC NULLS LAST
+                   ORDER BY rel DESC, last_seen_at_raw DESC NULLS LAST,
+                            label, canonical_id
                ) AS rn2
         FROM ranked
         WHERE rn <= $4
@@ -740,7 +749,7 @@ async def _fuzzy_match_document_titles_multi(
                ROW_NUMBER() OVER (
                    PARTITION BY ord
                    ORDER BY fts_hit DESC, trgm_sim DESC,
-                            updated_at DESC NULLS LAST
+                            updated_at DESC NULLS LAST, doc_id
                ) AS rn
         FROM ranked
         WHERE trgm_sim >= $3 OR fts_hit = 1

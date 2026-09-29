@@ -926,6 +926,12 @@ CREATE TABLE graph_nodes (
 );
 
 CREATE INDEX idx_graph_nodes_customer_label ON graph_nodes (customer_id, label);
+-- A node by canonical id when the caller does not know its label: the subgraph
+-- anchor (anchor_exists, agent tools' one-hop walk) and the adapter's entity
+-- name fetch. (customer_id, label, canonical_id) cannot serve a lookup without
+-- label, so each scanned the tenant's whole key prefix (migration 0143).
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_customer_canonical
+    ON graph_nodes (customer_id, canonical_id);
 CREATE INDEX idx_graph_nodes_props ON graph_nodes USING GIN (properties jsonb_path_ops);
 -- Functional indexes for the list pipeline's loose-match entity filter.
 -- Equality arms (= canonical_id, = properties->>'name') hit these; the
@@ -1663,6 +1669,11 @@ CREATE INDEX IF NOT EXISTS idx_pending_edges_from_document
 CREATE INDEX IF NOT EXISTS idx_pending_edges_to_document
     ON pending_edges (customer_id, to_canonical_id)
     WHERE to_label = 'Document';
+-- The FK to customers had only partial indexes, so every tenant-purge batch
+-- (research-os kb_mirror drain, 5,000 rows) was a full scan of the table
+-- (migration 0143).
+CREATE INDEX IF NOT EXISTS idx_pending_edges_customer
+    ON pending_edges (customer_id);
 ALTER TABLE pending_edges ENABLE ROW LEVEL SECURITY;
 ALTER TABLE pending_edges FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON pending_edges

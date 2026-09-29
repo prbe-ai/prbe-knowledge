@@ -295,6 +295,7 @@ jobs:
           tests/retrieval/test_bm25_project_scope_shape.py
           tests/retrieval/test_helpers_resolve_aliases.py
           tests/retrieval/test_helpers_expand_to_cluster_members.py
+          tests/retrieval/test_search_quick_wins.py
           tests/test_bm25_index_generations.py
           tests/test_custom_ingest.py
           tests/test_tombstone_purge.py
