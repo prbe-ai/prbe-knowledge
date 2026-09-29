@@ -530,7 +530,10 @@ async def _fuzzy_match_document_titles(
     SELECT doc_id, source_system, title, updated_at, trgm_sim, fts_hit
     FROM ranked
     WHERE trgm_sim >= $4 OR fts_hit = 1
-    ORDER BY fts_hit DESC, trgm_sim DESC, updated_at DESC NULLS LAST
+    -- doc_id last: without a unique tie-breaker, documents tied on every
+    -- other key crossed the LIMIT in scan order, so the same query could
+    -- ground on different documents run to run.
+    ORDER BY fts_hit DESC, trgm_sim DESC, updated_at DESC NULLS LAST, doc_id
     LIMIT $5
     """
 
@@ -740,7 +743,7 @@ async def _fuzzy_match_document_titles_multi(
                ROW_NUMBER() OVER (
                    PARTITION BY ord
                    ORDER BY fts_hit DESC, trgm_sim DESC,
-                            updated_at DESC NULLS LAST
+                            updated_at DESC NULLS LAST, doc_id
                ) AS rn
         FROM ranked
         WHERE trgm_sim >= $3 OR fts_hit = 1
