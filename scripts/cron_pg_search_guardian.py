@@ -65,7 +65,9 @@ from engine.shared.ops_alert import capture
 from engine.shared.partitions import (
     CHUNKS_PARENT,
     drop_tenant_partition,
+    ensure_tenant_partitions,
     find_orphan_partitions,
+    find_tenants_missing_partitions,
 )
 from engine.shared.pg_search_guardian import (
     analyze_partitioned_parents,
@@ -278,6 +280,44 @@ async def run_once(*, dry_run: bool = False) -> int:
                         "dropped; its rows were already gone by cascade",
                     },
                 )
+
+        # BACKSTOP FOR PROVISIONING. Every path that creates a tenant calls
+        # kb_provision_tenant() after the customer commits (migration 0144);
+        # this catches the ones that failed or never ran it -- a research-os
+        # deploy ahead of the engine, a lock timeout, a restore. Each tenant in
+        # its own transaction on a fresh connection, after the repair and sweep
+        # above, and failures only logged: a tenant whose rows already sit in
+        # DEFAULT cannot be attached here (split_default is the attended fix,
+        # and the DEFAULT alarm above already names it).
+        try:
+            missing = await find_tenants_missing_partitions(conn)
+        except Exception as exc:
+            missing = []
+            log.warning("guardian.missing_partitions_check_failed",
+                        error=f"{type(exc).__name__}: {exc}")
+        provisioned: list[str] = []
+        for tenant in missing:
+            if dry_run:
+                log.info("guardian.tenant_partitions_dry_run", tenant=tenant)
+                continue
+            try:
+                if await ensure_tenant_partitions(tenant):
+                    provisioned.append(tenant)
+                    log.info("guardian.tenant_partitions_provisioned", tenant=tenant)
+            except Exception as exc:
+                log.warning("guardian.tenant_partitions_failed", tenant=tenant,
+                            error=f"{type(exc).__name__}: {exc}")
+        if provisioned:
+            capture(
+                "kb_tenant_partitions_provisioned",
+                {
+                    "tenants": provisioned,
+                    "timeline_id": timeline,
+                    "state": "these tenants had no partition on some parent; "
+                    "the guardian created them. The caller that created the "
+                    "tenant did not (or failed to) call kb_provision_tenant()",
+                },
+            )
 
         # Statistics on a PARTITIONED PARENT are nobody else's job: PG16
         # autovacuum analyzes leaves only. Retrieval plans against the parent,

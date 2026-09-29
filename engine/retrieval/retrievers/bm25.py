@@ -91,8 +91,7 @@ from engine.shared.partitions import (
     PARTITION_PREFIX,
     UnsafeCustomerId,
     is_partitioned,
-    partition_exists,
-    partition_name_for,
+    partition_of,
 )
 
 log = get_logger(__name__)
@@ -274,7 +273,7 @@ async def bm25_scan_target(conn: Any, customer_id: str) -> str:
     of its own, because DEFAULT holds those rows and only the parent reaches
     them. `is_partitioned` is cached for the process lifetime in
     `_CHUNKS_PARTITIONED` -- a table does not stop being partitioned while a
-    process runs. `partition_exists` deliberately still hits the catalog every
+    process runs. `partition_of` deliberately still hits the catalog every
     call: a tenant provisioned after this process started has a partition this
     process has never seen, and that lookup is what notices.
     """
@@ -285,11 +284,14 @@ async def bm25_scan_target(conn: Any, customer_id: str) -> str:
         return CHUNKS_PARENT
     try:
         # NOT cached: a tenant provisioned after this process started has a
-        # partition this process has never seen, and `partition_exists` is the
+        # partition this process has never seen, and `partition_of` is the
         # lookup that notices. Only the table-shape answer is process-stable.
-        if not await partition_exists(conn, customer_id):
+        # Found by bound, not by name: partitions made before migration 0144
+        # carry sha1 names, later ones sha256.
+        part = await partition_of(conn, customer_id)
+        if part is None:
             return CHUNKS_PARENT
-        return partition_name_for(customer_id)
+        return part
     except UnsafeCustomerId:
         # `customers.customer_id` is bare TEXT with no CHECK, so an id outside
         # `_SAFE_CUSTOMER_ID` (a space, non-ASCII, 64+ chars) is storable --

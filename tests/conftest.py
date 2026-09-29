@@ -130,8 +130,11 @@ BEGIN
         SELECT c.relname
         FROM pg_inherits h
         JOIN pg_class c ON c.oid = h.inhrelid
-        WHERE h.inhparent = to_regclass('chunks')
-          AND pg_get_expr(c.relpartbound, c.oid) <> 'DEFAULT'
+        -- Every LIST(customer_id) parent, not only chunks: kb_provision_tenant
+        -- gives a tenant a partition on each, and a leftover leaks into the
+        -- next test (0144).
+        JOIN pg_partitioned_table pt ON pt.partrelid = h.inhparent
+        WHERE pg_get_expr(c.relpartbound, c.oid) <> 'DEFAULT'
     LOOP
         EXECUTE format('DROP TABLE IF EXISTS %I', part.relname);
     END LOOP;
