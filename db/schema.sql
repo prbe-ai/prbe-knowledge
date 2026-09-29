@@ -596,8 +596,10 @@ BEGIN
                 <> parent.relowner THEN
             EXECUTE format('ALTER TABLE public.%I OWNER TO %s', part, parent.relowner::regrole);
         END IF;
-        -- Exactly the parent's grants: first drop what the creating role's
-        -- default privileges put on the new table.
+        -- The parent's table-level grants to other roles, and nothing else:
+        -- first drop what the creating role's default privileges put on the
+        -- new table. (Column grants and an owner's revocation of its own
+        -- privileges are not reproduced; no kb parent uses either.)
         FOR grant_row IN
             SELECT DISTINCT g.grantee
             FROM pg_class leaf, aclexplode(leaf.relacl) g

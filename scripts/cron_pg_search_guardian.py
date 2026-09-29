@@ -139,37 +139,30 @@ STRANDED_IN_DEFAULT_SQLSTATE = "55000"
 PROVISION_BACKSTOP_TIMEOUT_S = 45.0
 
 
-async def _provision_missing(conn, timeline, *, dry_run: bool = False) -> None:
+async def _provision_missing(
+    conn, provisioned: list[str], *, dry_run: bool = False
+) -> None:
+    """Provision a window of missing tenants, appending each success to
+    `provisioned` as it commits (the caller announces them after its bound, so
+    a timeout can neither lose nor delay the record)."""
     missing = await find_tenants_missing_partitions(conn)
     if not missing:
         return
+    if dry_run:
+        log.info("guardian.tenant_partitions_dry_run", tenants=missing, count=len(missing))
+        return
     # A rotating window, not always the first N: tenants that keep failing
     # (or stay in DEFAULT) would otherwise starve every tenant sorted after
-    # them. The minute counter advances every tick.
-    start = _canary_tick() % len(missing)
-    window = (missing[start:] + missing[:start])[:PROVISION_BACKSTOP_MAX_TENANTS]
-    if dry_run:
-        for tenant in window:
-            log.info("guardian.tenant_partitions_dry_run", tenant=tenant)
-        return
+    # them. It advances a whole window per tick (the minute counter).
+    size = PROVISION_BACKSTOP_MAX_TENANTS
+    start = (_canary_tick() * size) % len(missing)
+    window = (missing[start:] + missing[:start])[:size]
     stranded: list[str] = []
     for tenant in window:
         try:
             if await ensure_tenant_partitions(tenant):
+                provisioned.append(tenant)
                 log.info("guardian.tenant_partitions_provisioned", tenant=tenant)
-                # Per tenant, not batched: a later tenant that hits the tick's
-                # bound would otherwise cancel the record of these repairs,
-                # and the next tick no longer sees them as missing.
-                capture(
-                    "kb_tenant_partitions_provisioned",
-                    {
-                        "tenants": [tenant],
-                        "timeline_id": timeline,
-                        "state": "this tenant had no partition on some parent; "
-                        "the guardian created it. The caller that created the "
-                        "tenant did not (or failed to) call kb_provision_tenant()",
-                    },
-                )
         except Exception as exc:
             # 55000 exactly: asyncpg's class for it is also the parent of
             # LockNotAvailableError (55P03), which is a real failure here.
@@ -522,9 +515,10 @@ async def run_once(*, dry_run: bool = False) -> int:
         # Each provision is bounded too (ensure_tenant_partition's timeout
         # cancels the statement server-side), so cancelling here is prompt; the
         # CronJob's activeDeadlineSeconds stays the hard stop.
+        provisioned: list[str] = []
         try:
             await asyncio.wait_for(
-                _provision_missing(conn, timeline, dry_run=dry_run),
+                _provision_missing(conn, provisioned, dry_run=dry_run),
                 PROVISION_BACKSTOP_TIMEOUT_S,
             )
         except TimeoutError:
@@ -533,6 +527,20 @@ async def run_once(*, dry_run: bool = False) -> int:
         except Exception as exc:
             log.warning("guardian.tenant_partitions_backstop_failed",
                         error=f"{type(exc).__name__}: {exc}")
+        # Announced outside the bound (capture is a blocking HTTP call) and
+        # whatever the bound did: these repairs have committed, and the next
+        # tick no longer sees these tenants as missing.
+        if provisioned:
+            capture(
+                "kb_tenant_partitions_provisioned",
+                {
+                    "tenants": provisioned,
+                    "timeline_id": timeline,
+                    "state": "these tenants had no partition on some parent; "
+                    "the guardian created them. The caller that created the "
+                    "tenant did not (or failed to) call kb_provision_tenant()",
+                },
+            )
 
         # Prewarm AFTER the repair and AFTER the timeline is recorded, on
         # purpose and against the reading order. The warm is minutes of

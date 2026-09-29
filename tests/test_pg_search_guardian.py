@@ -578,15 +578,15 @@ async def test_provisioning_backstop_is_bounded_and_tolerates_stranded_tenants(m
     """The backstop provisions what it can and never fails the tick.
 
     A tenant already in DEFAULT is refused by kb_provision_tenant() with
-    ObjectNotInPrerequisiteState: expected (split_default is the attended fix),
-    so it is neither a warning nor a crash. A lock timeout is logged and left
-    to the next tick. At most PROVISION_BACKSTOP_MAX_TENANTS are tried per
-    tick, because each can wait its full 3 s lock_timeout."""
+    SQLSTATE 55000: expected (split_default is the attended fix), so it is
+    neither a warning nor a crash. A lock timeout (55P03, a subclass of
+    55000's class in asyncpg) is logged and left to the next tick. At most
+    PROVISION_BACKSTOP_MAX_TENANTS are tried per tick, and the window advances
+    a whole window per tick so persistent failures cannot starve the rest."""
     from scripts import cron_pg_search_guardian as cron
 
-    tenants = ["ok"] + ["stranded", "locked"] + [f"t{i}" for i in range(20)]
+    tenants = ["ok", "stranded", "locked"] + [f"t{i}" for i in range(20)]
     tried: list[str] = []
-    captured: list[tuple[str, dict]] = []
 
     async def fake_ensure(tenant: str) -> bool:
         tried.append(tenant)
@@ -598,39 +598,64 @@ async def test_provisioning_backstop_is_bounded_and_tolerates_stranded_tenants(m
 
     monkeypatch.setattr(cron, "find_tenants_missing_partitions", _async_return(tenants))
     monkeypatch.setattr(cron, "ensure_tenant_partitions", fake_ensure)
-    monkeypatch.setattr(cron, "capture", lambda event, props: captured.append((event, props)) or True)
-
     monkeypatch.setattr(cron, "_canary_tick", lambda: 0)
     warned: list[str] = []
     monkeypatch.setattr(cron.log, "warning", lambda event, **kw: warned.append(kw.get("tenant")))
 
-    await cron._provision_missing(_FakeConn(), 1)
-    # A lock timeout (55P03, a subclass of 55000's class in asyncpg) is a
-    # failure worth a warning; only 55000 itself means "stranded in DEFAULT".
-    assert warned == ["locked"]
-
+    provisioned: list[str] = []
+    await cron._provision_missing(_FakeConn(), provisioned)
     assert tried == tenants[: cron.PROVISION_BACKSTOP_MAX_TENANTS]
-    provisioned = [t for _, props in captured for t in props["tenants"]]
+    assert warned == ["locked"]
     assert "ok" in provisioned and "stranded" not in provisioned and "locked" not in provisioned
-    assert len(captured) == len(provisioned)  # one event per repair, as it happens
 
-    # The window rotates, so tenants sorted after persistent failures get a turn.
+    # Next tick: the next whole window, not a one-tenant shift.
     tried.clear()
-    monkeypatch.setattr(cron, "_canary_tick", lambda: 15)
-    await cron._provision_missing(_FakeConn(), 1)
-    assert tried[0] == tenants[15]
-    assert "t19" in tried
+    monkeypatch.setattr(cron, "_canary_tick", lambda: 1)
+    await cron._provision_missing(_FakeConn(), [])
+    assert tried == tenants[10:20]
 
 
-async def test_provisioning_backstop_dry_run_lists_without_provisioning(monkeypatch) -> None:
+async def test_provisioning_backstop_dry_run_lists_every_tenant_without_provisioning(
+    monkeypatch,
+) -> None:
     from scripts import cron_pg_search_guardian as cron
 
     async def must_not_run(_tenant: str) -> bool:
         raise AssertionError("dry run provisioned")
 
-    monkeypatch.setattr(cron, "find_tenants_missing_partitions", _async_return(["a", "b"]))
+    missing = [f"t{i}" for i in range(25)]
+    logged: list[dict] = []
+    monkeypatch.setattr(cron, "find_tenants_missing_partitions", _async_return(missing))
     monkeypatch.setattr(cron, "ensure_tenant_partitions", must_not_run)
-    await cron._provision_missing(_FakeConn(), 1, dry_run=True)
+    monkeypatch.setattr(cron.log, "info", lambda event, **kw: logged.append(kw))
+    await cron._provision_missing(_FakeConn(), [], dry_run=True)
+    assert logged == [{"tenants": missing, "count": 25}]
+
+
+async def test_provisioning_backstop_announces_repairs_even_when_it_times_out(monkeypatch) -> None:
+    """Repairs that committed before the bound fired are still announced: the
+    next tick no longer sees those tenants as missing."""
+    from scripts import cron_pg_search_guardian as cron
+
+    captured: list[tuple[str, dict]] = []
+
+    async def slow_backstop(_conn, provisioned, **_k) -> None:
+        provisioned.append("done-before-timeout")
+        raise TimeoutError
+
+    monkeypatch.setattr(cron, "capture", lambda event, props: captured.append((event, props)) or True)
+    monkeypatch.setattr(cron, "find_broken_pg_search_indexes", _async_return([]))
+    monkeypatch.setattr(cron, "find_invalid_index_debris", _async_return([]))
+    monkeypatch.setattr(cron, "current_timeline_id", _async_return(1))
+    monkeypatch.setattr(cron, "read_last_timeline", _async_return(1))
+    monkeypatch.setattr(cron, "record_timeline", _async_return(None))
+    monkeypatch.setattr(cron, "_provision_missing", slow_backstop)
+    monkeypatch.setattr(cron, "get_pool", lambda: _FakePool())
+
+    assert await cron.run_once() == 0
+    assert ("kb_tenant_partitions_provisioned", "done-before-timeout") in [
+        (e, p["tenants"][0]) for e, p in captured if e == "kb_tenant_partitions_provisioned"
+    ]
 
 
 async def test_provisioning_backstop_runs_after_the_timeline_is_recorded(monkeypatch) -> None:
