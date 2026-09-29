@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import random
 import sys
 import time
 
@@ -151,12 +152,11 @@ async def _provision_missing(
     if dry_run:
         log.info("guardian.tenant_partitions_dry_run", tenants=missing, count=len(missing))
         return
-    # A rotating window, not always the first N: tenants that keep failing
-    # (or stay in DEFAULT) would otherwise starve every tenant sorted after
-    # them. It advances a whole window per tick (the minute counter).
-    size = PROVISION_BACKSTOP_MAX_TENANTS
-    start = (_canary_tick() * size) % len(missing)
-    window = (missing[start:] + missing[:start])[:size]
+    # A random sample, not always the first N (tenants that keep failing, or
+    # stay in DEFAULT, would starve every tenant sorted after them) and not a
+    # clock-driven window (skipped ticks can pin it to the same slice). Every
+    # missing tenant has the same chance each tick, with no state to keep.
+    window = random.sample(missing, min(PROVISION_BACKSTOP_MAX_TENANTS, len(missing)))
     stranded: list[str] = []
     for tenant in window:
         try:

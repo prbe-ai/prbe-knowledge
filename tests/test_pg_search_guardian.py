@@ -581,8 +581,8 @@ async def test_provisioning_backstop_is_bounded_and_tolerates_stranded_tenants(m
     SQLSTATE 55000: expected (split_default is the attended fix), so it is
     neither a warning nor a crash. A lock timeout (55P03, a subclass of
     55000's class in asyncpg) is logged and left to the next tick. At most
-    PROVISION_BACKSTOP_MAX_TENANTS are tried per tick, and the window advances
-    a whole window per tick so persistent failures cannot starve the rest."""
+    PROVISION_BACKSTOP_MAX_TENANTS are tried per tick, sampled at random so
+    persistent failures cannot starve the rest."""
     from scripts import cron_pg_search_guardian as cron
 
     tenants = ["ok", "stranded", "locked"] + [f"t{i}" for i in range(20)]
@@ -598,7 +598,7 @@ async def test_provisioning_backstop_is_bounded_and_tolerates_stranded_tenants(m
 
     monkeypatch.setattr(cron, "find_tenants_missing_partitions", _async_return(tenants))
     monkeypatch.setattr(cron, "ensure_tenant_partitions", fake_ensure)
-    monkeypatch.setattr(cron, "_canary_tick", lambda: 0)
+    monkeypatch.setattr(cron.random, "sample", lambda seq, k: list(seq)[:k])
     warned: list[str] = []
     monkeypatch.setattr(cron.log, "warning", lambda event, **kw: warned.append(kw.get("tenant")))
 
@@ -608,11 +608,17 @@ async def test_provisioning_backstop_is_bounded_and_tolerates_stranded_tenants(m
     assert warned == ["locked"]
     assert "ok" in provisioned and "stranded" not in provisioned and "locked" not in provisioned
 
-    # Next tick: the next whole window, not a one-tenant shift.
-    tried.clear()
-    monkeypatch.setattr(cron, "_canary_tick", lambda: 1)
-    await cron._provision_missing(_FakeConn(), [])
-    assert tried == tenants[10:20]
+    # Unpatched, the sample is bounded and drawn from the whole list.
+    monkeypatch.undo()
+    monkeypatch.setattr(cron, "find_tenants_missing_partitions", _async_return(tenants))
+    monkeypatch.setattr(cron, "ensure_tenant_partitions", fake_ensure)
+    seen: set[str] = set()
+    for _ in range(40):
+        tried.clear()
+        await cron._provision_missing(_FakeConn(), [])
+        assert len(tried) == cron.PROVISION_BACKSTOP_MAX_TENANTS
+        seen.update(tried)
+    assert seen == set(tenants)  # nobody is starved
 
 
 async def test_provisioning_backstop_dry_run_lists_every_tenant_without_provisioning(
