@@ -50,21 +50,24 @@ async def test_tenant_transactions_receive_no_notices(live_db):
 
 
 @pytest.mark.integration
-async def test_the_setting_is_scoped_to_the_tenant_transaction(live_db):
-    """Negative control, and proof it does not leak: outside with_tenant the
-    same pooled connections still notify, so the test above proves the
-    setting rather than an absent stopword."""
+async def test_the_setting_ends_with_the_tenant_transaction(live_db, settings):
+    """On ONE connection (not via the pool, whose RESET ALL would hide a
+    session-level leak): after with_tenant's statement commits, the default is
+    back and the same query notifies again -- the negative control too."""
+    import asyncpg
+
     notices: list[str] = []
-    listener = lambda _c, msg: notices.append(str(msg))  # noqa: E731
-    async with db_module.with_tenant("test-cust-notices"):
-        pass
-    async with db_module.raw_conn() as conn:
-        conn.add_log_listener(listener)
-        try:
-            assert await conn.fetchval("SHOW client_min_messages") == "notice"
+    conn = await asyncpg.connect(settings.database_url)
+    try:
+        conn.add_log_listener(lambda _c, msg: notices.append(str(msg)))
+        async with conn.transaction():
+            await conn.execute(db_module.TENANT_BIND_SQL, "test-cust-notices")
             await conn.fetch(_STOPWORD_SQL)
-        finally:
-            conn.remove_log_listener(listener)
+        assert notices == []
+        assert await conn.fetchval("SHOW client_min_messages") == "notice"
+        await conn.fetch(_STOPWORD_SQL)
+    finally:
+        await conn.close()
     assert len(notices) == 5
 
 
@@ -217,6 +220,32 @@ async def test_0143_replaces_a_wrong_same_named_index_and_keeps_a_right_one(live
     engine.dispose()
 
 
+@pytest.mark.integration
+async def test_0143_run_waits_for_another_migrator_without_blocking(live_db, settings):
+    """run() polls the migrator lock and gives up at its budget instead of
+    blocking in pg_advisory_lock (a blocked runner holds a snapshot the other
+    runner's concurrent build would wait for). It leaves no setting or lock."""
+    mod = _load_0143()
+    sync_dsn = settings.database_url.replace("postgresql://", "postgresql+psycopg://", 1)
+    engine = sa.create_engine(sync_dsn, isolation_level="AUTOCOMMIT")
+    with engine.connect() as holder, engine.connect() as bind:
+        holder.execute(sa.text(f"SELECT pg_advisory_lock({mod._MIGRATOR_LOCK})"))
+        try:
+            with pytest.raises(TimeoutError):
+                mod.run(bind, budget_seconds=3)
+        finally:
+            holder.execute(sa.text(f"SELECT pg_advisory_unlock({mod._MIGRATOR_LOCK})"))
+        assert bind.execute(sa.text("SHOW statement_timeout")).scalar() == "0"
+        assert bind.execute(sa.text("SHOW lock_timeout")).scalar() == "0"
+        # Uncontended: runs, and releases its lock.
+        mod.run(bind)
+        assert holder.execute(
+            sa.text(f"SELECT pg_try_advisory_lock({mod._MIGRATOR_LOCK})")
+        ).scalar()
+        holder.execute(sa.text(f"SELECT pg_advisory_unlock({mod._MIGRATOR_LOCK})"))
+    engine.dispose()
+
+
 _ROLE = "quickwins_app"
 
 
@@ -258,4 +287,6 @@ async def test_label_free_lookup_uses_the_index_under_force_rls(live_db, setting
     finally:
         await conn.close()
     assert "idx_graph_nodes_customer_canonical" in plan
-    assert "canonical_id = 'richardwei6'" in plan
+    cond = next(line for line in plan.splitlines() if "Index Cond" in line)
+    assert "canonical_id = 'richardwei6'" in cond
+    assert "customer_id = current_setting('app.current_customer_id'" in cond

@@ -21,11 +21,15 @@ that safe to leave unattended (0141 shipped without these; review of #608):
 
   * A session advisory lock serializes migrators across the autocommit
     boundary, so a second runner never mistakes a build in progress (which is
-    INVALID until it finishes) for a dead one and drops it.
-  * Explicit timeouts, set here rather than inherited: 0142 leaves a session
-    `lock_timeout = 5s` behind on an upgrade that runs through it. The build
-    may wait on old transactions (lock_timeout 0), bounded as a whole by a
-    25-minute statement_timeout that fits the hook's 30-minute deadline, and
+    INVALID until it finishes) for a dead one and drops it. It is POLLED with
+    pg_try_advisory_lock, one short statement per attempt: a runner BLOCKED in
+    pg_advisory_lock would hold a statement snapshot, and the first runner's
+    concurrent build waits for every older snapshot -- a deadlock.
+  * One wall-clock budget for the whole migration (lock wait and both
+    builds), 25 minutes, inside the hook's 30-minute deadline: each statement
+    gets statement_timeout = the time left. Set before anything waits, rather
+    than inherited: 0142 leaves a session `lock_timeout = 5s` behind on an
+    upgrade that runs through it (lock_timeout 0 here; the budget bounds it).
     client_connection_check_interval makes a killed hook pod's backend notice
     and stop instead of building on alone.
   * An existing index of the same name is accepted only when it is valid AND
@@ -39,6 +43,8 @@ that safe to leave unattended (0141 shipped without these; review of #608):
 Before the first research deploy that runs it, check pg_stat_activity ordered by
 xact_start: the build waits for every transaction older than itself.
 """
+
+import time
 
 import sqlalchemy as sa
 from alembic import op
@@ -55,6 +61,10 @@ INDEXES: tuple[tuple[str, str, str], ...] = (
 )
 
 _MIGRATOR_LOCK = "hashtextextended('prbe-knowledge:concurrent-index-migration', 0)"
+
+#: The whole migration's wall-clock budget, inside the hook's 1800 s deadline.
+BUDGET_SECONDS = 25 * 60
+_LOCK_POLL_SECONDS = 2.0
 
 
 def expected_definition(name: str, table: str, columns: str) -> str:
@@ -76,14 +86,25 @@ def _current(bind, name: str):
     ).first()
 
 
-def ensure_index(bind, name: str, table: str, columns: str) -> bool:
+def _budget(bind, deadline: float) -> None:
+    """statement_timeout = what is left of the budget; raise when none is."""
+    left_ms = int((deadline - time.monotonic()) * 1000)
+    if left_ms <= 0:
+        raise TimeoutError("0143 ran out of its time budget")
+    bind.execute(sa.text(f"SET statement_timeout = {left_ms}"))
+
+
+def ensure_index(bind, name: str, table: str, columns: str, deadline: float | None = None) -> bool:
     """Build `public.<name>` unless an identical valid one exists. True if built."""
+    deadline = deadline if deadline is not None else time.monotonic() + BUDGET_SECONDS
     want = expected_definition(name, table, columns)
     row = _current(bind, name)
     if row is not None and row.usable and row.definition == want:
         return False
     if row is not None:
+        _budget(bind, deadline)
         bind.execute(sa.text(f"DROP INDEX CONCURRENTLY IF EXISTS public.{name}"))
+    _budget(bind, deadline)
     bind.execute(sa.text(f"CREATE INDEX CONCURRENTLY {name} ON public.{table} ({columns})"))
     row = _current(bind, name)
     if row is None or not row.usable or row.definition != want:
@@ -91,22 +112,35 @@ def ensure_index(bind, name: str, table: str, columns: str) -> bool:
     return True
 
 
+def run(bind, budget_seconds: float = BUDGET_SECONDS) -> None:
+    """The whole migration on an autocommit connection (tests call this)."""
+    deadline = time.monotonic() + budget_seconds
+    # Before anything waits: do not inherit 0142's session lock_timeout.
+    bind.execute(sa.text("SET lock_timeout = 0"))
+    bind.execute(sa.text("SET client_connection_check_interval = '10s'"))
+    locked = False
+    try:
+        while True:
+            _budget(bind, deadline)
+            if bind.execute(sa.text(f"SELECT pg_try_advisory_lock({_MIGRATOR_LOCK})")).scalar():
+                locked = True
+                break
+            # Between statements: holding no snapshot while another runner builds.
+            time.sleep(_LOCK_POLL_SECONDS)
+        for name, table, columns in INDEXES:
+            ensure_index(bind, name, table, columns, deadline)
+    finally:
+        bind.execute(sa.text("RESET statement_timeout"))
+        bind.execute(sa.text("RESET client_connection_check_interval"))
+        bind.execute(sa.text("RESET lock_timeout"))
+        if locked:
+            bind.execute(sa.text(f"SELECT pg_advisory_unlock({_MIGRATOR_LOCK})"))
+
+
 def upgrade() -> None:
     # CREATE INDEX CONCURRENTLY cannot run inside a transaction.
     with op.get_context().autocommit_block():
-        bind = op.get_bind()
-        bind.execute(sa.text(f"SELECT pg_advisory_lock({_MIGRATOR_LOCK})"))
-        try:
-            bind.execute(sa.text("SET lock_timeout = 0"))
-            bind.execute(sa.text("SET statement_timeout = '25min'"))
-            bind.execute(sa.text("SET client_connection_check_interval = '10s'"))
-            for name, table, columns in INDEXES:
-                ensure_index(bind, name, table, columns)
-        finally:
-            bind.execute(sa.text("RESET client_connection_check_interval"))
-            bind.execute(sa.text("RESET statement_timeout"))
-            bind.execute(sa.text("RESET lock_timeout"))
-            bind.execute(sa.text(f"SELECT pg_advisory_unlock({_MIGRATOR_LOCK})"))
+        run(op.get_bind())
 
 
 def downgrade() -> None:

@@ -78,6 +78,13 @@ async def apply_connection_setup(conn: asyncpg.Connection) -> None:
 # public name is preferred for new call sites.
 _setup_connection = apply_connection_setup
 
+#: What with_tenant runs first in its transaction. Both values are LOCAL
+#: (is_local = true): they end with the transaction. See with_tenant.
+TENANT_BIND_SQL = (
+    "SELECT set_config('app.current_customer_id', $1, true),"
+    " set_config('client_min_messages', 'warning', true)"
+)
+
 
 async def init_pool(settings: Settings | None = None) -> asyncpg.Pool:
     """Initialize the module-level pool. Call once at process start."""
@@ -297,11 +304,7 @@ async def with_tenant(customer_id: str) -> AsyncIterator[asyncpg.Connection]:
         # parameter: a pooler such as PgBouncer refuses unknown startup
         # parameters, and a plain SET in the pool's `init` is undone by the
         # RESET ALL the pool runs on release. WARNING and above still arrive.
-        await conn.execute(
-            "SELECT set_config('app.current_customer_id', $1, true),"
-            " set_config('client_min_messages', 'warning', true)",
-            customer_id,
-        )
+        await conn.execute(TENANT_BIND_SQL, customer_id)
         yield conn
 
 
