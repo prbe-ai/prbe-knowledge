@@ -291,6 +291,7 @@ jobs:
           tests/retrieval/test_vector_recency_pool.py
           tests/retrieval/test_chunks_partition_pruning.py
           tests/retrieval/test_tenant_provisioning.py
+          tests/synth/test_bootstrap.py
           tests/retrieval/test_dedupe_gathered.py
           tests/retrieval/test_graph_discovery_ordering.py
           tests/retrieval/test_bm25_project_scope_shape.py

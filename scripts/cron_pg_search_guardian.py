@@ -57,6 +57,8 @@ import asyncio
 import sys
 import time
 
+import asyncpg
+
 from engine.retrieval.retrievers.bm25 import bm25_scan_target as _resolve_scan_target
 from engine.retrieval.retrievers.bm25 import bm25_search
 from engine.shared.db import close_pool, get_pool, init_pool
@@ -129,6 +131,42 @@ PREWARM_AFTER_PROMOTION = [
     "idx_chunks_embedding_v2_hnsw_live",
     "idx_chunks_bm25_v2",
 ]
+
+
+#: The provisioning backstop's bounds per tick: how many tenants, and how long.
+#: Each provision waits at most its own 3 s lock_timeout.
+PROVISION_BACKSTOP_MAX_TENANTS = 10
+PROVISION_BACKSTOP_TIMEOUT_S = 45.0
+
+
+async def _provision_missing(conn, timeline) -> None:
+    missing = await find_tenants_missing_partitions(conn)
+    provisioned: list[str] = []
+    stranded: list[str] = []
+    for tenant in missing[:PROVISION_BACKSTOP_MAX_TENANTS]:
+        try:
+            if await ensure_tenant_partitions(tenant):
+                provisioned.append(tenant)
+                log.info("guardian.tenant_partitions_provisioned", tenant=tenant)
+        except asyncpg.exceptions.ObjectNotInPrerequisiteStateError:
+            stranded.append(tenant)
+        except Exception as exc:
+            log.warning("guardian.tenant_partitions_failed", tenant=tenant,
+                        error=f"{type(exc).__name__}: {exc}")
+    if stranded:
+        log.info("guardian.tenant_partitions_stranded_in_default", tenants=stranded,
+                 remedy="split_default(<tenant>) moves the rows and provisions")
+    if provisioned:
+        capture(
+            "kb_tenant_partitions_provisioned",
+            {
+                "tenants": provisioned,
+                "timeline_id": timeline,
+                "state": "these tenants had no partition on some parent; "
+                "the guardian created them. The caller that created the "
+                "tenant did not (or failed to) call kb_provision_tenant()",
+            },
+        )
 
 
 async def run_once(*, dry_run: bool = False) -> int:
@@ -280,44 +318,6 @@ async def run_once(*, dry_run: bool = False) -> int:
                         "dropped; its rows were already gone by cascade",
                     },
                 )
-
-        # BACKSTOP FOR PROVISIONING. Every path that creates a tenant calls
-        # kb_provision_tenant() after the customer commits (migration 0144);
-        # this catches the ones that failed or never ran it -- a research-os
-        # deploy ahead of the engine, a lock timeout, a restore. Each tenant in
-        # its own transaction on a fresh connection, after the repair and sweep
-        # above, and failures only logged: a tenant whose rows already sit in
-        # DEFAULT cannot be attached here (split_default is the attended fix,
-        # and the DEFAULT alarm above already names it).
-        try:
-            missing = await find_tenants_missing_partitions(conn)
-        except Exception as exc:
-            missing = []
-            log.warning("guardian.missing_partitions_check_failed",
-                        error=f"{type(exc).__name__}: {exc}")
-        provisioned: list[str] = []
-        for tenant in missing:
-            if dry_run:
-                log.info("guardian.tenant_partitions_dry_run", tenant=tenant)
-                continue
-            try:
-                if await ensure_tenant_partitions(tenant):
-                    provisioned.append(tenant)
-                    log.info("guardian.tenant_partitions_provisioned", tenant=tenant)
-            except Exception as exc:
-                log.warning("guardian.tenant_partitions_failed", tenant=tenant,
-                            error=f"{type(exc).__name__}: {exc}")
-        if provisioned:
-            capture(
-                "kb_tenant_partitions_provisioned",
-                {
-                    "tenants": provisioned,
-                    "timeline_id": timeline,
-                    "state": "these tenants had no partition on some parent; "
-                    "the guardian created them. The caller that created the "
-                    "tenant did not (or failed to) call kb_provision_tenant()",
-                },
-            )
 
         # Statistics on a PARTITIONED PARENT are nobody else's job: PG16
         # autovacuum analyzes leaves only. Retrieval plans against the parent,
@@ -490,6 +490,32 @@ async def run_once(*, dry_run: bool = False) -> int:
         except Exception as exc:
             log.warning("guardian.bm25_canary_failed",
                         error=f"{type(exc).__name__}: {exc}")
+
+        # ---- backstop for provisioning ----
+        # Every path that creates a tenant calls kb_provision_tenant() after
+        # the customer commits (migration 0144); this catches the ones that
+        # failed or never ran it -- a lock timeout, a restore, engine code
+        # that started before 0144 was applied. LAST, after the repair, the
+        # timeline and the canary, and bounded twice (tenants per tick and
+        # wall clock), because each provision can wait up to its 3 s
+        # lock_timeout and none of this is urgent: a minute later is fine.
+        # Each tenant gets its own pooled connection and transaction.
+        #
+        # A tenant whose rows already sit in DEFAULT is refused by the
+        # function before any DDL (ObjectNotInPrerequisiteState).
+        # That is expected, not a failure: split_default() is the attended
+        # fix, and the DEFAULT alarm above already names the tenant.
+        if not dry_run:
+            try:
+                await asyncio.wait_for(
+                    _provision_missing(conn, timeline), PROVISION_BACKSTOP_TIMEOUT_S
+                )
+            except TimeoutError:
+                log.warning("guardian.tenant_partitions_timeout",
+                            reason="backstop exceeded its bound; the next tick continues")
+            except Exception as exc:
+                log.warning("guardian.tenant_partitions_backstop_failed",
+                            error=f"{type(exc).__name__}: {exc}")
 
         # Prewarm AFTER the repair and AFTER the timeline is recorded, on
         # purpose and against the reading order. The warm is minutes of

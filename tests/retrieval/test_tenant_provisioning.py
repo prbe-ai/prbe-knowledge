@@ -12,20 +12,26 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
+import time
 from pathlib import Path
 
+import asyncpg
 import pytest
 
 import engine.shared.db as db_module
 from engine.shared.partitions import (
+    PARTITION_DDL_LOCK_SQL,
     PARTITION_PREFIXES,
+    default_partition_name,
     ensure_tenant_partition,
     ensure_tenant_partitions,
     find_tenants_missing_partitions,
     partition_name_for,
     partition_of,
     partitioned_parents,
+    split_default,
 )
+from engine.shared.provisioning import create_customer
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -172,3 +178,188 @@ async def test_refuses_a_customer_that_does_not_exist(live_db):
         with pytest.raises(Exception, match="no customer"):
             await conn.fetchval("SELECT kb_provision_tenant($1)", "prov-nobody")
         assert await partition_of(conn, "prov-nobody") is None
+
+
+async def _strand_in_default(conn, tenant: str, n: int = 3) -> None:
+    """A document and `n` chunks for a tenant that has NO partition: DEFAULT."""
+    await conn.execute(
+        """
+        INSERT INTO documents (customer_id, doc_id, version, source_system,
+                               source_id, source_url, doc_type, content_hash,
+                               created_at, updated_at, valid_from, acl,
+                               title, body_preview)
+        VALUES ($2, $1, 1, 'custom_ingest', $1, 'https://x', 'custom.note',
+                'dh', NOW(), NOW(), NOW(), '{}'::jsonb, 'T', 'p')
+        """,
+        f"{tenant}:d1",
+        tenant,
+    )
+    await conn.execute(
+        """
+        INSERT INTO chunks (
+            chunk_id, doc_id, customer_id, chunk_index, content,
+            content_hash, token_count, chunker_version, first_seen_version,
+            last_seen_version, kind, visibility
+        )
+        SELECT $1 || ':c_' || g, $2, $1, g, 'c' || g, 'h' || g, 3, 'v1',
+               1, 1, 'content', 'approved'
+        FROM generate_series(1, $3::int) g
+        """,
+        tenant,
+        f"{tenant}:d1",
+        n,
+    )
+
+
+@pytest.mark.integration
+async def test_refuses_inside_a_transaction_that_wrote_customers_in_sql(live_db):
+    # research-os calls the function straight from SQL, so the guard against
+    # the documented deadlock has to live in the function, not only in Python.
+    async with db_module.raw_conn() as conn:
+        with pytest.raises(asyncpg.exceptions.ActiveSQLTransactionError, match="commit it first"):
+            async with conn.transaction():
+                await _add_customer(conn, "prov-sql-in-txn")
+                await conn.fetchval("SELECT kb_provision_tenant($1)", "prov-sql-in-txn")
+
+
+@pytest.mark.integration
+async def test_advisory_lock_wait_is_bounded_by_the_lock_timeout(live_db):
+    # The 3 s lock_timeout is a SET clause of the function, so it bounds the
+    # wait for the partition-DDL lock too (it used to be set after it: an
+    # attended split_default holding the lock hung every provision).
+    async with db_module.raw_conn() as holder, db_module.raw_conn() as conn:
+        await _add_customer(conn, "prov-bounded")
+        await holder.execute(f"SELECT pg_advisory_lock({PARTITION_DDL_LOCK_SQL})")
+        try:
+            started = time.monotonic()
+            with pytest.raises(asyncpg.exceptions.LockNotAvailableError):
+                await ensure_tenant_partition(conn, "prov-bounded")
+            assert time.monotonic() - started < 10
+        finally:
+            await holder.execute(f"SELECT pg_advisory_unlock({PARTITION_DDL_LOCK_SQL})")
+        assert await ensure_tenant_partition(conn, "prov-bounded") is True
+
+
+@pytest.mark.integration
+async def test_function_settings_do_not_leak_into_the_callers_transaction(live_db):
+    async with db_module.raw_conn() as conn:
+        await _add_customer(conn, "prov-leak")
+        async with conn.transaction():
+            await conn.execute("SET LOCAL lock_timeout = '17s'")
+            await conn.execute("SELECT set_config('app.current_customer_id', 'someone', true)")
+            assert await conn.fetchval("SELECT kb_provision_tenant($1)", "prov-leak") >= 1
+            assert await conn.fetchval("SHOW lock_timeout") == "17s"
+            assert await conn.fetchval("SELECT current_setting('app.current_customer_id')") == "someone"
+
+
+@pytest.mark.integration
+async def test_a_tenant_already_in_default_is_refused_then_split(live_db):
+    tenant = "prov-in-default"
+    async with db_module.raw_conn() as conn:
+        await _add_customer(conn, tenant)
+        await _strand_in_default(conn, tenant)
+        default_name = await default_partition_name(conn)
+        with pytest.raises(
+            asyncpg.exceptions.ObjectNotInPrerequisiteStateError, match="split_default"
+        ):
+            await ensure_tenant_partition(conn, tenant)
+        assert await partition_of(conn, tenant) is None
+        # The backstop keeps listing it; the attended fix clears it.
+        assert tenant in await find_tenants_missing_partitions(conn)
+        assert await split_default(conn, tenant) == 3
+        assert await partition_of(conn, tenant) == partition_name_for(tenant)
+        assert await conn.fetchval(
+            f'SELECT count(*) FROM ONLY "{default_name}" WHERE customer_id = $1', tenant
+        ) == 0
+
+
+@pytest.mark.integration
+async def test_default_check_sees_rows_under_rls_as_a_non_superuser(live_db):
+    # Prod's DEFAULT is under FORCE RLS and the function runs as `app`, not a
+    # superuser: without its function-scoped tenant GUC the check would see no
+    # rows and go on to lock DEFAULT and fail the ATTACH.
+    tenant = "prov-rls-default"
+    async with db_module.raw_conn() as conn:
+        await _add_customer(conn, tenant)
+        default_name = await default_partition_name(conn)
+        tx = conn.transaction()
+        await tx.start()
+        try:
+            await _strand_in_default(conn, tenant)
+            await conn.execute(f'ALTER TABLE "{default_name}" ENABLE ROW LEVEL SECURITY')
+            await conn.execute(
+                f'CREATE POLICY prov_test_iso ON "{default_name}" USING '
+                "(customer_id = current_setting('app.current_customer_id', true))"
+            )
+            await conn.execute("CREATE ROLE prov_test_app NOLOGIN")
+            await conn.execute(f'GRANT SELECT ON customers, "{default_name}" TO prov_test_app')
+            await conn.execute("GRANT EXECUTE ON FUNCTION kb_provision_tenant(text) TO prov_test_app")
+            await conn.execute("SET LOCAL ROLE prov_test_app")
+            with pytest.raises(
+                asyncpg.exceptions.ObjectNotInPrerequisiteStateError, match="already has rows"
+            ):
+                await conn.fetchval("SELECT kb_provision_tenant($1)", tenant)
+        finally:
+            await tx.rollback()
+
+
+@pytest.mark.integration
+async def test_leaf_takes_the_parents_owner_and_grants(live_db):
+    # A superuser calling this by hand (probe-peek runs as one) must not leave
+    # a leaf the parent's owner cannot ALTER: later migrations recurse into
+    # every leaf as that owner. Rolled back: nothing here outlives the test.
+    async with db_module.raw_conn() as conn:
+        await _add_customer(conn, "prov-owner")
+        tx = conn.transaction()
+        await tx.start()
+        try:
+            await conn.execute("CREATE ROLE prov_test_owner NOLOGIN")
+            await conn.execute("CREATE ROLE prov_test_reader NOLOGIN")
+            await conn.execute("ALTER TABLE chunks OWNER TO prov_test_owner")
+            await conn.execute("GRANT SELECT ON chunks TO prov_test_reader")
+            assert await conn.fetchval("SELECT kb_provision_tenant($1)", "prov-owner") >= 1
+            leaf = partition_name_for("prov-owner")
+            assert await conn.fetchval(
+                "SELECT relowner::regrole::text FROM pg_class WHERE relname = $1", leaf
+            ) == "prov_test_owner"
+            assert await conn.fetchval(
+                "SELECT has_table_privilege('prov_test_reader', $1::regclass, 'SELECT')", leaf
+            )
+        finally:
+            await tx.rollback()
+
+
+@pytest.mark.integration
+async def test_a_parent_without_a_prefix_is_skipped_not_fatal(live_db):
+    # A conversion's scratch table is LIST(customer_id) too; it used to make
+    # every provision raise "no partition prefix".
+    async with db_module.raw_conn() as conn:
+        await conn.execute(
+            "CREATE TABLE chunks_part (customer_id text NOT NULL, n int) "
+            "PARTITION BY LIST (customer_id)"
+        )
+        try:
+            await _add_customer(conn, "prov-scratch")
+            assert "chunks_part" not in await partitioned_parents(conn)
+            assert await ensure_tenant_partition(conn, "prov-scratch") is True
+            assert "prov-scratch" not in await find_tenants_missing_partitions(conn)
+        finally:
+            await conn.execute("DROP TABLE chunks_part")
+
+
+@pytest.mark.integration
+async def test_create_customer_refuses_an_unsafe_id_before_inserting(live_db):
+    with pytest.raises(ValueError, match="refusing"):
+        await create_customer("bad id; x", "Bad")
+    async with db_module.raw_conn() as conn:
+        assert not await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM customers WHERE customer_id = $1)", "bad id; x"
+        )
+
+
+@pytest.mark.integration
+async def test_create_customer_returns_the_key_and_provisions(live_db):
+    key = await create_customer("prov-created", "Created")
+    assert key
+    async with db_module.raw_conn() as conn:
+        assert await partition_of(conn, "prov-created") == partition_name_for("prov-created")

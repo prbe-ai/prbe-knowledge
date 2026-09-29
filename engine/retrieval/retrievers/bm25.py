@@ -291,6 +291,14 @@ async def bm25_scan_target(conn: Any, customer_id: str) -> str:
         part = await partition_of(conn, customer_id)
         if part is None:
             return CHUNKS_PARENT
+        # Read from the catalog and interpolated as a relation name, so it
+        # passes the same gate as the guardian's override. Every name the
+        # provisioner makes passes; anything else falls back to the parent,
+        # which is correct for every tenant, only slower.
+        if not _SAFE_SCAN_TARGET.fullmatch(part):
+            log.warning("bm25.partition_name_refused", customer_id=customer_id,
+                        partition=part)
+            return CHUNKS_PARENT
         return part
     except UnsafeCustomerId:
         # `customers.customer_id` is bare TEXT with no CHECK, so an id outside

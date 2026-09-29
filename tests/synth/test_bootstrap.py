@@ -53,6 +53,10 @@ def _mock_db() -> AsyncMock:
     # gives you distinct objects.)
     conn = AsyncMock()
     conn.execute = db.execute
+    # init_tenant provisions partitions on an acquired connection, outside
+    # any transaction; kb_provision_tenant() reports nothing created.
+    conn.is_in_transaction = MagicMock(return_value=False)
+    conn.fetchval = AsyncMock(return_value=0)
     conn.transaction = MagicMock()
     conn.transaction.return_value.__aenter__ = AsyncMock()
     conn.transaction.return_value.__aexit__ = AsyncMock(return_value=False)

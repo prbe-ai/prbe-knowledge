@@ -16,7 +16,7 @@ import hashlib
 from engine.shared.config import get_settings
 from engine.shared.db import raw_conn
 from engine.shared.logging import get_logger
-from engine.shared.partitions import ensure_tenant_partitions
+from engine.shared.partitions import ensure_tenant_partitions, validate_customer_id
 
 log = get_logger(__name__)
 
@@ -35,6 +35,9 @@ async def ensure_default_customer() -> None:
     # ingestion still works since the webhook path scopes to DEFAULT_CUSTOMER_ID.
     api_key_hash = hashlib.sha256(token.encode()).hexdigest() if token else ""
     r2_bucket = settings.bucket_for(customer_id)
+    # Before the upsert: provisioning runs after it commits, so an id no
+    # partition can be named for fails this boot without leaving a row.
+    validate_customer_id(customer_id)
 
     async with raw_conn() as conn:
         await conn.execute(
