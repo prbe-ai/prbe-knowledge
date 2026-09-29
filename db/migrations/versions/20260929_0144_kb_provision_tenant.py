@@ -33,7 +33,7 @@ skipped, not fatal):
         (ATTACH would fail after locking DEFAULT for up to 3 s; split_default()
         is the attended fix, and the guardian's DEFAULT alarm names the tenant)
     CREATE TABLE <name> (LIKE parent INCLUDING ALL)   -- no parent lock
-    owner and grants copied from the parent           -- LIKE copies neither
+    owner and grants set to exactly the parent's      -- LIKE copies neither
     ALTER TABLE parent ATTACH PARTITION <name> ...    -- SHARE UPDATE EXCLUSIVE
     ENABLE + FORCE RLS and a copy of EVERY parent policy on the leaf
 The leaf policies close the door a query naming the partition directly would
@@ -209,6 +209,17 @@ BEGIN
                 <> parent.relowner THEN
             EXECUTE format('ALTER TABLE public.%I OWNER TO %s', part, parent.relowner::regrole);
         END IF;
+        -- Exactly the parent's grants: first drop what the creating role's
+        -- default privileges put on the new table.
+        FOR grant_row IN
+            SELECT DISTINCT g.grantee
+            FROM pg_class leaf, aclexplode(leaf.relacl) g
+            WHERE leaf.oid = format('public.%I', part)::regclass
+              AND g.grantee <> leaf.relowner
+        LOOP
+            EXECUTE format('REVOKE ALL ON public.%I FROM %s', part,
+                CASE WHEN grant_row.grantee = 0 THEN 'PUBLIC' ELSE grant_row.grantee::regrole::text END);
+        END LOOP;
         FOR grant_row IN
             SELECT g.privilege_type, g.grantee, g.is_grantable
             FROM aclexplode(parent.relacl) g

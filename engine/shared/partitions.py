@@ -86,6 +86,9 @@ PARTITION_PREFIXES: dict[str, str] = {
 #: `ATTACH` needs only SHARE UPDATE EXCLUSIVE, so in practice it does not queue.
 PARTITION_LOCK_TIMEOUT = "3s"
 
+#: Upper bound on one kb_provision_tenant() call; asyncpg cancels it server-side.
+PROVISION_TIMEOUT_SECONDS = 30.0
+
 #: SQL for the advisory-lock key partition DDL takes -- kb_provision_tenant(),
 #: drop_tenant_partition and split_default today -- so they queue instead of
 #: deadlocking. Each takes it FIRST, before any table lock, with its
@@ -394,7 +397,13 @@ async def ensure_tenant_partition(
         )
     try:
         async with conn.transaction():
-            created = await conn.fetchval("SELECT kb_provision_tenant($1)", customer_id)
+            # Bounded (the function bounds lock waits at 3 s; this bounds the
+            # rest, e.g. ATTACH's scan of a big DEFAULT): on timeout asyncpg
+            # cancels the statement on the server, so a caller that gives up
+            # does not leave it running.
+            created = await conn.fetchval(
+                "SELECT kb_provision_tenant($1)", customer_id, timeout=PROVISION_TIMEOUT_SECONDS
+            )
     except asyncpg.exceptions.UndefinedFunctionError:
         log.warning(
             "partitions.provisioner_missing",

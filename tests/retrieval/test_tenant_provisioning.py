@@ -315,8 +315,13 @@ async def test_leaf_takes_the_parents_owner_and_grants(live_db):
         try:
             await conn.execute("CREATE ROLE prov_test_owner NOLOGIN")
             await conn.execute("CREATE ROLE prov_test_reader NOLOGIN")
+            await conn.execute("CREATE ROLE prov_test_extra NOLOGIN")
             await conn.execute("ALTER TABLE chunks OWNER TO prov_test_owner")
             await conn.execute("GRANT SELECT ON chunks TO prov_test_reader")
+            # The creating role's default privileges must not leak onto the leaf.
+            await conn.execute(
+                "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO prov_test_extra"
+            )
             assert await conn.fetchval("SELECT kb_provision_tenant($1)", "prov-owner") >= 1
             leaf = partition_name_for("prov-owner")
             assert await conn.fetchval(
@@ -324,6 +329,15 @@ async def test_leaf_takes_the_parents_owner_and_grants(live_db):
             ) == "prov_test_owner"
             assert await conn.fetchval(
                 "SELECT has_table_privilege('prov_test_reader', $1::regclass, 'SELECT')", leaf
+            )
+            acl = (
+                "SELECT array_agg(g.grantee::regrole::text || ':' || g.privilege_type "
+                "ORDER BY 1) FROM pg_class c, aclexplode(c.relacl) g "
+                "WHERE c.oid = $1::regclass AND g.grantee <> c.relowner"
+            )
+            assert await conn.fetchval(acl, leaf) == await conn.fetchval(acl, "chunks")
+            assert not await conn.fetchval(
+                "SELECT has_table_privilege('prov_test_extra', $1::regclass, 'SELECT')", leaf
             )
         finally:
             await tx.rollback()

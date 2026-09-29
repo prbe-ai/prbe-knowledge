@@ -600,12 +600,37 @@ async def test_provisioning_backstop_is_bounded_and_tolerates_stranded_tenants(m
     monkeypatch.setattr(cron, "ensure_tenant_partitions", fake_ensure)
     monkeypatch.setattr(cron, "capture", lambda event, props: captured.append((event, props)) or True)
 
+    monkeypatch.setattr(cron, "_canary_tick", lambda: 0)
+    warned: list[str] = []
+    monkeypatch.setattr(cron.log, "warning", lambda event, **kw: warned.append(kw.get("tenant")))
+
     await cron._provision_missing(_FakeConn(), 1)
+    # A lock timeout (55P03, a subclass of 55000's class in asyncpg) is a
+    # failure worth a warning; only 55000 itself means "stranded in DEFAULT".
+    assert warned == ["locked"]
 
     assert tried == tenants[: cron.PROVISION_BACKSTOP_MAX_TENANTS]
-    assert [e for e, _ in captured] == ["kb_tenant_partitions_provisioned"]
-    provisioned = captured[0][1]["tenants"]
+    provisioned = [t for _, props in captured for t in props["tenants"]]
     assert "ok" in provisioned and "stranded" not in provisioned and "locked" not in provisioned
+    assert len(captured) == len(provisioned)  # one event per repair, as it happens
+
+    # The window rotates, so tenants sorted after persistent failures get a turn.
+    tried.clear()
+    monkeypatch.setattr(cron, "_canary_tick", lambda: 15)
+    await cron._provision_missing(_FakeConn(), 1)
+    assert tried[0] == tenants[15]
+    assert "t19" in tried
+
+
+async def test_provisioning_backstop_dry_run_lists_without_provisioning(monkeypatch) -> None:
+    from scripts import cron_pg_search_guardian as cron
+
+    async def must_not_run(_tenant: str) -> bool:
+        raise AssertionError("dry run provisioned")
+
+    monkeypatch.setattr(cron, "find_tenants_missing_partitions", _async_return(["a", "b"]))
+    monkeypatch.setattr(cron, "ensure_tenant_partitions", must_not_run)
+    await cron._provision_missing(_FakeConn(), 1, dry_run=True)
 
 
 async def test_provisioning_backstop_runs_after_the_timeline_is_recorded(monkeypatch) -> None:
