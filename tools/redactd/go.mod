@@ -1,7 +1,8 @@
 module probe/redactd
 
-// The floor, not a pin: nothing here needs a recent toolchain, and a
-// directive above what the image ships fails the build rather than the test.
+// The floor, not a pin. golang.org/x/crypto >= v0.52.0 (the ssh security
+// fixes) sets it to 1.25.0. A directive above what the images ship (Go 1.25,
+// GOTOOLCHAIN=local) fails the build rather than the test.
 go 1.25.0
 
 require (
@@ -61,7 +62,7 @@ require (
 	github.com/subosito/gotenv v1.6.0 // indirect
 	github.com/tetratelabs/wazero v1.9.0 // indirect
 	github.com/therootcompany/xz v1.0.1 // indirect
-	github.com/ulikunitz/xz v0.5.14 // indirect
+	github.com/ulikunitz/xz v0.5.15 // indirect
 	github.com/wasilibs/go-re2 v1.9.0 // indirect
 	github.com/wasilibs/wazero-helpers v0.0.0-20240620070341-3dff1577cd52 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
