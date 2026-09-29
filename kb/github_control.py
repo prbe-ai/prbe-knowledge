@@ -109,8 +109,8 @@ async def retire_unrepresented_documents(
     await conn.execute(
         """UPDATE chunks c SET valid_to=coalesce(c.valid_to,now()),
             last_seen_version=LEAST(c.last_seen_version,
-                (SELECT max(d.version) FROM documents d
-                 WHERE d.customer_id=c.customer_id AND d.doc_id=c.doc_id))
+                COALESCE((SELECT max(d.version) FROM documents d
+                 WHERE d.customer_id=c.customer_id AND d.doc_id=c.doc_id), 0))
         WHERE c.customer_id=$1 AND c.doc_id=ANY($2::text[]) AND c.valid_to IS NULL""",
         customer_id,
         retired,

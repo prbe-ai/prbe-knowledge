@@ -141,6 +141,7 @@ import asyncpg
 
 from engine.shared.config import get_settings
 from engine.shared.constants import (
+    LIVE_CHUNK_LAST_SEEN,
     TOMBSTONE_PURGE_BATCH_SIZE,
     TOMBSTONE_PURGE_DAYS,
     TOMBSTONE_PURGE_DOCS_PER_GROUP,
@@ -223,7 +224,9 @@ _DRY_RUN_SQL = f"""
         (SELECT count(*) FROM eligible e
            JOIN chunks c
              ON c.customer_id = $1 AND c.doc_id = e.doc_id
-            AND c.last_seen_version <= e.version
+            AND (c.last_seen_version <= e.version
+                 OR (c.valid_to IS NOT NULL
+                     AND c.last_seen_version = {LIVE_CHUNK_LAST_SEEN}))
         ) AS chunks,
         (SELECT coalesce(jsonb_object_agg(source_system, n), '{{}}'::jsonb)
            FROM (SELECT source_system, count(*) AS n FROM eligible GROUP BY 1) s
@@ -267,6 +270,14 @@ _MANUAL_UPLOAD_KEYS_SQL = """
 # against the DELETE's own quals (EvalPlanQual), never against `doomed`'s
 # snapshot. A closed code-graph tombstone gives the re-create no row lock to
 # wait on, so this re-check is its only protection.
+#
+# The second arm takes CLOSED chunks still carrying the open-ended
+# LIVE_CHUNK_LAST_SEEN: a writer that set valid_to without capping the version
+# (a pod on the pre-sentinel code during a rollout or rollback) leaves them
+# above every tombstone version, and without this arm they would wait for
+# chunk retention's 30 days, past the deletion deadline. A re-create that
+# revives such a row sets valid_to back to NULL, and the DELETE re-checks
+# valid_to on the row itself, so the revival is still protected.
 # Returns (selected, deleted): the loop moves on from chunks only when fewer
 # than the batch were SELECTED, so rows a concurrent delete took, or a revival
 # kept, never read as "no chunks left".
@@ -276,6 +287,7 @@ _DELETE_CHUNKS_SQL = """
         FROM unnest($2::text[], $3::int[]) AS t(doc_id, version)
         JOIN chunks c ON c.customer_id = $1 AND c.doc_id = t.doc_id
         WHERE c.last_seen_version <= t.version
+           OR (c.valid_to IS NOT NULL AND c.last_seen_version = $5)
         LIMIT $4
     ),
     gone AS (
@@ -283,7 +295,8 @@ _DELETE_CHUNKS_SQL = """
         USING doomed
         WHERE c.customer_id = $1
           AND c.chunk_id = doomed.chunk_id
-          AND c.last_seen_version <= doomed.version
+          AND (c.last_seen_version <= doomed.version
+               OR (c.valid_to IS NOT NULL AND c.last_seen_version = $5))
         RETURNING 1
     )
     SELECT (SELECT count(*) FROM doomed) AS selected,
@@ -929,7 +942,8 @@ async def _purge_rows(
             budget = TOMBSTONE_PURGE_BATCH_SIZE
             _at("chunks")
             chunks = await conn.fetchrow(
-                _DELETE_CHUNKS_SQL, customer_id, ids, versions, budget
+                _DELETE_CHUNKS_SQL, customer_id, ids, versions, budget,
+                LIVE_CHUNK_LAST_SEEN,
             )
             batch["chunks"] += chunks["deleted"]
             budget -= chunks["selected"]

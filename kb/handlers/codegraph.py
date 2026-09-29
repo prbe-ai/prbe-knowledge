@@ -444,9 +444,14 @@ class CodeGraphConnector(Connector):
                     SET valid_to = NOW(),
                         last_seen_version = LEAST(
                             c.last_seen_version,
-                            (SELECT max(d.version) FROM documents d
-                              WHERE d.customer_id = c.customer_id
-                                AND d.doc_id = c.doc_id)
+                            -- COALESCE: with no document row left, LEAST
+                            -- would ignore the NULL and keep the sentinel.
+                            COALESCE(
+                                (SELECT max(d.version) FROM documents d
+                                  WHERE d.customer_id = c.customer_id
+                                    AND d.doc_id = c.doc_id),
+                                0
+                            )
                         )
                     WHERE c.customer_id = $1
                       AND c.valid_to IS NULL

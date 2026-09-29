@@ -523,3 +523,59 @@ async def test_metadata_backfill_caps_the_row_it_replaces(live_db) -> None:
     assert old["last_seen_version"] == 2, "replaced in place at version 3: capped to 3 - 1"
     assert new["valid_to"] is None
     assert (new["first_seen_version"], new["last_seen_version"]) == (3, LIVE_CHUNK_LAST_SEEN)
+
+
+async def test_a_real_delete_leaves_chunks_the_tombstone_purge_deletes(live_db) -> None:
+    """End to end (review of #604): a deletion through the real plan/apply caps
+    every live chunk below the tombstone, and the purge's own DELETE statement
+    removes them all. An open-ended chunk here would outlive the purge."""
+    import scripts.cron_tombstone_purge as purge
+
+    await _seed_customer()
+    n, _ = _normalizer()
+    doc_id = "slack:C1:deleted-end-to-end"
+    await _ingest(n, _doc(doc_id, "1"), ["alpha", "bravo"], meta="meta v1")
+    await _ingest(n, _doc(doc_id, "2"), ["alpha", "charlie"], meta="meta v1")
+    tomb = _doc(doc_id, "3")
+    tomb.deleted_at = datetime.now(UTC)
+    await _ingest(n, tomb, [])
+
+    rows = await _rows(doc_id)
+    assert rows and all(r["valid_to"] is not None for r in rows.values())
+    assert all(r["last_seen_version"] < tomb.version for r in rows.values())
+
+    async with db_module.raw_conn() as conn:
+        out = await conn.fetchrow(
+            purge._DELETE_CHUNKS_SQL, CUSTOMER, [doc_id], [tomb.version], 1000,
+            LIVE_CHUNK_LAST_SEEN,
+        )
+    assert out["deleted"] == len(rows)
+    assert await _rows(doc_id) == {}
+
+
+async def test_the_purge_takes_a_closed_chunk_left_open_ended(live_db) -> None:
+    """A pod on the pre-sentinel code (mid-rollout, or after a rollback) closes
+    chunks with valid_to only, leaving LIVE_CHUNK_LAST_SEEN above every
+    tombstone version. The purge takes them anyway; a re-created document's
+    live chunk (valid_to NULL) is untouched."""
+    import scripts.cron_tombstone_purge as purge
+
+    await _seed_customer()
+    n, _ = _normalizer()
+    doc_id = "slack:C1:old-pod-close"
+    await _ingest(n, _doc(doc_id, "1"), ["alpha", "bravo"])
+    async with db_module.raw_conn() as conn:
+        # The old-pod close: valid_to only, sentinel kept.
+        await conn.execute(
+            "UPDATE chunks SET valid_to = now() WHERE customer_id = $1 AND doc_id = $2"
+            " AND content = 'alpha'",
+            CUSTOMER,
+            doc_id,
+        )
+        out = await conn.fetchrow(
+            purge._DELETE_CHUNKS_SQL, CUSTOMER, [doc_id], [2], 1000, LIVE_CHUNK_LAST_SEEN
+        )
+    assert out["deleted"] == 1
+    left = await _rows(doc_id)
+    assert set(left) == {"bravo"}, "the live open-ended chunk is not the purge's to take"
+    assert left["bravo"]["valid_to"] is None

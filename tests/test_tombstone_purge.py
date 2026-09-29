@@ -1000,7 +1000,9 @@ async def test_revived_chunk_survives_a_racing_delete(live_db) -> None:
 
         async def delete():
             async with db_module.with_tenant(cid) as conn:
-                return await conn.fetchrow(purge._DELETE_CHUNKS_SQL, cid, [doc_id], [2], 100)
+                return await conn.fetchrow(
+                    purge._DELETE_CHUNKS_SQL, cid, [doc_id], [2], 100, LIVE_CHUNK_LAST_SEEN
+                )
 
         task = asyncio.create_task(delete())
         await _wait_for_lock_wait("DELETE FROM chunks")
