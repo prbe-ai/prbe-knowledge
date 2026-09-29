@@ -196,7 +196,7 @@ jobs:
           tests/test_credential_sweep.py
           tests/test_queue_tiers.py
           tests/test_redactd.py
-          tests/test_redactd_concurrency.py
+          tests/test_redactd_concurrency.py tests/test_cpu_pool_sizing.py
           tests/test_normalizer_cpu_offload.py
           tests/test_scanner_image_packaging.py
           tests/test_claim_protocol.py

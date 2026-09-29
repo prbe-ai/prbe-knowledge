@@ -115,6 +115,9 @@ class RedactdSupervisor:
         # Bumped on every spawn, so concurrent scans that fail on the same dead
         # daemon restart it once between them, not once each.
         self._generation = 0
+        # Scans between send and response. A timed-out scan restarts the
+        # daemon only when it is the last one in flight (see _scan_request).
+        self._in_flight = 0
         # One large scan at a time; see SERIAL_SCAN_BYTES.
         self._large_scans = threading.Lock()
         self._backoff = RESTART_BACKOFF_START_SECONDS
@@ -282,16 +285,31 @@ class RedactdSupervisor:
             # Not held across the round trip: waiting here is only ever for a
             # restart in progress, never for another caller's scan.
             generation = self._generation
+            self._in_flight += 1
+        timed_out = False
         try:
             return self._request(payload)
         except ScanUnavailable:
             raise
+        except TimeoutError:
+            timed_out = True
+            log.warning("redactd.request_timed_out")
         except Exception:
             log.warning("redactd.request_failed")
+        finally:
+            with self._lock:
+                self._in_flight -= 1
         with self._lock:
             # Scans that failed on the same dead daemon restart it once
             # between them: the first here restarts, the rest find it done.
             if self._generation == generation:
+                alive = self._proc is not None and self._proc.poll() is None
+                if timed_out and alive and self._in_flight > 0:
+                    # Slow, not dead, and still answering other scans: a
+                    # restart would drop their connections mid-response. Fail
+                    # this one (the row retries); if the daemon is truly
+                    # wedged, the last scan to time out restarts it.
+                    raise ScanUnavailable("redactd timed out", in_flight=self._in_flight)
                 self._restart_locked()
         try:
             return self._request(payload)
@@ -304,7 +322,9 @@ def _recv_exactly(sock: socket.socket, n: int) -> bytes:
     while len(buf) < n:
         chunk = sock.recv(n - len(buf))
         if not chunk:
-            raise ScanUnavailable("redactd closed the connection mid-response")
+            # A connection error, not a verdict: the daemon was restarted under
+            # this scan or died, and `_scan_request` retries it once.
+            raise ConnectionError("redactd closed the connection mid-response")
         buf.extend(chunk)
     return bytes(buf)
 

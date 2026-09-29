@@ -341,9 +341,14 @@ class Settings(BaseSettings):
     # it holds the GIL, so a 5.5 MB session's ~26 s scrub stalled every other
     # claim loop in the process. 0 turns the pool off (scrub on a thread, the
     # pre-pool behavior). Each process idles at ~80 MB and peaks at a few
-    # hundred MB on a multi-MB session, so 2 fits the worker's 4Gi limit; more
-    # than the pod's CPU limit (2) only adds throttling.
+    # hundred MB on a multi-MB session. The effective size is capped by the
+    # container's cgroup limits (cpu_pool._effective_size): one per whole CPU,
+    # none under 2Gi of memory -- the managed worker (1 CPU / 1Gi) gets none,
+    # the research worker (2 CPU / 4Gi) gets 2.
     ingest_cpu_pool_workers: int = 2
+    # A pool task that runs longer than this kills the pool and raises
+    # CpuPoolUnavailable (the row retries). The largest measured scrub is ~26 s.
+    ingest_cpu_pool_task_timeout_seconds: float = 300.0
     # Texts shorter than this (total characters) are scrubbed on a thread, not
     # the pool: they cost milliseconds of GIL, and sending them to the pool
     # would queue them behind a large session's scrub.
