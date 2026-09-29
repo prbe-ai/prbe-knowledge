@@ -1230,6 +1230,12 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   with bounded-mode guidance instead of allowing responses up to the retrieval
   service's 100 MB ceiling.
 
+### Security
+
+- **PyJWT 2.13.0 -> 2.15.1** (`uv lock --upgrade-package pyjwt`, no other packages
+  moved), remediating GHSA-w6j9-cwv2-h6wq: a malformed RSA JWK aborted parsing of
+  the whole JWK Set. Vulnerable range was `>=2.9.0,<=2.13.0`; fixed in 2.14.0.
+
 ## [0.1.0] - 2026-06-18
 
 Initial public release of the open-source community edition.
