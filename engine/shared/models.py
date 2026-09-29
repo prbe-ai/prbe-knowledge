@@ -171,9 +171,12 @@ class Chunk(BaseModel):
     """Content-addressable chunk row.
 
     Identity is (doc_id, content_hash). When a doc edits and a chunk with the
-    same content still exists, the existing row's `last_seen_version` is bumped
-    instead of writing a new row — so embedding cost is proportional to what
-    actually changed, not to total chunk count.
+    same content still exists, the existing row is kept instead of writing a
+    new row — so embedding cost is proportional to what actually changed, not
+    to total chunk count. A live row's `last_seen_version` is the open-ended
+    LIVE_CHUNK_LAST_SEEN (engine/shared/constants.py), so keeping it needs no
+    write either; closing it caps the range to the last version that
+    contained it.
     """
 
     chunk_id: str

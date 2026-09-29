@@ -431,14 +431,26 @@ class CodeGraphConnector(Connector):
                     SourceSystem.CODE_GRAPH.value,
                     prefix + "%",
                 )
-                # Mark live chunks stale.
+                # Mark live chunks stale, capping the version range as every
+                # close must: a live chunk's last_seen_version is the
+                # open-ended LIVE_CHUNK_LAST_SEEN, and left there it would
+                # join every version of a re-created document and never meet
+                # the tombstone purge's `last_seen_version <= version` bound.
+                # The documents above were tombstoned IN PLACE, so the highest
+                # version is the one these chunks were last part of.
                 await conn.execute(
                     """
-                    UPDATE chunks
-                    SET valid_to = NOW()
-                    WHERE customer_id = $1
-                      AND valid_to IS NULL
-                      AND doc_id LIKE $2
+                    UPDATE chunks c
+                    SET valid_to = NOW(),
+                        last_seen_version = LEAST(
+                            c.last_seen_version,
+                            (SELECT max(d.version) FROM documents d
+                              WHERE d.customer_id = c.customer_id
+                                AND d.doc_id = c.doc_id)
+                        )
+                    WHERE c.customer_id = $1
+                      AND c.valid_to IS NULL
+                      AND c.doc_id LIKE $2
                     """,
                     event.customer_id,
                     prefix + "%",

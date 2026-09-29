@@ -844,6 +844,32 @@ EMBEDDING_V2_PROXY_ALIAS = "gemini-embedding-2"
 EMBEDDING_V2_MAX_INPUT_TOKENS = 8192
 CHUNKER_VERSION = "naive-v1"
 
+#: `chunks.last_seen_version` of a LIVE chunk: an open end, meaning "still in
+#: every document version from first_seen_version on". The version join
+#: `d.version BETWEEN c.first_seen_version AND c.last_seen_version` therefore
+#: admits exactly the versions it admitted when a live chunk carried the
+#: current document version -- no later version exists yet.
+#:
+#: Why not the current version: then every re-ingest had to rewrite
+#: last_seen_version on every UNCHANGED chunk. The column is in the pg_search
+#: bm25 index, so no such update is ever HOT, and each one re-inserts into
+#: every index on `chunks`, HNSW included -- ~3,500 of them per append for a big
+#: live session. With the open end a reused chunk is written at most once (a row
+#: born under the old scheme is moved onto it on its first reuse) and never
+#: again.
+#:
+#: Every writer that CLOSES a chunk must cap this back to a real version: the
+#: normalizer's removal uses LEAST(last_seen_version, version - 1); the
+#: code-graph repo disconnect and GitHub retirement cap to the document's
+#: highest version. A closed chunk left at the sentinel would join every later
+#: version of a re-created document and escape the tombstone purge's
+#: `last_seen_version <= tombstone.version` bound forever.
+#:
+#: It is the int4 maximum, so NEVER add to it: `LIVE_CHUNK_LAST_SEEN + 1`
+#: overflows the column ("integer out of range"). LEAST() and subtraction are
+#: safe.
+LIVE_CHUNK_LAST_SEEN = 2_147_483_647
+
 # Per-symbol cap for code_graph chunks. Matches DEFAULT_CHUNK_TOKENS so code
 # and prose live on the same retrieval scale: a unified retriever ranks
 # candidates across sources and assumes chunks are roughly comparable units.
