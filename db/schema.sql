@@ -472,7 +472,6 @@ RETURNS integer
 LANGUAGE plpgsql
 SET search_path = pg_catalog, public, pg_temp
 SET lock_timeout = '3s'
-SET app.current_customer_id = ''
 AS $$
 DECLARE
     todo oid[];
@@ -483,6 +482,7 @@ DECLARE
     dflt text;
     resident boolean;
     roles text;
+    prev_tenant text;
     created integer := 0;
 BEGIN
     IF tenant IS NULL OR tenant !~ '^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$' THEN
@@ -545,9 +545,13 @@ BEGIN
     -- the lock_timeout and then fail its scan. split_default() is the fix.
     -- UNDER the advisory lock: reading DEFAULT takes a table lock, and one
     -- taken before the advisory lock deadlocks against a provision holding
-    -- it and asking for DEFAULT (ATTACH). The tenant GUC is function-scoped
-    -- (SET clause above): DEFAULT is under FORCE RLS on a converted plane,
-    -- and without it no row is visible.
+    -- it and asking for DEFAULT (ATTACH). The tenant GUC is set for the check
+    -- and put back afterwards: DEFAULT is under FORCE RLS on a converted
+    -- plane, and without it no row is visible. (Not a SET clause: PG15+
+    -- allows a custom setting in a function's SET clause only to a superuser,
+    -- and this function is created by `app`. On an error the transaction or
+    -- savepoint rolls the setting back by itself.)
+    prev_tenant := current_setting('app.current_customer_id', true);
     PERFORM set_config('app.current_customer_id', tenant, true);
     FOR parent IN SELECT c.oid, c.relname FROM pg_class c WHERE c.oid = ANY (todo) LOOP
         SELECT format('public.%I', d.relname) INTO dflt
@@ -565,6 +569,7 @@ BEGIN
             END IF;
         END IF;
     END LOOP;
+    PERFORM set_config('app.current_customer_id', coalesce(prev_tenant, ''), true);
 
     FOR parent IN
         SELECT c.oid, c.relname, c.relowner, c.relacl

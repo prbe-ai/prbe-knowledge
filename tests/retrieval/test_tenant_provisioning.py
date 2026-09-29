@@ -54,6 +54,34 @@ def test_schema_sql_carries_0144_bodies_verbatim():
 
 
 @pytest.mark.integration
+async def test_0144_bodies_create_as_a_non_superuser(live_db):
+    # Prod migrations run as `app`, not a superuser; the suite connects as
+    # one. The first 0144 deploy failed on a function SET clause for a custom
+    # setting, which PG15+ allows only to superusers. Create both bodies as a
+    # plain role, in a scratch schema it owns, and roll everything back.
+    migration = (REPO / "db/migrations/versions/20260929_0144_kb_provision_tenant.py").read_text()
+    bodies = [
+        re.search(rf'{name} = r"""(.*?)"""', migration, re.S).group(1)
+        for name in ("PARTITION_NAME_SQL", "PROVISION_SQL")
+    ]
+    async with db_module.raw_conn() as conn:
+        tx = conn.transaction()
+        await tx.start()
+        try:
+            await conn.execute("CREATE ROLE prov_test_migrator NOLOGIN")
+            await conn.execute("CREATE SCHEMA prov_test_fns AUTHORIZATION prov_test_migrator")
+            await conn.execute("SET LOCAL ROLE prov_test_migrator")
+            await conn.execute("SET LOCAL search_path = prov_test_fns")
+            for body in bodies:
+                await conn.execute(body)
+            assert await conn.fetchval(
+                "SELECT count(*) FROM pg_proc WHERE pronamespace = 'prov_test_fns'::regnamespace"
+            ) == 2
+        finally:
+            await tx.rollback()
+
+
+@pytest.mark.integration
 @pytest.mark.parametrize("parent", sorted(PARTITION_PREFIXES))
 @pytest.mark.parametrize(
     "customer_id", ["probe", "new-workspace", "a.b_c-D9", "x" * 63, "Bucket-Robotics"]
