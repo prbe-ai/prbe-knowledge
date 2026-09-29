@@ -8,6 +8,15 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Security
 
+- **`redactd`'s Go dependencies carry the x/crypto, rardecode and xz fixes (supersedes #599).**
+  `golang.org/x/crypto` 0.35.0 -> 0.52.0 (15 ssh advisories), `nwaples/rardecode/v2` 2.1.0 ->
+  2.3.0 (CVE-2025-11579; 2.3.0 restores the `WriteTo` that `mholt/archives` v0.1.2 needs, which
+  2.2.x dropped), and `ulikunitz/xz` 0.5.12 -> 0.5.15, not #599's 0.5.14: the Go vulnerability
+  database lists GO-2025-3922 as fixed in 0.5.15 and `govulncheck` still traced it into redactd at
+  0.5.14. x/crypto 0.52.0 needs Go 1.25, so the module floor is `go 1.25.0` and
+  `services/{ingestion,worker}/Dockerfile` build on `golang:1.25-bookworm` (they pinned 1.24.11,
+  which now fails `go mod download`), the same line as the data-plane image and CI.
+
 - **The vendored credential scanner is back in sync with research-os, with the #2000 rules.**
   `engine/ingest/_credential_{secrets,redaction,gate}.py` are regenerated from research-os
   (`scripts/sync_credential_scrubber.py --knowledge-root`); they had drifted ~1,000 lines. New

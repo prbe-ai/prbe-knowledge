@@ -1,6 +1,8 @@
-# Match the module's pinned toolchain floor; compile the same scanner for every
-# standalone ingress/worker image. No Go runtime or compiler ships in the final image.
-FROM golang:1.24.11-bookworm AS redactd-build
+# Same Go line as the image that ships redactd (prbe-data-plane-image's
+# redactd-build stage) and CI; it must be >= the go.mod floor, because the image
+# sets GOTOOLCHAIN=local. Compile the same scanner for every standalone
+# ingress/worker image. No Go runtime or compiler ships in the final image.
+FROM golang:1.25-bookworm AS redactd-build
 WORKDIR /build/redactd
 COPY tools/redactd/go.mod tools/redactd/go.sum ./
 RUN go mod download
