@@ -98,6 +98,7 @@ def ensure_index(bind, name: str, table: str, columns: str, deadline: float | No
     """Build `public.<name>` unless an identical valid one exists. True if built."""
     deadline = deadline if deadline is not None else time.monotonic() + BUDGET_SECONDS
     want = expected_definition(name, table, columns)
+    _budget(bind, deadline)
     row = _current(bind, name)
     if row is not None and row.usable and row.definition == want:
         return False
@@ -106,6 +107,7 @@ def ensure_index(bind, name: str, table: str, columns: str, deadline: float | No
         bind.execute(sa.text(f"DROP INDEX CONCURRENTLY IF EXISTS public.{name}"))
     _budget(bind, deadline)
     bind.execute(sa.text(f"CREATE INDEX CONCURRENTLY {name} ON public.{table} ({columns})"))
+    _budget(bind, deadline)
     row = _current(bind, name)
     if row is None or not row.usable or row.definition != want:
         raise RuntimeError(f"{name} is not usable after the build: {row}")
