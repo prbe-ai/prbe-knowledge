@@ -126,7 +126,7 @@ def test_a_permanently_dead_daemon_fails_closed(daemon, monkeypatch) -> None:
 def test_a_truncated_response_is_not_a_partial_success(daemon) -> None:
     """Fewer results than texts would silently mean "clean" for the missing
     ones."""
-    real = daemon._request_locked
+    real = daemon._request
 
     def _short(payload):
         out = real(payload)
@@ -134,7 +134,7 @@ def test_a_truncated_response_is_not_a_partial_success(daemon) -> None:
             out["findings"] = out["findings"][:-1]
         return out
 
-    daemon._request_locked = _short
+    daemon._request = _short
     with pytest.raises(ScanUnavailable, match="wrong number"):
         daemon.scan(["a", "b"])
 
@@ -170,6 +170,41 @@ def test_a_malformed_frame_gets_an_error_not_a_hang(daemon) -> None:
         s.sendall(struct.pack(">I", len(body)) + body)
         (length,) = struct.unpack(">I", s.recv(4))
         assert b"not valid JSON" in s.recv(length)
+
+
+def test_a_small_scan_is_not_queued_behind_a_large_one(daemon) -> None:
+    """The client once held one lock across every round trip, so a multi-MB
+    session's scan made every small document in the worker wait for it (31.5 s
+    measured for a 4 ms scan). Against the real daemon: a small scan started
+    while a large one is in flight comes back first."""
+    import threading
+
+    large_text = "export API_KEY=abc\n" * (4 * 1024 * 1024 // 19)
+    assert len(large_text) >= redactd.SERIAL_SCAN_BYTES
+    real = daemon._request
+    in_flight = threading.Event()
+
+    def spy(payload):
+        if payload.get("op") == "scan" and payload["texts"][0] is large_text:
+            in_flight.set()
+        return real(payload)
+
+    daemon._request = spy
+    done: dict[str, float] = {}
+
+    def scan_large() -> None:
+        daemon.scan([large_text])
+        done["large"] = time.monotonic()
+
+    thread = threading.Thread(target=scan_large, daemon=True)
+    thread.start()
+    assert in_flight.wait(10)
+    hits = daemon.scan([f"AWS Secret Access Key [None]: {_AWS_SECRET}"])[0]
+    done["small"] = time.monotonic()
+    thread.join(60)
+    assert any(rule == "probe-anchored-secret" for rule, _, _ in hits)
+    assert "large" in done, "the large scan did not complete"
+    assert done["small"] < done["large"], "the small scan waited for the large one"
 
 
 def test_scanning_is_orders_of_magnitude_cheaper_than_a_spawn(daemon) -> None:

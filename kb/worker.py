@@ -19,7 +19,7 @@ from typing import NoReturn
 
 import asyncpg
 
-from engine.ingest import secret_redaction
+from engine.ingest import cpu_pool, secret_redaction
 from engine.ingest.handlers.base import ConnectorContext, make_default_context
 from engine.ingest.queue_age import QueueAgeReporter
 from engine.ingest.worker import ReclaimLoop, Worker, _build_health_app
@@ -367,6 +367,7 @@ async def run_worker_forever() -> None:
         integration_poller.shutdown()
         queue_age_reporter.shutdown()
         secret_redaction.shutdown_supervisor()
+        cpu_pool.shutdown()
         if poll_scheduler is not None:
             poll_scheduler.stop()
         health_server.should_exit = True

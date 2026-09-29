@@ -134,7 +134,7 @@ def test_malformed_daemon_findings_fail_closed(monkeypatch, finding):
 
     supervisor = RedactdSupervisor()
     monkeypatch.setattr(
-        supervisor, "_request_locked", lambda request: {"ok": True, "findings": [[finding]]}
+        supervisor, "_request", lambda request: {"ok": True, "findings": [[finding]]}
     )
     with pytest.raises(ScanUnavailable):
         supervisor.scan(["synthetic content"])
@@ -145,7 +145,7 @@ def test_non_boolean_daemon_success_is_not_a_verdict(monkeypatch, ok):
     from engine.ingest.redactd import RedactdSupervisor
 
     supervisor = RedactdSupervisor()
-    monkeypatch.setattr(supervisor, "_request_locked", lambda request: {"ok": ok, "findings": [[]]})
+    monkeypatch.setattr(supervisor, "_request", lambda request: {"ok": ok, "findings": [[]]})
     with pytest.raises(ScanUnavailable):
         supervisor.scan(["synthetic content"])
 
@@ -256,10 +256,10 @@ def test_scanner_diagnostics_never_expose_credentials(monkeypatch, failure):
         supervisor = RedactdSupervisor()
         if failure == "daemon_rejection":
             monkeypatch.setattr(
-                supervisor, "_request_locked", lambda req: {"ok": False, "error": KEY}
+                supervisor, "_request", lambda req: {"ok": False, "error": KEY}
             )
         else:
-            monkeypatch.setattr(supervisor, "_request_locked", fail)
+            monkeypatch.setattr(supervisor, "_request", fail)
             monkeypatch.setattr(supervisor, "_restart_locked", lambda: None)
         def invoke():
             return supervisor.scan(["benign"])

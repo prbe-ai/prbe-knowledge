@@ -22,6 +22,7 @@ change rather than the size of the document.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import re
 from dataclasses import dataclass, field, replace
@@ -1098,7 +1099,9 @@ class Normalizer:
             else:
                 new_pieces = rewritten
         else:
-            new_pieces = chunk_text(_stringify_body(doc))
+            # On a thread: a 5.5 MB session body is ~0.5 s of tiktoken encode,
+            # which releases the GIL, so the event loop keeps running beside it.
+            new_pieces = await asyncio.to_thread(chunk_text, _stringify_body(doc))
             metadata_piece = _metadata_piece(doc)
 
         # PostgreSQL text values cannot contain U+0000. Source code can:
