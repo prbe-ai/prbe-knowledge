@@ -81,7 +81,10 @@ async def init_tenant(profile: Profile, db, bucket: ObjectStore) -> None:
     # their rows land in DEFAULT, which trips the guardian's DEFAULT alarm
     # during a perfectly normal synth run -- and, worse, makes synth-measured
     # retrieval latency unrepresentative of a real tenant's.
-    await ensure_tenant_partition(db, customer_id)
+    # `db` is a Pool; provisioning needs one connection, outside any
+    # transaction, after the customer row above has committed.
+    async with db.acquire() as conn:
+        await ensure_tenant_partition(conn, customer_id)
 
     bucket_name = await bucket.bucket_for(customer_id)
     await bucket.ensure_bucket(bucket_name)

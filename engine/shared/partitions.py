@@ -67,24 +67,61 @@ PARTITION_KEY = "customer_id"
 #: fits inside PostgreSQL's 63-byte identifier limit.
 PARTITION_PREFIX = "chunks_p_"
 
+#: Creation-name prefix per partitioned parent. Mirrored by the SQL function
+#: `kb_partition_name()` (migration 0144), which is what actually names new
+#: partitions; tests/retrieval/test_tenant_provisioning.py pins the two equal.
+#: The longest prefix + 40-char slug + "_" + 8 hex is 58 bytes, so the hash is
+#: never truncated by the 63-byte identifier limit.
+PARTITION_PREFIXES: dict[str, str] = {
+    "chunks": PARTITION_PREFIX,
+    "documents": "doc_p_",
+    "usage_events": "ue_p_",
+    "graph_nodes": "gn_p_",
+    "graph_edges": "ge_p_",
+    "graph_node_provenance": "gnp_p_",
+}
+
 #: DDL waits this long for a lock before giving up. Provisioning must not hang
 #: behind a long-running search or an autovacuum; the caller retries.
 #: `ATTACH` needs only SHARE UPDATE EXCLUSIVE, so in practice it does not queue.
 PARTITION_LOCK_TIMEOUT = "3s"
 
+#: Upper bound on one kb_provision_tenant() call; asyncpg cancels it server-side.
+PROVISION_TIMEOUT_SECONDS = 30.0
+
+#: SQL for the advisory-lock key partition DDL takes -- kb_provision_tenant(),
+#: drop_tenant_partition and split_default today -- so they queue instead of
+#: deadlocking. Each takes it FIRST, before any table lock, with its
+#: lock_timeout already set: taken after DEFAULT, a split deadlocked against a
+#: provision (review of #609). A conversion swap or a purge that detaches
+#: partitions must take it the same way when it lands.
+PARTITION_DDL_LOCK_SQL = "hashtextextended('kb_partition_ddl', 0)"
+
 #: `customer_id` values that may be interpolated into DDL. DDL cannot take bind
 #: parameters, so this is the boundary that makes interpolation safe. Deliberately
 #: narrower than what `customers.customer_id` accepts: a value outside this set
-#: is refused loudly rather than quoted and hoped for.
-_SAFE_CUSTOMER_ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$")
+#: is refused loudly rather than quoted and hoped for. Always `fullmatch`: `$`
+#: in Python also matches before one trailing newline.
+_SAFE_CUSTOMER_ID = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}")
+
+
+def validate_customer_id(customer_id: str) -> None:
+    """Raise UnsafeCustomerId unless this id may name a partition.
+
+    Callers that create a tenant check it BEFORE inserting the customer row:
+    provisioning runs after that row commits, so a refusal there would leave
+    a tenant that can never get a partition.
+    """
+    if not isinstance(customer_id, str) or not _SAFE_CUSTOMER_ID.fullmatch(customer_id):
+        raise UnsafeCustomerId(f"refusing to build DDL for customer_id: {customer_id!r}")
 
 
 class UnsafeCustomerId(ValueError):
     """A customer_id that must never be interpolated into DDL."""
 
 
-def partition_name_for(customer_id: str) -> str:
-    """Deterministic, collision-free partition name for a tenant.
+def partition_name_for(customer_id: str, parent: str = CHUNKS_PARENT) -> str:
+    """The name a NEW partition of `parent` gets for this tenant.
 
     Slug plus a hash of the ORIGINAL id. The slug alone is not enough: `a-b` and
     `a_b` are different tenants that sanitize to the same identifier, and the
@@ -92,12 +129,26 @@ def partition_name_for(customer_id: str) -> str:
     or worse, as an ATTACH pointing a second tenant at the first one's table.
     The hash is taken before sanitizing, so distinct ids always get distinct
     names.
+
+    A CREATION name. Partitions made before migration 0144 carry sha1 names
+    (`_legacy_partition_name`), later ones sha256 (computable in SQL, where
+    kb_provision_tenant() names them); `partition_of` tries both and falls
+    back to the bound.
     """
-    if not _SAFE_CUSTOMER_ID.match(customer_id):
-        raise UnsafeCustomerId(f"refusing to build DDL for customer_id: {customer_id!r}")
+    validate_customer_id(customer_id)
+    base = parent.removesuffix("__conv")
+    prefix = PARTITION_PREFIXES.get(base)
+    if prefix is None:
+        raise ValueError(f"no partition prefix declared for parent {parent!r}")
     slug = re.sub(r"[^a-z0-9]+", "_", customer_id.lower()).strip("_")[:40]
-    digest = hashlib.sha1(customer_id.encode()).hexdigest()[:8]
-    return f"{PARTITION_PREFIX}{slug}_{digest}"
+    digest = hashlib.sha256(customer_id.encode()).hexdigest()[:8]
+    return f"{prefix}{slug}_{digest}"
+
+
+def _legacy_partition_name(customer_id: str) -> str:
+    """The pre-0144 (sha1) name of a `chunks` partition. Only chunks had any."""
+    slug = re.sub(r"[^a-z0-9]+", "_", customer_id.lower()).strip("_")[:40]
+    return f"{PARTITION_PREFIX}{slug}_{hashlib.sha1(customer_id.encode()).hexdigest()[:8]}"
 
 
 async def is_partitioned(conn: asyncpg.Connection, table: str = CHUNKS_PARENT) -> bool:
@@ -112,32 +163,91 @@ async def is_partitioned(conn: asyncpg.Connection, table: str = CHUNKS_PARENT) -
     ) or False
 
 
+async def partition_of(
+    conn: asyncpg.Connection, customer_id: str, *, parent: str = CHUNKS_PARENT
+) -> str | None:
+    """The name of this tenant's ATTACHED partition of `parent`, or None.
+
+    Confirmed by the partition's BOUND, not its name alone: a name would also
+    report a half-built standalone table as done, while asking `pg_inherits`
+    makes a table whose ATTACH failed look unbuilt, which is what lets the next
+    call finish the job.
+
+    ON THE SEARCH PATH (bm25_scan_target, every query), so it looks the
+    expected names up first -- sha256 since migration 0144, sha1 before it --
+    through pg_class's name index: one indexed probe instead of deparsing every
+    partition's bound. Only when neither name is attached (a tenant still in
+    DEFAULT, or a partition renamed by hand) does it scan the bounds.
+    """
+    validate_customer_id(customer_id)
+    base = parent.removesuffix("__conv")
+    names = [partition_name_for(customer_id, parent)] if base in PARTITION_PREFIXES else []
+    if base == CHUNKS_PARENT:
+        names.append(_legacy_partition_name(customer_id))
+    hit = None if not names else await conn.fetchval(
+        """
+        SELECT leaf.relname
+        FROM pg_class leaf
+        JOIN pg_inherits h ON h.inhrelid = leaf.oid
+        WHERE leaf.relname = ANY ($3::text[])
+          AND h.inhparent = to_regclass($1)
+          AND pg_get_expr(leaf.relpartbound, leaf.oid) = format('FOR VALUES IN (%L)', $2::text)
+        LIMIT 1
+        """,
+        parent,
+        customer_id,
+        names,
+    )
+    if hit is not None:
+        return hit
+    return await conn.fetchval(
+        """
+        SELECT leaf.relname
+        FROM pg_inherits h
+        JOIN pg_class leaf ON leaf.oid = h.inhrelid
+        WHERE h.inhparent = to_regclass($1)
+          AND pg_get_expr(leaf.relpartbound, leaf.oid) = format('FOR VALUES IN (%L)', $2::text)
+        """,
+        parent,
+        customer_id,
+    )
+
+
 async def partition_exists(
     conn: asyncpg.Connection, customer_id: str, *, parent: str = CHUNKS_PARENT
 ) -> bool:
-    """True only when the partition exists AND is attached to the parent.
+    """True only when this tenant has a partition ATTACHED to the parent."""
+    return await partition_of(conn, customer_id, parent=parent) is not None
 
-    Name existence alone is the wrong test. `CREATE TABLE` and `ATTACH` are two
-    statements; if ATTACH fails the standalone table survives, and a
-    name-existence check would then report "already done" forever -- leaving
-    that tenant writing into DEFAULT with nothing ever retrying. Asking
-    `pg_inherits` makes a half-built partition look unbuilt, which is what lets
-    the next call finish the job.
+
+async def partitioned_parents(conn: asyncpg.Connection) -> list[str]:
+    """Every public table LIST-partitioned on customer_id that has a partition
+    prefix, referenced ones first.
+
+    The same catalog query kb_provision_tenant() iterates, so the guardian's
+    reconciler and the provisioner agree on what "all partitions" means. A
+    parent without a prefix (a conversion's scratch table such as
+    `chunks_part`) is skipped by both, not fatal to both.
     """
-    return (
-        await conn.fetchval(
-            """
-            SELECT EXISTS (
-                SELECT 1 FROM pg_inherits h
-                WHERE h.inhrelid = to_regclass($1)
-                  AND h.inhparent = to_regclass($2)
-            )
-            """,
-            partition_name_for(customer_id),
-            parent,
-        )
-        or False
+    rows = await conn.fetch(
+        """
+        SELECT c.relname
+        FROM pg_partitioned_table pt
+        JOIN pg_class c ON c.oid = pt.partrelid
+        JOIN pg_namespace ns ON ns.oid = c.relnamespace
+        JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = pt.partattrs[0]
+        WHERE ns.nspname = 'public' AND pt.partstrat = 'l' AND pt.partnatts = 1
+          AND a.attname = 'customer_id'
+        ORDER BY (
+            SELECT count(*) FROM pg_constraint k
+            WHERE k.conrelid = c.oid AND k.contype = 'f'
+              AND k.confrelid IN (SELECT partrelid FROM pg_partitioned_table)
+        ), c.relname
+        """
     )
+    return [
+        r["relname"] for r in rows if r["relname"].removesuffix("__conv") in PARTITION_PREFIXES
+    ]
 
 
 async def find_orphan_partitions(
@@ -211,11 +321,16 @@ async def drop_tenant_partition(
     partition works, but DETACH first means a failure between the two leaves a
     standalone table rather than a parent that briefly had a partition
     disappear underneath a concurrent plan.
+
+    The check is made AGAIN under the locks: research-os lets a purged slug be
+    claimed again, and a re-created tenant's first rows written between the
+    first check and the DETACH would be dropped with the table. SHARE on
+    `customers` holds any new customer row off until the drop commits.
     """
     if not await is_partitioned(conn, parent):
         return False
-    part = partition_name_for(customer_id)
-    if not await partition_exists(conn, customer_id, parent=parent):
+    part = await partition_of(conn, customer_id, parent=parent)
+    if part is None:
         return False
     still_there = await conn.fetchval(
         "SELECT EXISTS (SELECT 1 FROM customers WHERE customer_id = $1)", customer_id
@@ -227,7 +342,18 @@ async def drop_tenant_partition(
             f"cascade and this reclaims what is left."
         )
     async with conn.transaction():
+        # Timeout first, so it bounds the advisory-lock wait too; then the
+        # lock kb_provision_tenant() takes, before any table lock.
         await conn.execute(f"SET LOCAL lock_timeout = '{lock_timeout}'")
+        await conn.execute(f"SELECT pg_advisory_xact_lock({PARTITION_DDL_LOCK_SQL})")
+        await conn.execute("LOCK TABLE customers IN SHARE MODE")
+        if await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM customers WHERE customer_id = $1)", customer_id
+        ):
+            raise ValueError(
+                f"refusing to drop the partition for {customer_id!r}: the tenant "
+                f"was created again while the drop waited for its locks."
+            )
         await conn.execute(f'ALTER TABLE {parent} DETACH PARTITION "{part}"')
         await conn.execute(f'DROP TABLE "{part}"')
     return True
@@ -240,64 +366,100 @@ async def ensure_tenant_partition(
     parent: str = CHUNKS_PARENT,
     lock_timeout: str = PARTITION_LOCK_TIMEOUT,
 ) -> bool:
-    """Create and attach this tenant's partition. Returns True if it created one.
+    """Give this tenant a partition on EVERY partitioned parent. True if any was created.
 
-    Idempotent: an existing partition is left alone. Safe to call on a database
-    where the conversion has not run (returns False, does nothing).
+    Delegates to the SQL function kb_provision_tenant() (migration 0144), the
+    one implementation research-os also calls. `parent` and `lock_timeout` are
+    kept for callers' signatures; the function covers every parent and uses
+    its own 3 s lock_timeout.
 
-    NOT swallowed on failure. A tenant whose partition could not be created is a
-    tenant whose search will be slow and whose rows sit in DEFAULT; provisioning
-    should fail loudly rather than hand back a degraded tenant.
+    MUST NOT run inside the transaction that inserted the customer: ATTACH
+    takes SHARE ROW EXCLUSIVE on `customers` through the cloned FK, and two
+    such transactions deadlock (see 0144). Callers commit the customer first.
+    If `conn` is already inside a transaction this runs as a savepoint of it,
+    which is exactly that mistake, so it refuses (and the function itself
+    refuses when its transaction wrote `customers`).
+
+    NOT swallowed on failure: a tenant with no partition writes into DEFAULT
+    (or, once DEFAULT is gone, cannot write at all). The pg_search guardian
+    reconciles missing partitions every minute as the backstop. A tenant whose
+    rows are already in DEFAULT raises ObjectNotInPrerequisiteStateError;
+    split_default() is the attended fix. The one tolerated failure is the
+    function not existing yet: new engine code can start before the migrate
+    hook applies 0144, and the guardian provisions once it has.
     """
-    if not await is_partitioned(conn, parent):
-        return False
-    if await partition_exists(conn, customer_id, parent=parent):
-        return False
-
-    part = partition_name_for(customer_id)
-    # Safe: `part` comes from partition_name_for (regex-gated, then sanitized to
-    # [a-z0-9_]), and `customer_id` passed the same regex. Neither can carry a
-    # quote. DDL cannot take bind parameters, so this is the only option and the
-    # gate above is what makes it sound.
-    literal = customer_id.replace("'", "''")
-
-    # ONE TRANSACTION, for two reasons that are easy to miss.
-    #
-    # 1. `SET LOCAL` outside a transaction block is a NO-OP -- Postgres emits
-    #    `WARNING: SET LOCAL can only be used in transaction blocks` and moves
-    #    on. Both production callers use `raw_conn()`, which is autocommit, so
-    #    the documented lock cap simply would not exist and ATTACH could queue
-    #    behind autovacuum indefinitely. (Verified on the live database: after a
-    #    bare `SET LOCAL lock_timeout='3s'`, `SHOW lock_timeout` still reads 0.)
-    # 2. `CREATE TABLE` then `ATTACH` as separate autocommit statements leaves
-    #    an orphaned standalone table if ATTACH fails. Wrapped, a failure leaves
-    #    nothing behind and the next call starts clean.
-    async with conn.transaction():
-        await conn.execute(f"SET LOCAL lock_timeout = '{lock_timeout}'")
-        # Standalone first: this touches the parent not at all, so a slow build
-        # cannot block a reader. INCLUDING ALL brings the column defaults,
-        # checks, storage parameters and index definitions across; ATTACH then
-        # matches them to the parent's partitioned indexes and builds any that
-        # LIKE could not express (the BM25 child among them).
-        await conn.execute(f'CREATE TABLE "{part}" (LIKE "{parent}" INCLUDING ALL)')
-        await conn.execute(
-            f'ALTER TABLE "{parent}" ATTACH PARTITION "{part}" '
-            f"FOR VALUES IN ('{literal}')"
+    del parent, lock_timeout  # every parent, the function's own timeout
+    validate_customer_id(customer_id)
+    if conn.is_in_transaction():
+        raise RuntimeError(
+            "ensure_tenant_partition must run in its own transaction, not inside "
+            "the one that inserted the customer (deadlock; see migration 0144)"
         )
-        # Parent policies govern parent-routed queries, which is every
-        # application path. This covers the other door: a query naming the
-        # partition directly would otherwise see every row in it with no tenant
-        # check at all.
-        await conn.execute(f'ALTER TABLE "{part}" ENABLE ROW LEVEL SECURITY')
-        await conn.execute(f'ALTER TABLE "{part}" FORCE ROW LEVEL SECURITY')
-        await conn.execute(
-            f'CREATE POLICY tenant_isolation ON "{part}" '
-            f"USING ({PARTITION_KEY} = current_setting('app.current_customer_id', true))"
+    try:
+        async with conn.transaction():
+            # Bounded (the function bounds lock waits at 3 s; this bounds the
+            # rest, e.g. ATTACH's scan of a big DEFAULT): on timeout asyncpg
+            # cancels the statement on the server, so a caller that gives up
+            # does not leave it running.
+            created = await conn.fetchval(
+                "SELECT kb_provision_tenant($1)", customer_id, timeout=PROVISION_TIMEOUT_SECONDS
+            )
+    except asyncpg.exceptions.UndefinedFunctionError:
+        log.warning(
+            "partitions.provisioner_missing",
+            customer=customer_id,
+            reason="kb_provision_tenant() does not exist yet (migration 0144 not "
+            "applied); the pg_search guardian provisions once it is",
         )
-    log.info(
-        "partitions.created", customer=customer_id, partition=part, parent=parent
+        return False
+    if created:
+        log.info("partitions.created", customer=customer_id, partitions=created)
+    return bool(created)
+
+
+async def ensure_tenant_partitions(customer_id: str) -> bool:
+    """`ensure_tenant_partition` on a fresh pooled connection (its own transaction)."""
+    from engine.shared.db import raw_conn
+
+    async with raw_conn() as conn:
+        return await ensure_tenant_partition(conn, customer_id)
+
+
+async def find_tenants_missing_partitions(conn: asyncpg.Connection) -> list[str]:
+    """Active customers lacking an attached partition on some partitioned parent.
+
+    Every bound is deparsed ONCE (the materialized CTE) and hashed against
+    the customers, rather than once per customer x parent x partition: this
+    runs every minute from the guardian.
+    """
+    parents = await partitioned_parents(conn)
+    if not parents:
+        return []
+    rows = await conn.fetch(
+        """
+        WITH parents AS (
+            SELECT to_regclass(p) AS oid FROM unnest($1::text[]) AS p
+        ),
+        bounds AS MATERIALIZED (
+            SELECT h.inhparent AS parent, pg_get_expr(leaf.relpartbound, leaf.oid) AS bound
+            FROM pg_inherits h
+            JOIN pg_class leaf ON leaf.oid = h.inhrelid
+            WHERE h.inhparent IN (SELECT oid FROM parents)
+        )
+        SELECT c.customer_id
+        FROM customers c
+        CROSS JOIN parents p
+        LEFT JOIN bounds b
+          ON b.parent = p.oid AND b.bound = format('FOR VALUES IN (%L)', c.customer_id)
+        WHERE c.status = 'active'
+          AND c.customer_id ~ '^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$'
+          AND b.parent IS NULL
+        GROUP BY c.customer_id
+        ORDER BY c.customer_id
+        """,
+        parents,
     )
-    return True
+    return [r["customer_id"] for r in rows]
 
 
 async def default_partition_name(
@@ -369,6 +531,11 @@ async def split_default(
 
     async with conn.transaction():
         await conn.execute(f"SET LOCAL lock_timeout = '{lock_timeout}'")
+        # The partition-DDL lock FIRST, before DEFAULT: kb_provision_tenant()
+        # holds it and then needs DEFAULT (ATTACH scans it), so taking DEFAULT
+        # first (the DELETE below) and the lock second deadlocked the two.
+        # Re-entrant: the function takes it again inside this transaction.
+        await conn.execute(f"SELECT pg_advisory_xact_lock({PARTITION_DDL_LOCK_SQL})")
         # The re-INSERT goes through the parent, and `chunks`' tenant_isolation
         # policy carries a WITH CHECK clause (verified on the live database), so
         # without the GUC every row is rejected with "new row violates row-level
@@ -383,12 +550,15 @@ async def split_default(
             f"RETURNING {collist}",
             customer_id,
         )
+        # Called directly, inside THIS transaction: the rows just left DEFAULT
+        # in it, so neither the function's DEFAULT-resident check nor ATTACH's
+        # scan of DEFAULT finds any. No customers row is written here, so the
+        # deadlock ensure_tenant_partition guards against cannot arise.
+        await conn.fetchval("SELECT kb_provision_tenant($1)", customer_id)
         if not moved:
-            # Nothing to split; just make sure the partition exists so the next
-            # write lands correctly.
-            await ensure_tenant_partition(conn, customer_id, parent=parent)
+            # Nothing to split; the partition now exists so the next write
+            # lands correctly.
             return 0
-        await ensure_tenant_partition(conn, customer_id, parent=parent)
         placeholders = ", ".join(f"${i + 1}" for i in range(len(columns)))
         await conn.executemany(
             f'INSERT INTO "{parent}" ({collist}) VALUES ({placeholders})',
@@ -409,9 +579,14 @@ __all__ = [
     "default_partition_name",
     "drop_tenant_partition",
     "ensure_tenant_partition",
+    "ensure_tenant_partitions",
     "find_orphan_partitions",
+    "find_tenants_missing_partitions",
     "is_partitioned",
     "partition_exists",
     "partition_name_for",
+    "partition_of",
+    "partitioned_parents",
     "split_default",
+    "validate_customer_id",
 ]

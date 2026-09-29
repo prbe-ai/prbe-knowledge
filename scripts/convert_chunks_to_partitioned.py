@@ -432,19 +432,12 @@ async def _create_partitions(conn: asyncpg.Connection, tenants: list[str]) -> No
         )
         log(f"step 2: DEFAULT partition {default_name} created")
 
+    from engine.shared.partitions import partition_of
+
     for t in tenants:
         part = await _partition_name(t)
-        attached = await conn.fetchval(
-            """
-            SELECT EXISTS (
-                SELECT 1 FROM pg_inherits
-                WHERE inhrelid = to_regclass($1) AND inhparent = to_regclass($2)
-            )
-            """,
-            part,
-            NEW_TABLE,
-        )
-        if attached:
+        # By bound, under either naming scheme (sha1 before 0144, sha256 after).
+        if await partition_of(conn, t, parent=NEW_TABLE) is not None:
             continue
         literal = t.replace("'", "''")
         # A previous interrupted run can leave the standalone table without its

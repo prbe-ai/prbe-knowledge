@@ -8,15 +8,20 @@ rotating the API key behind an operator's back).
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import secrets
 
-from asyncpg.exceptions import UniqueViolationError
+from asyncpg.exceptions import (
+    DeadlockDetectedError,
+    LockNotAvailableError,
+    UniqueViolationError,
+)
 
 from engine.shared.db import raw_conn
 from engine.shared.exceptions import PrbeError
 from engine.shared.logging import get_logger
-from engine.shared.partitions import ensure_tenant_partition
+from engine.shared.partitions import ensure_tenant_partitions, validate_customer_id
 from engine.shared.storage import get_store
 
 log = get_logger(__name__)
@@ -46,16 +51,13 @@ async def create_customer(customer_id: str, display_name: str) -> str:
     Raises CustomerAlreadyExists on duplicate customer_id; callers wanting to
     reset a key should use rotate_customer_key() explicitly.
     """
+    # Before the row exists: provisioning runs after it commits, so an id no
+    # partition can be named for must be refused here, not there.
+    validate_customer_id(customer_id)
     api_key = _generate_api_key()
     api_key_hash = _hash_api_key(api_key)
     try:
-        async with raw_conn() as conn, conn.transaction():
-            # ONE TRANSACTION over both. `raw_conn()` is autocommit, so without
-            # this the customer row commits first and a partition failure leaves
-            # a tenant that exists, has no partition, never received its API key
-            # (the exception propagates before the return), and cannot be
-            # retried -- every attempt now raises CustomerAlreadyExists. Wrapped,
-            # a failure means the tenant was never created and a retry works.
+        async with raw_conn() as conn:
             await conn.execute(
                 """
                 INSERT INTO customers (customer_id, display_name, api_key_hash)
@@ -65,19 +67,43 @@ async def create_customer(customer_id: str, display_name: str) -> str:
                 display_name,
                 api_key_hash,
             )
-            # The tenant's `chunks` partition is part of creating the tenant,
-            # not a later cleanup: a tenant without one writes into DEFAULT,
-            # which is a shared relation with a shared ANN index -- the exact
-            # cost-mispricing partitioning removed, silently restored for them.
-            # ~7 ms (CREATE + ATTACH, SHARE UPDATE EXCLUSIVE), and a no-op on a
-            # database where the conversion has not run.
-            await ensure_tenant_partition(conn, customer_id)
     except UniqueViolationError as exc:
         raise CustomerAlreadyExists(
             "customer already exists", customer_id=customer_id
         ) from exc
+    # The tenant's partitions are part of creating the tenant, not a later
+    # cleanup: a tenant without one writes into DEFAULT (a shared relation with
+    # a shared ANN index) or, once DEFAULT is gone, cannot write at all.
+    #
+    # AFTER the customer commits, in its own transaction: ATTACH takes SHARE ROW
+    # EXCLUSIVE on `customers` through the cloned FK, so doing it inside the
+    # insert's transaction deadlocks two concurrent creates (migration 0144).
+    # The row has committed by now, so a failure here must NOT lose the key: a
+    # retry would only hit CustomerAlreadyExists. Lock timeouts are retried;
+    # anything else is logged and the pg_search guardian, which provisions
+    # missing partitions every minute, finishes the job.
+    try:
+        await _provision_partitions(customer_id)
+    except Exception as exc:
+        log.error(
+            "provisioning.partitions_failed",
+            customer=customer_id,
+            error=f"{type(exc).__name__}: {exc}",
+            remedy="the pg_search guardian provisions missing partitions every minute",
+        )
     log.info("provisioning.customer_created", customer=customer_id)
     return api_key
+
+
+async def _provision_partitions(customer_id: str, attempts: int = 3) -> None:
+    for attempt in range(1, attempts + 1):
+        try:
+            await ensure_tenant_partitions(customer_id)
+            return
+        except (LockNotAvailableError, DeadlockDetectedError):
+            if attempt == attempts:
+                raise
+            await asyncio.sleep(0.5 * attempt)
 
 
 async def rotate_customer_key(customer_id: str) -> str:

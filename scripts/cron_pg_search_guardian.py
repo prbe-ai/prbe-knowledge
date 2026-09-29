@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import random
 import sys
 import time
 
@@ -65,7 +66,9 @@ from engine.shared.ops_alert import capture
 from engine.shared.partitions import (
     CHUNKS_PARENT,
     drop_tenant_partition,
+    ensure_tenant_partitions,
     find_orphan_partitions,
+    find_tenants_missing_partitions,
 )
 from engine.shared.pg_search_guardian import (
     analyze_partitioned_parents,
@@ -127,6 +130,50 @@ PREWARM_AFTER_PROMOTION = [
     "idx_chunks_embedding_v2_hnsw_live",
     "idx_chunks_bm25_v2",
 ]
+
+
+#: The provisioning backstop's bounds per tick: how many tenants, and how long.
+#: Each provision waits at most its own 3 s lock_timeout.
+PROVISION_BACKSTOP_MAX_TENANTS = 10
+#: kb_provision_tenant()'s refusal for a tenant whose rows sit in DEFAULT.
+STRANDED_IN_DEFAULT_SQLSTATE = "55000"
+PROVISION_BACKSTOP_TIMEOUT_S = 45.0
+
+
+async def _provision_missing(
+    conn, provisioned: list[str], *, dry_run: bool = False
+) -> None:
+    """Provision a window of missing tenants, appending each success to
+    `provisioned` as it commits (the caller announces them after its bound, so
+    a timeout can neither lose nor delay the record)."""
+    missing = await find_tenants_missing_partitions(conn)
+    if not missing:
+        return
+    if dry_run:
+        log.info("guardian.tenant_partitions_dry_run", tenants=missing, count=len(missing))
+        return
+    # A random sample, not always the first N (tenants that keep failing, or
+    # stay in DEFAULT, would starve every tenant sorted after them) and not a
+    # clock-driven window (skipped ticks can pin it to the same slice). Every
+    # missing tenant has the same chance each tick, with no state to keep.
+    window = random.sample(missing, min(PROVISION_BACKSTOP_MAX_TENANTS, len(missing)))
+    stranded: list[str] = []
+    for tenant in window:
+        try:
+            if await ensure_tenant_partitions(tenant):
+                provisioned.append(tenant)
+                log.info("guardian.tenant_partitions_provisioned", tenant=tenant)
+        except Exception as exc:
+            # 55000 exactly: asyncpg's class for it is also the parent of
+            # LockNotAvailableError (55P03), which is a real failure here.
+            if getattr(exc, "sqlstate", None) == STRANDED_IN_DEFAULT_SQLSTATE:
+                stranded.append(tenant)
+                continue
+            log.warning("guardian.tenant_partitions_failed", tenant=tenant,
+                        error=f"{type(exc).__name__}: {exc}")
+    if stranded:
+        log.info("guardian.tenant_partitions_stranded_in_default", tenants=stranded,
+                 remedy="split_default(<tenant>) moves the rows and provisions")
 
 
 async def run_once(*, dry_run: bool = False) -> int:
@@ -450,6 +497,50 @@ async def run_once(*, dry_run: bool = False) -> int:
         except Exception as exc:
             log.warning("guardian.bm25_canary_failed",
                         error=f"{type(exc).__name__}: {exc}")
+
+        # ---- backstop for provisioning ----
+        # Every path that creates a tenant calls kb_provision_tenant() after
+        # the customer commits (migration 0144); this catches the ones that
+        # failed or never ran it -- a lock timeout, a restore, engine code
+        # that started before 0144 was applied. LAST, after the repair, the
+        # timeline and the canary, and bounded twice (tenants per tick and
+        # wall clock), because each provision can wait up to its 3 s
+        # lock_timeout and none of this is urgent: a minute later is fine.
+        # Each tenant gets its own pooled connection and transaction.
+        #
+        # A tenant whose rows already sit in DEFAULT is refused by the
+        # function before any DDL (ObjectNotInPrerequisiteState).
+        # That is expected, not a failure: split_default() is the attended
+        # fix, and the DEFAULT alarm above already names the tenant.
+        # Each provision is bounded too (ensure_tenant_partition's timeout
+        # cancels the statement server-side), so cancelling here is prompt; the
+        # CronJob's activeDeadlineSeconds stays the hard stop.
+        provisioned: list[str] = []
+        try:
+            await asyncio.wait_for(
+                _provision_missing(conn, provisioned, dry_run=dry_run),
+                PROVISION_BACKSTOP_TIMEOUT_S,
+            )
+        except TimeoutError:
+            log.warning("guardian.tenant_partitions_timeout",
+                        reason="backstop exceeded its bound; the next tick continues")
+        except Exception as exc:
+            log.warning("guardian.tenant_partitions_backstop_failed",
+                        error=f"{type(exc).__name__}: {exc}")
+        # Announced outside the bound (capture is a blocking HTTP call) and
+        # whatever the bound did: these repairs have committed, and the next
+        # tick no longer sees these tenants as missing.
+        if provisioned:
+            capture(
+                "kb_tenant_partitions_provisioned",
+                {
+                    "tenants": provisioned,
+                    "timeline_id": timeline,
+                    "state": "these tenants had no partition on some parent; "
+                    "the guardian created them. The caller that created the "
+                    "tenant did not (or failed to) call kb_provision_tenant()",
+                },
+            )
 
         # Prewarm AFTER the repair and AFTER the timeline is recorded, on
         # purpose and against the reading order. The warm is minutes of
