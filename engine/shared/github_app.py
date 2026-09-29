@@ -18,7 +18,7 @@ import time
 from datetime import UTC, datetime, timedelta
 
 import httpx
-from jose import jwt
+import jwt
 
 from engine.shared.config import get_settings
 from engine.shared.constants import GITHUB_INSTALLATION_SCOPE_PREFIX, SourceSystem
@@ -47,8 +47,10 @@ def _build_app_jwt(app_id: str, private_key_pem: str) -> str:
         "exp": now + 9 * 60,  # GitHub rejects exp > 10min out
         "iss": app_id,
     }
-    # python-jose is untyped; jwt.encode returns str.
-    return str(jwt.encode(claims, private_key_pem, algorithm="RS256"))
+    # PyJWT (not python-jose, whose hard `ecdsa` dependency carries an unfixed
+    # timing advisory). RS256 signing is deterministic, so the token is
+    # byte-identical to the python-jose one it replaces.
+    return jwt.encode(claims, private_key_pem, algorithm="RS256")
 
 
 async def _resolve_installation_id(customer_id: str) -> str:

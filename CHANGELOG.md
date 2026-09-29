@@ -36,6 +36,15 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   stays a plain `Exception` here (the engine has no SDK error tree), and the manual upload
   still refuses on findings (`test_manual_upload_secret_boundary.py`).
 
+- **`python-jose` is gone, and with it `ecdsa` (Dependabot #1, GHSA-wj6h-64fc-37mp).** The
+  Minerva timing advisory on python-ecdsa's P-256 signing has no patched release, and
+  python-jose required `ecdsa` even with its `cryptography` backend. Its one use, the standalone
+  GitHub App JWT in `engine/shared/github_app.py`, now signs with PyJWT, already a dependency.
+  RS256 signing is deterministic, so the token is byte-identical to python-jose's for the same
+  key and claims (checked on PKCS#1 and PKCS#8 keys). `uv.lock` drops `python-jose`, `ecdsa`
+  and `rsa`; nothing else moves. `tests/test_github_app_jwt.py` pins the token GitHub checks and
+  runs in the storage lane.
+
 ### Added
 
 - **What a customer deletes now leaves the engine completely, a week later.** A deleted item
