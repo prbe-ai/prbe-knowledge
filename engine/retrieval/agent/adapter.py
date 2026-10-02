@@ -13,6 +13,7 @@ new `gatherer_notes` field is passed through verbatim for debug clients.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any, get_args
 
@@ -598,6 +599,7 @@ async def to_query_response(
     min_confidence: str | None = None,
     id_pins: list[Any] | None = None,
     top_k: int | None = None,
+    pool_answer: Callable[[GathererOutput], int] | None = None,
 ) -> RetrieveResponse:
     """Wrap a GathererOutput in the existing RetrieveResponse shape.
 
@@ -658,6 +660,13 @@ async def to_query_response(
     a TypeError, not a fail-open default. Pass `None` explicitly when the
     caller genuinely has no gatherer outcome (non-gatherer paths, unit tests);
     that reports not-degraded, which is correct for those callers.
+
+    `pool_answer` (optional): `loop._answer_from_pool` bound to this search.
+    When the live-row gate drops EVERY document a selector picked (all
+    invented, or all out of scope), the selector gave no answer after all, so
+    the pool answers alone -- exactly as when nothing was selected -- and its
+    documents pass the same gate. Never a top-up: it runs only when the gate
+    left nothing.
     """
     if id_pins:
         # Identifier pins: exact matches for ids the USER TYPED, resolved by
@@ -736,17 +745,31 @@ async def to_query_response(
     # or the DB). Failure posture differs -- see _enforce_scope_on_chunks.
     gate_ok = True
     if customer_id:
-        gate_ok = await _enforce_scope_on_chunks(
-            customer_id,
-            gathered,
-            source_keys=source_keys,
-            doc_types=doc_types,
-            trace_id=trace_id,
-            source_keys_include_keyless=source_keys_include_keyless,
-            sources=sources,
-            project_id=project_id,
-            temporal=temporal,
-        )
+        async def _gate() -> bool:
+            return await _enforce_scope_on_chunks(
+                customer_id,
+                gathered,
+                source_keys=source_keys,
+                doc_types=doc_types,
+                trace_id=trace_id,
+                source_keys_include_keyless=source_keys_include_keyless,
+                sources=sources,
+                project_id=project_id,
+                temporal=temporal,
+            )
+
+        selected = any(c.doc_id and not c.harness_appended for c in gathered.chunks)
+        gate_ok = await _gate()
+        if pool_answer is not None and selected and not gathered.chunks:
+            appended = pool_answer(gathered)
+            log.warning(
+                "adapter.selection_dropped_pool_answers",
+                customer_id=customer_id,
+                trace_id=trace_id,
+                appended=appended,
+            )
+            if appended:
+                gate_ok = await _gate() and gate_ok
 
     doc_evidence = _build_doc_to_graph_evidence(prefanout)
 

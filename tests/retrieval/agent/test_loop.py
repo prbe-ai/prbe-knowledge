@@ -3231,6 +3231,47 @@ async def test_project_scope_reaches_prefanout_pins_and_response(
     assert resp.applied_scope == {"project_id": "proj-a"}
 
 
+async def test_a_selection_the_gate_empties_is_answered_by_the_pool(
+    monkeypatch: pytest.MonkeyPatch, fake_request: SimpleNamespace
+) -> None:
+    """Review #618: every doc the gatherer picked is invented (no live row),
+    so the gate drops them all. That is no answer, so the pool answers alone
+    -- through the same gate -- instead of the search returning nothing."""
+    async def gate(customer_id, doc_ids, **kwargs):  # type: ignore[no-untyped-def]
+        return {d: d.startswith("stub:") for d in doc_ids}
+
+    monkeypatch.setattr("engine.retrieval.agent.adapter._scope_verdicts", gate)
+    req = QueryRequest(query="what is PRB-17", top_k=5)
+    with patch(
+        "engine.retrieval.agent.loop.acompletion",
+        new=AsyncMock(return_value=_mk_resp(
+            tool_calls=[_terminal_call(_final_emission_args(chunks=2))]
+        )),
+    ):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+    assert [r.doc_id for r in resp.results] == ["stub:0"]
+    assert [m.channel for m in resp.results[0].matched_via] == ["recall_floor"]
+
+
+async def test_a_selection_the_gate_keeps_is_not_topped_up(
+    monkeypatch: pytest.MonkeyPatch, fake_request: SimpleNamespace
+) -> None:
+    """The counterpart: one pick survives the gate, so it ships alone."""
+    async def gate(customer_id, doc_ids, **kwargs):  # type: ignore[no-untyped-def]
+        return {d: d in ("doc-1", "stub:0") for d in doc_ids}
+
+    monkeypatch.setattr("engine.retrieval.agent.adapter._scope_verdicts", gate)
+    req = QueryRequest(query="what is PRB-17", top_k=5)
+    with patch(
+        "engine.retrieval.agent.loop.acompletion",
+        new=AsyncMock(return_value=_mk_resp(
+            tool_calls=[_terminal_call(_final_emission_args(chunks=2))]
+        )),
+    ):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+    assert [r.doc_id for r in resp.results] == ["doc-1"]
+
+
 async def test_no_project_scope_threads_none_everywhere(
     monkeypatch: pytest.MonkeyPatch, fake_request: SimpleNamespace
 ) -> None:

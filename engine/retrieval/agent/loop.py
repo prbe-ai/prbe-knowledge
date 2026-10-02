@@ -4251,6 +4251,14 @@ async def run_gatherer(
         status=status,
         id_pins=id_pins,
         top_k=req.top_k,
+        # The live-row gate can drop every doc a selector picked (invented or
+        # out-of-scope ids); the pool then answers alone, gated the same way.
+        pool_answer=lambda g: _answer_from_pool(
+            g,
+            state.prefanout,
+            status=status,
+            half_life_days=state.request_recency_half_life_days,
+        ).appended,
     )
 
 
