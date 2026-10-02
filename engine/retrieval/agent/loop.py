@@ -105,7 +105,6 @@ from engine.shared.constants import (
     SEARCH_AGENT_MAX_CONTEXT_TOKENS,
     SEARCH_AGENT_MAX_EXTENSIONS,
     SEARCH_AGENT_MAX_OUTPUT_TOKENS,
-    SEARCH_AGENT_MIN_OUTPUT,
     SEARCH_AGENT_PREFANOUT_MAX_SUBQUERIES,
     SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET,
     SEARCH_AGENT_RULER_MIN_CHARS,
@@ -297,13 +296,11 @@ class LoopState:
     # expansion and validation together (a ranked channel that correctly
     # selects a retired chunk must not have fetch_doc substitute live text).
     request_temporal: TemporalSpec = field(default_factory=TemporalSpec)
-    # QueryRequest.recall_floor_mode. `always` is the shipped behaviour;
-    # `conditional` skips the harness top-up when the gatherer's own answer is
-    # confident and substantial. Request-level so the A/B runs per query on one
-    # deployment instead of needing two.
+    # QueryRequest.recall_floor_mode, recorded on the trace only: no answer is
+    # topped up any more, so there is nothing for `conditional` to skip.
     request_recall_floor_mode: RecallFloorMode = "always"
     # Every doc_id the pre-fan-out render actually put in front of the
-    # gatherer. Filled by `_build_user_message`; read by the recall-floor
+    # gatherer. Filled by `_build_user_message`; read by the `agent.recall_floor`
     # accounting to separate a candidate the model REJECTED from one it never
     # saw. Empty when nothing was rendered (id-lookup short circuit).
     rendered_doc_ids: set[str] = field(default_factory=set)
@@ -342,11 +339,6 @@ class LoopState:
     # Set once the single Phase 2 query rewrite has been spent, so no path can
     # trigger a second one.
     rewrite_used: bool = False
-    # How many documents the response will actually carry (`QueryRequest.top_k`,
-    # capped at the floor's 10). A partial Jev answer reserves slots for the
-    # floor WITHIN this limit -- reserved beyond it, the final truncation
-    # would throw the floor's picks away.
-    response_limit: int = 10
 
 
 # Floor for the remaining-loop budget. Setup (grounding + extraction +
@@ -559,7 +551,7 @@ def _render_prefanout_budgeted(
     actually put in front of the model. It is an out-parameter rather than a
     second function because the selection below is the only place that knows
     what survived the budget, and a recomputation elsewhere would silently
-    drift from it the first time this ranking changes. The recall-floor
+    drift from it the first time this ranking changes. The `agent.recall_floor`
     accounting needs it to tell a candidate the gatherer REJECTED from one it
     was never shown.
 
@@ -1134,7 +1126,7 @@ def _empty_passthrough(
     both (review F9: shipping confidence='low' there made every consumer
     read the lane's best outcome as its weakest).
 
-    Recall-floor backfill may subsequently populate its chunks from citable
+    `_answer_from_pool` may subsequently populate its chunks from citable
     pre-fan-out evidence. When the loop already ran, preserve its
     harness-authoritative turn/tool ledger in the response metadata.
     """
@@ -1875,42 +1867,32 @@ def _build_prefanout_doc_meta(prefanout: dict[str, Any] | None) -> dict[str, dic
     return out
 
 
-# Recall floor: append top pre-fan-out docs the gatherer dropped until the
-# response carries at least this many DISTINCT docs. The gatherer runs
-# single-turn (SOFT_TURN_CAP=1, tool_choice="required") and curates the
-# wide pre-fan-out pool by hand; on breadth questions (multi-session /
-# temporal / commonsense) it under-emits, dropping gold docs that ARE in
-# the top-K pool. The adapter surfaces ONLY emitted chunks, so a dropped
-# gold doc is unrecoverable. Graded latency is set by the NUMBER of
-# sequential LLM turns (replay fixed-delay per call), so appending pool
-# docs the model already had in front of it is free; recall is the graded
-# metric and precision is not, so appending AFTER the gatherer's own picks
-# is strictly safe.
-_RECALL_FLOOR_DOCS = 10
+# The most DISTINCT docs one response carries. A cap, never a quota: a
+# selector that picks fewer delivers fewer, and nothing tops its answer up
+# (Richard, 2026-10-02: "if there aren't enough then there aren't enough").
+# Until then a "recall floor" appended raw pool docs to every answer until it
+# held this many; mixing that fixed fused order into a selector's own picks
+# only muddied them, so it is gone. What is left is `_answer_from_pool`: the
+# pool's fused order answers ALONE when no selector produced an answer at all.
+_RESPONSE_DOCS = 10
 
 
-#: `always` = top the response up to `_RECALL_FLOOR_DOCS` on every query (the
-#: shipped behaviour). `conditional` = only when the gatherer's own answer is
-#: thin. Defined here rather than in models.py because the loop is what acts
-#: on it; `QueryRequest.recall_floor_mode` re-exports the same Literal.
+#: `QueryRequest.recall_floor_mode`, recorded on the trace and no longer acted
+#: on: with no top-up there is nothing for `conditional` to skip.
 RecallFloorMode = Literal["always", "conditional"]
 
 
 @dataclass(slots=True)
 class RecallFloorOutcome:
-    """What the recall floor did, and the two numbers the A/B is graded on.
+    """What `_answer_from_pool` did, and the two numbers that grade curation.
 
-    `appended` alone cannot distinguish a gatherer that curated well from one
-    that was never shown the candidates -- both produce a large backfill. So:
+      rejected   — pool docs the selector WAS shown and chose not to deliver.
+      unexamined — pool docs it never saw (the gatherer's render budget, a Jev
+                   batch that failed). High means the budget, not the
+                   selector, is the ceiling.
 
-      rejected   — pool docs the gatherer WAS shown and chose not to emit.
-                   High and rising means curation is doing real work.
-      unexamined — pool docs that never fit the render budget. High means the
-                   budget, not the prompt, is the ceiling; no amount of prompt
-                   work recovers these.
-
-    `reason` records why the floor fired or did not, so a skipped backfill is
-    as visible in the logs as a performed one.
+    `reason` records whether the pool answered, so a search the selector
+    answered is as visible in the logs as one the pool answered.
     """
 
     appended: int
@@ -1941,11 +1923,11 @@ def _source_weight(
     TWO stages weigh sources, and they are not the same knob. This weight
     (`score_multiplier`: claude_code 0.5 in kb/handlers/claude_code.py, code
     graph 0.3 in kb/handlers/codegraph.py, everything else 1.0, plus the
-    recency decay) shapes the FUSED order that the gatherer render and the
-    recall-floor top-up read. The `jev` selector ranks the pool by Jev's
+    recency decay) shapes the FUSED order that the gatherer render and
+    `_answer_from_pool` read. The `jev` selector ranks the pool by Jev's
     probability instead and applies its own source-kind tier penalties there
     (`jev.rank_documents`, JEV_TIER_PENALTIES); this weight reaches a Jev
-    search only through the floor's top-up of unscored slots.
+    search only when Jev could not answer and the pool answers alone.
 
     Multiplier BEFORE decay, deliberately: otherwise a brand-new transcript
     sits at age 0, contributes no decay, and bypasses its demotion entirely.
@@ -2059,7 +2041,7 @@ def _has_citable_prefanout_evidence(prefanout: dict[str, Any] | None) -> bool:
     """Whether pre-fan-out contains a document safe to return without the LLM.
 
     ``_fuse_prefanout_docs`` already enforces the citation boundary used by
-    recall-floor backfill: a non-empty ``doc_id`` plus nonblank ``content``.
+    ``_answer_from_pool``: a non-empty ``doc_id`` plus nonblank ``content``.
     Reusing it here keeps the provider-error gate and response construction in
     lockstep, including inferred-edge hits that carry no citable body.
     """
@@ -2153,24 +2135,21 @@ def _log_recall_floor(
     customer_id: str,
     trace_id: str,
     status: str,
-    mode: RecallFloorMode,
     total_chunks: int,
 ) -> None:
-    """One log line per query, whether or not the floor fired.
+    """One log line per query, whether the selector or the pool answered.
 
-    Logged unconditionally -- the old call site logged only when it appended,
-    which made "the floor was skipped because the gatherer was good" and "the
-    floor never ran" the same observation. The A/B needs to tell those apart.
+    Logged unconditionally, so "the selector answered" and "this line never
+    ran" are different observations.
     """
     log.info(
         "agent.recall_floor",
         customer_id=customer_id,
         trace_id=trace_id,
         status=status,
-        mode=mode,
         reason=outcome.reason,
         appended=outcome.appended,
-        # Pool docs the gatherer saw and declined vs. never saw. See
+        # Pool docs the selector saw and declined vs. never saw. See
         # RecallFloorOutcome.
         rejected=outcome.rejected,
         unexamined=outcome.unexamined,
@@ -2178,48 +2157,24 @@ def _log_recall_floor(
     )
 
 
-def _recall_floor_should_backfill(
-    gathered: GathererOutput, *, mode: RecallFloorMode
-) -> tuple[bool, str]:
-    """Should the harness top this response up from the raw pool?
+def _pool_answers(gathered: GathererOutput, *, status: str) -> tuple[bool, str]:
+    """Does retrieval's own fused order answer this search?
 
-    Returns `(backfill, reason)`; `reason` is logged so a skipped backfill is
-    as visible as a performed one.
+    Only when no selector delivered anything: the `floor` selector (which
+    picks nothing by design), Jev unavailable, a gatherer that timed out or
+    failed. The answer is then the pool's fused order, capped at
+    `_RESPONSE_DOCS` -- a ranking with a cap, not a fill. A selector that
+    answered keeps its answer exactly, however few documents it holds; the pool
+    never tops it up. A pure identifier lookup's answer is its pins, which the
+    adapter delivers, so the pool stays out of it too.
 
-        mode=always       -> always, the shipped behaviour
-        mode=conditional  -> only when the curated answer looks THIN:
-                               confidence is not "high",  OR
-                               the gatherer emitted < SEARCH_AGENT_MIN_OUTPUT
-                               chunks,                    OR
-                               confidence is ABSENT
-
-    WHY CONDITIONAL AT ALL. The floor was unconditional, and it supplies 88% of
-    returned chunks: the gatherer's curation -- the `why_relevant` line, the
-    confidence grade, the decision NOT to emit something -- is a rounding error
-    in what a consumer actually receives. Skipping the top-up when the gatherer
-    already did a confident, substantial job is what makes curation mean
-    anything. It is a request-level A/B rather than a flip because the graded
-    metric is set-recall, and trading recall for precision is exactly the kind
-    of change that must be measured on a paired run, not asserted.
-
-    WHY ABSENT CONFIDENCE BACKFILLS (fail OPEN). A missing `confidence` is not
-    a low grade, it is a PARSE recovery: `_coerce_lenient` rebuilt an
-    off-schema emit (~2% of calls) and the field never survived. Treating that
-    as "not high" and backfilling keeps a provider quirk from silently cutting
-    recall; treating it as high would let the thinnest answers skip the floor.
+    Returns `(answers, reason)`; `reason` is logged on every search.
     """
-    if mode == "always":
-        return True, "mode_always"
-    confidence = getattr(gathered.gatherer_notes, "confidence", None)
-    if confidence not in _CONFIDENCE_VALID:
-        # Absent or unparseable -> a schema recovery, not a verdict. Fail open.
-        return True, "confidence_absent"
-    if confidence != "high":
-        return True, f"confidence_{confidence}"
-    emitted = len([c for c in gathered.chunks if c.doc_id])
-    if emitted < SEARCH_AGENT_MIN_OUTPUT:
-        return True, "output_below_min"
-    return False, "gatherer_sufficient"
+    if any(c.doc_id for c in gathered.chunks):
+        return False, "selector_answered"
+    if status == "id_lookup_short_circuit":
+        return False, "id_pins_answer"
+    return True, "no_selection"
 
 
 def _chunk_from_hit(
@@ -2231,7 +2186,7 @@ def _chunk_from_hit(
 ) -> GatheredChunk:
     """A delivered chunk built from a pre-fan-out hit, by the harness.
 
-    One constructor for every harness-built chunk (the recall floor, and the
+    One constructor for every harness-built chunk (`_answer_from_pool`, and the
     `jev` selector) so the two can never disagree about which doc-level fields a
     chunk carries. The content is the STORED text: nothing here was re-typed by
     a model, which is the whole point of harness-side emission.
@@ -2259,82 +2214,59 @@ def _chunk_from_hit(
     )
 
 
-def _backfill_recall_floor(
+def _answer_from_pool(
     gathered: GathererOutput,
     prefanout: dict[str, Any] | None,
     *,
+    status: str,
     half_life_days: float | None = None,
-    mode: RecallFloorMode = "always",
     examined_doc_ids: set[str] | None = None,
 ) -> RecallFloorOutcome:
-    """Append top fused pre-fan-out docs the gatherer didn't emit until the
-    response carries at least `_RECALL_FLOOR_DOCS` distinct docs.
+    """When no selector answered, answer with the pool's top fused docs.
 
-    No-op when the pool is empty, when the gatherer already cleared the floor,
-    or when `mode="conditional"` and the curated answer is already good enough
-    (see `_recall_floor_should_backfill`). Mutates `gathered.chunks` in place.
+    Mutates `gathered.chunks` in place, and only when `_pool_answers` says the
+    pool answers: then `gathered` holds no delivered doc, so the response is the
+    pool's fused order capped at `_RESPONSE_DOCS`, each chunk tagged
+    `recall_floor`. Otherwise nothing is appended -- a selector's answer is
+    never topped up, whatever its size.
 
-    THE DECISION, in order:
-
-        pool empty ----------------------------> nothing to append
-        mode=conditional and answer is strong -> skipped, reason recorded
-        floor already cleared -----------------> nothing needed
-        otherwise -----------------------------> append pool docs, newest
-                                                 fused rank first, each
-                                                 tagged `recall_floor`
-
-    Returns a `RecallFloorOutcome` carrying the count, the decision reason, and
-    the two numbers the A/B is graded on: how many pool docs the gatherer SAW
-    and did not emit (`rejected`) versus how many never reached it at all
-    (`unexamined`). Backfill share on its own cannot tell a gatherer that
-    curates well from one that never got the candidates.
+    Returns a `RecallFloorOutcome` with the count, the reason, and how many
+    pool docs the selector SAW and did not deliver (`rejected`) versus how many
+    never reached it (`unexamined`).
     """
     fused = _fuse_prefanout_docs(prefanout, half_life_days=half_life_days)
     emitted_docs = {c.doc_id for c in gathered.chunks if c.doc_id}
     examined = {d for d in (examined_doc_ids or set()) if d}
     pool_docs = {entry["doc_id"] for entry in fused}
-    # A pool doc the gatherer saw and chose not to emit is a REJECTION -- the
-    # curation working. A pool doc it never saw is a RENDER-BUDGET miss, which
-    # no prompt change can fix. They look identical in a backfill count.
+    # A pool doc the selector saw and chose not to deliver is a REJECTION -- the
+    # curation working. A pool doc it never saw is a budget or batch miss,
+    # which no prompt change can fix.
     rejected = len((pool_docs & examined) - emitted_docs) if examined else 0
     unexamined = len(pool_docs - examined - emitted_docs) if examined else len(
         pool_docs - emitted_docs
     )
 
-    should, reason = _recall_floor_should_backfill(gathered, mode=mode)
-    if not should:
+    answers, reason = _pool_answers(gathered, status=status)
+    if not answers:
         return RecallFloorOutcome(
             appended=0, reason=reason, rejected=rejected, unexamined=unexamined
         )
-
-    needed = _RECALL_FLOOR_DOCS - len(emitted_docs)
-    if needed <= 0:
-        return RecallFloorOutcome(
-            appended=0, reason="floor_already_met", rejected=rejected, unexamined=unexamined
-        )
-    appended = 0
-    for entry in fused:
-        if appended >= needed:
-            break
-        doc_id = entry["doc_id"]
-        if doc_id in emitted_docs:
-            continue
+    for entry in fused[:_RESPONSE_DOCS]:
         gathered.chunks.append(
             _chunk_from_hit(
-                doc_id,
+                entry["doc_id"],
                 entry["hit"],
                 # `recall_floor`, NOT the channel the hit came from. The channel
-                # would claim a model surfaced this passage on purpose; it did
-                # not. Carrying the real provenance is what lets a consumer
-                # weigh curated evidence against raw pool recall at all -- see
+                # would claim a selector chose this passage; nothing did.
+                # Carrying the real provenance is what lets a consumer weigh
+                # selected evidence against raw pool order at all -- see
                 # MatchProvenance.channel. `harness_appended` says the same on
                 # the chunk itself, so the trace records what was DELIVERED.
                 matched_via=["recall_floor"],
                 harness_appended=True,
             )
         )
-        emitted_docs.add(doc_id)
-        appended += 1
+    appended = min(len(fused), _RESPONSE_DOCS)
     return RecallFloorOutcome(
         appended=appended, reason=reason, rejected=rejected, unexamined=unexamined
     )
@@ -2803,11 +2735,12 @@ def _finalize_agent_timing(
 #          |
 #          +-- selector=gatherer --> LLM turn(s) re-type chosen chunks --+
 #          |                                                             |
-#          +-- selector=floor ----> (nothing picked) --------------------+--> recall
-#          |                                                             |    floor
-#          +-- selector=jev ------> Jev scores EVERY chunk --> top N ----+    tops up
-#                                     |   docs by best chunk (N = 10, or    / answers
-#                                     |   its scored share if partial)        alone
+#          +-- selector=floor ----> (nothing picked) --------------------+--> nothing
+#          |                                                             |    picked:
+#          +-- selector=jev ------> Jev scores EVERY chunk --> top N ----+    pool's
+#                                     |   docs by best chunk, N <= 10;        fused
+#                                     |   never topped up                     order
+#                                     |                                       answers
 #                                     |
 #                                     +-- best < SEARCH_REWRITE_BELOW_SCORE, or
 #                                         pool empty, rewrite not yet spent,
@@ -3020,11 +2953,11 @@ async def _select_without_gatherer(
 ) -> tuple[GathererOutput, GathererStatus]:
     """Pick the documents without the gatherer LLM. Never raises.
 
-    `floor`: pick nothing; the recall floor downstream fills the response.
-    `jev`: score the pool, emit the top documents' best chunks. Any Jev failure
-    degrades to the floor with status `jev_unavailable` -- the answer a `floor`
-    request would have got -- so a vendor outage costs quality, never the
-    search. `deadline` is the agent stage's `perf_counter` deadline: the rewrite
+    `floor`: pick nothing; `_answer_from_pool` downstream answers with the
+    pool's fused order. `jev`: score the pool, emit the top documents' best
+    chunks. Any Jev failure picks nothing, with status `jev_unavailable` -- the
+    answer a `floor` request would have got -- so a vendor outage costs
+    quality, never the search. `deadline` is the agent stage's `perf_counter` deadline: the rewrite
     is skipped when too little of it is left, and the caller bounds the whole
     call by it.
     """
@@ -3076,7 +3009,7 @@ async def _select_without_gatherer(
         )
         return _empty_passthrough("jev_unavailable", state), "jev_unavailable"
 
-    ranked = jev.rank_documents(pool, scores, limit=_RECALL_FLOOR_DOCS)
+    ranked = jev.rank_documents(pool, scores, limit=_RESPONSE_DOCS)
     # The best probability is read off the DELIVERED set, not off `ranked[0]`:
     # the ranking subtracts a tier penalty (JEV_TIER_PENALTIES), so the first
     # delivered document is not always the one Jev rated highest. The rewrite
@@ -3101,7 +3034,7 @@ async def _select_without_gatherer(
             # The first pass already scored: keep it, report the gap.
             sel["rewrite"]["rescore_error"] = f"{type(exc).__name__}"
         pool = grown
-        ranked = jev.rank_documents(pool, scores, limit=_RECALL_FLOOR_DOCS)
+        ranked = jev.rank_documents(pool, scores, limit=_RESPONSE_DOCS)
         best_after = jev.delivered_best(ranked)
         sel["rewrite"]["best_after"] = round(best_after, 4) if best_after is not None else None
         sel["rewrite"]["helped"] = bool(
@@ -3117,14 +3050,9 @@ async def _select_without_gatherer(
         sel["unscored"] = len(pool) - len(scores)
     if sel.get("partial"):
         # Part of the pool was never scored, so Jev's top ten are the top ten
-        # of what it SAW. Give it only its share of the slots and let the floor
-        # fill the rest from retrieval's own order -- and say so: this is a
+        # of what it SAW. They ship as they are -- nothing fills the slots an
+        # unscored batch might have won -- and the status says so: this is a
         # degraded answer, not an `ok` one.
-        share = len(scores) / max(1, len(pool))
-        limit = max(1, min(_RECALL_FLOOR_DOCS, state.response_limit))
-        # Floor, not round: with any part unscored the floor keeps >= 1 slot
-        # (unless the limit is 1, where Jev's single best must stand).
-        ranked = ranked[: max(1, min(limit - 1, int(limit * share)) if limit > 1 else 1)]
         status = "jev_partial"
 
     channels = jev.channels_by_chunk(state.prefanout)
@@ -3137,8 +3065,8 @@ async def _select_without_gatherer(
         )
         for r in ranked
     ]
-    # What Jev actually SCORED, for the recall-floor accounting that separates
-    # "rejected" from "never examined": a doc in a batch that failed was not
+    # What Jev actually SCORED, for the `agent.recall_floor` accounting that
+    # separates "rejected" from "never examined": a doc in a batch that failed was not
     # examined, and must not be reported as Jev turning it down.
     state.rendered_doc_ids = _scoreable_doc_ids({c: h for c, h in pool.items() if c in scores})
     # Confidence describes the DELIVERED set (the same number the rewrite
@@ -3391,10 +3319,8 @@ async def run_gatherer(
     if pure_lookup:
         # Skip the extractor LLM call outright: there is no topical residual
         # to extract entities or reformulations FROM. The prefanout below
-        # still runs (raw query, grounded anchors); the short-circuit block
-        # projects its top fused docs into the response via the recall-floor
-        # backfill, so the answer carries context around the pinned docs,
-        # not just their cards.
+        # still runs (raw query, grounded anchors) and rides the trace; the
+        # answer is the pins alone -- no pool docs are appended around them.
         extracted = EntityExtraction()
     else:
         # Seed the extractor too — without it, entity extraction variance
@@ -3558,19 +3484,8 @@ async def run_gatherer(
     request_doc_types = req.doc_types or None
     request_sources = [s.value for s in req.sources] if req.sources else None
     request_discovery = bool(req.discovery)
-    # The A/B lever. `conditional` is honoured only when the deployment opts in,
-    # exactly like any other unreleased retrieval posture: a request must not be
-    # able to change how much recall a tenant gets until we have measured it.
-    # Off -> every request runs `always`, the shipped behaviour, whatever it asks
-    # for. The rejection is silent by design (the request is still valid and
-    # still served); `agent.recall_floor` logs the mode actually applied.
-    from engine.shared.config import get_settings as _get_settings
-
-    request_recall_floor_mode: RecallFloorMode = (
-        req.recall_floor_mode
-        if _get_settings().recall_floor_conditional_enabled
-        else "always"
-    )
+    # Recorded on the trace, not acted on (see LoopState).
+    request_recall_floor_mode: RecallFloorMode = req.recall_floor_mode
     request_source_keys_include_keyless = bool(req.source_keys_include_keyless)
     request_per_source_top_k = req.per_source_top_k
     effective_doc_types = request_doc_types or search_options.doc_types or None
@@ -3712,8 +3627,9 @@ async def run_gatherer(
     else:
         # `floor` / `jev` never send a prompt: rendering one tokenises the whole
         # pool on the event loop and ~80KB of text nobody reads would land in
-        # the trace blob. It also leaves `rendered_doc_ids` empty, so the floor
-        # does not count pool docs as "rejected" by a gatherer that never ran.
+        # the trace blob. It also leaves `rendered_doc_ids` empty, so
+        # `_answer_from_pool` does not count pool docs as "rejected" by a
+        # gatherer that never ran.
         user_msg = ""
         system_prompt = ""
 
@@ -3731,7 +3647,6 @@ async def run_gatherer(
         request_recall_floor_mode=request_recall_floor_mode,
         rendered_doc_ids=rendered_doc_ids,
         selector=selector,
-        response_limit=max(1, min(_RECALL_FLOOR_DOCS, req.top_k or _RECALL_FLOOR_DOCS)),
         grounding_json=_grounding_json,
         extraction_json=_extraction_json,
         request_temporal=request_temporal,
@@ -3793,11 +3708,9 @@ async def run_gatherer(
         # excludes this status — it is the lane working as designed
         # (~seconds instead of LLM turns), so the passthrough overrides the
         # degraded-path defaults: confidence high, no dropped marker
-        # (review F9). The recall-floor backfill below projects the top
-        # fused prefanout docs into the response so it carries context
-        # around the pinned docs, not just their cards — without the
-        # explicit call the early return would skip the shared backfill at
-        # the end of this function and discard the prefanout (review F1).
+        # (review F9). The adapter delivers the pins; no pool docs are
+        # appended around them (`_pool_answers` -> "id_pins_answer"). The
+        # call stays so this path logs `agent.recall_floor` like every other.
         log.info(
             "agent.id_lookup_short_circuit",
             customer_id=customer_id,
@@ -3811,11 +3724,11 @@ async def run_gatherer(
             confidence="high",
             record_drop=False,
         )
-        floor = _backfill_recall_floor(
+        floor = _answer_from_pool(
             gathered,
             state.prefanout,
+            status=status,
             half_life_days=state.request_recency_half_life_days,
-            mode=state.request_recall_floor_mode,
             examined_doc_ids=state.rendered_doc_ids,
         )
         _log_recall_floor(
@@ -3823,7 +3736,6 @@ async def run_gatherer(
             customer_id=customer_id,
             trace_id=trace_id,
             status=status,
-            mode=state.request_recall_floor_mode,
             total_chunks=len(gathered.chunks),
         )
         timing["agent_ms"] = (time.perf_counter() - t_agent) * 1000
@@ -4016,8 +3928,8 @@ async def run_gatherer(
 
     gathered: GathererOutput | None = None
     if state.selector != "gatherer":
-        # `floor` / `jev`: no LLM turn. The recall floor below still runs and
-        # tops the response up exactly as it does after the gatherer.
+        # `floor` / `jev`: no LLM turn. `_answer_from_pool` below answers only
+        # if nothing was selected, exactly as it does after the gatherer.
         t_select = time.perf_counter()
         # The same stage cap the gatherer lives under. Each Jev call has its own
         # timeout, but the rewrite adds an LLM call, a fan-out and a rescore;
@@ -4041,7 +3953,7 @@ async def run_gatherer(
         # What is LEFT of the stage budget after setup. Floored at a small positive
         # value rather than 0: a non-positive wait_for would cancel the loop before
         # it ran a single turn, and an already-blown budget should still degrade
-        # through the normal timeout path (which backfills from the pre-fan-out)
+        # through the normal timeout path (where the pool answers alone)
         # rather than take a different branch.
         loop_budget = _remaining_loop_budget(t_stage_start)
         # Did the floor above do ALL the work? Setup (grounding + extraction +
@@ -4125,7 +4037,7 @@ async def run_gatherer(
                 # The configured provider call/chain has already ended. Do not
                 # replay this high-token turn in-process. In managed mode the
                 # gateway owns Cerebras -> Fireworks; direct mode retains SDK
-                # behavior. The recall-floor backfill below converts the citable
+                # behavior. `_answer_from_pool` below converts the citable
                 # pre-fan-out pool into a low-confidence response without masking
                 # fatal auth, configuration, validation, or unknown errors.
                 log.warning(
@@ -4180,25 +4092,15 @@ async def run_gatherer(
                 )
                 raise HTTPException(status_code=503, detail="search agent unavailable") from exc
 
-    # Recall-floor backfill. The single-turn gatherer curates the wide
-    # pre-fan-out pool by hand and under-emits on breadth questions; append
-    # the top fused pool docs it dropped (after its own picks) so the
-    # graded recall isn't capped by hand-curation. Latency-neutral — no
-    # added LLM turn. Also recovers recall on degraded paths (loop_timeout
-    # / schema_violation) where `gathered` is empty but the pool has hits.
-    # A Jev answer that is partial or missing reserved its empty slots FOR the
-    # floor: `conditional` mode must not skip the top-up just because the
-    # scored part looks confident.
-    floor_mode: RecallFloorMode = (
-        "always"
-        if status in ("jev_partial", "jev_unavailable")
-        else state.request_recall_floor_mode
-    )
-    floor = _backfill_recall_floor(
+    # A selector's answer ships as it is; only when nothing was selected (the
+    # `floor` selector, Jev unavailable, a gatherer that timed out or failed)
+    # does the pool's fused order answer, capped at `_RESPONSE_DOCS`. Never a
+    # top-up: an answer is the selector's or the pool's, not a mix.
+    floor = _answer_from_pool(
         gathered,
         state.prefanout,
+        status=status,
         half_life_days=state.request_recency_half_life_days,
-        mode=floor_mode,
         examined_doc_ids=state.rendered_doc_ids,
     )
     _log_recall_floor(
@@ -4206,11 +4108,10 @@ async def run_gatherer(
         customer_id=customer_id,
         trace_id=trace_id,
         status=status,
-        mode=floor_mode,
         total_chunks=len(gathered.chunks),
     )
 
-    # Dedupe AFTER the backfill, never inside it. The pool can hold the same
+    # Dedupe AFTER the pool answer, never inside it. The pool can hold the same
     # passage the gatherer already emitted (a Slack cross-post, a Notion
     # mirror), and order here is delivery order -- gatherer picks first -- so
     # the curated copy with its `why_relevant` line is the one that survives.
@@ -4350,6 +4251,22 @@ async def run_gatherer(
         status=status,
         id_pins=id_pins,
         top_k=req.top_k,
+        # The live-row gate can drop every doc a selector picked (invented or
+        # out-of-scope ids); the pool then answers alone, gated the same way.
+        # Offered only when a selector DID answer -- decided here, from the
+        # loop's own outcome, never from model-suppliable chunk flags.
+        pool_answer=(
+            (
+                lambda g: _answer_from_pool(
+                    g,
+                    state.prefanout,
+                    status=status,
+                    half_life_days=state.request_recency_half_life_days,
+                ).appended
+            )
+            if floor.reason == "selector_answered"
+            else None
+        ),
     )
 
 

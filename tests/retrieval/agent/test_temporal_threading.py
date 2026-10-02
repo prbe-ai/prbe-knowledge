@@ -29,7 +29,7 @@ from engine.retrieval.agent.adapter import (
     _scope_verdicts,
     to_query_response,
 )
-from engine.retrieval.agent.loop import LoopState, _backfill_recall_floor, _execute_tool_call
+from engine.retrieval.agent.loop import LoopState, _answer_from_pool, _execute_tool_call
 from engine.retrieval.agent.models import GatheredChunk, GathererNotes, GathererOutput
 from engine.retrieval.agent.tools import (
     _coerce_temporal,
@@ -182,7 +182,7 @@ async def test_response_reports_the_real_doc_version(monkeypatch: pytest.MonkeyP
 
 
 # ============================================================
-# 4. The recall floor marks what it appends
+# 4. The pool answer marks what it appends
 # ============================================================
 
 
@@ -195,7 +195,7 @@ def test_backfill_marks_every_chunk_it_appends() -> None:
         "bm25": [], "graph": [], "inferred_edge": [],
     }]}
     gathered = GathererOutput(chunks=[], gatherer_notes=GathererNotes())
-    outcome = _backfill_recall_floor(gathered, prefanout)
+    outcome = _answer_from_pool(gathered, prefanout, status="ok")
     assert outcome.appended == 3 and len(gathered.chunks) == 3
     assert all(c.harness_appended for c in gathered.chunks)
     # And each one says HOW it got here, not which channel it was pulled from.
@@ -473,7 +473,7 @@ def test_backfilled_chunks_carry_the_version_they_were_read_from() -> None:
         "bm25": [], "graph": [], "inferred_edge": [],
     }]}
     gathered = GathererOutput(chunks=[], gatherer_notes=GathererNotes())
-    assert _backfill_recall_floor(gathered, prefanout).appended == 1
+    assert _answer_from_pool(gathered, prefanout, status="ok").appended == 1
     assert gathered.chunks[0].doc_version == 4
 
 

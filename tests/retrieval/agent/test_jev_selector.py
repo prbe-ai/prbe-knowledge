@@ -7,8 +7,9 @@ Two layers:
   * `run_gatherer` end to end with each selector, on the suite's stubbed
     grounding / extraction / pre-fan-out. The load-bearing checks are that
     `floor` and `jev` NEVER call the gatherer LLM, that Jev's order survives
-    to the response, and that every Jev failure degrades to the recall floor
-    instead of failing the search.
+    to the response, that a partial Jev answer is never topped up, and that
+    every Jev failure is answered by the pool's fused order instead of failing
+    the search.
 """
 
 from __future__ import annotations
@@ -568,11 +569,14 @@ async def test_a_hanging_jev_is_cut_by_its_timeout_and_the_floor_answers(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_partial_scoring_is_degraded_and_the_floor_fills_the_rest(monkeypatch):
+async def test_partial_scoring_is_degraded_and_never_topped_up(monkeypatch):
+    scored_docs: set[str] = set()
+
     async def half(query, pool, *, api_key, client=None):
         out = jev.ScoreResult(requests=1)
         keys = list(pool)
         out.scores = {c: 0.9 for c in keys[: len(keys) // 2]}
+        scored_docs.update(pool[c].get("doc_id") or c for c in out.scores)
         out.errors = ["http_503:unknown"]
         return out
 
@@ -581,10 +585,11 @@ async def test_partial_scoring_is_degraded_and_the_floor_fills_the_rest(monkeypa
         resp = await L.run_gatherer(_req(selector="jev"), customer_id="c1", request=fr)
     assert fr.state.gatherer_status == "jev_partial"
     assert resp.degraded is True
-    assert len(resp.results) == 10
-    floor_filled = [r for r in resp.results
-                    if any(m.channel == "recall_floor" for m in r.matched_via)]
-    assert floor_filled, "the floor must fill the slots Jev could not rank"
+    assert resp.results
+    assert len(resp.results) == min(10, len(scored_docs))
+    assert {r.doc_id for r in resp.results} <= scored_docs, \
+        "only documents Jev scored may ship; nothing fills the unscored slots"
+    assert not any(any(m.channel == "recall_floor" for m in r.matched_via) for r in resp.results)
 
 
 @pytest.mark.asyncio
@@ -805,15 +810,20 @@ async def test_invalid_probabilities_are_not_scores():
 
 @pytest.mark.asyncio
 async def test_a_200_that_skips_answers_is_partial_not_ok(monkeypatch):
+    scored_docs: set[str] = set()
+
     async def skippy(query, pool, *, api_key, client=None):
         out = jev.ScoreResult(requests=1)
         out.scores = {c: 0.9 for c in list(pool)[:3]}  # no errors, just gaps
+        scored_docs.update(pool[c].get("doc_id") or c for c in out.scores)
         return out
 
     fr = _state()
     with patch.object(jev, "score_pool", new=skippy):
         resp = await L.run_gatherer(_req(selector="jev"), customer_id="c1", request=fr)
-    assert fr.state.gatherer_status == "jev_partial" and len(resp.results) == 10
+    assert fr.state.gatherer_status == "jev_partial"
+    # Three scored chunks -> at most three documents, not ten.
+    assert 1 <= len(resp.results) == len(scored_docs) <= 3
 
 
 @pytest.mark.asyncio
@@ -861,24 +871,26 @@ async def test_a_slow_rewrite_keeps_the_first_pass(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_partial_answers_force_the_floor_even_in_conditional_mode(monkeypatch):
-    from engine.shared.config import get_settings
-
-    monkeypatch.setattr(get_settings(), "recall_floor_conditional_enabled", True)
-
+async def test_recall_floor_mode_is_accepted_and_changes_nothing(monkeypatch):
+    """Callers still send `recall_floor_mode`; it must not 422 and must not
+    bring a top-up back."""
     async def half(query, pool, *, api_key, client=None):
         out = jev.ScoreResult(requests=1)
         out.scores = {c: 0.9 for c in list(pool)[: len(pool) // 2]}
         out.errors = ["http_503:unknown"]
         return out
 
-    fr = _state()
-    with patch.object(jev, "score_pool", new=half):
-        resp = await L.run_gatherer(
-            _req(selector="jev", recall_floor_mode="conditional"), customer_id="c1", request=fr
-        )
-    assert fr.state.gatherer_status == "jev_partial"
-    assert len(resp.results) == 10
+    results = {}
+    for mode in ("always", "conditional"):
+        fr = _state()
+        with patch.object(jev, "score_pool", new=half):
+            resp = await L.run_gatherer(
+                _req(selector="jev", recall_floor_mode=mode), customer_id="c1", request=fr
+            )
+        assert fr.state.gatherer_status == "jev_partial"
+        assert not any(any(m.channel == "recall_floor" for m in r.matched_via) for r in resp.results)
+        results[mode] = [r.doc_id for r in resp.results]
+    assert results["always"] == results["conditional"]
 
 
 @pytest.mark.asyncio
@@ -910,7 +922,7 @@ async def test_each_request_keeps_the_pool_wait_bound():
 
 
 @pytest.mark.asyncio
-async def test_partial_answers_leave_the_floor_room_inside_top_k(monkeypatch):
+async def test_a_partial_answer_fills_top_k_with_scored_documents_only(monkeypatch):
     async def most(query, pool, *, api_key, client=None):
         out = jev.ScoreResult(requests=1)
         keys = list(pool)
@@ -922,8 +934,8 @@ async def test_partial_answers_leave_the_floor_room_inside_top_k(monkeypatch):
     with patch.object(jev, "score_pool", new=most):
         resp = await L.run_gatherer(_req(selector="jev", top_k=5), customer_id="c1", request=fr)
     assert len(resp.results) == 5
-    assert any(any(m.channel == "recall_floor" for m in r.matched_via) for r in resp.results), \
-        "a partial answer must leave the floor at least one of the slots the caller will see"
+    assert not any(any(m.channel == "recall_floor" for m in r.matched_via) for r in resp.results), \
+        "every slot the caller sees holds a document Jev scored"
 
 
 @pytest.mark.asyncio

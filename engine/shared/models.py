@@ -430,27 +430,17 @@ class QueryRequest(BaseModel):
             "get the deployment's default. `gatherer`: an LLM reads the top of "
             "the candidate pool and picks. `floor`: the top documents by fused "
             "retrieval score, no model. `jev`: a typed-decision model scores "
-            "every candidate and the best-scoring documents ship, topped up "
-            "from the floor. Useful for comparing selectors on the same query; "
+            "every candidate and the best-scoring documents ship, never "
+            "topped up. Useful for comparing selectors on the same query; "
             "every value returns the same response shape."
         ),
     )
     recall_floor_mode: Literal["always", "conditional"] = Field(
         default="always",
         description=(
-            "How the harness tops a response up from the raw pre-fan-out pool. "
-            "`always` (default) appends pool docs until the response carries 10 "
-            "distinct documents, whatever the gatherer emitted. `conditional` "
-            "appends only when the gatherer's own answer looks thin -- its "
-            "confidence is not `high`, or it emitted fewer than the minimum "
-            "number of chunks. Use `conditional` when you would rather receive "
-            "five curated passages, each with a `why_relevant` line written by "
-            "a model that read it, than ten of which five are raw pool docs "
-            "nobody vouched for; keep `always` when recall is what you are "
-            "graded on. Backfilled chunks are tagged `matched_via` channel "
-            "`recall_floor`, so you can tell the two apart either way. Honoured "
-            "only on deployments that have enabled it; elsewhere every request "
-            "runs `always`."
+            "No effect. Responses are never topped up from the raw pool any "
+            "more, so there is nothing for `conditional` to skip; accepted so "
+            "existing callers keep working, and recorded on the trace."
         ),
     )
     source_keys_include_keyless: bool = Field(
@@ -580,15 +570,13 @@ class MatchProvenance(BaseModel):
         "graph",
         "inferred_edge",
         "id_lookup",
-        # The harness appended this chunk to clear the recall floor -- the
-        # gatherer never emitted it, so no channel "surfaced" it in the sense
-        # the other five mean. It is named rather than folded into the channel
-        # the chunk happened to come from because the two carry different
-        # warranties: a `vector` entry says a model read the passage and chose
-        # it, a `recall_floor` entry says only that it ranked highly in the
-        # pre-fan-out pool. A consumer weighing curated evidence against raw
-        # recall cannot tell them apart otherwise, and today 88% of returned
-        # chunks arrive this way.
+        # No selector picked anything (the `floor` selector, Jev unavailable, a
+        # gatherer that failed), so the response is the pre-fan-out pool's own
+        # fused order -- never a top-up of a selector's answer. It is named
+        # rather than folded into the channel the chunk happened to come from
+        # because the two carry different warranties: a `vector` entry says a
+        # selector read the passage and chose it, a `recall_floor` entry says
+        # only that it ranked highly in the pool.
         "recall_floor",
     ]
     rank: int

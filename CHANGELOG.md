@@ -135,6 +135,17 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   2026-09-25, 109 of 181 Claude Code batch uploads in 4 hours failed this way.
 
 ### Changed
+- **A search answer is never topped up from the raw pool any more.** Until now every answer was
+  padded to 10 documents with retrieval's fused order: the gatherer's picks, and the slots Jev left
+  when it scored only part of the pool (`jev_partial`), were filled with raw-pool documents tagged
+  `recall_floor`. Now a selector's answer ships as it is, however few documents it holds, and
+  `jev_partial` returns Jev's ranking of what it scored. The pool's fused order answers ALONE only
+  when nothing was selected: the `floor` selector, Jev unavailable, or a gatherer that timed out or
+  failed (still tagged `recall_floor`, still capped at 10). A pure identifier lookup returns its
+  pins without pool documents around them. `recall_floor_mode` is still accepted and recorded on
+  the trace but has no effect; the `recall_floor_conditional_enabled` setting is gone. Last 7 days
+  in prod: 37 top-up documents across 14 of 3,511 searches with results (31 in 8 `jev_partial`
+  searches, 6 in 6 `ok` Jev searches); the 27 searches the pool answered alone keep their answer.
 - **A re-ended session pays only for what changed.** When a coding-agent session is resumed and
   ended again, each segment the session already mined, unchanged, is answered from a cache of
   that segment's earlier model answer instead of a new model call; so is the supersession

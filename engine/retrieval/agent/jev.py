@@ -465,9 +465,9 @@ async def score_pool(
     """Score every chunk in `pool`; batches run concurrently.
 
     Raises `JevError` only when NOTHING came back. A partial result (one batch
-    failed) is returned as-is: the unscored chunks rank below every scored one,
-    and the recall floor tops the response up -- which is the same answer the
-    request would have got without Jev at all.
+    failed) is returned as-is: the unscored chunks are left out of the ranking,
+    and the answer ships with what WAS scored, never topped up (status
+    `jev_partial`).
     """
     if not api_key:
         raise JevError("TYPESAFE_API_KEY is not configured")
@@ -590,7 +590,7 @@ def rank_documents(
 ) -> list[RankedDoc]:
     """The top `limit` DOCUMENTS by their best-scoring chunk, less a tier penalty.
 
-    Units are documents because that is what the recall floor counts and what
+    Units are documents because that is what the response cap counts and what
     a reader receives -- ranking chunks would let one long document take every
     slot. A document scores as its best chunk: a long doc whose fourth chunk is
     the answer must not be ranked on its first.
