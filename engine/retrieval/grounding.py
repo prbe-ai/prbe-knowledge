@@ -590,7 +590,12 @@ async def _entity_rows(
     default for entities).
     """
     global _entity_match_fn_exists
-    if customer_id:
+    # Only positive integer caps go to the function: the inline statement
+    # treats a NULL cap as "no limit" and raises on a negative one, while the
+    # function returns nothing for both. Every production caller passes a
+    # positive cap; anything else keeps today's behaviour.
+    caps_ok = all(isinstance(c, int) and c > 0 for c in (per_type_cap, total_cap))
+    if customer_id and caps_ok:
         if _entity_match_fn_exists is None:
             _entity_match_fn_exists = await _function_exists(conn, _ENTITY_MATCH_FN)
         if _entity_match_fn_exists:

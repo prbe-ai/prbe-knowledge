@@ -693,3 +693,28 @@ async def test_0147_reinstall_accepts_a_handed_over_identical_copy(live_db, sett
             bind.execute(sa.text("DROP ROLE kbe_migrator"))
     finally:
         engine.dispose()
+
+
+@pytest.mark.integration
+async def test_a_non_positive_or_missing_cap_keeps_todays_statement(live_db, monkeypatch):
+    """The function returns nothing for a NULL or negative cap; the inline
+    statement does not (NULL = no limit, negative raises), so such caps never
+    reach the function."""
+    from engine.retrieval import grounding
+
+    called: list[object] = []
+
+    async def spy(*args, **kwargs):
+        called.append(args)
+        return None, False
+
+    monkeypatch.setattr(grounding, "_match_function_rows", spy)
+    monkeypatch.setattr(grounding, "_entity_match_fn_exists", True)
+    async with db_module.raw_conn() as conn:
+        for total_cap in (None, -1, 0):
+            rows = await grounding._entity_rows(
+                conn, "tenant-x", ["probe"], ["Service"], 5, total_cap,
+                "SELECT 1 WHERE false",
+            )
+            assert rows == []  # the inline statement ran
+    assert called == []
