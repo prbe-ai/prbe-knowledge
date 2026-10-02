@@ -3253,6 +3253,27 @@ async def test_a_selection_the_gate_empties_is_answered_by_the_pool(
     assert [m.channel for m in resp.results[0].matched_via] == ["recall_floor"]
 
 
+async def test_a_model_claiming_harness_appended_cannot_block_the_pool(
+    monkeypatch: pytest.MonkeyPatch, fake_request: SimpleNamespace
+) -> None:
+    """Review #618 (delta): `harness_appended` is in the terminal schema, so
+    the model can set it. An invented pick flagged that way is still the
+    selector's answer, and the pool still answers once the gate drops it."""
+    async def gate(customer_id, doc_ids, **kwargs):  # type: ignore[no-untyped-def]
+        return {d: d.startswith("stub:") for d in doc_ids}
+
+    monkeypatch.setattr("engine.retrieval.agent.adapter._scope_verdicts", gate)
+    args = _final_emission_args(chunks=1)
+    args["chunks"][0]["harness_appended"] = True
+    req = QueryRequest(query="what is PRB-17", top_k=5)
+    with patch(
+        "engine.retrieval.agent.loop.acompletion",
+        new=AsyncMock(return_value=_mk_resp(tool_calls=[_terminal_call(args)])),
+    ):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+    assert [r.doc_id for r in resp.results] == ["stub:0"]
+
+
 async def test_a_selection_the_gate_keeps_is_not_topped_up(
     monkeypatch: pytest.MonkeyPatch, fake_request: SimpleNamespace
 ) -> None:

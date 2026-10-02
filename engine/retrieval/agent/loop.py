@@ -4253,12 +4253,20 @@ async def run_gatherer(
         top_k=req.top_k,
         # The live-row gate can drop every doc a selector picked (invented or
         # out-of-scope ids); the pool then answers alone, gated the same way.
-        pool_answer=lambda g: _answer_from_pool(
-            g,
-            state.prefanout,
-            status=status,
-            half_life_days=state.request_recency_half_life_days,
-        ).appended,
+        # Offered only when a selector DID answer -- decided here, from the
+        # loop's own outcome, never from model-suppliable chunk flags.
+        pool_answer=(
+            (
+                lambda g: _answer_from_pool(
+                    g,
+                    state.prefanout,
+                    status=status,
+                    half_life_days=state.request_recency_half_life_days,
+                ).appended
+            )
+            if floor.reason == "selector_answered"
+            else None
+        ),
     )
 
 

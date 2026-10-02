@@ -661,12 +661,14 @@ async def to_query_response(
     caller genuinely has no gatherer outcome (non-gatherer paths, unit tests);
     that reports not-degraded, which is correct for those callers.
 
-    `pool_answer` (optional): `loop._answer_from_pool` bound to this search.
-    When the live-row gate drops EVERY document a selector picked (all
-    invented, or all out of scope), the selector gave no answer after all, so
-    the pool answers alone -- exactly as when nothing was selected -- and its
-    documents pass the same gate. Never a top-up: it runs only when the gate
-    left nothing.
+    `pool_answer` (optional): `loop._answer_from_pool` bound to this search,
+    passed ONLY when a selector answered (the loop decides that from its own
+    state -- `harness_appended` on a chunk is model-suppliable, so it is not
+    evidence). When the live-row gate drops EVERY document that answer held
+    (all invented, or all out of scope), the selector gave no answer after
+    all, so the pool answers alone -- exactly as when nothing was selected --
+    and its documents pass the same gate. Never a top-up: it runs only when
+    the gate left nothing.
     """
     if id_pins:
         # Identifier pins: exact matches for ids the USER TYPED, resolved by
@@ -758,9 +760,8 @@ async def to_query_response(
                 temporal=temporal,
             )
 
-        selected = any(c.doc_id and not c.harness_appended for c in gathered.chunks)
         gate_ok = await _gate()
-        if pool_answer is not None and selected and not gathered.chunks:
+        if pool_answer is not None and not gathered.chunks:
             appended = pool_answer(gathered)
             log.warning(
                 "adapter.selection_dropped_pool_answers",
