@@ -230,7 +230,7 @@ async def _strand_in_default(conn, tenant: str, n: int = 3) -> None:
             last_seen_version, kind, visibility
         )
         SELECT $1 || ':c_' || g, $2, $1, g, 'c' || g, 'h' || g, 3, 'v1',
-               1, 1, 'content', 'approved'
+               1, 2147483647, 'content', 'approved'
         FROM generate_series(1, $3::int) g
         """,
         tenant,

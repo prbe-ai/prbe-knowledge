@@ -30,6 +30,7 @@ import asyncio
 from datetime import UTC, datetime
 from typing import Any
 
+import asyncpg
 import httpx
 import pytest
 
@@ -221,8 +222,10 @@ async def test_reused_chunks_are_written_at_most_once(live_db, in_place: bool) -
         "meta one": LIVE_CHUNK_LAST_SEEN,
     }
 
-    # alpha as a pre-sentinel pod left it: last_seen == the live version.
-    await _mark_legacy(doc_id, "alpha", 1)
+    # The shape a pre-sentinel pod left (last_seen == the live version) can no
+    # longer exist: chunks_live_sentinel_chk (migration 0145) refuses it.
+    with pytest.raises(asyncpg.exceptions.CheckViolationError, match="chunks_live_sentinel_chk"):
+        await _mark_legacy(doc_id, "alpha", 1)
     before = await _rows(doc_id)
 
     v2 = await _ingest(
@@ -230,10 +233,9 @@ async def test_reused_chunks_are_written_at_most_once(live_db, in_place: bool) -
     )
     after_v2 = await _rows(doc_id)
     assert v2.version == (1 if in_place else 2)
-    # The legacy row is moved onto the sentinel -- its one write.
-    assert after_v2["alpha"]["last_seen_version"] == LIVE_CHUNK_LAST_SEEN
-    assert after_v2["alpha"]["xmin"] != before["alpha"]["xmin"]
     # Already open-ended: not written at all, content or metadata chunk.
+    assert after_v2["alpha"]["last_seen_version"] == LIVE_CHUNK_LAST_SEEN
+    assert after_v2["alpha"]["xmin"] == before["alpha"]["xmin"]
     assert after_v2["bravo"]["xmin"] == before["bravo"]["xmin"]
     assert after_v2["meta one"]["xmin"] == before["meta one"]["xmin"]
     assert after_v2["charlie"]["last_seen_version"] == LIVE_CHUNK_LAST_SEEN
@@ -342,18 +344,18 @@ async def test_three_versions_retrieve_exactly_what_they_contained(live_db) -> N
     now_results = {name: await _retrieve(doc_id, spec) for name, spec in specs.items()}
     assert now_results == expected
 
-    # The rows as the pre-sentinel code left them: a live chunk carried the
-    # current version. Every mode must return the same thing.
+    # The rows as the pre-sentinel code left them (a live chunk carrying the
+    # current version) are refused since migration 0145, which is what lets
+    # BM25 read "live" off the indexed last_seen_version.
     async with db_module.raw_conn() as conn:
-        await conn.execute(
-            "UPDATE chunks SET last_seen_version = 3"
-            " WHERE customer_id = $1 AND doc_id = $2 AND last_seen_version = $3",
-            CUSTOMER,
-            doc_id,
-            LIVE_CHUNK_LAST_SEEN,
-        )
-    legacy_results = {name: await _retrieve(doc_id, spec) for name, spec in specs.items()}
-    assert legacy_results == now_results
+        with pytest.raises(asyncpg.exceptions.CheckViolationError, match="chunks_live_sentinel_chk"):
+            await conn.execute(
+                "UPDATE chunks SET last_seen_version = 3"
+                " WHERE customer_id = $1 AND doc_id = $2 AND last_seen_version = $3",
+                CUSTOMER,
+                doc_id,
+                LIVE_CHUNK_LAST_SEEN,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -553,11 +555,12 @@ async def test_a_real_delete_leaves_chunks_the_tombstone_purge_deletes(live_db) 
     assert await _rows(doc_id) == {}
 
 
-async def test_the_purge_takes_a_closed_chunk_left_open_ended(live_db) -> None:
-    """A pod on the pre-sentinel code (mid-rollout, or after a rollback) closes
-    chunks with valid_to only, leaving LIVE_CHUNK_LAST_SEEN above every
-    tombstone version. The purge takes them anyway; a re-created document's
-    live chunk (valid_to NULL) is untouched."""
+async def test_an_old_pod_close_is_refused(live_db) -> None:
+    """A pod on the pre-sentinel code (mid-rollout, or after a rollback) closed
+    chunks with valid_to only, leaving LIVE_CHUNK_LAST_SEEN on a closed row.
+    Since migration 0145 that write is refused (chunks_live_sentinel_chk), so
+    the purge's handling of such rows has nothing left to find; the live
+    chunk stays untouched."""
     import scripts.cron_tombstone_purge as purge
 
     await _seed_customer()
@@ -566,16 +569,16 @@ async def test_the_purge_takes_a_closed_chunk_left_open_ended(live_db) -> None:
     await _ingest(n, _doc(doc_id, "1"), ["alpha", "bravo"])
     async with db_module.raw_conn() as conn:
         # The old-pod close: valid_to only, sentinel kept.
-        await conn.execute(
-            "UPDATE chunks SET valid_to = now() WHERE customer_id = $1 AND doc_id = $2"
-            " AND content = 'alpha'",
-            CUSTOMER,
-            doc_id,
-        )
+        with pytest.raises(asyncpg.exceptions.CheckViolationError, match="chunks_live_sentinel_chk"):
+            await conn.execute(
+                "UPDATE chunks SET valid_to = now() WHERE customer_id = $1 AND doc_id = $2"
+                " AND content = 'alpha'",
+                CUSTOMER,
+                doc_id,
+            )
         out = await conn.fetchrow(
             purge._DELETE_CHUNKS_SQL, CUSTOMER, [doc_id], [2], 1000, LIVE_CHUNK_LAST_SEEN
         )
-    assert out["deleted"] == 1
+    assert out["deleted"] == 0
     left = await _rows(doc_id)
-    assert set(left) == {"bravo"}, "the live open-ended chunk is not the purge's to take"
-    assert left["bravo"]["valid_to"] is None
+    assert set(left) == {"alpha", "bravo"}, "live open-ended chunks are not the purge's to take"

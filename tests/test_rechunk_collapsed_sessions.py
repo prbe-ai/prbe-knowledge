@@ -163,7 +163,7 @@ async def collapsed(live_db, monkeypatch):
                 last_seen_version, kind, embedding_v2, embedding_v2_model,
                 embedding_v2_dim, visibility, title)
             SELECT doc_id || ':c_collapsed', doc_id, customer_id, 0, $3, $4, 3,
-                chunker_version, 1, 1, 'content', embedding_v2, embedding_v2_model,
+                chunker_version, 1, 2147483647, 'content', embedding_v2, embedding_v2_model,
                 embedding_v2_dim, visibility, title
             FROM chunks WHERE customer_id=$1 AND doc_id=$2 AND kind='content' LIMIT 1
             """,

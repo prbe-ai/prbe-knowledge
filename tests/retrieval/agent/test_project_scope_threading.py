@@ -233,7 +233,7 @@ async def _seed_project_docs(customer_id: str) -> None:
                 embedding, first_seen_version, last_seen_version
             ) VALUES (
                 $1 || ':c0', $1, $2, 0, 'body of ' || $1, 'chash-' || $1, 3, 'content',
-                array_fill(0::real, ARRAY[3072])::halfvec, 1, 1
+                array_fill(0::real, ARRAY[3072])::halfvec, 1, 2147483647
             )
             """,
             [("doc-a", customer_id), ("doc-b", customer_id), ("doc-none", customer_id)],

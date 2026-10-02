@@ -106,7 +106,7 @@ async def _seed_doc(
                 $1, $2, $3,
                 0, $4, $5, 5,
                 array_fill(0::real, ARRAY[3072])::halfvec,
-                $6, $6
+                $6, 2147483647
             )
             ON CONFLICT (customer_id, doc_id, content_hash) DO NOTHING
             """,

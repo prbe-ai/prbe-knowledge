@@ -82,10 +82,10 @@ import asyncpg
 
 from engine.retrieval.helpers import origin_of, project_scope_predicate, source_key_predicate
 from engine.retrieval.temporal import build_predicate, live_version_join
-from engine.shared.constants import TOP_K_BM25
+from engine.shared.constants import LIVE_CHUNK_LAST_SEEN, TOP_K_BM25
 from engine.shared.db import with_tenant
 from engine.shared.logging import get_logger
-from engine.shared.models import TemporalSpec, normalize_author_id
+from engine.shared.models import TemporalMode, TemporalSpec, normalize_author_id
 from engine.shared.partitions import (
     CHUNKS_PARENT,
     PARTITION_PREFIX,
@@ -583,8 +583,8 @@ async def bm25_search(
         pool_size = top_k * _BM25_POOL_MULTIPLIER * (_BM25_SCOPED_POOL_FACTOR if scoped else 1)
         params.append(pool_size)
         pool_idx = len(params)
-        # The tenant and visibility filters appear TWICE below, and both
-        # copies are load-bearing.
+        # The tenant filter appears TWICE below, and both copies are
+        # load-bearing (visibility used to as well; see pool_chunk_sql).
         #
         # As plain SQL predicates (`c.customer_id = $1`, `c.visibility =
         # 'approved'`) pg_search cannot see them: the ParadeDB scan applies
@@ -656,6 +656,28 @@ async def bm25_search(
         visibility_must = (
             "" if include_drafts else "paradedb.term('visibility', 'approved'),"
         )
+        # LIVE IN THE INDEX, NOT ON THE HEAP. pg_search 0.23.4 turns every SQL
+        # predicate it cannot index into its own heap filter, so the old
+        # `c.valid_to IS NULL` made TopK fetch and discard every closed
+        # version (most rows: probe holds ~1 M chunks, ~470 k live). Since
+        # migration 0145 the CHECK chunks_live_sentinel_chk makes "live"
+        # exactly "last_seen_version = LIVE_CHUNK_LAST_SEEN", an INDEXED field,
+        # and pg_search pushes this literal equality into the index as a term
+        # (verified on the T9 rig: same plan as an explicit paradedb.term).
+        # Rig, full pool statement p50: 4.2-8.6x fewer buffers, 2.3-4.5x
+        # faster, same top-50 on 7 of 8 queries (the 8th differs by ties that
+        # already vary run to run). A literal, not a parameter: it is a
+        # constant, and a bound parameter is the shape pg_search has rejected
+        # before. AS_OF and ALL keep their valid_to predicates unchanged.
+        #
+        # The SQL copy of the visibility filter is gone for the same reason:
+        # `visibility_must` above is exact (one untokenized-equivalent token,
+        # 'approved' vs 'draft'), so the heap copy only cost buffers. The
+        # TENANT keeps both copies; see above for why those are load-bearing.
+        if spec.mode in (TemporalMode.LATEST, TemporalMode.CHANGED_BETWEEN):
+            pool_chunk_sql = f"AND c.last_seen_version = {int(LIVE_CHUNK_LAST_SEEN)}"
+        else:
+            pool_chunk_sql = pred.chunk_sql
         # `_scan_target_override` is the pg_search guardian's seam and nothing
         # else's: the canary runs this exact function once as production does
         # and once forced onto the parent, because the first fix for the
@@ -702,8 +724,7 @@ async def bm25_search(
                       paradedb.match('content', $2)
                     ])
                   ])
-              {"" if include_drafts else "AND c.visibility = 'approved'"}
-              {pred.chunk_sql}
+              {pool_chunk_sql}
             ORDER BY paradedb.score(c.chunk_id) DESC
             LIMIT ${pool_idx}
         """

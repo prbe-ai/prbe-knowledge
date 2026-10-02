@@ -222,11 +222,20 @@ def _reset_iterscan_verification():
     depend on which test happened to go first. Reset around every test so each
     one exercises the same path.
     """
+    from engine.retrieval.retrievers import bm25 as _b
     from engine.retrieval.retrievers import vector as _v
 
     _v._ITERSCAN_VERIFIED = None
+    # Same for bm25's process-lifetime table-shape caches: a fake connection
+    # that answers None (RecordingConn) caches "chunks is not partitioned" for
+    # every later test in the process, and a real BM25 test then scans the
+    # parent.
+    _b._CHUNKS_PARTITIONED = None
+    _b._bm25_v3_available = None
     yield
     _v._ITERSCAN_VERIFIED = None
+    _b._CHUNKS_PARTITIONED = None
+    _b._bm25_v3_available = None
 
 
 class RecordingConn:

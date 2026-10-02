@@ -95,7 +95,7 @@ async def _seed(conn, customer_id: str, n: int, doc_id: str | None = None) -> No
             kind, visibility
         )
         SELECT $1 || ':c_' || g, $2, $3, g, 'content ' || g, 'h' || g,
-               3, 'v1', 1, 1, 'content', 'approved'
+               3, 'v1', 1, 2147483647, 'content', 'approved'
         FROM generate_series(1, $4::int) g
         """,
         customer_id,
@@ -232,10 +232,10 @@ async def test_upsert_uses_the_tenant_qualified_key(seeded) -> None:
             chunk_id, doc_id, customer_id, chunk_index, content, content_hash,
             token_count, chunker_version, first_seen_version, last_seen_version,
             kind, visibility
-        ) VALUES ($1, $2, $3, 1, 'content 1', 'h1', 3, 'v1', 1, 9, 'content',
-                  'approved')
+        ) VALUES ($1, $2, $3, 1, 'content 1', 'h1', 3, 'v2', 1, 2147483647,
+                  'content', 'approved')
         ON CONFLICT (customer_id, doc_id, content_hash) DO UPDATE
-            SET last_seen_version = EXCLUDED.last_seen_version
+            SET chunker_version = EXCLUDED.chunker_version
         """,
         f"{SMALL}:c_1",
         f"{SMALL}:d1",
@@ -243,10 +243,10 @@ async def test_upsert_uses_the_tenant_qualified_key(seeded) -> None:
     )
     assert (
         await conn.fetchval(
-            "SELECT last_seen_version FROM chunks WHERE customer_id=$1 AND content_hash='h1'",
+            "SELECT chunker_version FROM chunks WHERE customer_id=$1 AND content_hash='h1'",
             SMALL,
         )
-        == 9
+        == "v2"
     )
 
 
@@ -268,7 +268,7 @@ async def test_two_tenants_may_share_a_chunk_id(seeded) -> None:
                 chunk_id, doc_id, customer_id, chunk_index, content,
                 content_hash, token_count, chunker_version, first_seen_version,
                 last_seen_version, kind, visibility
-            ) VALUES ($1, $2, $3, 99, 'shared', $4, 3, 'v1', 1, 1, 'content',
+            ) VALUES ($1, $2, $3, 99, 'shared', $4, 3, 'v1', 1, 2147483647, 'content',
                       'approved')
             """,
             shared_chunk_id,
@@ -323,7 +323,7 @@ async def test_split_default_moves_a_stranded_tenant(live_db: None) -> None:
                 last_seen_version, kind, visibility
             )
             SELECT $1 || ':c_' || g, $2, $3, g, 'c' || g, 'h' || g, 3, 'v1',
-                   1, 1, 'content', 'approved'
+                   1, 2147483647, 'content', 'approved'
             FROM generate_series(1, 5) g
             """,
             stranded,

@@ -111,7 +111,7 @@ async def _seed(customer_id: str) -> None:
                     ) VALUES (
                         $1, $2, $3, $4, $5, $6, 5, 'content',
                         array_fill(0::real, ARRAY[3072])::halfvec,
-                        1, 1
+                        1, 2147483647
                     )
                     """,
                     f"{doc_id}-c{idx}", doc_id, customer_id, idx, body,
