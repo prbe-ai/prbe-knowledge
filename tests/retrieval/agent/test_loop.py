@@ -3241,6 +3241,10 @@ async def test_a_selection_the_gate_empties_is_answered_by_the_pool(
         return {d: d.startswith("stub:") for d in doc_ids}
 
     monkeypatch.setattr("engine.retrieval.agent.adapter._scope_verdicts", gate)
+    # No identifier pins: a pin is an unflagged chunk the gate would also see.
+    monkeypatch.setattr(
+        "engine.retrieval.agent.loop.lookup_identifiers", AsyncMock(return_value=([], set()))
+    )
     req = QueryRequest(query="what is PRB-17", top_k=5)
     with patch(
         "engine.retrieval.agent.loop.acompletion",
@@ -3263,6 +3267,10 @@ async def test_a_model_claiming_harness_appended_cannot_block_the_pool(
         return {d: d.startswith("stub:") for d in doc_ids}
 
     monkeypatch.setattr("engine.retrieval.agent.adapter._scope_verdicts", gate)
+    # No identifier pins: a pin is an unflagged chunk the gate would also see.
+    monkeypatch.setattr(
+        "engine.retrieval.agent.loop.lookup_identifiers", AsyncMock(return_value=([], set()))
+    )
     args = _final_emission_args(chunks=1)
     args["chunks"][0]["harness_appended"] = True
     req = QueryRequest(query="what is PRB-17", top_k=5)
@@ -3282,6 +3290,10 @@ async def test_a_selection_the_gate_keeps_is_not_topped_up(
         return {d: d in ("doc-1", "stub:0") for d in doc_ids}
 
     monkeypatch.setattr("engine.retrieval.agent.adapter._scope_verdicts", gate)
+    # No identifier pins: a pin is an unflagged chunk the gate would also see.
+    monkeypatch.setattr(
+        "engine.retrieval.agent.loop.lookup_identifiers", AsyncMock(return_value=([], set()))
+    )
     req = QueryRequest(query="what is PRB-17", top_k=5)
     with patch(
         "engine.retrieval.agent.loop.acompletion",
