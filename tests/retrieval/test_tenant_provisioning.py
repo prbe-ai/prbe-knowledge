@@ -430,6 +430,26 @@ async def test_guardian_reports_partition_drift_and_nothing_else(live_db):
             assert drift.get(leaf) == ["rls_not_forced", "policies"]
         finally:
             await tx.rollback()
+        # The parent losing FORCE RLS is drift too: its owner reads every tenant.
+        tx = conn.transaction()
+        await tx.start()
+        try:
+            await conn.execute("ALTER TABLE chunks NO FORCE ROW LEVEL SECURITY")
+            parents = [d for d in await find_partition_drift(conn) if d["partition"] is None]
+            assert parents == [{"table": "chunks", "partition": None, "problems": ["parent_rls_not_forced"]}]
+        finally:
+            await tx.rollback()
+        # Same roles in another order is not drift.
+        tx = conn.transaction()
+        await tx.start()
+        try:
+            await conn.execute("CREATE ROLE prov_drift_a NOLOGIN")
+            await conn.execute("CREATE ROLE prov_drift_b NOLOGIN")
+            await conn.execute("CREATE POLICY prov_two_roles ON chunks FOR SELECT TO prov_drift_a, prov_drift_b USING (true)")
+            await conn.execute(f'CREATE POLICY prov_two_roles ON "{leaf}" FOR SELECT TO prov_drift_b, prov_drift_a USING (true)')
+            assert all(d["partition"] != leaf for d in await find_partition_drift(conn))
+        finally:
+            await tx.rollback()
 
 
 @pytest.mark.integration

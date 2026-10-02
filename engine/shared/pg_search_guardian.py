@@ -835,7 +835,9 @@ async def find_partition_drift(conn: asyncpg.Connection) -> list[dict[str, objec
             SELECT p.polrelid,
                    array_agg(
                        p.polname || ':' || p.polcmd::text || ':' || p.polpermissive::text
-                       || ':' || p.polroles::text
+                       -- roles as a sorted set: equivalent policies may list them
+                       -- in another order (the provisioner rebuilds them).
+                       || ':' || (SELECT string_agg(r::text, ',' ORDER BY r) FROM unnest(p.polroles) r)
                        || ':' || coalesce(pg_get_expr(p.polqual, p.polrelid), '')
                        || ':' || coalesce(pg_get_expr(p.polwithcheck, p.polrelid), '')
                        ORDER BY p.polname
@@ -844,6 +846,7 @@ async def find_partition_drift(conn: asyncpg.Connection) -> list[dict[str, objec
             GROUP BY p.polrelid
         )
         SELECT parent.relname AS parent,
+               NOT (parent.relrowsecurity AND parent.relforcerowsecurity) AS parent_rls_not_forced,
                leaf.relname AS partition,
                leaf.relowner <> parent.relowner AS owner_differs,
                NOT (leaf.relrowsecurity AND leaf.relforcerowsecurity) AS rls_not_forced,
@@ -862,6 +865,10 @@ async def find_partition_drift(conn: asyncpg.Connection) -> list[dict[str, objec
         """
     )
     found: list[dict[str, object]] = []
+    # The parent itself: reads through it are governed by ITS policies, and
+    # its owner (`app`) bypasses them without FORCE.
+    for parent in sorted({r["parent"] for r in rows if r["parent_rls_not_forced"]}):
+        found.append({"table": parent, "partition": None, "problems": ["parent_rls_not_forced"]})
     for r in rows:
         problems = [
             name
