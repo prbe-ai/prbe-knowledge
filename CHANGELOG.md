@@ -83,19 +83,20 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Fixed
 
-- **A quiet source's per-source vector top-up is exact, fast, and actually its top K.** The
-  top-up for a source short in the 400-row ANN pool filtered on the joined `documents` row, so
-  its HNSW walk ran until enough of that source turned up: on research (EXPLAIN ANALYZE as
-  `app`, 2026-10-02, cold cache) new-workspace's codex top-up walked 18,935 tuples in 22.4 s
-  for a source that tenant does not have, and probe's custom_ingest top-up took 8.1-26.0 s and
-  returned 3 of the source's true top 20. A short source with at most 40,000 live chunks in
-  the tenant now takes an exact statement (`ORDER BY score DESC, chunk_id`, which HNSW cannot
-  serve): 25 ms for the absent source, 0.77-0.92 s warm / 9.1-10.9 s cold for probe's
-  custom_ingest, true top 20 every time. Bigger sources keep the HNSW top-up with
-  `hnsw.max_scan_tuples` 5,000 instead of 20,000 (7.6-9.4 s cold instead of 25-26 s). The
-  per-source counts are taken in the background and cached for 10 minutes, so no search waits
-  for one; a source not counted yet keeps the old top-up. On a probe-sized rig (443k chunks)
-  the per-source vector search went from p50 5.9 s / max 7.1 s to p50 0.41 s / max 0.44 s.
+- **A quiet source's per-source vector top-up returns its true top K, and an absent one costs
+  nothing.** The top-up for a source short in the 400-row ANN pool filtered on the joined
+  `documents` row, so its HNSW walk ran until enough of that source turned up: on research
+  (EXPLAIN ANALYZE as `app`, 2026-10-02, cold cache) new-workspace's codex top-up walked 18,935
+  tuples in 22.4 s for a source that tenant does not have, and probe's custom_ingest top-up took
+  8.1-26.0 s and returned 3 of the source's true top 20. A short source with at most 40,000 live
+  embedded chunks in the tenant now takes an exact statement (`ORDER BY score DESC, chunk_id`,
+  which HNSW cannot serve), without parallel workers and behind its own gate of 2 per process:
+  25 ms for the absent source; for probe's custom_ingest 14.2 s cold / 1.45 s warm -- slower
+  than a warm walk (0.31-0.54 s), the gain there is recall (20 of 20). Bigger sources keep the
+  HNSW top-up with `hnsw.max_scan_tuples` 5,000 instead of 20,000. Per-source counts are taken
+  in the background, one at a time per process, with a 15 s statement timeout and a 60 s delay
+  after a failure; only a count younger than 10 minutes routes, and a source without one keeps
+  the HNSW top-up.
 
 - **A large live session no longer stalls every other ingest on its worker.** Re-planning a
   5.5 MB session (21.5k events, re-run on every append) took ~50 s, of which ~26 s was the

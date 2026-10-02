@@ -278,6 +278,42 @@ async def test_pool_and_exact_statements_are_not_bounded(db: _Dispatcher) -> Non
     assert not any("max_scan_tuples" in str(a) for _, a in calls)
 
 
+async def test_exact_statements_have_their_own_gate(db: _Dispatcher, monkeypatch) -> None:
+    """Six small short sources: no more than the exact gate's worth of exact
+    statements run at once, each without parallel workers."""
+    in_flight = 0
+    peak = 0
+    real_fetch = _Dispatcher.fetch
+
+    async def _counting(self: _Dispatcher, sql: str, *params: Any) -> list[Any]:
+        nonlocal in_flight, peak
+        if _EXACT_ORDER.search(sql):
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.01)
+            in_flight -= 1
+        return await real_fetch(self, sql, *params)
+
+    monkeypatch.setattr(_Dispatcher, "fetch", _counting)
+    monkeypatch.setattr(vector_mod, "_EXACT_STATEMENT_SEMAPHORE", asyncio.Semaphore(2))
+    db.pool_rows = []
+    db.source_rows = ["a", "b", "c", "d", "e", "f"]
+    db.sizes = dict.fromkeys(db.source_rows, 1)
+    await _search(db)
+    calls = _record_executes(db)
+    db.fetched.clear()
+    await _search(db)
+
+    assert len(_topups(db)) == 6 and all(_EXACT_ORDER.search(s) for s, _ in _topups(db))
+    assert peak == 2, f"exact gate not applied: {peak} in flight"
+    parallel = [a for s, a in calls if "max_parallel_workers_per_gather" in s]
+    assert parallel == [(str(vector_mod.PER_SOURCE_EXACT_PARALLEL_WORKERS),)] * 6
+
+
+def test_exact_gate_is_below_the_ann_gate() -> None:
+    assert 0 < vector_mod.PER_SOURCE_EXACT_MAX_CONCURRENT < vector_mod._ANN_STATEMENT_SEMAPHORE._value
+
+
 def test_the_bound_is_below_pgvectors_default() -> None:
     """A bound at or above 20,000 bounds nothing."""
     assert 0 < vector_mod.PER_SOURCE_TOPUP_MAX_SCAN_TUPLES < 20_000
@@ -308,21 +344,149 @@ async def test_no_count_when_nothing_is_short(db: _Dispatcher) -> None:
     assert _size_queries(db) == []
 
 
-async def test_count_is_cached_and_a_stale_one_still_routes(db: _Dispatcher, monkeypatch) -> None:
-    _two_short_sources(db)
-    db.sizes = {"pi": 1, "custom_ingest": 1}
+def _clock(monkeypatch) -> list[float]:
     clock = [1000.0]
     monkeypatch.setattr(vector_mod.time, "monotonic", lambda: clock[0])
+    return clock
 
+
+async def test_count_is_cached(db: _Dispatcher, monkeypatch) -> None:
+    _clock(monkeypatch)
+    _two_short_sources(db)
+    db.sizes = {"pi": 1, "custom_ingest": 1}
     await _search(db)
     await _search(db)
-    assert len(_size_queries(db)) == 1, "a cached count was re-run"
+    await _search(db)
+    assert len(_size_queries(db)) == 1, "a fresh count was re-run"
 
-    clock[0] += vector_mod.SOURCE_SIZE_TTL_SECONDS + 1
+
+async def test_recount_starts_before_expiry_and_routing_holds(db: _Dispatcher, monkeypatch) -> None:
+    """Past SOURCE_SIZE_REFRESH_AFTER_SECONDS (but inside the TTL) the count
+    is still used AND a recount starts, so a source in steady use does not
+    drop to the HNSW top-up every TTL."""
+    clock = _clock(monkeypatch)
+    _two_short_sources(db)
+    db.sizes = {"pi": 1, "custom_ingest": 1}
+    await _search(db)
+    clock[0] += vector_mod.SOURCE_SIZE_REFRESH_AFTER_SECONDS + 1
     db.fetched.clear()
     await _search(db)
-    assert all(_EXACT_ORDER.search(s) for s, _ in _topups(db)), "an expired count stopped routing"
+    assert all(_EXACT_ORDER.search(s) for s, _ in _topups(db))
+    assert len(_size_queries(db)) == 1, "no recount ahead of expiry"
+
+
+async def test_expired_count_never_routes_exact(db: _Dispatcher, monkeypatch) -> None:
+    """A count past the TTL is not used: until a new one lands the source
+    takes the HNSW top-up, so a source that grew past the threshold cannot
+    stay on the exact scan on the strength of an old count."""
+    clock = _clock(monkeypatch)
+    _two_short_sources(db)
+    db.sizes = {"pi": 1, "custom_ingest": 1}
+    await _search(db)
+    clock[0] += vector_mod.SOURCE_SIZE_TTL_SECONDS + 1
+    db.fetched.clear()
+    await vector_mod.vector_search("cust-1", "q", top_k=30, per_source_top_k=2)
+    assert all(_ANN_ORDER.search(s) for s, _ in _topups(db)), "an expired count routed exact"
+    await drain_size_counts()
     assert len(_size_queries(db)) == 1, "an expired count was not recounted"
+
+
+async def test_source_that_grows_past_the_threshold_leaves_the_exact_scan(
+    db: _Dispatcher, monkeypatch
+) -> None:
+    clock = _clock(monkeypatch)
+    _two_short_sources(db)
+    db.sizes = {"pi": 1, "custom_ingest": SMALL}
+    await _counted_search(db)
+    assert _EXACT_ORDER.search({p[-1]: s for s, p in _topups(db)}["custom_ingest"])
+
+    db.sizes["custom_ingest"] = BIG  # it grew
+    clock[0] += vector_mod.SOURCE_SIZE_REFRESH_AFTER_SECONDS + 1
+    await _search(db)  # still inside the TTL: routes on the old count, recounts
+    db.fetched.clear()
+    await _search(db)
+    by_source = {p[-1]: s for s, p in _topups(db)}
+    assert _ANN_ORDER.search(by_source["custom_ingest"]), "the grown source stayed exact"
+    assert _EXACT_ORDER.search(by_source["pi"])
+
+
+async def test_failed_recount_falls_back_and_waits_before_retrying(
+    db: _Dispatcher, monkeypatch
+) -> None:
+    """A failed recount does not keep the old count alive past its TTL, and
+    the next searches do not hammer the database with retries."""
+    clock = _clock(monkeypatch)
+    _two_short_sources(db)
+    db.sizes = {"pi": 1, "custom_ingest": 1}
+    await _search(db)
+
+    real_fetch = _Dispatcher.fetch
+
+    async def _failing_count(self: _Dispatcher, sql: str, *params: Any) -> list[Any]:
+        if "AS live_chunks" in sql:
+            self.fetched.append((sql, params))
+            raise asyncpg.exceptions.QueryCanceledError("canceling statement due to statement timeout")
+        return await real_fetch(self, sql, *params)
+
+    monkeypatch.setattr(_Dispatcher, "fetch", _failing_count)
+    clock[0] += vector_mod.SOURCE_SIZE_TTL_SECONDS + 1
+    db.fetched.clear()
+    for _ in range(3):
+        await _search(db)
+    assert all(_ANN_ORDER.search(s) for s, _ in _topups(db)), "routed exact on a count that failed to refresh"
+    assert len(_size_queries(db)) == 1, "a failed count was retried with no delay"
+
+    clock[0] += vector_mod.SOURCE_SIZE_RETRY_SECONDS + 1
+    monkeypatch.setattr(_Dispatcher, "fetch", real_fetch)
+    db.fetched.clear()
+    await _search(db)
+    assert len(_size_queries(db)) == 1, "not retried after the delay"
+    db.fetched.clear()
+    await _search(db)
+    assert all(_EXACT_ORDER.search(s) for s, _ in _topups(db))
+
+
+async def test_counts_across_a_tenant_burst_are_capped_not_queued(
+    db: _Dispatcher, monkeypatch
+) -> None:
+    """Ten tenants' first searches at once: at most
+    SOURCE_SIZE_MAX_CONCURRENT_COUNTS counts run (each holds a pool
+    connection); the rest are skipped, not queued, and no search waits."""
+    in_flight = 0
+    peak = 0
+    release = asyncio.Event()
+    real_fetch = _Dispatcher.fetch
+
+    async def _slow_count(self: _Dispatcher, sql: str, *params: Any) -> list[Any]:
+        nonlocal in_flight, peak
+        if "AS live_chunks" in sql:
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await release.wait()
+            in_flight -= 1
+        return await real_fetch(self, sql, *params)
+
+    monkeypatch.setattr(_Dispatcher, "fetch", _slow_count)
+    _two_short_sources(db)
+    db.sizes = {"pi": 1, "custom_ingest": 1}
+    tenants = [f"cust-{i}" for i in range(10)]
+    await asyncio.wait_for(
+        asyncio.gather(*(
+            vector_mod.vector_search(t, "q", top_k=30, per_source_top_k=2) for t in tenants
+        )),
+        timeout=2,
+    )
+    assert len(vector_mod._SOURCE_SIZE_TASKS) == vector_mod.SOURCE_SIZE_MAX_CONCURRENT_COUNTS
+    await asyncio.sleep(0)
+    assert peak == vector_mod.SOURCE_SIZE_MAX_CONCURRENT_COUNTS
+    release.set()
+    await drain_size_counts()
+    assert len(_size_queries(db)) == vector_mod.SOURCE_SIZE_MAX_CONCURRENT_COUNTS
+    # the skipped tenants are counted by their next searches
+    for t in tenants:
+        await vector_mod.vector_search(t, "q", top_k=30, per_source_top_k=2)
+        await drain_size_counts()
+    assert sorted({p[0] for _, p in _size_queries(db)}) == sorted(tenants)
 
 
 async def test_concurrent_searches_share_one_count(db: _Dispatcher, monkeypatch) -> None:

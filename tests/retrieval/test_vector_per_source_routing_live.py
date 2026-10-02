@@ -36,6 +36,8 @@ from engine.shared.partitions import ensure_tenant_partition
 pytestmark = pytest.mark.integration
 
 TENANT = "route-live"
+#: last_seen_version of a live chunk (chunks_live_sentinel_chk).
+LIVE = 2_147_483_647
 OTHER = "route-live-other"
 NONSUPER = "prbe_vector_routing_app"
 DIM = 3072
@@ -91,15 +93,16 @@ async def _seed_tenant(conn, tenant: str, *, big: int, pi: int, ci: int) -> None
         INSERT INTO chunks (customer_id, doc_id, chunk_id, chunk_index, content, content_hash,
                             token_count, first_seen_version, last_seen_version, embedding_v2,
                             kind, visibility)
-        VALUES ($1, $2, $3, $4, 'c', 'h' || $4::int, 1, 1, 1, $5::text::halfvec, 'content', 'approved')
+        VALUES ($1, $2, $3, $4, 'c', 'h' || $4::int, 1, 1, $6, $5::text::halfvec, 'content', 'approved')
         """,
-        [r[:5] for r in rows],
+        [(*r[:5], LIVE) for r in rows],
     )
 
 
 async def _seed_dead_pi_rows(conn) -> None:
-    """Rows the count must NOT see: a closed chunk, an unembedded chunk, and
-    a chunk of a superseded document version."""
+    """Rows the count must NOT see: a closed chunk, a live chunk with no
+    embedding yet, and a live document version with no chunk at all (pi:dead
+    -- its only chunk belonged to version 1 and was closed with it)."""
     v = _lit(CENTER_PI)
     await conn.execute(
         """
@@ -108,12 +111,11 @@ async def _seed_dead_pi_rows(conn) -> None:
                             valid_to, kind, visibility)
         VALUES ($1, $1 || ':pi:0', 'closed', 90, 'c', 'h90', 1, 1, 1, $2::text::halfvec, NOW(),
                 'content', 'approved'),
-               ($1, $1 || ':pi:0', 'unembedded', 91, 'c', 'h91', 1, 1, 1, NULL, NULL,
+               ($1, $1 || ':pi:0', 'unembedded', 91, 'c', 'h91', 1, 1, $3, NULL, NULL,
                 'content', 'approved')
         """,
-        TENANT, v,
+        TENANT, v, LIVE,
     )
-    # pi:dead -- version 1 closed, version 2 live; its chunk only spans v1.
     for version, valid_to in ((1, "NOW()"), (2, "NULL")):
         await conn.execute(
             f"""
@@ -129,9 +131,9 @@ async def _seed_dead_pi_rows(conn) -> None:
         """
         INSERT INTO chunks (customer_id, doc_id, chunk_id, chunk_index, content, content_hash,
                             token_count, first_seen_version, last_seen_version, embedding_v2,
-                            kind, visibility)
+                            valid_to, kind, visibility)
         VALUES ($1, $1 || ':pi:dead', 'old-version', 0, 'c', 'hd', 1, 1, 1, $2::text::halfvec,
-                'content', 'approved')
+                NOW(), 'content', 'approved')
         """,
         TENANT, v,
     )
@@ -322,6 +324,91 @@ async def test_count_stops_at_the_cap(seeded, monkeypatch) -> None:
     assert await vector_mod._count_source_sizes(TENANT, ["pi"]) == {"pi": 21}
 
 
+async def test_documents_without_embedded_chunks_do_not_count(seeded, monkeypatch) -> None:
+    """A source with more live DOCUMENTS than the threshold but only a few
+    live, embedded CHUNKS is small: the exact scan reads chunks, so chunks
+    are what the count counts. 40 live docs (threshold 20): 3 with an
+    embedded chunk, 5 whose only chunk has no embedding yet, 32 with none."""
+    async with db_module.raw_conn() as conn:
+        for i in range(40):
+            doc_id = f"{TENANT}:linear:{i}"
+            await conn.execute(
+                """
+                INSERT INTO documents (customer_id, doc_id, version, source_system, source_id,
+                                       source_url, doc_type, content_hash, created_at,
+                                       updated_at, valid_from, acl, title)
+                VALUES ($1, $2, 1, 'linear', $2, 'https://x', 'linear.issue', 'h', NOW(),
+                        NOW(), NOW(), '{}'::jsonb, 't')
+                """,
+                TENANT, doc_id,
+            )
+            if i < 8:
+                await conn.execute(
+                    """
+                    INSERT INTO chunks (customer_id, doc_id, chunk_id, chunk_index, content,
+                                        content_hash, token_count, first_seen_version,
+                                        last_seen_version, embedding_v2, kind, visibility)
+                    VALUES ($1, $2, $2 || ':c0', 0, 'c', 'h', 1, 1, $3,
+                            CASE WHEN $4 THEN $5::text::halfvec END, 'content', 'approved')
+                    """,
+                    TENANT, doc_id, LIVE, i < 3, _lit(CENTER_PI),
+                )
+    monkeypatch.setattr(vector_mod, "PER_SOURCE_EXACT_MAX_CHUNKS", 20)
+    sizes = await vector_mod._count_source_sizes(TENANT, ["linear"])
+    assert sizes == {"linear": 3}
+    assert vector_mod._routes_exact(sizes["linear"])
+
+
+async def test_count_burst_leaves_the_pool_to_searches(live_db, settings, monkeypatch) -> None:
+    """Eight tenants' first searches at once on a THREE-connection pool, with
+    every count made to take 1.5 s in the database. Only
+    SOURCE_SIZE_MAX_CONCURRENT_COUNTS counts may hold a connection; the rest
+    are skipped, so every search finishes long before the count does. With
+    one count per tenant in flight the three connections would be held by
+    counts and the searches would queue behind them."""
+    import asyncio
+    import time
+
+    await db_module.close_pool()
+    await db_module.init_pool(settings.model_copy(update={"db_pool_max_size": 3, "db_pool_min_size": 1}))
+    await _fresh_counts(monkeypatch, count=False)
+    monkeypatch.setattr(
+        vector_mod,
+        "_SOURCE_SIZE_SQL",
+        f"SELECT x.* FROM ({vector_mod._SOURCE_SIZE_SQL}) x CROSS JOIN pg_sleep(1.5)",
+    )
+    in_flight = 0
+    peak = 0
+    real_count = vector_mod._count_source_sizes
+
+    async def _tracked(customer_id: str, sources: list[str]) -> dict[str, int]:
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        try:
+            return await real_count(customer_id, sources)
+        finally:
+            in_flight -= 1
+
+    monkeypatch.setattr(vector_mod, "_count_source_sizes", _tracked)
+    monkeypatch.setattr(vector_mod, "get_embedder_v2", _embedder(_queries()[0]))
+
+    started = time.perf_counter()
+    await asyncio.gather(*(
+        vector_mod.vector_search(
+            f"burst-{i}", "q", top_k=20, per_source_top_k=K, sources=SOURCES,
+            temporal=TemporalSpec(),
+        )
+        for i in range(8)
+    ))
+    searches_s = time.perf_counter() - started
+    assert vector_mod._SOURCE_SIZE_TASKS, "no count was started"
+    await _drain()
+
+    assert searches_s < 1.2, f"searches waited on counts: {searches_s:.2f} s"
+    assert peak == vector_mod.SOURCE_SIZE_MAX_CONCURRENT_COUNTS
+
+
 async def test_count_as_a_nonsuperuser(as_nonsuper) -> None:
     sizes = await vector_mod._count_source_sizes(TENANT, ["pi", "codex"])
     assert sizes == {"pi": 30, "codex": 0}
@@ -372,14 +459,23 @@ async def test_bound_stops_the_walk(live_db, monkeypatch) -> None:
 # helpers
 # ============================================================
 
-async def _fresh_counts(monkeypatch) -> None:
-    """An empty per-process count cache, then TENANT's counts taken the way
-    the background refresh takes them -- so the searches under test are
-    routed, as every search after a pod's first one is."""
+async def _fresh_counts(monkeypatch, *, count: bool = True) -> None:
+    """An empty per-process count state (and fresh gates, which bind to the
+    test's event loop), then TENANT's counts taken the way the background
+    refresh takes them -- so the searches under test are routed, as every
+    search after a pod's first one is."""
+    import asyncio
+
     monkeypatch.setattr(vector_mod, "_SOURCE_SIZE_CACHE", {})
     monkeypatch.setattr(vector_mod, "_SOURCE_SIZE_INFLIGHT", set())
     monkeypatch.setattr(vector_mod, "_SOURCE_SIZE_TASKS", set())
-    await vector_mod._refresh_source_sizes(TENANT, SOURCES)
+    monkeypatch.setattr(vector_mod, "_SOURCE_SIZE_RETRY_AT", {})
+    monkeypatch.setattr(
+        vector_mod, "_EXACT_STATEMENT_SEMAPHORE",
+        asyncio.Semaphore(vector_mod.PER_SOURCE_EXACT_MAX_CONCURRENT),
+    )
+    if count:
+        await vector_mod._refresh_source_sizes(TENANT, SOURCES)
 
 
 async def _drain() -> None:

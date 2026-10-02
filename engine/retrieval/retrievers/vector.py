@@ -80,10 +80,11 @@ _ANN_STATEMENT_SEMAPHORE = asyncio.Semaphore(6)
 #   - new-workspace/codex, a source that tenant does not have (the planner
 #     priced it at 2,076 docs): 18,935 tuples, 22.4 s, 0 rows. Exact: 25 ms.
 #   - probe/custom_ingest (30,431 chunks): 6,416-20,096 tuples, 8.1-26.0 s
-#     cold (0.31 s when the same walk is repeated warm); of the 20 rows one
-#     walk returned, 3 were in the source's true top 20. Exact: 9.1-10.9 s
-#     cold, 0.77-0.92 s warm (372k buffer hits), and it IS the true top 20.
-#     Exact reads the same pages every time, so in steady state it is warm.
+#     cold, 0.31-0.54 s when the same walk is repeated warm; of the 20 rows
+#     one walk returned, 3 were in the source's true top 20. Exact without
+#     parallel workers: 14.2 s cold, 1.45 s warm -- SLOWER than a warm walk,
+#     and it IS the true top 20. For this source the trade is recall, not
+#     time.
 #   - bucket-robotics/codex (10,956): 10.4 s vs exact 2.4 s, both cold.
 # On a probe-sized rig (443k chunks) the custom_ingest top-up was p50 5.5 s
 # with recall@20 0.05; exact, p50 0.4 s with recall 1.0.
@@ -110,21 +111,56 @@ PER_SOURCE_EXACT_MAX_CHUNKS = 40_000
 # 0.589 today -> 0.699.
 PER_SOURCE_TOPUP_MAX_SCAN_TUPLES = 5_000
 
-# How long a tenant's per-source live-chunk count is trusted before it is
-# recounted. Routing only ever picks between "exact" (always correct) and
-# today's HNSW statement, so a stale count can cost speed, never correctness.
+# Admission for the exact statement, per process, on top of the ANN gate
+# (an exact statement holds a slot of each, so the vector channel's total
+# stays at most _ANN_STATEMENT_SEMAPHORE's 6). An exact top-up is CPU-bound:
+# probe/custom_ingest (30k chunks) took 1.45 s warm without parallel workers
+# on the research plane's 3.5-CPU database (0.77-0.92 s with two workers,
+# i.e. ~2.4 CPU-s), and a search fans out to up to four sub-queries, on two
+# retrieval pods. Two per process keeps the exact scans of the whole fleet
+# to at most four cores' worth.
+#
+# Without parallel workers (PER_SOURCE_EXACT_PARALLEL_WORKERS): on the rig
+# (3.5 CPUs, 30k- and 40k-chunk sources, warm) a lone exact statement costs
+# 0.23 CPU-s instead of 0.35 (212 ms instead of 117 ms), and a burst of 8
+# costs 2.0 CPU-s instead of 3.0, statement p50 683 ms / max 1,085 ms against
+# 730 / 932 ms ungated with two workers each.
+PER_SOURCE_EXACT_MAX_CONCURRENT = 2
+_EXACT_STATEMENT_SEMAPHORE = asyncio.Semaphore(PER_SOURCE_EXACT_MAX_CONCURRENT)
+PER_SOURCE_EXACT_PARALLEL_WORKERS = 0
+
+# How long a tenant's per-source live-chunk count is used for routing. An
+# EXPIRED count is never used: the source takes the HNSW top-up until a new
+# count lands, so a source that grew past the threshold is exact-scanned for
+# at most this long. Recounted from SOURCE_SIZE_REFRESH_AFTER_SECONDS on, so a
+# source in steady use does not drop to HNSW every TTL.
 SOURCE_SIZE_TTL_SECONDS = 600.0
+SOURCE_SIZE_REFRESH_AFTER_SECONDS = 480.0
 
-#: (customer_id, source_system) -> (expires_at monotonic, live chunk count,
-#: capped at PER_SOURCE_EXACT_MAX_CHUNKS + 1). Kept after it expires: a stale
-#: count still routes while its recount runs.
+# Counts are background work on the process's shared pool (30 connections):
+# at most this many run at once, process-wide. A count that finds the gate
+# full is skipped, not queued -- its source keeps the HNSW top-up and the
+# next search that needs it tries again -- so a burst across tenants cannot
+# turn into a queue of connections.
+SOURCE_SIZE_MAX_CONCURRENT_COUNTS = 1
+# A failed count is not retried for this long, per (tenant, source).
+SOURCE_SIZE_RETRY_SECONDS = 60.0
+# And no count holds its connection for longer than this.
+SOURCE_SIZE_STATEMENT_TIMEOUT_MS = 15_000
+
+#: (customer_id, source_system) -> (counted_at monotonic, live chunk count,
+#: capped at PER_SOURCE_EXACT_MAX_CHUNKS + 1).
 _SOURCE_SIZE_CACHE: dict[tuple[str, str], tuple[float, int]] = {}
-#: Counts in flight, so concurrent sub-queries do not start the same one twice.
+#: (customer_id, source_system) -> monotonic time before which a failed count
+#: is not retried.
+_SOURCE_SIZE_RETRY_AT: dict[tuple[str, str], float] = {}
+#: Sources whose count is in flight, so concurrent sub-queries do not start
+#: the same one twice.
 _SOURCE_SIZE_INFLIGHT: set[tuple[str, str]] = set()
-#: Strong references to the background count tasks (the event loop keeps only
-#: weak ones); tests await them.
+#: The background count tasks in flight: strong references (the event loop
+#: keeps only weak ones), and their number is what
+#: SOURCE_SIZE_MAX_CONCURRENT_COUNTS bounds. Tests await them.
 _SOURCE_SIZE_TASKS: set[asyncio.Task[None]] = set()
-
 
 @dataclass(slots=True)
 class VectorHit:
@@ -573,40 +609,33 @@ def _routes_exact(live_chunks: int | None) -> bool:
 
 
 #: Live, embedded chunks per source for one tenant, each count stopped at $3
-#: (= PER_SOURCE_EXACT_MAX_CHUNKS + 1) so its cost is bounded by the threshold,
-#: not by the source. The docs gate first: a source with >= $3 live documents
-#: has at least that many chunks (and is big), and saying so reads only the
-#: documents index -- the chunk join runs for the small ones alone. CASE
-#: evaluates the chunk subquery lazily, only for sources under the gate.
-#: Cost is O(min(source, threshold)) index probes: 5.0 s / 192k buffers for
-#: probe's custom_ingest + pi + github on a cold research-plane cache, which
-#: is why it runs in the background (`_source_sizes`).
+#: (= PER_SOURCE_EXACT_MAX_CHUNKS + 1) so its cost is bounded by the
+#: threshold, not by the source: O(min(source, threshold)) index probes. It
+#: counts exactly the rows that decide the exact statement's cost -- live
+#: chunks with an embedding, of live document versions -- and nothing cheaper
+#: stands in for them: a live document can have no live chunk, or chunks
+#: with no embedding yet, so document counts make a small source look big.
+#: 192k buffers / 5.0 s for probe's custom_ingest + pi + github on a cold
+#: research-plane cache, which is why it runs in the background
+#: (`_source_sizes`), one at a time.
 #:
-#: Counts LIVE chunks of LIVE documents and ignores the request's other
-#: filters (visibility, source_keys, project, doc_type, author): every one of
-#: those only removes rows, so the count is an upper bound on what the exact
-#: statement will touch, and it is the same for every request, so it caches.
+#: Ignores the request's other filters (visibility, source_keys, project,
+#: doc_type, author): each only removes rows, so the count is an upper bound
+#: on what the exact statement touches, and it is the same for every
+#: request, so it caches.
 _SOURCE_SIZE_SQL = f"""
     SELECT s AS source_system,
-           CASE
-             WHEN (SELECT count(*) FROM (
-                     SELECT 1 FROM documents d
-                     WHERE d.customer_id = $1 AND d.source_system = s
-                       AND d.valid_to IS NULL
-                     LIMIT $3) docs) >= $3
-             THEN $3
-             ELSE (SELECT count(*) FROM (
-                     SELECT 1 FROM documents d
-                     JOIN chunks c
-                       ON c.customer_id = d.customer_id
-                      AND c.doc_id = d.doc_id
-                      {live_version_join("d", "c")}
-                     WHERE d.customer_id = $1 AND c.customer_id = $1
-                       AND d.source_system = s
-                       AND d.valid_to IS NULL AND c.valid_to IS NULL
-                       AND c.embedding_v2 IS NOT NULL
-                     LIMIT $3) live)
-           END AS live_chunks
+           (SELECT count(*) FROM (
+                SELECT 1 FROM documents d
+                JOIN chunks c
+                  ON c.customer_id = d.customer_id
+                 AND c.doc_id = d.doc_id
+                 {live_version_join("d", "c")}
+                WHERE d.customer_id = $1 AND c.customer_id = $1
+                  AND d.source_system = s
+                  AND d.valid_to IS NULL AND c.valid_to IS NULL
+                  AND c.embedding_v2 IS NOT NULL
+                LIMIT $3) live) AS live_chunks
     FROM unnest($2::text[]) AS s
 """
 
@@ -615,6 +644,10 @@ async def _count_source_sizes(customer_id: str, sources: list[str]) -> dict[str,
     """Run _SOURCE_SIZE_SQL: each source's live, embedded chunk count for this
     tenant, capped at PER_SOURCE_EXACT_MAX_CHUNKS + 1."""
     async with with_tenant(customer_id) as conn:
+        await conn.execute(
+            "SELECT set_config('statement_timeout', $1, true)",
+            str(SOURCE_SIZE_STATEMENT_TIMEOUT_MS),
+        )
         rows = await conn.fetch(
             _SOURCE_SIZE_SQL, customer_id, sources, PER_SOURCE_EXACT_MAX_CHUNKS + 1
         )
@@ -622,51 +655,61 @@ async def _count_source_sizes(customer_id: str, sources: list[str]) -> dict[str,
 
 
 async def _refresh_source_sizes(customer_id: str, sources: list[str]) -> None:
-    """Count `sources` and cache the result. Never raises: a failed count
-    leaves the old entries (or none), and those sources keep the route they
-    had -- for a source never counted, the HNSW top-up that ran before this
-    routing existed."""
+    """Count `sources` and cache the result. Never raises: on failure the
+    sources are not retried for SOURCE_SIZE_RETRY_SECONDS, and they route on
+    whatever count is still fresh -- once that expires, the HNSW top-up."""
     try:
         sizes = await _count_source_sizes(customer_id, sources)
     except Exception as exc:  # a background task: nothing above it would see the error
+        retry_at = time.monotonic() + SOURCE_SIZE_RETRY_SECONDS
+        for s in sources:
+            _SOURCE_SIZE_RETRY_AT[(customer_id, s)] = retry_at
         log.warning(
             "vector.source_sizes_failed",
             customer_id=customer_id,
             sources=sources,
             error=type(exc).__name__,
-            reason="routing stays on the previous count, or the HNSW top-up",
+            retry_in_s=SOURCE_SIZE_RETRY_SECONDS,
+            reason="these sources take the HNSW top-up once their count expires",
         )
         return
     finally:
         for s in sources:
             _SOURCE_SIZE_INFLIGHT.discard((customer_id, s))
-    expires = time.monotonic() + SOURCE_SIZE_TTL_SECONDS
+    counted_at = time.monotonic()
     for s, n in sizes.items():
-        _SOURCE_SIZE_CACHE[(customer_id, s)] = (expires, n)
+        _SOURCE_SIZE_CACHE[(customer_id, s)] = (counted_at, n)
+        _SOURCE_SIZE_RETRY_AT.pop((customer_id, s), None)
 
 
 def _source_sizes(customer_id: str, sources: list[str]) -> dict[str, int]:
-    """The cached live-chunk counts for `sources`, WITHOUT waiting for a count.
+    """The FRESH cached live-chunk counts for `sources`; never waits for one.
 
-    A source with no entry, or an expired one, is (re)counted in the
-    background -- one statement for all of them, at most one in flight per
-    (tenant, source) -- and an expired entry is still returned meanwhile. The
-    count is never on the request path because it is not always cheap: at the
-    40k threshold it read 192k buffers / 5.0 s for probe's custom_ingest +
-    pi + github on a cold research-plane cache (2026-10-02). A source never
-    counted yet is simply absent from the result, which routes it to the HNSW
-    top-up -- what every top-up did before this routing.
+    A source with no count, or one older than the TTL, is left out, which
+    routes it to the HNSW top-up -- what every top-up did before this
+    routing. Sources with no count, or one past
+    SOURCE_SIZE_REFRESH_AFTER_SECONDS, are (re)counted in the background: one
+    statement for all of them, unless the source is already being counted,
+    failed within SOURCE_SIZE_RETRY_SECONDS, or the process already runs
+    SOURCE_SIZE_MAX_CONCURRENT_COUNTS counts (then it is skipped, and the
+    next search that needs it tries again).
     """
     out: dict[str, int] = {}
     due: list[str] = []
     now = time.monotonic()
     for s in sources:
-        hit = _SOURCE_SIZE_CACHE.get((customer_id, s))
-        if hit is not None:
+        key = (customer_id, s)
+        hit = _SOURCE_SIZE_CACHE.get(key)
+        age = now - hit[0] if hit is not None else None
+        if hit is not None and age is not None and age < SOURCE_SIZE_TTL_SECONDS:
             out[s] = hit[1]
-        if (hit is None or hit[0] <= now) and (customer_id, s) not in _SOURCE_SIZE_INFLIGHT:
+        if (
+            (age is None or age >= SOURCE_SIZE_REFRESH_AFTER_SECONDS)
+            and key not in _SOURCE_SIZE_INFLIGHT
+            and _SOURCE_SIZE_RETRY_AT.get(key, 0.0) <= now
+        ):
             due.append(s)
-    if due:
+    if due and len(_SOURCE_SIZE_TASKS) < SOURCE_SIZE_MAX_CONCURRENT_COUNTS:
         _SOURCE_SIZE_INFLIGHT.update((customer_id, s) for s in due)
         task = asyncio.get_running_loop().create_task(_refresh_source_sizes(customer_id, due))
         _SOURCE_SIZE_TASKS.add(task)
@@ -741,12 +784,14 @@ async def _per_source_ann_search(
         order HNSW cannot serve, so the planner walks the documents
         (customer_id, source_system) index into the chunk partition's
         (customer_id, doc_id) index and sorts that source's rows. It returns
-        the TRUE top-K for the source: recall can only go up.
+        the TRUE top-K for the source: recall can only go up. Admitted
+        through its own gate (PER_SOURCE_EXACT_MAX_CONCURRENT) as well as
+        the ANN one, without parallel workers.
       - bigger: the HNSW top-up of step 2, with its walk capped at
         PER_SOURCE_TOPUP_MAX_SCAN_TUPLES instead of 20,000.
-      - no count (not counted yet in this process, the count failed, or a
-        temporal mode it cannot bound): the HNSW top-up, as before this
-        routing existed.
+      - no fresh count (not counted yet in this process, expired, the count
+        failed, or a temporal mode it cannot bound): the HNSW top-up, as
+        before this routing existed.
 
     Failure honesty: iterative scan gives up after max_scan_tuples, so an
     ultra-rare source inside a huge corpus can still under-return -- now only
@@ -837,7 +882,17 @@ async def _per_source_ann_search(
             f"\n            ORDER BY score DESC, c.chunk_id"
             f"\n            LIMIT $3"
         )
-        async with _ANN_STATEMENT_SEMAPHORE, with_tenant(customer_id) as conn:
+        # Its own, smaller gate first, then a slot of the ANN gate: never
+        # hold an ANN slot while queueing for the exact one.
+        async with (
+            _EXACT_STATEMENT_SEMAPHORE,
+            _ANN_STATEMENT_SEMAPHORE,
+            with_tenant(customer_id) as conn,
+        ):
+            await conn.execute(
+                "SELECT set_config('max_parallel_workers_per_gather', $1, true)",
+                str(PER_SOURCE_EXACT_PARALLEL_WORKERS),
+            )
             rows: list[Any] = await conn.fetch(sql, *exact_params)
         return rows
 

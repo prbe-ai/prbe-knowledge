@@ -120,6 +120,7 @@ def install_dispatcher(monkeypatch: pytest.MonkeyPatch) -> _Dispatcher:
     monkeypatch.setattr(vector_mod, "_SOURCE_SIZE_CACHE", {})
     monkeypatch.setattr(vector_mod, "_SOURCE_SIZE_INFLIGHT", set())
     monkeypatch.setattr(vector_mod, "_SOURCE_SIZE_TASKS", set())
+    monkeypatch.setattr(vector_mod, "_SOURCE_SIZE_RETRY_AT", {})
 
     class _Embedder:
         async def embed_query(self, text: str) -> list[float]:
