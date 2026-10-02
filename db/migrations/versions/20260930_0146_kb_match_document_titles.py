@@ -95,7 +95,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "0146_kb_match_titles"
-down_revision = "0144_kb_provision_tenant"
+down_revision = "0145_chunks_live_sentinel"
 branch_labels = None
 depends_on = None
 
