@@ -78,7 +78,7 @@ async def _insert_chunk(conn, customer_id: str, doc_id: str, content: str, idx: 
             length($5) / 4,
             array_fill(0::real, ARRAY[3072])::halfvec,
             'openai/text-embedding-3-large', 3072,
-            'naive-v1', 1, 1, NOW()
+            'naive-v1', 1, 2147483647, NOW()
         )
         ON CONFLICT (customer_id, chunk_id) DO NOTHING
         """,
@@ -306,7 +306,7 @@ async def _insert_chunk_with_v2(
             (SELECT array_agg(v)::halfvec
                FROM (SELECT $5::real AS v FROM generate_series(1, 3072)) s),
             'gemini-embedding-2', 3072,
-            'naive-v1', 1, 1, NOW()
+            'naive-v1', 1, 2147483647, NOW()
         )
         ON CONFLICT (customer_id, chunk_id) DO NOTHING
         """,

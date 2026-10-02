@@ -88,7 +88,7 @@ async def _seed_corpus(customer_id: str) -> None:
                 ) VALUES (
                     $1, 'doc-bm25-tsv', $2, 0, $3, $4, 5, 'content',
                     array_fill(0::real, ARRAY[3072])::halfvec,
-                    1, 1
+                    1, 2147483647
                 )
                 """,
                 chunk_id, customer_id, body, f"chash-{chunk_id}",

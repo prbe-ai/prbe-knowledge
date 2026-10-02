@@ -99,7 +99,7 @@ async def _seed_doc_with_repo_link(
             ) VALUES (
                 $1, $2, $3, 0, $4, $5, 5,
                 array_fill(0::real, ARRAY[3072])::halfvec,
-                1, 1
+                1, 2147483647
             )
             """,
             f"{doc_id}:c0", doc_id, customer_id,

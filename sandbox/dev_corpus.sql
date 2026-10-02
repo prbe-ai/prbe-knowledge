@@ -33,17 +33,19 @@ VALUES
      '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z', '{}')
 ON CONFLICT DO NOTHING;
 
+-- Live chunks are open-ended: last_seen_version = 2147483647 (CHECK
+-- chunks_live_sentinel_chk, prbe-knowledge migration 0145).
 INSERT INTO chunks
     (chunk_id, doc_id, customer_id, chunk_index, content, content_hash,
      token_count, first_seen_version, last_seen_version)
 VALUES
     ('slack:C100:1000#0', 'slack:C100:1000', 'eval-tenant', 0,
      'To rotate the LiteLLM master key, update litellm.env and run the k8s secrets sync script, then restart the gateway.',
-     'devhash-1', 24, 1, 1),
+     'devhash-1', 24, 1, 2147483647),
     ('github:pr:100#0', 'github:pr:100', 'eval-tenant', 0,
      'This PR adds a pgvector HNSW index over chunks.embedding_v2 (halfvec cosine) to speed up vector retrieval recall.',
-     'devhash-2', 22, 1, 1),
+     'devhash-2', 22, 1, 2147483647),
     ('github:pr:100#1', 'github:pr:100', 'eval-tenant', 1,
      'Benchmarks show recall at 10 improves once the HNSW index replaces the brute-force scan over embeddings.',
-     'devhash-3', 20, 1, 1)
+     'devhash-3', 20, 1, 2147483647)
 ON CONFLICT DO NOTHING;

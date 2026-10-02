@@ -360,6 +360,10 @@ CREATE TABLE chunks (
     last_seen_version    INT  NOT NULL,
     valid_from           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     valid_to             TIMESTAMPTZ,
+    -- Live <=> open-ended (migration 0145). BM25 filters "live" index-side on
+    -- last_seen_version; this makes that the same set as valid_to IS NULL.
+    CONSTRAINT chunks_live_sentinel_chk
+        CHECK ((valid_to IS NULL) = (last_seen_version = 2147483647)),
 
     metadata             JSONB NOT NULL DEFAULT '{}',
     -- 'content' = body chunk (default for all rows pre-0018).

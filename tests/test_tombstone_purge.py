@@ -350,7 +350,7 @@ async def test_old_tombstone_is_purged_everywhere(app_settings, settings, bucket
     for chunk_id, first, last in (("g1", 1, 1), ("g2", 1, 2), ("g-meta", 2, 2)):
         await _chunk(cid, gone, chunk_id, first, last, live=False)
     await _chunk(cid, kept, "k-old", 1, 1, live=False)
-    await _chunk(cid, kept, "k-live", 1, 2, live=True)
+    await _chunk(cid, kept, "k-live", 1, LIVE_CHUNK_LAST_SEEN, live=True)
 
     async with db_module.raw_conn() as conn:
         await conn.execute(
@@ -993,7 +993,9 @@ async def test_revived_chunk_survives_a_racing_delete(live_db) -> None:
         tx = writer.transaction()
         await tx.start()
         await writer.execute(
-            "UPDATE chunks SET last_seen_version = 3, valid_to = NULL"
+            # A revive reopens the row open-ended, as the upsert does
+            # (chunks_live_sentinel_chk, migration 0145).
+            "UPDATE chunks SET last_seen_version = 2147483647, valid_to = NULL"
             " WHERE customer_id = $1 AND chunk_id = 'revived'",
             cid,
         )

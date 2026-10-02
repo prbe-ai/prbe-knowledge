@@ -294,7 +294,10 @@ async def _seed_two_versions(customer_id: str) -> tuple[datetime, datetime]:
         await conn.execute(_INSERT_DOC, "edited", 1, customer_id, t0, t1)
         await conn.execute(_INSERT_DOC, "edited", 2, customer_id, t1, None)
         await conn.execute(_INSERT_CHUNK, "edited:v1", "edited", customer_id, "old text", 1, 1, t0, t1)
-        await conn.execute(_INSERT_CHUNK, "edited:v2", "edited", customer_id, "new text", 2, 2, t1, None)
+        # Live: open-ended last_seen (chunks_live_sentinel_chk, migration 0145).
+        await conn.execute(
+            _INSERT_CHUNK, "edited:v2", "edited", customer_id, "new text", 2, 2147483647, t1, None
+        )
     return t0 + timedelta(days=1), t1
 
 

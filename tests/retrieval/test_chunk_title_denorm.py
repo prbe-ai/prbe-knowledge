@@ -74,7 +74,7 @@ async def _insert_chunk(
     *,
     title: str | None,
     first_version: int = 1,
-    last_version: int = 1,
+    last_version: int = 2147483647,  # live: open-ended (migration 0145's CHECK)
 ) -> None:
     """Insert a chunk, optionally WITHOUT a title (path 3)."""
     async with raw_conn() as conn:
@@ -171,7 +171,7 @@ async def test_retitle_restamps_chunks_spanning_multiple_versions(pg_search_db) 
     await _seed_doc(cust, doc, "V1 Title", version=1)
     await _insert_chunk(
         cust, doc, 0, "spanning body", title="V1 Title",
-        first_version=1, last_version=3,
+        first_version=1,
     )
     await _seed_doc(cust, doc, "V2 Title", version=2)
 

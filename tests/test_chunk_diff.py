@@ -275,7 +275,7 @@ async def test_removed_chunk_version_range_agrees_with_valid_to(live_db) -> None
                 """,
                 customer_id, doc_id, version, f"dh-{doc_id}",
             )
-        # Chunk last seen at version 3 in both docs.
+        # A live chunk in both docs: open-ended last_seen (0145's CHECK).
         for doc_id, chunk_id, chash in (
             ("doc-samever", "ck-samever", "hash-samever"),
             ("doc-bumped", "ck-bumped", "hash-bumped"),
@@ -285,18 +285,18 @@ async def test_removed_chunk_version_range_agrees_with_valid_to(live_db) -> None
                 INSERT INTO chunks (customer_id, chunk_id, doc_id, chunk_index,
                                     content, content_hash, token_count,
                                     first_seen_version, last_seen_version)
-                VALUES ($1, $2, $3, 0, 'body', $4, 1, 1, 3)
+                VALUES ($1, $2, $3, 0, 'body', $4, 1, 1, 2147483647)
                 """,
                 customer_id, chunk_id, doc_id, chash,
             )
 
-        # Same-version removal: doc at 3, chunk last_seen 3 -> capped to 2.
+        # Same-version removal: doc at 3, open-ended chunk -> capped to 2.
         await _apply_chunk_plan(
             conn,
             SimpleNamespace(customer_id=customer_id, doc_id="doc-samever", version=3),  # type: ignore[arg-type]
             _ChunkPlan(removed_hashes={"hash-samever"}),
         )
-        # Version-bump removal: doc now at 4, chunk last_seen 3 -> stays 3.
+        # Version-bump removal: doc now at 4, open-ended chunk -> capped to 3.
         await _apply_chunk_plan(
             conn,
             SimpleNamespace(customer_id=customer_id, doc_id="doc-bumped", version=4),  # type: ignore[arg-type]

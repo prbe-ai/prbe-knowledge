@@ -54,7 +54,7 @@ async def test_direct_real_retrievers_respect_tenant_scope_and_live_documents(pg
                 """INSERT INTO chunks (
                     chunk_id,doc_id,customer_id,chunk_index,content,content_hash,token_count,
                     embedding_v2,first_seen_version,last_seen_version,visibility
-                ) VALUES ($1,$1,$2,0,$3,$1,5,$4::halfvec,1,1,$5)""",
+                ) VALUES ($1,$1,$2,0,$3,$1,5,$4::halfvec,1, 2147483647,$5)""",
                 doc_id, tenant, content, vec, visibility,
             )
 

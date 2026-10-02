@@ -69,7 +69,7 @@ async def _seed_full_cluster(customer_id: str) -> None:
             ) VALUES (
                 $1, $2, $3, 0, 'body', 'chash', 5,
                 array_fill(0::real, ARRAY[3072])::halfvec,
-                1, 1
+                1, 2147483647
             )
             """,
             f"{DOC_ID}:c0", DOC_ID, customer_id,
@@ -174,7 +174,7 @@ async def _seed_unmerged_person(customer_id: str) -> None:
                 embedding, first_seen_version, last_seen_version
             ) VALUES (
                 'd-loner:c0', 'd-loner', $1, 0, 'body', 'chash', 5,
-                array_fill(0::real, ARRAY[3072])::halfvec, 1, 1
+                array_fill(0::real, ARRAY[3072])::halfvec, 1, 2147483647
             )
             """,
             customer_id,
