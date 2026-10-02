@@ -110,6 +110,23 @@ INDEX_CONTRACTS: Final[tuple[IndexContract, ...]] = (
         ),
     ),
     IndexContract(
+        # The function body lives in db/schema.sql (byte-identical to 0146's),
+        # so that is where the predicate is matched.
+        index="idx_documents_title_trgm_count",
+        table="documents",
+        expression="customer_id, (array_length(show_trgm(title), 1))",
+        source_file="db/schema.sql",
+        predicate="array_length(show_trgm(d.title), 1) BETWEEN floor(pn * sim_floor)::int",
+        why=(
+            "kb_match_document_titles_multi_v1's exact trigram-count prefilter "
+            "for one-word probes. The window must be read from this index: the "
+            "trigram GIN admits 30,000+ rows for a short probe while the planner "
+            "expects ~20 (T12 rig: 'sesion' 63 ms via the window, 267 ms via "
+            "the GIN). The bounds must stay int casts of the probe's count, or "
+            "the index is not used."
+        ),
+    ),
+    IndexContract(
         index="idx_graph_nodes_name_trgm",
         table="graph_nodes",
         expression="lower((properties ->> 'name'::text)) gin_trgm_ops",

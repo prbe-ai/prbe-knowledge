@@ -312,6 +312,10 @@ jobs:
       # test_workflow_memory_dropped is here for the same reason: it proves
       # migration 0142 removes every workflow-memory table, function and
       # preference key 0114-0118 created, and that schema.sql creates none.
+      # test_title_match_function proves kb_match_document_titles_multi_v1 (0146)
+      # returns grounding's inline title rows exactly, under a superuser, a
+      # BYPASSRLS non-superuser and an RLS-bound owner, and that the engine
+      # falls back when it is missing or fails.
       #
       # The three test_auto_merge_* files cover entity auto-merge, which on the
       # managed plane EXECUTES real merges: the Jev judge's request and verdict
@@ -364,6 +368,7 @@ jobs:
           tests/retrieval/test_helpers_resolve_aliases.py
           tests/retrieval/test_helpers_expand_to_cluster_members.py
           tests/retrieval/test_search_quick_wins.py
+          tests/retrieval/test_title_match_function.py
           tests/test_bm25_index_generations.py
           tests/test_custom_ingest.py
           tests/test_tombstone_purge.py
