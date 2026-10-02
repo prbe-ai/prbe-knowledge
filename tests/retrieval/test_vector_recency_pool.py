@@ -74,19 +74,18 @@ async def test_recency_now_enables_the_iterative_scan_like_relevance(
     )
 
 
-async def test_recency_per_source_uses_the_pool_and_topup_strategy(
+async def test_recency_per_source_uses_the_single_pool(
     recorded: RecordingConn,
 ) -> None:
-    """recency + per_source_top_k no longer windows one global pool (which
-    let a loud source's 180 nearest chunks starve a quiet one); it takes
-    the same distance-ordered pool + per-source top-ups as relevance and
-    ranks each source's slots by time in Python."""
+    """recency + per_source_top_k takes the same distance-ordered pool as
+    relevance (one ANN statement, no top-ups) and ranks each source's at
+    most K rows by time in Python."""
     await vector_mod.vector_search(
         customer_id="c1", query_text="q", top_k=10, sort_by="recency",
         per_source_top_k=3,
     )
     pool_fetches = [(s, p) for s, p in recorded.fetched if "<=>" in s]
-    assert pool_fetches, recorded.fetched
+    assert len(pool_fetches) == 1, recorded.fetched
     sql, params = pool_fetches[0]
     assert "ROW_NUMBER()" not in sql
     assert "updated_at DESC" not in sql  # ranking moved to Python

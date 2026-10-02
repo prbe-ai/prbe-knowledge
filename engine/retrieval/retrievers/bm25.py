@@ -782,7 +782,8 @@ async def bm25_search(
               {project_filter}
         """
         if per_source_top_k is not None:
-            # Per-source top-K slotting (PR#78 recall guarantee, server-side).
+            # Per-source cap: at most K rows per source from this pool (never a
+            # fill; a short source keeps what it has).
             # Window orders by SELECTED columns, not the raw ts_rank expr.
             partition_order = (
                 "updated_at DESC, chunk_id"

@@ -463,8 +463,8 @@ class QueryRequest(BaseModel):
             "of these keys OR have no key at all'. This lets a single request "
             "mix keyed corpora (custom-ingest) with keyless connector corpora "
             "instead of a client fanning out one request per corpus. No effect "
-            "when `source_keys` is unset. Pair with `per_source_top_k` to keep "
-            "one loud source from burying another in the shared budget."
+            "when `source_keys` is unset. Pair with `per_source_top_k` to cap "
+            "how many hits any one source may take."
         ),
     )
     scope: ScopeSpec | None = Field(
@@ -480,11 +480,12 @@ class QueryRequest(BaseModel):
         default=None,
         gt=0,
         description=(
-            "When set, the recall channels (vector + BM25) fetch this many hits "
-            "PER source_system and union them, instead of one global top_k "
-            "across all sources. Guarantees every source a slot in a "
-            "mixed-source request -- the recall guarantee a client otherwise "
-            "gets by fanning out one request per source (PR#78). The graph and "
+            "When set, the recall channels (vector + BM25) keep at most this "
+            "many hits PER source_system from their candidate pool and "
+            "interleave sources by rank, so one loud source cannot take every "
+            "slot. A CAP, never a quota: a source with fewer matches keeps "
+            "fewer, and a source with none in the pool gets none (no extra "
+            "per-source queries; changed 2026-10-02). The graph and "
             "inferred-edge channels are unaffected (graph hits are "
             "surprise-ranked in-process, and are single-source in the common "
             "anchored case). No effect when unset (single global top_k, "

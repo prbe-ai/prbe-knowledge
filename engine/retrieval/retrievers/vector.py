@@ -24,12 +24,16 @@ log = get_logger(__name__)
 # measurement on the research plane (792k chunks, 2026-08-26): LIMIT 400 ran in
 # 456 ms through the HNSW index, and 400 comfortably covers every source's
 # quota (per_source_top_k caps at 50, and tenants carry a handful of sources).
-# The floor exists so a small top_k cannot shrink the pool below usefulness --
-# the pool's whole job is to satisfy MOST sources' quotas so the per-source
-# top-up phase has little or nothing to do.
+# The floor exists so a small top_k cannot shrink the pool below usefulness.
+# Since 2026-10-02 the pool is the WHOLE candidate set of the per-source path:
+# per_source_top_k only caps each source within it; nothing tops a source up.
 PER_SOURCE_ANN_POOL = 400
 
 # Process-wide ceiling on concurrent ANN statements from the per-source path.
+#
+# (The history below speaks of per-source top-up statements; those were
+# removed on 2026-10-02 -- each search now issues one pool statement per
+# sub-query -- so this gate sees fewer statements than it was sized for.)
 #
 # Why it exists, measured on the research plane 2026-08-26: the pre-fan-out
 # runs up to 4 reformulated sub-queries concurrently, each sub-query's vector
@@ -161,13 +165,10 @@ async def vector_search(
     always post-filtering something.
 
     `per_source_top_k`, when set (unified search sends it on EVERY request),
-    guarantees each source_system its own top-K slot -- the PR#78 recall
-    guarantee, server-side. See `_per_source_ann_search` for how that
-    guarantee is kept WITHOUT abandoning the ANN index. The first
-    implementation kept it by skipping the ANN LIMIT and windowing the full
-    matching set, which planned as a Parallel Seq Scan + a 626k-row Sort and
-    ran 37-52 SECONDS on the research plane -- ~97% of the retrieval stage's
-    budget, and the actual cause of the 2026-08-26 search timeouts.
+    CAPS each source_system at K rows of one bounded ANN pool. It never fills:
+    a source with fewer than K rows in the pool keeps what it has. See
+    `_per_source_ann_search` for the history (a full-scan window, then
+    per-source top-up queries, both removed).
 
     Result ordering is deterministic. The ANN pool is ordered by distance
     ALONE (the only shape HNSW can serve), then the outer query applies the
@@ -196,12 +197,11 @@ async def vector_search(
         sort_by=sort_by,
     )
 
-    # The per-source guarantee gets its own strategy on BOTH sorts: a
-    # bounded ANN pool plus per-source ANN top-ups, all through the index.
-    # For recency the pool and top-ups are still distance-ordered (the only
-    # order the HNSW index serves); only the per-source ranking that hands
-    # out the K slots switches to updated_at. A global recency pool alone
-    # would let one loud source's 180 nearest chunks starve a quiet one.
+    # `per_source_top_k` is a CAP on one bounded ANN pool: a source with more
+    # than K rows in the pool keeps its best K; a source with fewer keeps what
+    # it has. Nothing tops a source up (see _per_source_ann_search). For
+    # recency the pool is still distance-ordered (the only order HNSW
+    # serves); only the ranking inside each source switches to updated_at.
     if per_source_top_k is not None:
         rows = await _per_source_ann_search(
             customer_id=customer_id,
@@ -210,7 +210,6 @@ async def vector_search(
             ann_order_sql=ann_order_sql,
             top_k=top_k,
             per_source_top_k=per_source_top_k,
-            sources=sources,
             rank_by=sort_by,
         )
         return _to_hits(rows)
@@ -491,142 +490,47 @@ async def _per_source_ann_search(
     ann_order_sql: str,
     top_k: int,
     per_source_top_k: int,
-    sources: list[str] | None,
     rank_by: str = "relevance",
 ) -> list[Any]:
-    """The per-source recall guarantee, kept ON the ANN index.
+    """One bounded ANN pool, capped at K rows per source. Never a top-up.
 
-    `rank_by="recency"`: the pool and the top-ups are unchanged (distance-
-    ordered, index-served); only the per-source ranking below hands out the
-    K slots by `updated_at DESC, chunk_id` instead of score. That keeps the
-    quiet-source guarantee on the recency path, which a single global
-    recency pool cannot give.
+    The pool is one global ANN query, `ORDER BY distance LIMIT pool_size`
+    (index scan). `_rank_per_source` then keeps at most K rows per
+    source_system and interleaves sources by rank. A source with fewer than K
+    rows in the pool keeps what it has -- if there are not enough, there are
+    not enough (Richard, 2026-10-02).
 
-    HISTORY, because the previous shape looked reasonable and cost 37-52
-    seconds. The guarantee (PR#78): every source_system gets its own top-K
-    slots, because cosine scores are not comparable across sources and a
-    global budget hands every slot to the chattiest corpus --
-    `custom_ingest`'s first hit once ranked 61st globally and a LIMIT of 30
-    cut that corpus entirely. The first server-side implementation kept the
-    guarantee by SKIPPING the ANN LIMIT and windowing the FULL matching set.
-    Correct, and catastrophically slow: on the research plane that planned as
-    a Parallel Seq Scan over 626k joined rows + Sort + WindowAgg, 37-52s per
-    query, ~97% of the retrieval stage -- the 2026-08-26 search timeouts.
-    Its comment claimed production used the fast default path; unified
-    search sends per_source_top_k on every request, so production ALWAYS
-    took the slow one.
+    HISTORY. PR#78 made K a quota: every source "got" K slots, because a
+    global budget once cut `custom_ingest` entirely (its first hit ranked
+    61st). It was first kept by windowing the full matching set (37-52 s,
+    the 2026-08-26 timeouts), then by one extra ANN query per short source
+    ("top-ups", #513). Those top-ups forced low-scoring rows into the result
+    and were the slowest part of a search (2.0 s mean each, ~4 per search,
+    up to 42.9 s; filtered HNSW walks that often returned the wrong rows).
+    Removed: K only trims.
 
-    The replacement keeps both properties -- per-source recall AND the index
-    -- by decomposing:
-
-      1. POOL: one global ANN query, `ORDER BY distance LIMIT pool_size`
-         (index scan, ~456ms measured at 400 on 792k chunks). Because the
-         pool is globally distance-ordered, any source with >= K rows in it
-         has its true per-source top-K there already.
-      2. TOP-UP: only for sources the pool left short, one ANN query each
-         with `d.source_system = $s`, again `ORDER BY distance LIMIT K`.
-         pgvector's iterative scan widens each scan until the quota is
-         found, which is precisely the rank-61 case done correctly: walk
-         deeper for the quiet source, but through the index, bounded by
-         `hnsw.max_scan_tuples` (default 20k visited tuples) instead of by
-         the table.
-      3. The top-ups run CONCURRENTLY (each on its own pooled connection),
-         so wall clock is pool + max(top-up) -- measured ~600ms per quiet
-         source -- not pool + sum. Serial SQL for the same decomposition
-         measured 2.9s; concurrent Python measures ~1.1s wall.
-
-    Failure honesty: iterative scan gives up after max_scan_tuples, so an
-    ultra-rare source inside a huge corpus can still under-return. The old
-    full scan would have found it, 40 seconds late; the budget upstream
-    (`ENGINE_TIMEOUT_SECONDS` = 30s < the old path's floor) means those
-    results were never actually delivered to anyone. Bounded-but-fast is the
-    honest trade, and it is the same one the default ANN path already makes.
-
-    `sources`, when the caller set it, is both a hard filter (already inside
-    `inner_sql`) and the quota list -- no discovery query needed. Otherwise
-    the tenant's live source list comes from a skip-scan on
-    `idx_documents_customer_source` (~1ms), never a DISTINCT seq scan.
+    `rank_by="recency"` ranks within a source by `updated_at DESC, chunk_id`
+    instead of score; the pool stays distance-ordered either way.
     """
     pool_limit = max(top_k, PER_SOURCE_ANN_POOL)
+    # Parameter slot 3 is the query's LIMIT: `_build_inner_query` binds $3 to
+    # top_k for the single-query paths; the pool swaps in its own size rather
+    # than appending a parameter and leaving $3 dangling (an unreferenced $n
+    # has no inferable type and fails at bind time).
+    pool_params = list(params)
+    pool_params[2] = pool_limit
+    sql = (
+        f"{inner_sql}\n            ORDER BY {ann_order_sql}"
+        f"\n            LIMIT $3"
+    )
+    async with _ANN_STATEMENT_SEMAPHORE, with_tenant(customer_id) as conn:
+        await _enable_iterative_scan(conn)
+        pool_rows = await conn.fetch(sql, *pool_params)
 
-    # Parameter slot 3 is each query's own LIMIT. `_build_inner_query` binds
-    # $3 to top_k for the single-query paths; here every ANN query has a
-    # DIFFERENT limit (pool size, per-source quota), so each swaps its own
-    # value into the slot instead of appending a new parameter and leaving $3
-    # dangling. Postgres infers a statement's parameter list from the highest
-    # $n it references, and a $3 that appears in no expression has no
-    # inferable type: the bind fails with `could not determine data type of
-    # parameter $3`. That is not hypothetical -- the first deploy of this
-    # path did exactly that on every request, and the fake-connection unit
-    # tests could not see it because bind-time errors only exist on a real
-    # protocol. The live-binding test exists because of this.
-
-    async def _fetch_pool() -> list[Any]:
-        pool_params = list(params)
-        pool_params[2] = pool_limit
-        sql = (
-            f"{inner_sql}\n            ORDER BY {ann_order_sql}"
-            f"\n            LIMIT $3"
-        )
-        async with _ANN_STATEMENT_SEMAPHORE, with_tenant(customer_id) as conn:
-            await _enable_iterative_scan(conn)
-            return await conn.fetch(sql, *pool_params)
-
-    async def _fetch_sources() -> list[str]:
-        if sources:
-            return list(sources)
-        # Loose index scan over (customer_id, source_system, ...): each
-        # recursion hops to the next distinct source via the btree, so cost
-        # is O(distinct sources), not O(documents). A plain DISTINCT here
-        # seq-scanned ~211k rows.
-        sql = """
-            WITH RECURSIVE r AS (
-                (SELECT source_system FROM documents
-                 WHERE customer_id = $1
-                 ORDER BY source_system LIMIT 1)
-                UNION ALL
-                SELECT (SELECT d2.source_system FROM documents d2
-                        WHERE d2.customer_id = $1
-                          AND d2.source_system > r.source_system
-                        ORDER BY d2.source_system LIMIT 1)
-                FROM r WHERE r.source_system IS NOT NULL
-            )
-            SELECT source_system FROM r WHERE source_system IS NOT NULL
-        """
-        async with with_tenant(customer_id) as conn:
-            rows = await conn.fetch(sql, customer_id)
-        return [r["source_system"] for r in rows]
-
-    async def _fetch_topup(source: str) -> list[Any]:
-        topup_params = [*params, source]
-        topup_params[2] = per_source_top_k
-        sql = (
-            f"{inner_sql}\n              AND d.source_system = ${len(topup_params)}"
-            f"\n            ORDER BY {ann_order_sql}"
-            f"\n            LIMIT $3"
-        )
-        async with _ANN_STATEMENT_SEMAPHORE, with_tenant(customer_id) as conn:
-            await _enable_iterative_scan(conn)
-            return await conn.fetch(sql, *topup_params)
-
-    pool_rows, src_list = await asyncio.gather(_fetch_pool(), _fetch_sources())
-
-    counts: dict[str, int] = defaultdict(int)
-    for r in pool_rows:
-        counts[r["source_system"]] += 1
-    short = [s for s in src_list if counts[s] < per_source_top_k]
-
-    topup_rows: list[Any] = []
-    if short:
-        for batch in await asyncio.gather(*(_fetch_topup(s) for s in short)):
-            topup_rows.extend(batch)
-
-    # Merge in Python, mirroring the SQL window this replaces exactly:
-    # rank rows within each source by (score DESC, chunk_id), keep at most K
-    # per source, then interleave by rank (every source's rank-1 before any
-    # source's rank-2 -- see the interleave rationale above), cap at top_k.
+    # Rank within each source by (score DESC, chunk_id), keep at most K per
+    # source, interleave by rank, cap at top_k.
     return _rank_per_source(
-        [*pool_rows, *topup_rows],
+        pool_rows,
         per_source_top_k=per_source_top_k,
         top_k=top_k,
         rank_by=rank_by,
@@ -640,17 +544,14 @@ def _rank_per_source(
     top_k: int,
     rank_by: str = "relevance",
 ) -> list[Any]:
-    """Merge pool + top-up rows in Python, mirroring the SQL window this
-    replaced: dedupe by chunk_id (a short source's pool rows reappear in its
-    top-up -- first occurrence wins, rows identical), rank rows WITHIN each
+    """Rank pool rows in Python, mirroring the SQL window this replaced:
+    dedupe by chunk_id (first occurrence wins), rank rows WITHIN each
     source, keep at most K per source, then interleave by rank (every
-    source's rank-1 before any source's rank-2 -- see the interleave
-    rationale in the per-source docstring), cap at top_k.
+    source's rank-1 before any source's rank-2), cap at top_k.
 
     `rank_by="recency"` ranks within a source by `updated_at DESC, chunk_id`
     instead of `score DESC, chunk_id`; the pool that fed it stays distance-
-    ordered either way, which is what keeps the quiet-source guarantee on
-    the recency path.
+    ordered either way.
     """
     if rank_by == "recency":
         def _key(r: Any) -> tuple[Any, ...]:

@@ -90,9 +90,8 @@ class _Dispatcher:
         if "WITH RECURSIVE" in sql:
             return [{"source_system": s} for s in self.source_rows]
         if "AND d.source_system = $" in sql:
-            # top-up: the scalar source equality this path appends (last
-            # parameter). Distinct from the caller's hard filter, which
-            # spells `= ANY($N::text[])`.
+            # A per-source top-up would spell this scalar equality; the path
+            # must never issue one (the caller's hard filter is `= ANY(...)`).
             return self.topup_rows.get(params[-1], [])
         return self.pool_rows
 
@@ -146,86 +145,48 @@ async def test_every_candidate_query_is_ann_limited(db: _Dispatcher) -> None:
         )
 
 
-async def test_recency_per_source_takes_the_same_pool_and_topups(db: _Dispatcher) -> None:
-    """recency + per-source no longer windows a full scan (nor one global
-    recency pool, which let a loud source starve a quiet one): it takes the
-    same distance-ordered pool + per-source top-ups as relevance, and only the
-    in-Python ranking switches to updated_at. Every candidate query stays
-    ANN-ordered and LIMITed. See test_vector_recency_pool.py."""
+async def test_recency_per_source_takes_the_same_single_pool(db: _Dispatcher) -> None:
+    """recency + per-source takes the same distance-ordered pool as relevance;
+    only the in-Python ranking switches to updated_at. One ANN statement, no
+    top-up. See test_vector_recency_pool.py."""
     db.pool_rows = [_row("c1", "github", 0.9), _row("c2", "github", 0.8)]
-    db.source_rows = ["github", "custom_ingest"]
-    db.topup_rows["custom_ingest"] = [_row("c9", "custom_ingest", 0.4)]
     await _search(db, sort_by="recency")
     candidate_sqls = [s for s, _ in db.fetched if "FROM chunks c" in s]
-    assert len(candidate_sqls) == 2  # pool + one top-up for the short source
-    for sql in candidate_sqls:
-        assert "ROW_NUMBER()" not in sql
-        assert re.search(r"ORDER BY\s+c\.embedding_v2\s+<=>\s+\$2::halfvec\s+LIMIT \$\d+", sql)
+    assert len(candidate_sqls) == 1
+    assert "ROW_NUMBER()" not in candidate_sqls[0]
+    assert re.search(r"ORDER BY\s+c\.embedding_v2\s+<=>\s+\$2::halfvec\s+LIMIT \$\d+", candidate_sqls[0])
 
 
-async def test_iterative_scan_is_enabled_on_every_ann_connection(db: _Dispatcher) -> None:
-    """Each concurrent ANN query runs on its own pooled connection, and each
-    needs its own SET LOCAL -- the GUC does not travel between connections.
-    Without it a quiet source's top-up under-returns exactly like the
-    source_keys case the docstring documents."""
-    db.pool_rows = [_row("c1", "github", 0.9), _row("c2", "github", 0.8)]
-    db.source_rows = ["github", "custom_ingest"]
-    db.topup_rows["custom_ingest"] = [_row("c9", "custom_ingest", 0.4)]
+async def test_iterative_scan_is_enabled_on_the_ann_connection(db: _Dispatcher) -> None:
+    db.pool_rows = [_row("c1", "github", 0.9)]
     await _search(db)
-
     ann_fetches = sum(1 for s, _ in db.fetched if "FROM chunks c" in s)
     iterscan_sets = sum(1 for s in db.executed if "hnsw.iterative_scan" in s)
-    assert ann_fetches == 2  # pool + one top-up
-    assert iterscan_sets == ann_fetches
+    assert ann_fetches == 1
+    assert iterscan_sets == 1
 
 
 # ============================================================
-# Top-ups: only for sources the pool left short
+# K is a cap, never a quota: nothing tops a source up
 # ============================================================
 
-async def test_no_topups_when_the_pool_satisfies_every_quota(db: _Dispatcher) -> None:
-    """A pool row count >= K per source means that source's true top-K is
-    already in the pool (it is globally distance-ordered), so no second
-    query. The common case costs exactly one ANN round-trip."""
+async def test_a_short_source_is_never_topped_up(db: _Dispatcher) -> None:
+    """A source with fewer than K rows in the pool keeps what it has; a
+    source absent from the pool stays absent. One ANN statement, no source
+    discovery, no per-source query (Richard, 2026-10-02: "if there arent
+    enough then there arent enough for a source")."""
     db.pool_rows = [
         _row("g1", "github", 0.9),
         _row("g2", "github", 0.8),
-        _row("s1", "slack", 0.7),
-        _row("s2", "slack", 0.6),
+        _row("ci1", "custom_ingest", 0.3),
     ]
-    db.source_rows = ["github", "slack"]
-    await _search(db)
+    hits = await _search(db, sources=["github", "custom_ingest", "slack"])
 
-    topups = [s for s, _ in db.fetched if "AND d.source_system = $" in s]
-    assert topups == []
-
-
-async def test_topup_runs_only_for_the_short_source(db: _Dispatcher) -> None:
-    """The rank-61 case: a quiet source missing from the pool gets its own
-    ANN query; the loud one that filled its quota does not."""
-    db.pool_rows = [
-        _row("g1", "github", 0.9),
-        _row("g2", "github", 0.8),
-    ]
-    db.source_rows = ["github", "custom_ingest"]
-    db.topup_rows["custom_ingest"] = [_row("ci1", "custom_ingest", 0.3)]
-    hits = await _search(db)
-
-    topup_params = [p for s, p in db.fetched if "AND d.source_system = $" in s]
-    assert [p[-1] for p in topup_params] == ["custom_ingest"]
-    assert {h.source_system for h in hits} == {"github", "custom_ingest"}
-
-
-async def test_caller_sources_list_is_the_quota_list(db: _Dispatcher) -> None:
-    """When the caller passed `sources`, that list IS the quota set -- no
-    discovery query. A source outside it must never get a top-up, because
-    the hard filter already excludes its rows."""
-    db.pool_rows = [_row("g1", "github", 0.9)]
-    await _search(db, sources=["github", "slack"])
-
+    assert len(db.fetched) == 1
     assert not any("WITH RECURSIVE" in s for s, _ in db.fetched)
-    topup_params = [p for s, p in db.fetched if "AND d.source_system = $" in s]
-    assert sorted(p[-1] for p in topup_params) == ["github", "slack"]
+    assert not any("AND d.source_system = $" in s for s, _ in db.fetched)
+    assert [h.chunk_id for h in hits] == ["g1", "ci1", "g2"]
+    assert "slack" not in {h.source_system for h in hits}
 
 
 # ============================================================
@@ -259,14 +220,10 @@ async def test_per_source_quota_and_global_cap_hold(db: _Dispatcher) -> None:
     assert [h.chunk_id for h in hits] == ["g0", "g1"]  # K=2 of 5
 
 
-async def test_pool_and_topup_overlap_dedupes(db: _Dispatcher) -> None:
-    """A short source's pool rows reappear inside its top-up (the top-up is
-    a superset by construction). The duplicate must collapse, or one chunk
-    eats two of its source's K slots."""
+async def test_duplicate_pool_rows_collapse(db: _Dispatcher) -> None:
+    """A chunk must not eat two of its source's K slots."""
     shared = _row("ci1", "custom_ingest", 0.5)
-    db.pool_rows = [_row("g1", "github", 0.9), _row("g2", "github", 0.8), shared]
-    db.source_rows = ["github", "custom_ingest"]
-    db.topup_rows["custom_ingest"] = [dict(shared), _row("ci2", "custom_ingest", 0.4)]
+    db.pool_rows = [_row("g1", "github", 0.9), shared, dict(shared), _row("ci2", "custom_ingest", 0.4)]
     hits = await _search(db)
 
     ci = [h.chunk_id for h in hits if h.source_system == "custom_ingest"]
@@ -281,7 +238,7 @@ async def test_ann_statements_respect_the_admission_bound(db: _Dispatcher, monke
     channel_total 214s vs channel_max 74s, pure thrash. Every statement was
     individually index-shaped and fast; the storm was the problem. Admission
     control is the fix, so this pins that the bound is actually applied to
-    both statement kinds (pool AND top-up), not just declared."""
+    the pool statement, not just declared."""
     import asyncio as aio
 
     in_flight = 0
@@ -301,7 +258,7 @@ async def test_ann_statements_respect_the_admission_bound(db: _Dispatcher, monke
     monkeypatch.setattr(vector_mod, "_ANN_STATEMENT_SEMAPHORE", vector_mod.asyncio.Semaphore(2))
 
     db.pool_rows = []
-    db.source_rows = ["a", "b", "c", "d", "e", "f"]  # every source short -> 6 top-ups
-    await _search(db)
+    # Concurrent searches share the bound; each makes exactly one statement.
+    await aio.gather(*(_search(db) for _ in range(6)))
 
     assert peak <= 2, f"admission bound violated: {peak} ANN statements in flight"
