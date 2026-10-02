@@ -239,8 +239,9 @@ async def _fuzzy_match_entities(
     """
 
     async with with_tenant(customer_id) as conn:
-        rows = await conn.fetch(
-            sql, customer_id, trgm_probe, trgm_probe, labels, per_type_cap, total_cap
+        rows = await _entity_rows(
+            conn, customer_id, [trgm_probe], labels, per_type_cap, total_cap,
+            sql, customer_id, trgm_probe, trgm_probe, labels, per_type_cap, total_cap,
         )
 
     out: list[GroundingCandidate] = []
@@ -474,6 +475,39 @@ _TITLE_MATCH_FN_SQL: Final[str] = """
 _title_match_fn_exists: bool | None = None
 
 
+async def _function_exists(conn: asyncpg.Connection, signature: str) -> bool:
+    return bool(await conn.fetchval("SELECT to_regprocedure($1) IS NOT NULL", signature))
+
+
+async def _match_function_rows(
+    conn: asyncpg.Connection,
+    customer_id: str,
+    fn_sql: str,
+    fn_args: tuple[object, ...],
+    fallback_event: str,
+) -> tuple[list[asyncpg.Record] | None, bool]:
+    """(rows, False) from a kb_match_* function, or (None, dropped) after
+    logging why it could not answer; dropped is True when it no longer exists.
+
+    A savepoint: a failed call must leave the transaction usable for the
+    inline statement the caller falls back to.
+    """
+    try:
+        async with conn.transaction():
+            return await conn.fetch(fn_sql, *fn_args), False
+    except asyncpg.PostgresError as exc:
+        log.warning(
+            fallback_event,
+            extra={
+                "customer_id": customer_id,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            },
+        )
+        # Dropped since the existence check (a downgrade): stop asking.
+        return None, isinstance(exc, asyncpg.UndefinedFunctionError)
+
+
 async def _title_rows(
     conn: asyncpg.Connection,
     customer_id: str,
@@ -490,29 +524,85 @@ async def _title_rows(
     global _title_match_fn_exists
     if customer_id:
         if _title_match_fn_exists is None:
-            _title_match_fn_exists = bool(await conn.fetchval(
-                "SELECT to_regprocedure($1) IS NOT NULL", _TITLE_MATCH_FN,
-            ))
+            _title_match_fn_exists = await _function_exists(conn, _TITLE_MATCH_FN)
         if _title_match_fn_exists:
-            try:
-                # A savepoint: a failed call must leave the transaction
-                # usable for the inline statement.
-                async with conn.transaction():
-                    return await conn.fetch(
-                        _TITLE_MATCH_FN_SQL, probes, _DOC_TITLE_TRGM_FLOOR, cap,
-                    )
-            except asyncpg.PostgresError as exc:
-                if isinstance(exc, asyncpg.UndefinedFunctionError):
-                    # Dropped since the check (a downgrade): stop asking.
-                    _title_match_fn_exists = False
-                log.warning(
-                    "grounding.title_function_fallback",
-                    extra={
-                        "customer_id": customer_id,
-                        "error_type": type(exc).__name__,
-                        "error": str(exc),
-                    },
-                )
+            rows, dropped = await _match_function_rows(
+                conn, customer_id, _TITLE_MATCH_FN_SQL,
+                (probes, _DOC_TITLE_TRGM_FLOOR, cap),
+                "grounding.title_function_fallback",
+            )
+            if rows is not None:
+                return rows
+            if dropped:
+                _title_match_fn_exists = False
+    return await conn.fetch(inline_sql, *inline_args)
+
+
+# ---------------------------------------------------------------------------
+# Index-backed entity lookup (migration 0147).
+#
+# The same story for graph_nodes: both entity matchers run INLINE as `app`
+# under FORCE RLS, so neither idx_graph_nodes_name_trgm (`%`) nor a full-text
+# index (`@@`) may be used, and every call rebuilds to_tsvector() of every
+# grounding-label name of the tenant once per probe (1,559 ms mean for the
+# multi-probe statement in production over 30 days). kb_match_entities_multi_v1()
+# returns exactly the multi-probe statement's rows -- same `rel`, same
+# per-label and total caps, same (label, canonical_id) tie-breakers -- and is
+# index-backed once it is owned by the BYPASSRLS `resolver` role. Migration
+# 0147's docstring has the reasoning; tests/retrieval/test_entity_match_function.py
+# pins the parity.
+#
+# The single-probe matcher calls it with one probe: a one-element multi-probe
+# result IS the single-probe result (same keys; rn2 <= total_cap ordered by
+# rn2 is the single statement's ORDER BY ... LIMIT total_cap). Same rules as
+# the title lookup: used when it exists and the tenant is non-empty, any error
+# falls back to the inline SQL inside a SAVEPOINT, with a warning.
+# ---------------------------------------------------------------------------
+
+_ENTITY_MATCH_FN: Final[str] = (
+    "public.kb_match_entities_multi_v1(text[], text[], integer, integer)"
+)
+_ENTITY_MATCH_FN_SQL: Final[str] = """
+    SELECT f.ord, f.label, f.canonical_id, f.kind, f.display_name,
+           f.last_seen_at_raw, f.rel
+    FROM kb_match_entities_multi_v1($1::text[], $2::text[], $3::int, $4::int)
+         WITH ORDINALITY AS f
+    ORDER BY f.ord, f.ordinality
+"""
+#: None until the first lookup asks the catalog; then whether it exists.
+_entity_match_fn_exists: bool | None = None
+
+
+async def _entity_rows(
+    conn: asyncpg.Connection,
+    customer_id: str,
+    probes: list[str],
+    labels: list[str],
+    per_type_cap: int,
+    total_cap: int,
+    inline_sql: str,
+    *inline_args: object,
+) -> list[asyncpg.Record]:
+    """Entity-match rows from the function when usable, else the inline SQL.
+
+    The function's `%` reads pg_trgm.similarity_threshold from this
+    transaction exactly as the inline SQL does (grounding leaves it at the
+    default for entities).
+    """
+    global _entity_match_fn_exists
+    if customer_id:
+        if _entity_match_fn_exists is None:
+            _entity_match_fn_exists = await _function_exists(conn, _ENTITY_MATCH_FN)
+        if _entity_match_fn_exists:
+            rows, dropped = await _match_function_rows(
+                conn, customer_id, _ENTITY_MATCH_FN_SQL,
+                (probes, labels, per_type_cap, total_cap),
+                "grounding.entity_function_fallback",
+            )
+            if rows is not None:
+                return rows
+            if dropped:
+                _entity_match_fn_exists = False
     return await conn.fetch(inline_sql, *inline_args)
 
 
@@ -757,8 +847,9 @@ async def _fuzzy_match_entities_multi(
     """
 
     async with with_tenant(customer_id) as conn:
-        rows = await conn.fetch(
-            sql, customer_id, probes, labels, per_type_cap, total_cap
+        rows = await _entity_rows(
+            conn, customer_id, probes, labels, per_type_cap, total_cap,
+            sql, customer_id, probes, labels, per_type_cap, total_cap,
         )
 
     out: list[list[GroundingCandidate]] = [[] for _ in probes]

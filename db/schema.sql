@@ -1337,6 +1337,16 @@ CREATE INDEX idx_graph_nodes_canonical_id_trgm
     ON graph_nodes USING gin (LOWER(canonical_id) gin_trgm_ops);
 CREATE INDEX idx_graph_nodes_name_trgm
     ON graph_nodes USING gin (LOWER(properties->>'name') gin_trgm_ops);
+-- Grounding's entity lookup (migration 0147): the full-text expression of
+-- grounding.py's entity statements, character for character, and the trigram
+-- COUNT of the lowercased name per (tenant, label). kb_match_entities_multi_v1()
+-- reads the count as an exact prefilter: similarity >= t implies
+-- t*|B| <= |A| <= |B|/t over the two trigram sets. Not partial, so ANALYZE
+-- collects their expression statistics and the planner uses them.
+CREATE INDEX idx_graph_nodes_name_tsv
+    ON graph_nodes USING gin (to_tsvector('english', coalesce(properties->>'name', '')));
+CREATE INDEX idx_graph_nodes_name_trgm_count
+    ON graph_nodes (customer_id, label, (array_length(show_trgm(lower(properties->>'name')), 1)));
 -- Lane A: partial index on community_id for cross-community surprise-score lookups.
 CREATE INDEX idx_graph_nodes_customer_community
     ON graph_nodes (customer_id, community_id) WHERE community_id IS NOT NULL;
@@ -1450,6 +1460,215 @@ CREATE POLICY tenant_isolation ON graph_edges
 CREATE POLICY tenant_isolation ON graph_node_provenance
     USING (customer_id = current_setting('app.current_customer_id', true))
     WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
+
+-- Grounding's entity lookup (migration 0147). Returns exactly the rows of
+-- grounding.py's multi-probe entity statement; index-backed once a research-os
+-- Job re-owns it to the BYPASSRLS role `resolver` (D71), the statement
+-- unchanged while RLS still applies to its owner. The body below is
+-- byte-identical to 0147's (tests pin it); the migration's docstring has the
+-- reasoning.
+
+CREATE OR REPLACE FUNCTION kb_match_entities_multi_v1(
+    probes text[], labels text[], per_type_cap integer, total_cap integer
+)
+RETURNS TABLE (
+    ord bigint, label text, canonical_id text, kind text, display_name text,
+    last_seen_at_raw text, rel real
+)
+LANGUAGE plpgsql STABLE SECURITY DEFINER
+SET search_path = pg_catalog, public, pg_temp
+SET plan_cache_mode = force_custom_plan
+AS $$
+DECLARE
+    tenant text := current_setting('app.current_customer_id', true);
+    thr real;
+    folds_alike boolean;
+    probe text;
+    i bigint := 0;
+    q tsquery;
+    pn integer;
+    trgm_ids bigint[];
+BEGIN
+    IF tenant IS NULL OR tenant = '' OR probes IS NULL OR labels IS NULL
+       OR per_type_cap IS NULL OR per_type_cap <= 0
+       OR total_cap IS NULL OR total_cap <= 0 THEN
+        RETURN;
+    END IF;
+    -- What `%` compares against: the caller's pg_trgm.similarity_threshold.
+    thr := show_limit();
+
+    -- Owned by a role RLS applies to (before the hand-over to `resolver`):
+    -- no index can help, and per-probe legs would each re-read the tenant.
+    -- Or a threshold the count window cannot express. Run grounding.py's
+    -- statement as it is.
+    IF row_security_active('public.graph_nodes'::regclass) OR NOT (thr >= 0.01) THEN
+        RETURN QUERY
+        WITH probe_list AS (
+            SELECT u.p, u.ord FROM unnest(probes) WITH ORDINALITY AS u(p, ord)
+        ),
+        ranked AS (
+            SELECT
+                pl.ord,
+                n.label, n.canonical_id,
+                n.properties->>'kind' AS kind,
+                coalesce(n.properties->>'name', n.canonical_id) AS display_name,
+                n.properties->>'last_seen_at' AS last_seen_at_raw,
+                GREATEST(
+                    similarity(coalesce(n.properties->>'name',''), pl.p),
+                    CASE
+                        WHEN to_tsvector('english', coalesce(n.properties->>'name', ''))
+                             @@ plainto_tsquery('english', pl.p) THEN 0.5
+                        ELSE 0.0
+                    END
+                ) AS rel,
+                row_number() OVER (
+                    PARTITION BY pl.ord, n.label
+                    ORDER BY GREATEST(
+                        similarity(coalesce(n.properties->>'name',''), pl.p),
+                        CASE
+                            WHEN to_tsvector('english', coalesce(n.properties->>'name', ''))
+                                 @@ plainto_tsquery('english', pl.p) THEN 0.5
+                            ELSE 0.0
+                        END
+                    ) DESC,
+                    (n.properties->>'last_seen_at')::timestamptz DESC NULLS LAST,
+                    n.canonical_id
+                ) AS rn
+            FROM public.graph_nodes n
+            CROSS JOIN probe_list pl
+            WHERE n.customer_id = tenant
+              AND n.label = ANY(labels)
+              AND (
+                  lower(n.properties->>'name') % pl.p
+                  OR to_tsvector('english', coalesce(n.properties->>'name', ''))
+                     @@ plainto_tsquery('english', pl.p)
+              )
+        ),
+        capped AS (
+            SELECT r.ord, r.label, r.canonical_id, r.kind, r.display_name,
+                   r.last_seen_at_raw, r.rel,
+                   row_number() OVER (
+                       PARTITION BY r.ord
+                       ORDER BY r.rel DESC, r.last_seen_at_raw DESC NULLS LAST,
+                                r.label, r.canonical_id
+                   ) AS rn2
+            FROM ranked r
+            WHERE r.rn <= per_type_cap
+        )
+        SELECT c.ord, c.label, c.canonical_id, c.kind, c.display_name,
+               c.last_seen_at_raw, c.rel
+        FROM capped c
+        WHERE c.rn2 <= total_cap
+        ORDER BY c.ord, c.rn2;
+        RETURN;
+    END IF;
+
+    -- pg_trgm folds case with the libc ctype; so does lower() under a libc
+    -- default collation, and then a full-text hit outside the trigram leg
+    -- scores exactly 0.5 for a threshold <= 0.5 (see the shortcut below).
+    folds_alike := (SELECT d.datlocprovider = 'c'
+                    FROM pg_catalog.pg_database d
+                    WHERE d.datname = current_database());
+
+    FOREACH probe IN ARRAY probes LOOP
+        i := i + 1;
+        CONTINUE WHEN probe IS NULL;
+        q := plainto_tsquery('english', probe);
+        pn := array_length(show_trgm(probe), 1);
+
+        -- Trigram leg: the nodes whose lower(name) is `%` the probe.
+        IF pn IS NULL THEN
+            -- No trigrams (punctuation only, ''): similarity is 0.
+            trgm_ids := '{}';
+        ELSIF pn < 16 THEN
+            -- One word: the trigram-count window. OFFSET 0 keeps `%` out of
+            -- index selection; the GIN admits too much for a short probe.
+            SELECT coalesce(array_agg(w.node_id), '{}') INTO trgm_ids
+            FROM (
+                SELECT n.node_id, n.properties
+                FROM public.graph_nodes n
+                WHERE n.customer_id = tenant
+                  AND n.label = ANY(labels)
+                  AND array_length(show_trgm(lower(n.properties->>'name')), 1)
+                      BETWEEN floor(pn * thr)::int AND ceil(pn / thr)::int
+                OFFSET 0
+            ) w
+            WHERE lower(w.properties->>'name') % probe;
+        ELSE
+            -- Longer probes: the trigram GIN is selective; the planner chooses.
+            SELECT coalesce(array_agg(n.node_id), '{}') INTO trgm_ids
+            FROM public.graph_nodes n
+            WHERE n.customer_id = tenant
+              AND n.label = ANY(labels)
+              AND lower(n.properties->>'name') % probe;
+        END IF;
+
+        RETURN QUERY
+        WITH cand AS MATERIALIZED (
+            SELECT c.label, c.canonical_id, c.properties,
+                   CASE
+                       -- Full-text hit, not a trigram match: similarity is
+                       -- below the threshold, so GREATEST(.., 0.5) is 0.5.
+                       WHEN c.fts_hit AND folds_alike AND thr <= 0.5
+                            AND NOT (c.node_id = ANY(trgm_ids)) THEN 0.5::real
+                       ELSE GREATEST(
+                           similarity(coalesce(c.properties->>'name',''), probe),
+                           CASE WHEN c.fts_hit THEN 0.5 ELSE 0.0 END
+                       )
+                   END AS rel,
+                   (c.properties->>'last_seen_at')::timestamptz AS last_seen_at
+            FROM (
+                -- Full-text leg.
+                SELECT n.node_id, n.label, n.canonical_id, n.properties, true AS fts_hit
+                FROM public.graph_nodes n
+                WHERE n.customer_id = tenant
+                  AND n.label = ANY(labels)
+                  AND to_tsvector('english', coalesce(n.properties->>'name', '')) @@ q
+                UNION ALL
+                -- Trigram matches that are not full-text hits.
+                SELECT n.node_id, n.label, n.canonical_id, n.properties, false
+                FROM public.graph_nodes n
+                WHERE n.node_id = ANY(trgm_ids)
+                  AND n.customer_id = tenant
+                  AND NOT (to_tsvector('english', coalesce(n.properties->>'name', '')) @@ q)
+            ) c
+        ),
+        per_label AS (
+            -- The top per_type_cap of each label present: today's per-label
+            -- row_number() <= per_type_cap, as a top-N sort.
+            SELECT t.label, t.canonical_id, t.properties, t.rel
+            FROM (SELECT DISTINCT c.label FROM cand c) l
+            CROSS JOIN LATERAL (
+                SELECT c.label, c.canonical_id, c.properties, c.rel
+                FROM cand c
+                WHERE c.label = l.label
+                ORDER BY c.rel DESC, c.last_seen_at DESC NULLS LAST, c.canonical_id
+                LIMIT per_type_cap
+            ) t
+        ),
+        capped AS (
+            SELECT p.label, p.canonical_id,
+                   p.properties->>'kind' AS kind,
+                   coalesce(p.properties->>'name', p.canonical_id) AS display_name,
+                   p.properties->>'last_seen_at' AS last_seen_at_raw,
+                   p.rel,
+                   row_number() OVER (
+                       ORDER BY p.rel DESC, p.properties->>'last_seen_at' DESC NULLS LAST,
+                                p.label, p.canonical_id
+                   ) AS rn2
+            FROM per_label p
+        )
+        SELECT i, c.label, c.canonical_id, c.kind, c.display_name,
+               c.last_seen_at_raw, c.rel
+        FROM capped c
+        WHERE c.rn2 <= total_cap
+        ORDER BY c.rn2;
+    END LOOP;
+END
+$$;
+
+REVOKE EXECUTE ON FUNCTION kb_match_entities_multi_v1(text[], text[], integer, integer) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION kb_match_entities_multi_v1(text[], text[], integer, integer) TO CURRENT_ROLE;
 
 -- ---------------------------------------------------------------------------
 -- Entity clusters: manual identity merging via dashboard (migration 0071).

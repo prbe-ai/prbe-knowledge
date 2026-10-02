@@ -127,6 +127,38 @@ INDEX_CONTRACTS: Final[tuple[IndexContract, ...]] = (
         ),
     ),
     IndexContract(
+        # kb_match_entities_multi_v1 (0147) lives in db/schema.sql.
+        index="idx_graph_nodes_name_tsv",
+        table="graph_nodes",
+        expression="to_tsvector('english', coalesce(properties->>'name', ''))",
+        source_file="db/schema.sql",
+        predicate="to_tsvector('english', coalesce(n.properties->>'name', '')) @@ q",
+        why=(
+            "kb_match_entities_multi_v1's full-text leg. Without it every call "
+            "rebuilds to_tsvector() of every grounding-label name of the tenant "
+            "per probe -- the cost of grounding's entity channel (1,559 ms mean "
+            "in prod). The expression must stay grounding.py's, character for "
+            "character."
+        ),
+    ),
+    IndexContract(
+        index="idx_graph_nodes_name_trgm_count",
+        table="graph_nodes",
+        expression="customer_id, label, (array_length(show_trgm(lower(properties->>'name')), 1))",
+        source_file="db/schema.sql",
+        predicate=(
+            "array_length(show_trgm(lower(n.properties->>'name')), 1) "
+            "BETWEEN floor(pn * thr)::int"
+        ),
+        why=(
+            "kb_match_entities_multi_v1's exact trigram-count prefilter for "
+            "one-word probes: the trigram GIN admits every name holding a "
+            "short probe's trigrams ('session' is in all 7,386 AgentSession "
+            "names of `probe`). T16 rig: 40 ms via the GIN, 5 ms via the window. "
+            "The count must be of lower(name), the string `%` compares."
+        ),
+    ),
+    IndexContract(
         index="idx_graph_nodes_name_trgm",
         table="graph_nodes",
         expression="lower((properties ->> 'name'::text)) gin_trgm_ops",
