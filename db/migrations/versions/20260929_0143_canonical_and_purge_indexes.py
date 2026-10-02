@@ -45,6 +45,8 @@ xact_start: the build waits for every transaction older than itself.
 """
 
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import sqlalchemy as sa
 from alembic import op
@@ -90,14 +92,15 @@ def _budget(bind, deadline: float) -> None:
     """statement_timeout = what is left of the budget; raise when none is."""
     left_ms = int((deadline - time.monotonic()) * 1000)
     if left_ms <= 0:
-        raise TimeoutError("0143 ran out of its time budget")
+        raise TimeoutError("concurrent-index migration ran out of its time budget")
     bind.execute(sa.text(f"SET statement_timeout = {left_ms}"))
 
 
-def ensure_index(bind, name: str, table: str, columns: str, deadline: float | None = None) -> bool:
-    """Build `public.<name>` unless an identical valid one exists. True if built."""
-    deadline = deadline if deadline is not None else time.monotonic() + BUDGET_SECONDS
-    want = expected_definition(name, table, columns)
+def build_index(bind, name: str, create_sql: str, want: str, deadline: float) -> bool:
+    """Run `create_sql` (a CREATE INDEX CONCURRENTLY of `public.<name>`) unless a
+    valid index of that name whose pg_get_indexdef() is exactly `want` exists.
+    Anything else of that name is dropped CONCURRENTLY first; the result is
+    verified. True if built. 0146 reuses this for an expression index."""
     _budget(bind, deadline)
     row = _current(bind, name)
     if row is not None and row.usable and row.definition == want:
@@ -106,7 +109,7 @@ def ensure_index(bind, name: str, table: str, columns: str, deadline: float | No
         _budget(bind, deadline)
         bind.execute(sa.text(f"DROP INDEX CONCURRENTLY IF EXISTS public.{name}"))
     _budget(bind, deadline)
-    bind.execute(sa.text(f"CREATE INDEX CONCURRENTLY {name} ON public.{table} ({columns})"))
+    bind.execute(sa.text(create_sql))
     _budget(bind, deadline)
     row = _current(bind, name)
     if row is None or not row.usable or row.definition != want:
@@ -114,8 +117,24 @@ def ensure_index(bind, name: str, table: str, columns: str, deadline: float | No
     return True
 
 
-def run(bind, budget_seconds: float = BUDGET_SECONDS) -> None:
-    """The whole migration on an autocommit connection (tests call this)."""
+def ensure_index(bind, name: str, table: str, columns: str, deadline: float | None = None) -> bool:
+    """Build `public.<name>` unless an identical valid one exists. True if built."""
+    deadline = deadline if deadline is not None else time.monotonic() + BUDGET_SECONDS
+    return build_index(
+        bind,
+        name,
+        f"CREATE INDEX CONCURRENTLY {name} ON public.{table} ({columns})",
+        expected_definition(name, table, columns),
+        deadline,
+    )
+
+
+@contextmanager
+def migrator_session(bind, budget_seconds: float = BUDGET_SECONDS) -> Iterator[float]:
+    """Hold the migrator lock on an autocommit connection; yield the deadline.
+
+    Everything that waits runs inside the one budget; on the way out the
+    session settings are reset and the lock released, whatever happened."""
     deadline = time.monotonic() + budget_seconds
     # Before anything waits: do not inherit 0142's session lock_timeout.
     bind.execute(sa.text("SET lock_timeout = 0"))
@@ -129,14 +148,20 @@ def run(bind, budget_seconds: float = BUDGET_SECONDS) -> None:
                 break
             # Between statements: holding no snapshot while another runner builds.
             time.sleep(_LOCK_POLL_SECONDS)
-        for name, table, columns in INDEXES:
-            ensure_index(bind, name, table, columns, deadline)
+        yield deadline
     finally:
         bind.execute(sa.text("RESET statement_timeout"))
         bind.execute(sa.text("RESET client_connection_check_interval"))
         bind.execute(sa.text("RESET lock_timeout"))
         if locked:
             bind.execute(sa.text(f"SELECT pg_advisory_unlock({_MIGRATOR_LOCK})"))
+
+
+def run(bind, budget_seconds: float = BUDGET_SECONDS) -> None:
+    """The whole migration on an autocommit connection (tests call this)."""
+    with migrator_session(bind, budget_seconds) as deadline:
+        for name, table, columns in INDEXES:
+            ensure_index(bind, name, table, columns, deadline)
 
 
 def upgrade() -> None:

@@ -274,6 +274,17 @@ CREATE INDEX idx_documents_doc_id_trgm ON documents USING GIN (doc_id gin_trgm_o
 CREATE INDEX idx_documents_title_trgm ON documents USING GIN (title gin_trgm_ops)
     WHERE valid_to IS NULL;
 
+-- Trigram COUNT of the live title, per tenant (migration 0146), and its
+-- expression statistics. kb_match_document_titles_multi_v1() reads it as an
+-- exact prefilter: similarity >= t implies t*|B| <= |A| <= |B|/t over the two
+-- trigram sets. The statistics are what let the planner size that window; a
+-- partial index's own expression stats are ignored by the planner.
+CREATE INDEX idx_documents_title_trgm_count
+    ON documents (customer_id, (array_length(show_trgm(title), 1)))
+    WHERE valid_to IS NULL;
+CREATE STATISTICS IF NOT EXISTS documents_title_trgm_count_stx
+    ON (array_length(show_trgm(title), 1)) FROM documents;
+
 -- GIN over the weighted title tsvector (migration 0099).
 CREATE INDEX idx_documents_title_tsv ON documents USING GIN (title_tsv);
 -- Supports the FK below to ingestion_events. Postgres indexes the REFERENCED
@@ -310,6 +321,143 @@ ALTER TABLE documents FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON documents
     USING (customer_id = current_setting('app.current_customer_id', true))
     WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
+
+-- Grounding's document-title lookup (migration 0146). Returns exactly the rows
+-- of grounding.py's multi-probe statement; index-backed once a research-os Job
+-- re-owns it to the BYPASSRLS role `resolver` (D71), the statement unchanged
+-- while RLS still applies to its owner. The body below is byte-identical to
+-- 0146's (tests pin it); the migration's docstring has the reasoning.
+
+CREATE OR REPLACE FUNCTION kb_match_document_titles_multi_v1(
+    probes text[], sim_floor real, per_probe_cap integer
+)
+RETURNS TABLE (ord bigint, doc_id text, source_system text, title text, updated_at timestamptz)
+LANGUAGE plpgsql STABLE SECURITY DEFINER
+SET search_path = pg_catalog, public, pg_temp
+SET plan_cache_mode = force_custom_plan
+AS $$
+DECLARE
+    tenant text := current_setting('app.current_customer_id', true);
+    probe text;
+    i bigint := 0;
+    q tsquery;
+    pn integer;
+    n bigint;
+BEGIN
+    IF tenant IS NULL OR tenant = '' OR probes IS NULL
+       OR per_probe_cap IS NULL OR per_probe_cap <= 0 THEN
+        RETURN;
+    END IF;
+    IF sim_floor IS NULL OR NOT (sim_floor > 0 AND sim_floor <= 1) THEN
+        RAISE EXCEPTION 'kb_match_document_titles_multi_v1: sim_floor must be in (0, 1], got %',
+            sim_floor USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    -- Owned by a role RLS applies to (before the hand-over to `resolver`):
+    -- no index can help, and per-probe legs would each re-read the tenant.
+    -- Run grounding.py's statement as it is.
+    IF row_security_active('public.documents'::regclass) THEN
+        RETURN QUERY
+        WITH probe_list AS (
+            SELECT u.p, u.ord FROM unnest(probes) WITH ORDINALITY AS u(p, ord)
+        ),
+        ranked AS (
+            SELECT pl.ord, d.doc_id, d.source_system, d.title, d.updated_at,
+                   similarity(d.title, pl.p) AS trgm_sim,
+                   CASE WHEN d.title_preview_tsv @@ plainto_tsquery('english', pl.p)
+                        THEN 1 ELSE 0 END AS fts_hit
+            FROM public.documents d
+            CROSS JOIN probe_list pl
+            WHERE d.customer_id = tenant
+              AND d.valid_to IS NULL
+              AND d.title IS NOT NULL
+              AND d.title <> ''
+              AND (d.title % pl.p
+                   OR d.title_preview_tsv @@ plainto_tsquery('english', pl.p))
+        ),
+        capped AS (
+            SELECT r.ord, r.doc_id, r.source_system, r.title, r.updated_at,
+                   row_number() OVER (
+                       PARTITION BY r.ord
+                       ORDER BY r.fts_hit DESC, r.trgm_sim DESC,
+                                r.updated_at DESC NULLS LAST, r.doc_id
+                   ) AS rn
+            FROM ranked r
+            WHERE r.trgm_sim >= sim_floor OR r.fts_hit = 1
+        )
+        SELECT c.ord, c.doc_id, c.source_system, c.title, c.updated_at
+        FROM capped c
+        WHERE c.rn <= per_probe_cap
+        ORDER BY c.ord, c.rn;
+        RETURN;
+    END IF;
+
+    FOREACH probe IN ARRAY probes LOOP
+        i := i + 1;
+        q := plainto_tsquery('english', probe);
+
+        -- Full-text hits rank above every trigram-only row.
+        RETURN QUERY
+        SELECT i, d.doc_id, d.source_system, d.title, d.updated_at
+        FROM public.documents d
+        WHERE d.customer_id = tenant
+          AND d.valid_to IS NULL
+          AND d.title IS NOT NULL
+          AND d.title <> ''
+          AND d.title_preview_tsv @@ q
+        ORDER BY similarity(d.title, probe) DESC, d.updated_at DESC NULLS LAST, d.doc_id
+        LIMIT per_probe_cap;
+        GET DIAGNOSTICS n = ROW_COUNT;
+        CONTINUE WHEN n >= per_probe_cap;
+
+        -- No trigrams (punctuation only): similarity is 0, below any floor.
+        pn := array_length(show_trgm(probe), 1);
+        CONTINUE WHEN pn IS NULL;
+
+        IF pn < 16 THEN
+            -- One word: read the trigram-count window. OFFSET 0 keeps `%` out
+            -- of index selection; the GIN admits too much for a short probe.
+            RETURN QUERY
+            SELECT i, w.doc_id, w.source_system, w.title, w.updated_at
+            FROM (
+                SELECT d.doc_id, d.source_system, d.title, d.updated_at, d.title_preview_tsv
+                FROM public.documents d
+                WHERE d.customer_id = tenant
+                  AND d.valid_to IS NULL
+                  AND d.title IS NOT NULL
+                  AND d.title <> ''
+                  AND array_length(show_trgm(d.title), 1)
+                      BETWEEN floor(pn * sim_floor)::int AND ceil(pn / sim_floor)::int
+                OFFSET 0
+            ) w
+            WHERE w.title % probe
+              AND similarity(w.title, probe) >= sim_floor
+              AND NOT (w.title_preview_tsv @@ q)
+            ORDER BY similarity(w.title, probe) DESC, w.updated_at DESC NULLS LAST, w.doc_id
+            LIMIT per_probe_cap - n;
+        ELSE
+            -- Longer probes: the trigram GIN is selective; the planner chooses.
+            RETURN QUERY
+            SELECT i, d.doc_id, d.source_system, d.title, d.updated_at
+            FROM public.documents d
+            WHERE d.customer_id = tenant
+              AND d.valid_to IS NULL
+              AND d.title IS NOT NULL
+              AND d.title <> ''
+              AND array_length(show_trgm(d.title), 1)
+                  BETWEEN floor(pn * sim_floor)::int AND ceil(pn / sim_floor)::int
+              AND d.title % probe
+              AND similarity(d.title, probe) >= sim_floor
+              AND NOT (d.title_preview_tsv @@ q)
+            ORDER BY similarity(d.title, probe) DESC, d.updated_at DESC NULLS LAST, d.doc_id
+            LIMIT per_probe_cap - n;
+        END IF;
+    END LOOP;
+END
+$$;
+
+REVOKE EXECUTE ON FUNCTION kb_match_document_titles_multi_v1(text[], real, integer) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION kb_match_document_titles_multi_v1(text[], real, integer) TO CURRENT_ROLE;
 
 -- ---------------------------------------------------------------------------
 -- chunks: content-addressable retrieval units.

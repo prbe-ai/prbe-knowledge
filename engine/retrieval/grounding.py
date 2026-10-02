@@ -41,6 +41,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Final
 
+import asyncpg
+
 from engine.shared.constants import (
     GROUNDING_ENTITY_LABELS,
     entity_type_for_node,
@@ -430,10 +432,88 @@ _DOC_TITLE_TRGM_FLOOR: Final[float] = 0.3
 # does not touch.
 #
 # NOT a substitute for the structural fix: short concept probes still pay
-# the RLS-blocked scan (~1.1 s). That fix is a security decision (LEAKPROOF
-# flip vs a SECURITY DEFINER lookup) and is deliberately not smuggled into
-# a perf change -- same discipline as the floor above.
+# the RLS-blocked scan (~1.1 s) on the inline statement. The fix is the
+# SECURITY DEFINER lookup below (kb_match_document_titles_multi_v1, decision
+# D71); this gate is independent of it.
 _DOC_TITLE_MAX_TOKENS: Final[int] = 6
+
+
+# ---------------------------------------------------------------------------
+# Index-backed title lookup (migration 0146).
+#
+# Both title matchers below run INLINE as `app` under FORCE RLS, where
+# neither `%` nor `@@` is LEAKPROOF, so no title index may be used and every
+# call reads every live titled document of the tenant (9.3 s mean for the
+# multi-probe statement in production). kb_match_document_titles_multi_v1()
+# returns exactly the multi-probe statement's rows -- same ranking keys, same
+# doc_id tie-breaker, same per-probe cap -- and is index-backed once it is
+# owned by the BYPASSRLS `resolver` role. The migration's docstring has the
+# reasoning; tests/retrieval/test_title_match_function.py pins the parity.
+#
+# The single-probe matcher calls it with one probe: a one-element multi-probe
+# result IS the single-probe result (same keys, LIMIT == per-probe cap; the
+# multi/single contract further down already relies on that).
+#
+# Used when it exists (asked once per process) and the tenant is non-empty:
+# the inline SQL filters on the argument, the function on the tenant GUC, and
+# with_tenant() binds a default tenant for ''. Any error from it falls back to
+# the inline SQL inside a SAVEPOINT, with a warning -- it is an optimization,
+# never the only way to an answer.
+# ---------------------------------------------------------------------------
+
+_TITLE_MATCH_FN: Final[str] = (
+    "public.kb_match_document_titles_multi_v1(text[], real, integer)"
+)
+_TITLE_MATCH_FN_SQL: Final[str] = """
+    SELECT f.ord, f.doc_id, f.source_system, f.title, f.updated_at
+    FROM kb_match_document_titles_multi_v1($1::text[], $2::real, $3::int)
+         WITH ORDINALITY AS f
+    ORDER BY f.ord, f.ordinality
+"""
+#: None until the first lookup asks the catalog; then whether it exists.
+_title_match_fn_exists: bool | None = None
+
+
+async def _title_rows(
+    conn: asyncpg.Connection,
+    customer_id: str,
+    probes: list[str],
+    cap: int,
+    inline_sql: str,
+    *inline_args: object,
+) -> list[asyncpg.Record]:
+    """Title-match rows from the function when usable, else the inline SQL.
+
+    The caller has bound the tenant and set pg_trgm.similarity_threshold;
+    the function's `%` reads that setting exactly as the inline SQL does.
+    """
+    global _title_match_fn_exists
+    if customer_id:
+        if _title_match_fn_exists is None:
+            _title_match_fn_exists = bool(await conn.fetchval(
+                "SELECT to_regprocedure($1) IS NOT NULL", _TITLE_MATCH_FN,
+            ))
+        if _title_match_fn_exists:
+            try:
+                # A savepoint: a failed call must leave the transaction
+                # usable for the inline statement.
+                async with conn.transaction():
+                    return await conn.fetch(
+                        _TITLE_MATCH_FN_SQL, probes, _DOC_TITLE_TRGM_FLOOR, cap,
+                    )
+            except asyncpg.PostgresError as exc:
+                if isinstance(exc, asyncpg.UndefinedFunctionError):
+                    # Dropped since the check (a downgrade): stop asking.
+                    _title_match_fn_exists = False
+                log.warning(
+                    "grounding.title_function_fallback",
+                    extra={
+                        "customer_id": customer_id,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    },
+                )
+    return await conn.fetch(inline_sql, *inline_args)
 
 
 async def _fuzzy_match_document_titles(
@@ -552,7 +632,8 @@ async def _fuzzy_match_document_titles(
             "SET LOCAL pg_trgm.similarity_threshold = "
             f"{_DOC_TITLE_TRGM_FLOOR}"
         )
-        rows = await conn.fetch(
+        rows = await _title_rows(
+            conn, customer_id, [trgm_probe], cap,
             sql, customer_id, trgm_probe, trgm_probe, _DOC_TITLE_TRGM_FLOOR, cap,
         )
 
@@ -768,8 +849,9 @@ async def _fuzzy_match_document_titles_multi(
             "SET LOCAL pg_trgm.similarity_threshold = "
             f"{_DOC_TITLE_TRGM_FLOOR}"
         )
-        rows = await conn.fetch(
-            sql, customer_id, probes, _DOC_TITLE_TRGM_FLOOR, cap
+        rows = await _title_rows(
+            conn, customer_id, probes, cap,
+            sql, customer_id, probes, _DOC_TITLE_TRGM_FLOOR, cap,
         )
 
     out: list[list[GroundingCandidate]] = [[] for _ in probes]
