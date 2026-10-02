@@ -163,40 +163,9 @@ class Settings(BaseSettings):
     #: old model's answers would keep being served for unchanged segments.
     claude_code_extraction_cache_revision: str = Field(default="1")
 
-    #: Honour `QueryRequest.recall_floor_mode="conditional"`. OFF by default.
-    #:
-    #: The recall floor tops every response up to 10 distinct docs from the raw
-    #: pre-fan-out pool, and it supplies ~88% of the chunks consumers receive --
-    #: so the gatherer's curation is currently a rounding error in what anyone
-    #: actually reads. `conditional` skips the top-up when the gatherer's own
-    #: answer is confident and substantial, which is the change that makes
-    #: curation mean something.
-    #:
-    #: It is gated because the graded metric is set-recall and this trades
-    #: recall for precision. The gate exists to run a PAIRED A/B on one
-    #: deployment -- same day, same corpus, mode chosen per request -- rather
-    #: than to ship the behaviour quietly. With it off, a request asking for
-    #: `conditional` is served `always`; nothing errors.
-    #: ON. The DEFAULT is still `always` -- every response is topped up to
-    #: `_RECALL_FLOOR_DOCS` from the raw pool, exactly as before -- so turning
-    #: this on changes nothing for a caller who does not ask.
-    #:
-    #: What it enables is the CHOICE. A caller that passes
-    #: `recall_floor_mode="conditional"` now gets what the gatherer actually
-    #: selected, with the top-up skipped when its answer was already confident
-    #: and substantial. Off, that request was silently served `always`.
-    #:
-    #: It is a per-request lever rather than a flip because the trade is real
-    #: and unmeasured: the floor supplies ~88% of delivered chunks, so skipping
-    #: it means FEWER results, and fewer-but-curated only wins if the curation
-    #: is good. `agent.recall_floor` logs `rejected` (pool docs the gatherer saw
-    #: and declined) against `unexamined` (docs it never got shown) on every
-    #: query, which is the paired comparison that settles it.
-    recall_floor_conditional_enabled: bool = Field(default=True)
-
     # TypeSafe Jev, the result selector (engine/retrieval/agent/jev.py). Empty
-    # means Jev is unavailable and every `jev` request falls back to the recall
-    # floor -- logged, never raised. The key lives in `engine-secrets`
+    # means Jev is unavailable and every `jev` request is answered by the pool's
+    # fused order (the `floor` selector) -- logged, never raised. The key lives in `engine-secrets`
     # (research) and `managed-data-plane-secrets` (managed).
     typesafe_api_key: str = Field(default="")
 

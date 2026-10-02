@@ -1154,11 +1154,6 @@ SEARCH_AGENT_HARD_CAP = SEARCH_AGENT_TOOL_BUDGET + (
     SEARCH_AGENT_EXTENSION_GRANT * SEARCH_AGENT_MAX_EXTENSIONS
 )  # 40
 
-# Min curated results the agent should return before falling back to "no
-# confident match". If the agent emits fewer than this, harness logs a
-# `gatherer.under_min_output` anomaly for trace review.
-SEARCH_AGENT_MIN_OUTPUT = 5
-
 # Per-tool top_k defaults. The agent may override at call time. See plan
 # section "Per-tool top_k defaults" for the bytes/turn budget reasoning.
 #
@@ -1826,7 +1821,7 @@ SEARCH_AGENT_FALLBACK_INFERENCE_MODEL = os.getenv(
 # grounding + extraction + pre-fan-out (~4s) come OUT of this budget rather
 # than being added to it. Whatever happens, the stage returns within this many
 # seconds; timeout degrades to the citable pre-fan-out evidence the harness
-# already retrieved (`_backfill_recall_floor` off `state.prefanout`), which is
+# already retrieved (`_answer_from_pool` off `state.prefanout`), which is
 # a real result set, not an error.
 #
 # 60s, cut from 90s (2026-08-04). With a 5s primary cut and a 12s fallback
@@ -1847,7 +1842,7 @@ SEARCH_AGENT_FALLBACK_INFERENCE_MODEL = os.getenv(
 # the degrade to pre-fan-out. The 5s of slack under 30 covers response
 # serialisation and the hop back to research-os.
 #
-# Timing out here is not an error: it degrades to `_backfill_recall_floor` off
+# Timing out here is not an error: it degrades to `_answer_from_pool` off
 # `state.prefanout`, which is a real citable result set. Returning that at 25s
 # beats returning nothing at 30.
 SEARCH_AGENT_LOOP_TIMEOUT_SECONDS = 25.0

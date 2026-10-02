@@ -34,9 +34,9 @@ MatchedViaChannel = Literal[
     "id_lookup",
     "entity_cluster",
     "reissue",
-    # Harness-appended to clear the recall floor. See MatchProvenance.channel
-    # in shared/models.py for why this is its own name and not the channel the
-    # chunk was pulled from.
+    # Harness-appended when no selector answered and the pool's fused order
+    # answers alone. See MatchProvenance.channel in shared/models.py for why
+    # this is its own name and not the channel the chunk was pulled from.
     "recall_floor",
 ]
 
@@ -63,13 +63,13 @@ GathererStatus = Literal[
     # is one query away instead of an archaeology project.
     "loop_budget_starved",
     # The `jev` selector could not score the pool (no key, timeout, provider
-    # error, every batch failed) and the recall floor answered alone. Degraded:
+    # error, every batch failed) and the pool's fused order answered alone. Degraded:
     # the caller got floor-quality results -- the same as the `floor` selector
     # -- instead of what it asked for.
     "jev_unavailable",
-    # Jev scored only PART of the pool (some batches failed). It keeps its
-    # share of the ten slots and the recall floor fills the rest. Degraded:
-    # the best documents may have been in the batches that were never scored.
+    # Jev scored only PART of the pool (some batches failed). Its ranking of
+    # what it scored ships as is, never topped up. Degraded: the best
+    # documents may have been in the batches that were never scored.
     "jev_partial",
     "schema_violation",
     # The response gate could not re-verify the emitted chunks against the
