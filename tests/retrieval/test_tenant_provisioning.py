@@ -405,3 +405,38 @@ async def test_create_customer_returns_the_key_and_provisions(live_db):
     assert key
     async with db_module.raw_conn() as conn:
         assert await partition_of(conn, "prov-created") == partition_name_for("prov-created")
+
+
+@pytest.mark.integration
+async def test_guardian_reports_partition_drift_and_nothing_else(live_db):
+    # A provisioned leaf matches its parent; drop its policy or RLS by hand and
+    # the guardian's drift detector names it (plan T13, kb_partition_drift).
+    from engine.shared.pg_search_guardian import find_partition_drift
+
+    async with db_module.raw_conn() as conn:
+        await _add_customer(conn, "prov-drift")
+        await ensure_tenant_partition(conn, "prov-drift")
+        leaf = await partition_of(conn, "prov-drift")
+        assert all(d["partition"] != leaf for d in await find_partition_drift(conn))
+        tx = conn.transaction()
+        await tx.start()
+        try:
+            policy = await conn.fetchval(
+                "SELECT polname FROM pg_policy WHERE polrelid = $1::regclass LIMIT 1", leaf
+            )
+            await conn.execute(f'DROP POLICY "{policy}" ON "{leaf}"')
+            await conn.execute(f'ALTER TABLE "{leaf}" NO FORCE ROW LEVEL SECURITY')
+            drift = {d["partition"]: d["problems"] for d in await find_partition_drift(conn)}
+            assert drift.get(leaf) == ["rls_not_forced", "policies"]
+        finally:
+            await tx.rollback()
+
+
+@pytest.mark.integration
+async def test_a_fresh_install_has_no_partition_drift(live_db):
+    # db/schema.sql's DEFAULT partition used to have no RLS at all; every leaf
+    # of a fresh install must match its parent or the alarm fires every tick.
+    from engine.shared.pg_search_guardian import find_partition_drift
+
+    async with db_module.raw_conn() as conn:
+        assert await find_partition_drift(conn) == []

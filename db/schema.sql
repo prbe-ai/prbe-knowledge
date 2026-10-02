@@ -1006,6 +1006,16 @@ ALTER TABLE chunks FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON chunks
     USING (customer_id = current_setting('app.current_customer_id', true))
     WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
+-- The DEFAULT partition is a table in its own right: a query naming it directly
+-- is governed by ITS policies, not the parent's. Same shape as every tenant
+-- leaf kb_provision_tenant() makes (0144); the guardian's kb_partition_drift
+-- alarm checks it. (Planes converted by scripts/convert_chunks_to_partitioned.py
+-- already have this.)
+ALTER TABLE chunks_p_default ENABLE ROW LEVEL SECURITY;
+ALTER TABLE chunks_p_default FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON chunks_p_default
+    USING (customer_id = current_setting('app.current_customer_id', true))
+    WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
 
 
 -- ---------------------------------------------------------------------------
