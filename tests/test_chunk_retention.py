@@ -48,7 +48,7 @@ async def _seed(customer_id: str) -> None:
                                     content, content_hash, token_count,
                                     first_seen_version, last_seen_version, valid_to)
                 VALUES ($1, $2, 'doc-r', 0, 'body', $3, 1, 1,
-                        CASE WHEN $2 = 'ck-live' THEN 5 ELSE 2 END,
+                        CASE WHEN $2 = 'ck-live' THEN 2147483647 ELSE 2 END,
                         {valid_to_sql})
                 """,
                 customer_id,

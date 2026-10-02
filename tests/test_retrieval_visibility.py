@@ -133,7 +133,7 @@ async def _seed_doc(
             ) VALUES (
                 $1, $2, $3,
                 0, $4, $5, 5,
-                1, 1,
+                1, 2147483647,
                 $6,
                 array_fill(0::real, ARRAY[3072])::halfvec,
                 $7

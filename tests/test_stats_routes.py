@@ -158,7 +158,8 @@ async def _seed_chunk(
         ) VALUES (
             $1, $2, $3,
             0, $4, $5, 1,
-            1, 1, $6
+            -- Live (no valid_to) is open-ended (CHECK chunks_live_sentinel_chk).
+            1, CASE WHEN $6::timestamptz IS NULL THEN 2147483647 ELSE 1 END, $6
         )
         """,
         f"{customer_id}:{doc_id}:{suffix}",

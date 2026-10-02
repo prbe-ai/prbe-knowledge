@@ -196,10 +196,17 @@ async def pg_search_db(live_db):
             "SELECT count(*) FROM pg_extension WHERE extname = 'pg_search'"
         )
     if not has_it:
-        pytest.skip(
+        reason = (
             "pg_search not installed on the test database -- BM25 retrieval "
             "cannot be exercised. See pg_search_db in tests/retrieval/conftest.py."
         )
+        # The pg_search CI job sets this: there, a skip would be a green job
+        # that ran none of what it exists to run.
+        import os
+
+        if os.environ.get("PRBE_REQUIRE_PG_SEARCH"):
+            pytest.fail(reason)
+        pytest.skip(reason)
     yield None
 
 

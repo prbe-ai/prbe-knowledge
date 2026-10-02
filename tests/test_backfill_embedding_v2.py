@@ -167,7 +167,7 @@ async def _insert_chunk_no_v2(
             length($5) / 4,
             array_fill(0::real, ARRAY[3072])::halfvec,
             'openai/text-embedding-3-large', 3072,
-            'naive-v1', 1, 1, NOW()
+            'naive-v1', 1, 2147483647, NOW()
         )
         ON CONFLICT (customer_id, chunk_id) DO NOTHING
         """,

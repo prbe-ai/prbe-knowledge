@@ -109,7 +109,7 @@ async def _seed_doc_with_chunks(
                     $1, $2, $3,
                     $4, $5, $6, 5,
                     array_fill(0::real, ARRAY[3072])::halfvec,
-                    $7, $7
+                    $7, 2147483647
                 )
                 """,
                 # Include version in chunk_id so seeding multiple versions of
