@@ -342,6 +342,45 @@ async def test_sources_specific_version(live_db, settings) -> None:
     assert body["doc_version"] == 1
 
 
+async def test_a_chunk_dropped_by_a_same_version_rewrite_stays_out_of_that_version(
+    live_db, settings
+) -> None:
+    """Rows closed by an in-place rewrite before migration 0125 kept an uncapped
+    last_seen; they were closed while their version was still live, so they
+    must not reappear in it."""
+    api_key = await _seed_customer("cust-ver-coalesced")
+    await _seed_doc_with_chunks(
+        "cust-ver-coalesced", "slack:T:C:3.1", chunks=["kept text"], version=1
+    )
+    async with raw_conn() as conn:
+        # A chunk dropped from v1 by a same-version rewrite, legacy shape:
+        # closed an hour before v1 was superseded, last_seen left at 1.
+        await conn.execute(
+            """
+            INSERT INTO chunks (chunk_id, doc_id, customer_id, chunk_index, content,
+                                content_hash, token_count, first_seen_version,
+                                last_seen_version, valid_to, visibility)
+            VALUES ('slack:T:C:3.1:dropped', 'slack:T:C:3.1', 'cust-ver-coalesced', 1,
+                    'dropped mid-v1', 'h-dropped', 1, 1, 1, NOW() - interval '1 hour', 'approved')
+            """
+        )
+        await conn.execute(
+            "UPDATE documents SET valid_to = NOW() WHERE customer_id='cust-ver-coalesced' AND version=1"
+        )
+        await conn.execute(
+            "UPDATE chunks SET valid_to = NOW(), last_seen_version = 1"
+            " WHERE customer_id='cust-ver-coalesced' AND chunk_id LIKE '%:v1'"
+        )
+    await _seed_doc_with_chunks(
+        "cust-ver-coalesced", "slack:T:C:3.1", chunks=["v2 text"], version=2
+    )
+    resp_v1 = await _get_source(
+        "slack:T:C:3.1", headers={"Authorization": f"Bearer {api_key}"}, query="?version=1"
+    )
+    await init_pool(settings)
+    assert resp_v1.json()["content"] == "kept text"
+
+
 async def test_sources_specific_version_returns_its_removed_chunks(live_db, settings) -> None:
     api_key = await _seed_customer("cust-ver-hist")
     await _seed_doc_with_chunks("cust-ver-hist", "slack:T:C:2.1", chunks=["v1 content"], version=1)
