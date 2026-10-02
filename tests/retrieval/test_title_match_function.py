@@ -377,7 +377,8 @@ async def test_invalid_floor_raises_and_empty_inputs_return_nothing(live_db):
     await _seed()
     async with db_module.raw_conn() as conn, conn.transaction():
         await conn.execute(db_module.TENANT_BIND_SQL, TENANT)
-        for floor in (0.0, -1.0, 1.5):
+        # 1e-9 would overflow the count window's int bound; refused, not crashed.
+        for floor in (0.0, -1.0, 1.5, 1e-9):
             with pytest.raises(asyncpg.InvalidParameterValueError, match="sim_floor must be in"):
                 async with conn.transaction():
                     await conn.fetch(_CALL, ["retry"], floor, 4)
@@ -481,5 +482,48 @@ async def test_0146_index_matches_schema_sql_and_rebuilds_a_wrong_one(live_db, s
                 "SELECT count(*) FROM pg_statistic_ext WHERE stxname = 'documents_title_trgm_count_stx'"
             )).scalar() == 1
             assert bind.execute(sa.text("SHOW lock_timeout")).scalar() == "0"
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.integration
+async def test_0146_reinstall_accepts_a_handed_over_identical_copy(live_db, settings):
+    """After the Job re-owns the function, `app` cannot replace it: a downgrade
+    (which leaves it) and re-upgrade must accept the identical copy rather than
+    fail the release, and must refuse a re-owned copy with another body."""
+    mod = _load_0146()
+    sync_dsn = settings.database_url.replace("postgresql://", "postgresql+psycopg://", 1)
+    engine = sa.create_engine(sync_dsn, isolation_level="AUTOCOMMIT")
+    try:
+        with engine.connect() as bind:
+            bind.execute(sa.text(
+                "DO $r$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'kbm_owner') "
+                "THEN CREATE ROLE kbm_owner NOLOGIN; END IF; END $r$"
+            ))
+            bind.execute(sa.text(f"ALTER FUNCTION {mod.FUNCTION_SIGNATURE} OWNER TO kbm_owner"))
+            bind.execute(sa.text("CREATE ROLE kbm_migrator NOLOGIN"))
+            bind.execute(sa.text("GRANT CREATE ON SCHEMA public TO kbm_migrator"))
+            bind.execute(sa.text("SET ROLE kbm_migrator"))
+            try:
+                mod.install_function(bind)  # identical, foreign-owned: accepted
+            finally:
+                bind.execute(sa.text("RESET ROLE"))
+            # A foreign-owned copy with another body is refused.
+            bind.execute(sa.text(
+                f"ALTER FUNCTION {mod.FUNCTION_SIGNATURE} OWNER TO CURRENT_USER"
+            ))
+            bind.execute(sa.text(mod.MATCH_TITLES_SQL.replace("tenant text :=", "tenant  text :=")))
+            bind.execute(sa.text(f"ALTER FUNCTION {mod.FUNCTION_SIGNATURE} OWNER TO kbm_owner"))
+            bind.execute(sa.text("SET ROLE kbm_migrator"))
+            try:
+                with pytest.raises(RuntimeError, match="_v2"):
+                    mod.install_function(bind)
+            finally:
+                bind.execute(sa.text("RESET ROLE"))
+            # Put the real body back under the suite's own role for later tests.
+            bind.execute(sa.text(f"ALTER FUNCTION {mod.FUNCTION_SIGNATURE} OWNER TO CURRENT_USER"))
+            bind.execute(sa.text(mod.MATCH_TITLES_SQL))
+            bind.execute(sa.text("REVOKE CREATE ON SCHEMA public FROM kbm_migrator"))
+            bind.execute(sa.text("DROP ROLE kbm_migrator"))
     finally:
         engine.dispose()

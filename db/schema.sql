@@ -348,8 +348,10 @@ BEGIN
        OR per_probe_cap IS NULL OR per_probe_cap <= 0 THEN
         RETURN;
     END IF;
-    IF sim_floor IS NULL OR NOT (sim_floor > 0 AND sim_floor <= 1) THEN
-        RAISE EXCEPTION 'kb_match_document_titles_multi_v1: sim_floor must be in (0, 1], got %',
+    -- >= 0.01: the count window's upper bound is ceil(pn / sim_floor)::int,
+    -- which overflows int for a vanishing floor. Grounding uses 0.3.
+    IF sim_floor IS NULL OR NOT (sim_floor >= 0.01 AND sim_floor <= 1) THEN
+        RAISE EXCEPTION 'kb_match_document_titles_multi_v1: sim_floor must be in [0.01, 1], got %',
             sim_floor USING ERRCODE = 'invalid_parameter_value';
     END IF;
 

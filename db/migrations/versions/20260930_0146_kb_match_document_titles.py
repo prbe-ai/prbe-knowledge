@@ -136,8 +136,10 @@ BEGIN
        OR per_probe_cap IS NULL OR per_probe_cap <= 0 THEN
         RETURN;
     END IF;
-    IF sim_floor IS NULL OR NOT (sim_floor > 0 AND sim_floor <= 1) THEN
-        RAISE EXCEPTION 'kb_match_document_titles_multi_v1: sim_floor must be in (0, 1], got %',
+    -- >= 0.01: the count window's upper bound is ceil(pn / sim_floor)::int,
+    -- which overflows int for a vanishing floor. Grounding uses 0.3.
+    IF sim_floor IS NULL OR NOT (sim_floor >= 0.01 AND sim_floor <= 1) THEN
+        RAISE EXCEPTION 'kb_match_document_titles_multi_v1: sim_floor must be in [0.01, 1], got %',
             sim_floor USING ERRCODE = 'invalid_parameter_value';
     END IF;
 
@@ -275,11 +277,47 @@ def run(bind, budget_seconds: float | None = None) -> None:
         bind.execute(sa.text("ANALYZE public.documents"))
 
 
+FUNCTION_SIGNATURE = "public.kb_match_document_titles_multi_v1(text[], real, integer)"
+
+
+def _function_body() -> str:
+    """The plpgsql body inside MATCH_TITLES_SQL's dollar quotes (pg_proc.prosrc)."""
+    start = MATCH_TITLES_SQL.index("AS $$") + len("AS $$")
+    return MATCH_TITLES_SQL[start : MATCH_TITLES_SQL.index("$$;", start)]
+
+
+def install_function(bind) -> None:
+    """CREATE OR REPLACE the function, unless the hand-over already re-owned it.
+
+    After the research-os Job hands it to `resolver`, `app` may not replace it
+    -- so a downgrade (which leaves it, see below) followed by a re-upgrade
+    would fail here and block the release. An existing copy that `app` does
+    not own is accepted when its body is exactly this one; any other body
+    means a change that must ship as _v2.
+    """
+    row = bind.execute(
+        sa.text(
+            "SELECT p.proowner = (SELECT oid FROM pg_roles WHERE rolname = current_user) AS mine,"
+            " p.proowner::regrole::text AS owner, p.prosrc AS body"
+            " FROM pg_proc p WHERE p.oid = to_regprocedure(:sig)"
+        ),
+        {"sig": FUNCTION_SIGNATURE},
+    ).first()
+    if row is None or row.mine:
+        bind.execute(sa.text(MATCH_TITLES_SQL))
+        return
+    if row.body != _function_body():
+        raise RuntimeError(
+            f"{FUNCTION_SIGNATURE} is owned by {row.owner} with a different body; "
+            "a changed lookup ships as _v2 (D26)"
+        )
+
+
 def upgrade() -> None:
     # CREATE INDEX CONCURRENTLY cannot run inside a transaction.
     with op.get_context().autocommit_block():
         run(op.get_bind())
-    op.execute(MATCH_TITLES_SQL)
+    install_function(op.get_bind())
 
 
 def downgrade() -> None:
