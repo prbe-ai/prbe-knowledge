@@ -80,6 +80,7 @@ from engine.shared.pg_search_guardian import (
     find_broken_pg_search_indexes,
     find_invalid_index_debris,
     find_nonempty_default_partitions,
+    find_partition_drift,
     find_partitions_missing_required_index,
     find_unpartitioned_tables,
     prewarm_indexes,
@@ -208,6 +209,9 @@ async def run_once(*, dry_run: bool = False) -> int:
         # Non-empty DEFAULT means a tenant is back on a shared index, which is
         # the fault partitioning removed, restored silently for that tenant.
         default_rows = await find_nonempty_default_partitions(conn)
+        # A leaf whose owner, FORCE RLS or policies differ from its parent's:
+        # a query naming the leaf directly is governed by the LEAF's policies.
+        drift = await find_partition_drift(conn)
         # The conversion is attended and out of band, so a plane can sit at
         # alembic head with a flat `chunks`. Expected, briefly; invisible, never.
         unpartitioned = await find_unpartitioned_tables(conn)
@@ -228,6 +232,7 @@ async def run_once(*, dry_run: bool = False) -> int:
             debris_count=len(debris),
             absent_count=len(absent),
             partitions_missing_index=len(partitions_missing_index),
+            partition_drift=len(drift),
             default_partition_bytes=sum(int(d["heap_bytes"]) for d in default_rows),
             unpartitioned=unpartitioned,
             orphan_partitions=[p for p, _ in orphans],
@@ -278,6 +283,19 @@ async def run_once(*, dry_run: bool = False) -> int:
                     "timeline_id": timeline,
                     "state": "lexical search returns nothing for these tenants; "
                     "the rebuild cron must build the missing child index",
+                },
+            )
+
+        if drift:
+            capture(
+                "kb_partition_drift",
+                {
+                    "partitions": drift,
+                    "timeline_id": timeline,
+                    "state": "these tenant partitions no longer match their parent's "
+                    "owner, FORCE RLS or policies; a query naming the partition "
+                    "directly is governed by its own policies. Re-apply the parent's "
+                    "(kb_provision_tenant() shows the shape) and find what changed it",
                 },
             )
 

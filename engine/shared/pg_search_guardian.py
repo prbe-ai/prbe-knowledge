@@ -814,6 +814,76 @@ async def find_nonempty_default_partitions(
     return found
 
 
+async def find_partition_drift(conn: asyncpg.Connection) -> list[dict[str, object]]:
+    """Tenant partitions whose isolation differs from their parent's.
+
+    A leaf is a table in its own right: a query that names it directly is
+    governed by the LEAF's RLS, not the parent's, and later migrations that
+    ALTER the parent recurse into each leaf as the parent's owner.
+    kb_provision_tenant() (0144) makes every new leaf match -- same owner,
+    ENABLE + FORCE RLS, every parent policy -- but nothing re-checks it
+    afterwards: a policy added to the parent later, a leaf created or altered
+    by hand, or one owned by whoever ran a manual fix all drift silently.
+
+    Covers every public LIST(customer_id) parent (the same discovery as the
+    provisioner), DEFAULT included. Policies compare on name, command,
+    permissive/restrictive, roles and both expressions. Catalog-only.
+    """
+    rows = await conn.fetch(
+        """
+        WITH pol AS (
+            SELECT p.polrelid,
+                   array_agg(
+                       p.polname || ':' || p.polcmd::text || ':' || p.polpermissive::text
+                       -- roles as a sorted set: equivalent policies may list them
+                       -- in another order (the provisioner rebuilds them).
+                       || ':' || (SELECT string_agg(r::text, ',' ORDER BY r) FROM unnest(p.polroles) r)
+                       || ':' || coalesce(pg_get_expr(p.polqual, p.polrelid), '')
+                       || ':' || coalesce(pg_get_expr(p.polwithcheck, p.polrelid), '')
+                       ORDER BY p.polname
+                   ) AS sig
+            FROM pg_policy p
+            GROUP BY p.polrelid
+        )
+        SELECT parent.relname AS parent,
+               NOT (parent.relrowsecurity AND parent.relforcerowsecurity) AS parent_rls_not_forced,
+               leaf.relname AS partition,
+               leaf.relowner <> parent.relowner AS owner_differs,
+               NOT (leaf.relrowsecurity AND leaf.relforcerowsecurity) AS rls_not_forced,
+               lp.sig IS DISTINCT FROM pp.sig AS policies_differ
+        FROM pg_partitioned_table pt
+        JOIN pg_class parent ON parent.oid = pt.partrelid
+        JOIN pg_namespace ns ON ns.oid = parent.relnamespace
+        JOIN pg_attribute a ON a.attrelid = parent.oid AND a.attnum = pt.partattrs[0]
+        JOIN pg_inherits h ON h.inhparent = parent.oid
+        JOIN pg_class leaf ON leaf.oid = h.inhrelid
+        LEFT JOIN pol pp ON pp.polrelid = parent.oid
+        LEFT JOIN pol lp ON lp.polrelid = leaf.oid
+        WHERE ns.nspname = 'public' AND pt.partstrat = 'l' AND pt.partnatts = 1
+          AND a.attname = 'customer_id'
+        ORDER BY parent.relname, leaf.relname
+        """
+    )
+    found: list[dict[str, object]] = []
+    # The parent itself: reads through it are governed by ITS policies, and
+    # its owner (`app`) bypasses them without FORCE.
+    for parent in sorted({r["parent"] for r in rows if r["parent_rls_not_forced"]}):
+        found.append({"table": parent, "partition": None, "problems": ["parent_rls_not_forced"]})
+    for r in rows:
+        problems = [
+            name
+            for name, bad in (
+                ("owner", r["owner_differs"]),
+                ("rls_not_forced", r["rls_not_forced"]),
+                ("policies", r["policies_differ"]),
+            )
+            if bad
+        ]
+        if problems:
+            found.append({"table": r["parent"], "partition": r["partition"], "problems": problems})
+    return found
+
+
 async def read_known_absent(conn: asyncpg.Connection) -> frozenset[str]:
     """The absences already reported, so alerts fire on transitions only.
 
