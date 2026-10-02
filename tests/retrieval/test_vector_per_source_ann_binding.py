@@ -50,10 +50,10 @@ async def test_per_source_path_binds(live_db) -> None:
     assert hits == []
 
 
-async def test_topup_statement_binds(live_db) -> None:
-    """Force the top-up branch: a caller-supplied source list makes every
-    listed source short on an empty database, so the top-up SQL executes --
-    the statement whose dangling $3 shipped broken."""
+async def test_per_source_pool_with_a_caller_source_list_binds(live_db) -> None:
+    """The pool statement with the caller's hard source filter binds on a real
+    protocol (a dangling $3 once shipped broken on this path). Every listed
+    source is empty here, and nothing tops it up: the answer is empty."""
     hits = await vector_mod.vector_search(
         "cust-bind",
         "q",
