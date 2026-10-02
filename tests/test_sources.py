@@ -342,13 +342,6 @@ async def test_sources_specific_version(live_db, settings) -> None:
     assert body["doc_version"] == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="/sources?version=N reads chunks with `valid_to IS NULL`, so a superseded "
-    "version only shows chunks that are still live. Before migration 0145 this "
-    "test passed on a fixture shape (live chunk with an exact last_seen) that no "
-    "writer produces; with realistic rows v1's removed chunk is not returned.",
-)
 async def test_sources_specific_version_returns_its_removed_chunks(live_db, settings) -> None:
     api_key = await _seed_customer("cust-ver-hist")
     await _seed_doc_with_chunks("cust-ver-hist", "slack:T:C:2.1", chunks=["v1 content"], version=1)
@@ -368,6 +361,12 @@ async def test_sources_specific_version_returns_its_removed_chunks(live_db, sett
     )
     await init_pool(settings)
     assert resp_v1.json()["content"] == "v1 content"
+    # ...and the live document still shows only the live text.
+    resp_live = await _get_source(
+        "slack:T:C:2.1", headers={"Authorization": f"Bearer {api_key}"}
+    )
+    await init_pool(settings)
+    assert resp_live.json()["content"] == "v2 different content"
 
 
 @pytest.mark.asyncio

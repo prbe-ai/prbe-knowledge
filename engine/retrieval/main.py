@@ -913,6 +913,21 @@ def _source_view_response(
     )
 
 
+def _chunk_liveness_sql(version: int | None) -> str:
+    """`valid_to IS NULL` for the live document; nothing for an explicit version.
+
+    A chunk belongs to version N when N lies in [first_seen_version,
+    last_seen_version]: writers cap last_seen below the version that removed a
+    chunk, and a live chunk is open-ended (CHECK chunks_live_sentinel_chk, 0145).
+    So for the live document `valid_to IS NULL` only restates the range, while
+    for an OLDER version it removed every chunk a later version dropped -- an
+    explicit `?version=N` returned the old document with only the text that
+    survived to today. Known limit: a chunk removed and later revived keeps its
+    original first_seen, so the versions in between show it too.
+    """
+    return "AND valid_to IS NULL" if version is None else ""
+
+
 async def _load_source_doc_and_chunks(
     *,
     customer_id: str,
@@ -936,7 +951,7 @@ async def _load_source_doc_and_chunks(
         FROM chunks
         WHERE customer_id = $1
           AND doc_id = $2
-          AND valid_to IS NULL
+          {_chunk_liveness_sql(version)}
           AND kind = 'content'
           AND $3 BETWEEN first_seen_version AND last_seen_version
           {chunk_visibility_filter}
@@ -1474,12 +1489,12 @@ async def get_source(
             raise HTTPException(status_code=404, detail=f"document not found: {doc_id}")
 
         chunk_rows = await conn.fetch(
-            """
+            f"""
             SELECT content, chunk_index
             FROM chunks
             WHERE customer_id = $1
               AND doc_id = $2
-              AND valid_to IS NULL
+              {_chunk_liveness_sql(version)}
               AND kind = 'content'
               AND $3 BETWEEN first_seen_version AND last_seen_version
               AND visibility = 'approved'
