@@ -62,6 +62,11 @@ class _Dispatcher:
         self.pool_rows: list[dict[str, Any]] = []
         self.source_rows: list[str] = []
         self.topup_rows: dict[str, list[dict[str, Any]]] = {}
+        # Live-chunk count per source, answered to `_source_sizes`. Unset
+        # sources read as big, which keeps them on the HNSW top-up these
+        # tests pin; the exact route has its own file
+        # (test_vector_per_source_routing.py).
+        self.sizes: dict[str, int] = {}
         self.fetched: list[tuple[str, tuple[Any, ...]]] = []
         self.executed: list[str] = []
         self.read_back: list[str] = []
@@ -87,6 +92,9 @@ class _Dispatcher:
 
     async def fetch(self, sql: str, *params: Any) -> list[Any]:
         self.fetched.append((sql, params))
+        if "AS live_chunks" in sql:
+            big = vector_mod.PER_SOURCE_EXACT_MAX_CHUNKS + 1
+            return [{"source_system": s, "live_chunks": self.sizes.get(s, big)} for s in params[1]]
         if "WITH RECURSIVE" in sql:
             return [{"source_system": s} for s in self.source_rows]
         if "AND d.source_system = $" in sql:
@@ -97,8 +105,9 @@ class _Dispatcher:
         return self.pool_rows
 
 
-@pytest.fixture
-def db(monkeypatch: pytest.MonkeyPatch) -> _Dispatcher:
+def install_dispatcher(monkeypatch: pytest.MonkeyPatch) -> _Dispatcher:
+    """Route the vector module's connections and embedder to one dispatcher.
+    Shared with test_vector_per_source_routing.py."""
     dispatcher = _Dispatcher()
 
     @asynccontextmanager
@@ -106,6 +115,11 @@ def db(monkeypatch: pytest.MonkeyPatch) -> _Dispatcher:
         yield dispatcher
 
     monkeypatch.setattr(vector_mod, "with_tenant", _fake_with_tenant)
+    # The size cache is per process; a count cached by one test must not
+    # route the next one.
+    monkeypatch.setattr(vector_mod, "_SOURCE_SIZE_CACHE", {})
+    monkeypatch.setattr(vector_mod, "_SOURCE_SIZE_INFLIGHT", set())
+    monkeypatch.setattr(vector_mod, "_SOURCE_SIZE_TASKS", set())
 
     class _Embedder:
         async def embed_query(self, text: str) -> list[float]:
@@ -115,10 +129,26 @@ def db(monkeypatch: pytest.MonkeyPatch) -> _Dispatcher:
     return dispatcher
 
 
+@pytest.fixture
+def db(monkeypatch: pytest.MonkeyPatch) -> _Dispatcher:
+    return install_dispatcher(monkeypatch)
+
+
 async def _search(db: _Dispatcher, **kwargs: Any) -> list[Any]:
-    return await vector_mod.vector_search(
+    hits = await vector_mod.vector_search(
         "cust-1", "q", top_k=30, per_source_top_k=2, **kwargs
     )
+    await drain_size_counts()
+    return hits
+
+
+async def drain_size_counts() -> None:
+    """Let the background live-chunk counts the search scheduled finish, so
+    none outlives the test's event loop and the next search sees them."""
+    import asyncio
+
+    while vector_mod._SOURCE_SIZE_TASKS:
+        await asyncio.gather(*list(vector_mod._SOURCE_SIZE_TASKS))
 
 
 # ============================================================

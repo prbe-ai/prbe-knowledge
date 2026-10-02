@@ -295,7 +295,12 @@ jobs:
       # The vector-channel SQL-shape files (test_ann_order_by_shape,
       # test_vector_per_source_ann*, test_vector_recency_pool) pin the ORDER BY
       # / LIMIT the HNSW index can serve; they were not on the list when the
-      # recency path silently dropped its LIMIT. test_custom_ingest and
+      # recency path silently dropped its LIMIT. The two
+      # test_vector_per_source_routing files pin which top-up a short source
+      # takes (exact under the size threshold, a bounded HNSW walk above it),
+      # that the exact one returns the true top-K, and that the walk bound is
+      # what pgvector reads -- the live file also runs as a non-superuser under
+      # FORCE RLS. test_custom_ingest and
       # test_backfill_custom_doc_types cover the custom.<type> doc_type mapping
       # and its backfill; test_retire_experiment_nodes covers folding the retired
       # Experiment graph nodes into their Project nodes (T6).
@@ -358,6 +363,8 @@ jobs:
           tests/retrieval/test_vector_per_source_ann.py
           tests/retrieval/test_vector_per_source_ann_binding.py
           tests/retrieval/test_vector_recency_pool.py
+          tests/retrieval/test_vector_per_source_routing.py
+          tests/retrieval/test_vector_per_source_routing_live.py
           tests/retrieval/test_chunks_partition_pruning.py
           tests/retrieval/test_tenant_provisioning.py
           tests/retrieval/test_bm25_live_sentinel.py

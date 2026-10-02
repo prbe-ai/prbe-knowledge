@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -16,7 +17,7 @@ from engine.shared.constants import TOP_K_VECTOR, VECTOR_RECENCY_POOL_MULTIPLIER
 from engine.shared.db import with_tenant
 from engine.shared.embeddings import get_embedder_v2
 from engine.shared.logging import get_logger
-from engine.shared.models import TemporalSpec, normalize_author_id
+from engine.shared.models import TemporalMode, TemporalSpec, normalize_author_id
 
 log = get_logger(__name__)
 
@@ -66,6 +67,63 @@ PER_SOURCE_ANN_POOL = 400
 # fan-out volume through THIS wider gate, so on a disk-bound database the
 # two must be considered together, not flipped independently.
 _ANN_STATEMENT_SEMAPHORE = asyncio.Semaphore(6)
+
+# Per-source TOP-UP routing: a short source whose tenant holds at most this
+# many live, embedded chunks is answered EXACTLY (distance computed for every
+# one of its chunks, no HNSW); a bigger one keeps the HNSW top-up.
+#
+# Why, measured on the research plane 2026-10-02 (EXPLAIN ANALYZE as `app`,
+# cold cache): the source filter lives on the JOINed documents row, so an
+# HNSW top-up walks the tenant's whole graph until enough of ITS rows survive
+# the join, and a source is only ever topped up because it was rare near the
+# query. So the walk runs long and finds the wrong rows:
+#   - new-workspace/codex, a source that tenant does not have (the planner
+#     priced it at 2,076 docs): 18,935 tuples, 22.4 s, 0 rows. Exact: 25 ms.
+#   - probe/custom_ingest (30,431 chunks): 6,416-20,096 tuples, 8.1-26.0 s
+#     cold (0.31 s when the same walk is repeated warm); of the 20 rows one
+#     walk returned, 3 were in the source's true top 20. Exact: 9.1-10.9 s
+#     cold, 0.77-0.92 s warm (372k buffer hits), and it IS the true top 20.
+#     Exact reads the same pages every time, so in steady state it is warm.
+#   - bucket-robotics/codex (10,956): 10.4 s vs exact 2.4 s, both cold.
+# On a probe-sized rig (443k chunks) the custom_ingest top-up was p50 5.5 s
+# with recall@20 0.05; exact, p50 0.4 s with recall 1.0.
+#
+# 40,000 covers every short source measured above. Above it exact stops
+# paying even warm (~12 buffer hits a row, TOAST-bound): probe/github (58k)
+# answered one walk in 130 ms, though another took 10.7 s -- the walk bound
+# below is what handles those.
+#
+# The planner cannot make this call itself: `documents` is not partitioned,
+# so it multiplies the tenant's and the source's selectivities independently
+# and prices an absent source as thousands of rows.
+PER_SOURCE_EXACT_MAX_CHUNKS = 40_000
+
+# Bound on one HNSW top-up's walk (`hnsw.max_scan_tuples`, pgvector default
+# 20,000), so one statement cannot run for tens of seconds: 5,000 measured
+# 7.6-9.4 s cold where 20,000 measured 25-26 s (probe/custom_ingest). Only a
+# source above PER_SOURCE_EXACT_MAX_CHUNKS that is sparse around the query
+# reaches it. A capped walk returns a PREFIX of what the uncapped walk would
+# have found, and gives up the rows found last -- rows that were rarely in
+# the source's true top-K anyway. On the rig, recall@20 against exact for
+# the capped sources: codex 0.20 -> 0.09, claude_code 0.01 -> 0.00, github
+# 0.00 -> 0.00; across every short source, with the exact route above,
+# 0.589 today -> 0.699.
+PER_SOURCE_TOPUP_MAX_SCAN_TUPLES = 5_000
+
+# How long a tenant's per-source live-chunk count is trusted before it is
+# recounted. Routing only ever picks between "exact" (always correct) and
+# today's HNSW statement, so a stale count can cost speed, never correctness.
+SOURCE_SIZE_TTL_SECONDS = 600.0
+
+#: (customer_id, source_system) -> (expires_at monotonic, live chunk count,
+#: capped at PER_SOURCE_EXACT_MAX_CHUNKS + 1). Kept after it expires: a stale
+#: count still routes while its recount runs.
+_SOURCE_SIZE_CACHE: dict[tuple[str, str], tuple[float, int]] = {}
+#: Counts in flight, so concurrent sub-queries do not start the same one twice.
+_SOURCE_SIZE_INFLIGHT: set[tuple[str, str]] = set()
+#: Strong references to the background count tasks (the event loop keeps only
+#: weak ones); tests await them.
+_SOURCE_SIZE_TASKS: set[asyncio.Task[None]] = set()
 
 
 @dataclass(slots=True)
@@ -212,6 +270,11 @@ async def vector_search(
             per_source_top_k=per_source_top_k,
             sources=sources,
             rank_by=sort_by,
+            # The size count reads LIVE chunks of LIVE documents, which bounds
+            # what these two modes can match. AS_OF / ALL also match closed
+            # chunks, which the count does not see -- and have no ANN index
+            # to escape from anyway (see the HNSW index's comment in schema.sql).
+            exact_eligible=spec.mode in (TemporalMode.LATEST, TemporalMode.CHANGED_BETWEEN),
         )
         return _to_hits(rows)
 
@@ -483,6 +546,134 @@ async def _enable_iterative_scan(conn: asyncpg.Connection) -> None:
         log.info("vector.iterative_scan_verified", guc=_ITERSCAN_GUC, value=actual)
 
 
+_MAX_SCAN_TUPLES_GUC = "hnsw.max_scan_tuples"
+
+
+async def _bound_topup_walk(conn: asyncpg.Connection) -> None:
+    """Cap this transaction's HNSW walk at PER_SOURCE_TOPUP_MAX_SCAN_TUPLES.
+
+    `set_config(..., true)` is SET LOCAL: it ends with with_tenant's
+    transaction and cannot leak through the pool. Like iterative_scan this is
+    a namespaced pgvector GUC, accepted as a placeholder until pgvector loads
+    in the session and adopted when it does -- which happens before any walk,
+    because the walk IS pgvector. The live test reads it back as pgvector
+    sees it (tests/retrieval/test_vector_per_source_routing_live.py).
+    """
+    await conn.execute(
+        "SELECT set_config($1, $2, true)",
+        _MAX_SCAN_TUPLES_GUC,
+        str(PER_SOURCE_TOPUP_MAX_SCAN_TUPLES),
+    )
+
+
+def _routes_exact(live_chunks: int | None) -> bool:
+    """True when a short source should be answered exactly. `None` (no
+    count) keeps the HNSW top-up, which is what ran before this routing."""
+    return live_chunks is not None and live_chunks <= PER_SOURCE_EXACT_MAX_CHUNKS
+
+
+#: Live, embedded chunks per source for one tenant, each count stopped at $3
+#: (= PER_SOURCE_EXACT_MAX_CHUNKS + 1) so its cost is bounded by the threshold,
+#: not by the source. The docs gate first: a source with >= $3 live documents
+#: has at least that many chunks (and is big), and saying so reads only the
+#: documents index -- the chunk join runs for the small ones alone. CASE
+#: evaluates the chunk subquery lazily, only for sources under the gate.
+#: Cost is O(min(source, threshold)) index probes: 5.0 s / 192k buffers for
+#: probe's custom_ingest + pi + github on a cold research-plane cache, which
+#: is why it runs in the background (`_source_sizes`).
+#:
+#: Counts LIVE chunks of LIVE documents and ignores the request's other
+#: filters (visibility, source_keys, project, doc_type, author): every one of
+#: those only removes rows, so the count is an upper bound on what the exact
+#: statement will touch, and it is the same for every request, so it caches.
+_SOURCE_SIZE_SQL = f"""
+    SELECT s AS source_system,
+           CASE
+             WHEN (SELECT count(*) FROM (
+                     SELECT 1 FROM documents d
+                     WHERE d.customer_id = $1 AND d.source_system = s
+                       AND d.valid_to IS NULL
+                     LIMIT $3) docs) >= $3
+             THEN $3
+             ELSE (SELECT count(*) FROM (
+                     SELECT 1 FROM documents d
+                     JOIN chunks c
+                       ON c.customer_id = d.customer_id
+                      AND c.doc_id = d.doc_id
+                      {live_version_join("d", "c")}
+                     WHERE d.customer_id = $1 AND c.customer_id = $1
+                       AND d.source_system = s
+                       AND d.valid_to IS NULL AND c.valid_to IS NULL
+                       AND c.embedding_v2 IS NOT NULL
+                     LIMIT $3) live)
+           END AS live_chunks
+    FROM unnest($2::text[]) AS s
+"""
+
+
+async def _count_source_sizes(customer_id: str, sources: list[str]) -> dict[str, int]:
+    """Run _SOURCE_SIZE_SQL: each source's live, embedded chunk count for this
+    tenant, capped at PER_SOURCE_EXACT_MAX_CHUNKS + 1."""
+    async with with_tenant(customer_id) as conn:
+        rows = await conn.fetch(
+            _SOURCE_SIZE_SQL, customer_id, sources, PER_SOURCE_EXACT_MAX_CHUNKS + 1
+        )
+    return {r["source_system"]: int(r["live_chunks"]) for r in rows}
+
+
+async def _refresh_source_sizes(customer_id: str, sources: list[str]) -> None:
+    """Count `sources` and cache the result. Never raises: a failed count
+    leaves the old entries (or none), and those sources keep the route they
+    had -- for a source never counted, the HNSW top-up that ran before this
+    routing existed."""
+    try:
+        sizes = await _count_source_sizes(customer_id, sources)
+    except Exception as exc:  # a background task: nothing above it would see the error
+        log.warning(
+            "vector.source_sizes_failed",
+            customer_id=customer_id,
+            sources=sources,
+            error=type(exc).__name__,
+            reason="routing stays on the previous count, or the HNSW top-up",
+        )
+        return
+    finally:
+        for s in sources:
+            _SOURCE_SIZE_INFLIGHT.discard((customer_id, s))
+    expires = time.monotonic() + SOURCE_SIZE_TTL_SECONDS
+    for s, n in sizes.items():
+        _SOURCE_SIZE_CACHE[(customer_id, s)] = (expires, n)
+
+
+def _source_sizes(customer_id: str, sources: list[str]) -> dict[str, int]:
+    """The cached live-chunk counts for `sources`, WITHOUT waiting for a count.
+
+    A source with no entry, or an expired one, is (re)counted in the
+    background -- one statement for all of them, at most one in flight per
+    (tenant, source) -- and an expired entry is still returned meanwhile. The
+    count is never on the request path because it is not always cheap: at the
+    40k threshold it read 192k buffers / 5.0 s for probe's custom_ingest +
+    pi + github on a cold research-plane cache (2026-10-02). A source never
+    counted yet is simply absent from the result, which routes it to the HNSW
+    top-up -- what every top-up did before this routing.
+    """
+    out: dict[str, int] = {}
+    due: list[str] = []
+    now = time.monotonic()
+    for s in sources:
+        hit = _SOURCE_SIZE_CACHE.get((customer_id, s))
+        if hit is not None:
+            out[s] = hit[1]
+        if (hit is None or hit[0] <= now) and (customer_id, s) not in _SOURCE_SIZE_INFLIGHT:
+            due.append(s)
+    if due:
+        _SOURCE_SIZE_INFLIGHT.update((customer_id, s) for s in due)
+        task = asyncio.get_running_loop().create_task(_refresh_source_sizes(customer_id, due))
+        _SOURCE_SIZE_TASKS.add(task)
+        task.add_done_callback(_SOURCE_SIZE_TASKS.discard)
+    return out
+
+
 async def _per_source_ann_search(
     *,
     customer_id: str,
@@ -493,6 +684,7 @@ async def _per_source_ann_search(
     per_source_top_k: int,
     sources: list[str] | None,
     rank_by: str = "relevance",
+    exact_eligible: bool = False,
 ) -> list[Any]:
     """The per-source recall guarantee, kept ON the ANN index.
 
@@ -535,8 +727,30 @@ async def _per_source_ann_search(
          source -- not pool + sum. Serial SQL for the same decomposition
          measured 2.9s; concurrent Python measures ~1.1s wall.
 
+    WHICH top-up a short source gets (2026-10-02). Step 2's walk is only
+    cheap when the source is common near the query. When it is not, the walk
+    runs to `hnsw.max_scan_tuples`: 18,935 tuples / 22.4 s for a source the
+    tenant does not even have, 20,096 tuples / 25.3 s for 3 rows of a 30k-
+    chunk source (research plane, EXPLAIN ANALYZE as `app`). So each short
+    source is routed on its tenant's live-chunk count (`_source_sizes`:
+    counted for the short sources only, off the request path, cached per
+    process):
+
+      - count <= PER_SOURCE_EXACT_MAX_CHUNKS: EXACT. Same filtered SELECT,
+        `AND d.source_system = $s`, ordered by `score DESC, chunk_id` -- an
+        order HNSW cannot serve, so the planner walks the documents
+        (customer_id, source_system) index into the chunk partition's
+        (customer_id, doc_id) index and sorts that source's rows. It returns
+        the TRUE top-K for the source: recall can only go up.
+      - bigger: the HNSW top-up of step 2, with its walk capped at
+        PER_SOURCE_TOPUP_MAX_SCAN_TUPLES instead of 20,000.
+      - no count (not counted yet in this process, the count failed, or a
+        temporal mode it cannot bound): the HNSW top-up, as before this
+        routing existed.
+
     Failure honesty: iterative scan gives up after max_scan_tuples, so an
-    ultra-rare source inside a huge corpus can still under-return. The old
+    ultra-rare source inside a huge corpus can still under-return -- now only
+    for sources above the exact threshold, and at the lower cap. The old
     full scan would have found it, 40 seconds late; the budget upstream
     (`ENGINE_TIMEOUT_SECONDS` = 30s < the old path's floor) means those
     results were never actually delivered to anyone. Bounded-but-fast is the
@@ -607,7 +821,25 @@ async def _per_source_ann_search(
         )
         async with _ANN_STATEMENT_SEMAPHORE, with_tenant(customer_id) as conn:
             await _enable_iterative_scan(conn)
+            await _bound_topup_walk(conn)
             return await conn.fetch(sql, *topup_params)
+
+    async def _fetch_exact(source: str) -> list[Any]:
+        # Same filters as the top-up; only the ORDER BY differs, and that is
+        # the point: `score DESC` is not a shape the HNSW index can serve, so
+        # no plan can take the walk. Every row of this one small source gets
+        # its exact distance and the true top-K comes back, chunk_id breaking
+        # ties exactly as the outer query of the other paths does.
+        exact_params = [*params, source]
+        exact_params[2] = per_source_top_k
+        sql = (
+            f"{inner_sql}\n              AND d.source_system = ${len(exact_params)}"
+            f"\n            ORDER BY score DESC, c.chunk_id"
+            f"\n            LIMIT $3"
+        )
+        async with _ANN_STATEMENT_SEMAPHORE, with_tenant(customer_id) as conn:
+            rows: list[Any] = await conn.fetch(sql, *exact_params)
+        return rows
 
     pool_rows, src_list = await asyncio.gather(_fetch_pool(), _fetch_sources())
 
@@ -618,7 +850,20 @@ async def _per_source_ann_search(
 
     topup_rows: list[Any] = []
     if short:
-        for batch in await asyncio.gather(*(_fetch_topup(s) for s in short)):
+        # Counted only for the sources that need a top-up, in the background,
+        # and cached: routing reads whatever count is already there.
+        sizes = _source_sizes(customer_id, short) if exact_eligible else {}
+        exact = [s for s in short if _routes_exact(sizes.get(s))]
+        log.info(
+            "vector.per_source_topups",
+            customer_id=customer_id,
+            exact=exact,
+            ann=[s for s in short if s not in exact],
+            sizes={s: sizes.get(s) for s in short},
+        )
+        for batch in await asyncio.gather(
+            *(_fetch_exact(s) if s in exact else _fetch_topup(s) for s in short)
+        ):
             topup_rows.extend(batch)
 
     # Merge in Python, mirroring the SQL window this replaces exactly:
