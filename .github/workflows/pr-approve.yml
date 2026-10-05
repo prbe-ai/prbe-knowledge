@@ -1,0 +1,101 @@
+# =============================================================================
+# pr-approve — the required approving review on every PR into main.
+# =============================================================================
+# main's ruleset needs one approval before a merge (SOC 2 change management,
+# Oneleet's "code approval" test), and GitHub never lets an author approve their
+# own PR. The reviewer is prbe-ai/research-os's scripts/pr_approve.py: this job
+# checks it out of research-os main and runs it against the PR here. It reads
+# the title, description, file list and diff, asks Claude once, and posts
+# APPROVE or a COMMENT naming what blocks the merge. research-os's own
+# .github/workflows/pr-approve.yml explains the design; this file is the same
+# in every prbe-ai repo that uses it.
+#
+# - pull_request_target, not pull_request: this workflow runs from main, so a
+#   PR cannot edit the reviewer that judges it. Nothing from the PR is checked
+#   out or executed; its diff is read through the API, as text.
+# - The prbe-pr-approver GitHub App posts the review. Its key lives in this
+#   repo's `pr-approval` environment (deployment branches: main only), so a
+#   workflow a PR adds cannot read it. The app must be installed on this repo
+#   (Contents and Pull requests: read and write, or its APPROVE does not count)
+#   and on research-os, and must never be a ruleset bypass actor.
+#   "Allow GitHub Actions to create and approve pull requests" stays OFF.
+# - A PR that changes this file gets a COMMENT asking for a person.
+# - Fork and Dependabot PRs are skipped: a person approves those.
+# - workflow_dispatch reviews one PR on demand (from main only):
+#     gh workflow run pr-approve.yml --ref main -f pr=<N>
+name: pr-approve
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review, edited]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Number of the PR to review
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    # `edited` only matters when the base changed (a stacked PR retargeted onto
+    # main); a title or description edit changes no code.
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || (github.event.pull_request.draft == false
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && github.event.pull_request.user.login != 'dependabot[bot]'
+      && (github.event.action != 'edited' || github.event.changes.base != null))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: pr-approval
+    concurrency:
+      group: pr-approve-${{ github.event.pull_request.number || inputs.pr }}
+      cancel-in-progress: true
+    steps:
+      - name: Mint a read-only token for the reviewer's code
+        id: reviewer
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.PR_APPROVER_APP_ID }}
+          private-key: ${{ secrets.PR_APPROVER_PRIVATE_KEY }}
+          owner: prbe-ai
+          repositories: research-os
+          permission-contents: read
+
+      - name: Check out the reviewer from research-os main
+        uses: actions/checkout@v4
+        with:
+          repository: prbe-ai/research-os
+          ref: main
+          token: ${{ steps.reviewer.outputs.token }}
+          persist-credentials: false
+          sparse-checkout: |
+            /scripts/__init__.py
+            /scripts/pr_approve.py
+            /.github/workflows/pr-approve.yml
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # research-os's workflow pins the SDK to its uv.lock; use that pin.
+      - name: Install the Anthropic SDK
+        run: pip install --quiet "$(grep -o -m1 'anthropic==[0-9.]*' .github/workflows/pr-approve.yml)"
+
+      - name: Mint the approver app token for this repo
+        id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.PR_APPROVER_APP_ID }}
+          private-key: ${{ secrets.PR_APPROVER_PRIVATE_KEY }}
+
+      - name: Review and approve
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr }}
+        run: python -m scripts.pr_approve
