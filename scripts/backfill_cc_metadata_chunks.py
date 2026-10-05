@@ -18,6 +18,7 @@ Usage:
     .venv/bin/python -m scripts.backfill_cc_metadata_chunks --customer cust-X
     .venv/bin/python -m scripts.backfill_cc_metadata_chunks --source codex
     .venv/bin/python -m scripts.backfill_cc_metadata_chunks --source pi
+    .venv/bin/python -m scripts.backfill_cc_metadata_chunks --source kimi_code
 
 Idempotent: re-running picks up only docs whose live metadata-chunk
 content_hash differs from what _metadata_text(doc) now produces, so a
@@ -347,6 +348,7 @@ async def _amain() -> int:
             SourceSystem.CLAUDE_CODE.value,
             SourceSystem.CODEX.value,
             SourceSystem.PI.value,
+            SourceSystem.KIMI_CODE.value,
         ),
         default=SourceSystem.CLAUDE_CODE.value,
         help="Coding-agent source to backfill (default: claude_code)",

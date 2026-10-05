@@ -30,7 +30,7 @@ from kb.admin_routes import verify_internal_knowledge_key
 
 router = APIRouter(prefix="/api/sessions", dependencies=[Depends(verify_internal_knowledge_key)])
 EMPTY_HASH = hashlib.sha256(b"").hexdigest()
-_SOURCES = {"claude_code", "codex", "pi"}
+_SOURCES = {"claude_code", "codex", "pi", "kimi_code"}
 _FIELDS = (
     "session_id",
     "batch_seq",

@@ -25,6 +25,9 @@ class SourceSystem(StrEnum):
     # document rather than minting a second source, because this enum is
     # read in roughly 40 places across three repos and cannot grow per fork.
     PI = "pi"
+    # Kimi Code (Moonshot AI's coding agent) sessions arrive shimmed into
+    # Claude-Code shape by the tap's sanitizer, exactly like Codex and pi above.
+    KIMI_CODE = "kimi_code"
     MANUAL_UPLOAD = "manual_upload"
     CUSTOM_INGEST = "custom_ingest"
     CODE_GRAPH = "code_graph"
@@ -39,6 +42,7 @@ AGENT_SESSION_SOURCES: tuple[SourceSystem, ...] = (
     SourceSystem.CLAUDE_CODE,
     SourceSystem.CODEX,
     SourceSystem.PI,
+    SourceSystem.KIMI_CODE,
 )
 
 
@@ -58,6 +62,7 @@ SOURCE_DISPLAY_NAMES: dict[SourceSystem, str] = {
     SourceSystem.CLAUDE_CODE: "Claude Code",
     SourceSystem.CODEX: "Codex",
     SourceSystem.PI: "pi",
+    SourceSystem.KIMI_CODE: "Kimi Code",
     SourceSystem.MANUAL_UPLOAD: "Manual upload",
     SourceSystem.CUSTOM_INGEST: "Custom Ingest",
     SourceSystem.CODE_GRAPH: "Code",
@@ -968,7 +973,7 @@ WORKER_DRAIN_STALL_THRESHOLD_SECONDS = 180.0
 #                                    just now: slack, github, linear, notion,
 #                                    granola, sentry, manual uploads, incidents
 #    60  PRIORITY_AGENT_CAPTURE      automatic coding-agent transcripts:
-#                                    claude_code, codex, pi
+#                                    claude_code, codex, pi, kimi_code
 #    50  PRIORITY_BACKGROUND         backfills and code_graph; never blocks
 #                                    anything live
 #

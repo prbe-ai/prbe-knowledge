@@ -18,7 +18,7 @@ from engine.shared.db import raw_conn, with_tenant
 #
 # Other SourceSystem values use different lifecycles and are intentionally
 # not gated here:
-#   - CLAUDE_CODE / CODEX / PI: agent sessions, no OAuth token
+#   - CLAUDE_CODE / CODEX / PI / KIMI_CODE: agent sessions, no OAuth token
 #   - MANUAL_UPLOAD / CUSTOM_INGEST: BYO upload paths, separate token tables
 #   - CODE_GRAPH: derived from github content; its own enqueue path
 #                 short-circuits when the upstream github source disappears
@@ -41,6 +41,7 @@ _UNGATED_SOURCES: frozenset[SourceSystem] = frozenset(
         SourceSystem.CLAUDE_CODE,
         SourceSystem.CODEX,
         SourceSystem.PI,
+        SourceSystem.KIMI_CODE,
         SourceSystem.MANUAL_UPLOAD,
         SourceSystem.CUSTOM_INGEST,
         SourceSystem.CODE_GRAPH,

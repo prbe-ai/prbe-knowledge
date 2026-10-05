@@ -247,6 +247,17 @@ def test_source_preference_rule_includes_pi_as_agent_session() -> None:
         assert "claude_code, codex, pi" in sp
 
 
+def test_source_preference_rule_includes_kimi_code_as_agent_session() -> None:
+    """Kimi Code (KimiCodeConnector) emits `source_system=kimi_code` chunks
+    through the same synthesis pipeline as the other agent sessions, so the
+    AGENT SESSION bucket must name it too -- same reason as pi above."""
+    from datetime import UTC, datetime
+
+    now = datetime(2026, 5, 20, tzinfo=UTC)
+    for sp in (_build_system_prompt(now), _build_streaming_system_prompt(now)):
+        assert "claude_code, codex, pi, kimi_code" in sp
+
+
 def test_format_user_prompt_renders_neighbor_metadata_for_chronology() -> None:
     """The synthesis LLM previously refused chronology queries
     (answer="" on "reconstruct the multi-granola timeline") because

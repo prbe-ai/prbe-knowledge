@@ -53,6 +53,7 @@ def test_the_tiers_are_ordered_and_distinct() -> None:
         (SourceSystem.CLAUDE_CODE, PRIORITY_AGENT_CAPTURE),
         (SourceSystem.CODEX, PRIORITY_AGENT_CAPTURE),
         (SourceSystem.PI, PRIORITY_AGENT_CAPTURE),
+        (SourceSystem.KIMI_CODE, PRIORITY_AGENT_CAPTURE),
         (SourceSystem.SLACK, PRIORITY_LIVE_INTEGRATION),
         (SourceSystem.GITHUB, PRIORITY_LIVE_INTEGRATION),
         (SourceSystem.PAGERDUTY, PRIORITY_LIVE_INTEGRATION),
@@ -70,7 +71,7 @@ def test_codex_and_pi_inherit_the_capture_tier_not_the_old_shared_one() -> None:
     so a re-tier that edited only the parent would silently leave them behind
     if the inheritance ever stopped working."""
     _import_every_connector()
-    for source in (SourceSystem.CODEX, SourceSystem.PI):
+    for source in (SourceSystem.CODEX, SourceSystem.PI, SourceSystem.KIMI_CODE):
         assert get_source_profile(source.value).ingestion_priority == (
             get_source_profile(SourceSystem.CLAUDE_CODE.value).ingestion_priority
         )
@@ -81,13 +82,23 @@ def test_research_content_outranks_every_capture_source() -> None:
     as four numbers that could all be edited together."""
     _import_every_connector()
     content = get_source_profile(SourceSystem.CUSTOM_INGEST.value).ingestion_priority
-    for source in (SourceSystem.CLAUDE_CODE, SourceSystem.CODEX, SourceSystem.PI):
+    for source in (
+        SourceSystem.CLAUDE_CODE,
+        SourceSystem.CODEX,
+        SourceSystem.PI,
+        SourceSystem.KIMI_CODE,
+    ):
         assert content > get_source_profile(source.value).ingestion_priority
 
 
 def test_captures_never_outrank_a_live_integration() -> None:
     _import_every_connector()
-    for source in (SourceSystem.CLAUDE_CODE, SourceSystem.CODEX, SourceSystem.PI):
+    for source in (
+        SourceSystem.CLAUDE_CODE,
+        SourceSystem.CODEX,
+        SourceSystem.PI,
+        SourceSystem.KIMI_CODE,
+    ):
         assert (
             get_source_profile(source.value).ingestion_priority
             < get_source_profile(SourceSystem.SLACK.value).ingestion_priority

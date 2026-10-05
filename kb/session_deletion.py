@@ -1,6 +1,6 @@
 """Delete captured coding-agent sessions: chosen by id, or every session one person authored.
 
-A customer may ask for specific Claude Code / Codex / pi sessions to be erased,
+A customer may ask for specific Claude Code / Codex / pi / Kimi Code sessions to be erased,
 or for everything one person captured, and it has to be finished within 30
 days (backups trail by 8). The source purge (kb/purge_routes.py) can only drop
 a whole integration; this removes single sessions, everywhere they live, and
@@ -15,7 +15,7 @@ X-Internal-Knowledge-Key header, tenant from X-Prbe-Customer, never the body)
           "author": {"employee_id": "<uuid>", "email": "a@b.c"},   # either or both keys;
                                                     # with both, the id decides wherever
                                                     # a capture names one
-          "sources": ["claude_code", "codex", "pi"],  # optional filter, default all three
+          "sources": ["claude_code", "codex", "pi", "kimi_code"],  # optional filter, default all
           "dry_run": true,                          # DEFAULT: report, change nothing
           "reason": "customer request",             # required to apply
           "ticket": "prbe-ai/research-os#123",      # optional
@@ -214,7 +214,7 @@ class SessionRef:
     session_id: str
 
     def session_doc_id(self, customer_id: str) -> str:
-        # kb/handlers/claude_code.py _build_session_doc; codex/pi share it.
+        # kb/handlers/claude_code.py _build_session_doc; codex/pi/kimi_code share it.
         return f"{self.source}:{customer_id}:{self.session_id}"
 
     def agent_node_id(self) -> str:

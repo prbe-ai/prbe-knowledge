@@ -13,6 +13,7 @@ Probe ingests from these sources:
 | `claude_code`    | API             | Claude Code session ingest                    |
 | `codex`          | API             | Codex session ingest                          |
 | `pi`             | API             | pi session ingest                             |
+| `kimi_code`      | API             | Kimi Code session ingest                      |
 | `granola`        | API             | Granola meeting-notes ingest                  |
 | `manual_upload`  | API             | upload a file/document directly               |
 

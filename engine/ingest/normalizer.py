@@ -1130,7 +1130,7 @@ class Normalizer:
         # CREDENTIAL REDACTION (the server-side backstop). Runs at this shared
         # boundary for the same reason NUL normalization does: every connector
         # reaches persistence through here, so one call covers claude_code,
-        # codex, pi, custom_ingest and manual_uploads, and a new connector
+        # codex, pi, kimi_code, custom_ingest and manual_uploads, and a new connector
         # inherits it rather than having to remember.
         #
         # BEFORE the content hash, deliberately. The hash is the reuse key: if

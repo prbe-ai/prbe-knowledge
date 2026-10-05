@@ -60,6 +60,15 @@ def test_session_token_narrowed_by_pi_source() -> None:
     assert out == ["claude_code.session"]
 
 
+def test_session_token_narrowed_by_kimi_code_source() -> None:
+    """Kimi Code inherits the `claude_code.` doc_type prefix exactly like pi
+    and Codex: KimiCodeConnector emits CLAUDE_CODE_SESSION docs, so a
+    `sources=[kimi_code]` filter must narrow "session" to that family rather
+    than to nothing. Same registry dependency as the pi test above."""
+    out = resolve_doc_type_token("session", sources=[SourceSystem.KIMI_CODE])
+    assert out == ["claude_code.session"]
+
+
 def test_unknown_token_returns_none() -> None:
     assert resolve_doc_type_token("frobnication") is None
 

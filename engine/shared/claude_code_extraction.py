@@ -689,7 +689,12 @@ _TRIGGER = (
 #: from a fluent one.
 _CONFIDENCE = ("high", "medium", "low")
 
-_AGENT_LABELS = {"claude_code": "Claude Code", "codex": "Codex", "pi": "pi"}
+_AGENT_LABELS = {
+    "claude_code": "Claude Code",
+    "codex": "Codex",
+    "pi": "pi",
+    "kimi_code": "Kimi Code",
+}
 
 #: Authorship of a decision. Ordered from most to least human involvement.
 _DECIDED_BY = (
