@@ -34,7 +34,12 @@ from kb.admin_routes import verify_internal_knowledge_key
 router = APIRouter(prefix="/api/stats", tags=["stats"])
 
 _DEVICE_PAIRED_SOURCES = frozenset(
-    {SourceSystem.CLAUDE_CODE.value, SourceSystem.CODEX.value, SourceSystem.PI.value}
+    {
+        SourceSystem.CLAUDE_CODE.value,
+        SourceSystem.CODEX.value,
+        SourceSystem.PI.value,
+        SourceSystem.KIMI_CODE.value,
+    }
 )
 
 #: These counts change on ingestion, not per request, and the dashboard refetches

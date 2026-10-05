@@ -1438,3 +1438,28 @@ class PiConnector(ClaudeCodeConnector):
     _doc_id_prefix: ClassVar[str] = "pi"
     _agent_label: ClassVar[str] = "pi"
     _session_title_prefix: ClassVar[str] = "pi session"
+
+
+@register_connector(SourceSystem.KIMI_CODE)
+class KimiCodeConnector(ClaudeCodeConnector):
+    """Kimi Code sessions, shimmed into Claude-Code shape by the tap's
+    sanitizer (research-os `kimi_sanitize`, reading Kimi Code's
+    `agents/main/wire.jsonl`). Inherits all parsing / fetch_supplementary /
+    normalize logic from ClaudeCodeConnector — only the source label and
+    doc-id prefix differ so dashboard queries can distinguish provenance.
+
+    Anything Kimi-specific the sanitizer keeps rides along on each event in
+    the raw dict, the way `_codex_extras` / `_pi_extras` do. It survives into
+    raw R2 storage but is not parsed into units.
+    """
+
+    source_system: ClassVar[SourceSystem] = SourceSystem.KIMI_CODE
+    display_name: ClassVar[str] = "Kimi Code"
+    # Source profile (doc_type_prefix "claude_code.", priority 60, 0.5
+    # multiplier, 7d half-life) is inherited from ClaudeCodeConnector on
+    # purpose, exactly as Codex and pi inherit it: same doc shape, same
+    # coalescing semantics, same staleness curve — only the provenance label
+    # differs.
+    _doc_id_prefix: ClassVar[str] = "kimi_code"
+    _agent_label: ClassVar[str] = "kimi_code"
+    _session_title_prefix: ClassVar[str] = "Kimi Code session"

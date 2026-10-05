@@ -776,7 +776,7 @@ def test_hits_without_a_doc_id_are_not_scoreable():
 def test_every_doc_class_maps_to_a_real_doc_type():
     from engine.shared.constants import DocType
 
-    known = {d.value for d in DocType} | {"codex.session", "pi.session"}
+    known = {d.value for d in DocType} | {"codex.session", "pi.session", "kimi_code.session"}
     for cls, types in jev.DOC_CLASSES.items():
         for t in types or []:
             assert t in known, (cls, t)
@@ -1085,6 +1085,7 @@ def test_source_system_from_any_chunk_of_the_document():
     ("custom_ingest:t:experiments:8f3e", "8f3e", 2),
     ("", "", 2),
     ("pi:t:1", "transcript", 3),
+    ("kimi_code:t:1", "transcript", 3),
     ("codex:t:1", "transcript", 3),
     ("linear:t:ISSUE-1", "linear", 1),
     ("notion:t:page-1", "notion", 1),

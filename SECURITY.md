@@ -52,9 +52,9 @@ standalone (community) deployment to any untrusted network:
   `LINEAR_WEBHOOK_SECRET`, `NOTION_WEBHOOK_VERIFICATION_TOKEN`,
   `SENTRY_WEBHOOK_SECRET`). Sources without a public webhook surface
   (`code_graph`, `custom_ingest`) reject all standalone webhook
-  traffic. Agent-session sources (`claude_code`, `codex`, `manual_upload`)
-  have no signature scheme — keep 8080 reachable only from networks you
-  trust (compose publishes it on the host; firewall it).
+  traffic. Agent-session sources (`claude_code`, `codex`, `pi`, `kimi_code`,
+  `manual_upload`) have no signature scheme — keep 8080 reachable only from
+  networks you trust (compose publishes it on the host; firewall it).
 - **Note that `ENVIRONMENT=local` disables webhook signature checks** for
   sources whose secret is unset ("dev bypass"). Never run a network-exposed
   deployment as `local`.

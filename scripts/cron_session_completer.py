@@ -1,4 +1,4 @@
-"""End agent sessions (Claude Code, Codex, pi) whose client never said goodbye.
+"""End agent sessions (Claude Code, Codex, pi, Kimi Code) whose client never said goodbye.
 
 Appends a finalize.marker key to each idle session's live queue row. The worker,
 on next claim, sees an end signal on top of the row and mines the session once

@@ -710,11 +710,11 @@ _DOC_CLASS_TABLE: dict[str, tuple[list[str] | None, str]] = {
     "notion_pages": (["notion.page", "notion.database"], "Notion pages"),
     "sentry_errors": (["sentry.issue", "sentry.event"], "Sentry issues, errors or incidents"),
     "meetings": (["granola.meeting"], "meetings (Granola notes)"),
-    # All three coding agents' sessions: a "sessions" question that filtered to
-    # Claude Code alone would hide Codex (2,510 live on `probe`) and pi.
+    # Every coding agent's sessions: a "sessions" question that filtered to
+    # Claude Code alone would hide Codex (2,510 live on `probe`), pi and Kimi Code.
     "agent_sessions": (
-        ["claude_code.session", "codex.session", "pi.session"],
-        "coding-agent sessions (Claude Code, Codex, pi)",
+        ["claude_code.session", "codex.session", "pi.session", "kimi_code.session"],
+        "coding-agent sessions (Claude Code, Codex, pi, Kimi Code)",
     ),
 }
 DOC_CLASSES: dict[str, list[str] | None] = {k: v[0] for k, v in _DOC_CLASS_TABLE.items()}

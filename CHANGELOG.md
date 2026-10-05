@@ -47,6 +47,20 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Added
 
+- **Kimi Code is a session source (`kimi_code`), beside Claude Code, Codex and pi.**
+  `SourceSystem.KIMI_CODE` ("Kimi Code") and `KimiCodeConnector`, a subclass of
+  `ClaudeCodeConnector` like `CodexConnector`/`PiConnector`: research-os's tap uploads Kimi
+  Code sessions already sanitized into the shared session shape, so only the provenance
+  (`source_system`, `kimi_code:` doc ids, "Kimi Code session" titles, the extraction prompt's
+  agent name) differs. Batches arrive at the existing `POST /webhooks/kimi_code`; receipts read
+  at `GET /api/sessions/kimi_code/<id>/receipts`. Doc types stay `claude_code.*` and the queue
+  tier, 0.5 score multiplier and 7-day half-life are inherited, as for Codex and pi. It joins
+  every hand-written agent list (webhook coalescing, idle finalizer, per-device stats, receipts,
+  disconnect gate, grounding, synthesis and Jev session class, metadata backfill `--source`),
+  and `tests/test_agent_session_source_sets.py` pins each of those lists to
+  `AGENT_SESSION_SOURCES` so the next agent fails a test instead of shipping a straggler. No
+  migration: no table constrains `source_system`.
+
 - **What a customer deletes now leaves the engine completely, a week later.** A deleted item
   (a research-os run, project or note, or a Slack/Linear/Notion/GitHub/code-graph delete)
   used to become a tombstone and stay: every `documents` version (title, body preview,

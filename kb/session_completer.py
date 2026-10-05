@@ -1,4 +1,4 @@
-"""Periodic finalizer for agent-session sources (Claude Code, Codex, pi) that go idle.
+"""Periodic finalizer for agent-session sources (Claude Code, Codex, pi, Kimi Code) that go idle.
 
 A session is mined only once it has ENDED (engine.shared.session_signals: the
 newest key on its queue row is an end signal). Clients end their own sessions;
@@ -58,7 +58,12 @@ log = get_logger(__name__)
 
 #: Every agent-session source ingests in coalescing mode and needs ending when
 #: idle. Each is swept on its own so the marker lands under its own R2 prefix.
-AGENT_SOURCES = (SourceSystem.CLAUDE_CODE, SourceSystem.CODEX, SourceSystem.PI)
+AGENT_SOURCES = (
+    SourceSystem.CLAUDE_CODE,
+    SourceSystem.CODEX,
+    SourceSystem.PI,
+    SourceSystem.KIMI_CODE,
+)
 
 #: How many times the sweep re-queues a session whose last pass was partial.
 #: A segment that always fails must not become a new daily loop.
