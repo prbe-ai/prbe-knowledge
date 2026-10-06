@@ -179,6 +179,10 @@ class Settings(BaseSettings):
     #: session as it goes; the completing pass always writes the final one.
     #: 0: only ended sessions have one (and a resumed session's is removed).
     session_trajectory_live_interval_s: int = Field(default=60)
+    #: Largest LIVE copy written (the final copy keeps the 8 MB cap). Each live
+    #: write pays a full credential scrub; past this a running session has no
+    #: live copy until it ends. p95 trajectory measured 326 KB.
+    session_trajectory_live_max_bytes: int = Field(default=2_000_000)
     #: Reuse a segment's extraction when the same session re-ends with that
     #: segment unchanged (engine/shared/extraction_cache.py). Off = no cache
     #: read or write; every segment is mined, as before.

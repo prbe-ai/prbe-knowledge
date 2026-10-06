@@ -488,8 +488,8 @@ async def backfill(args: argparse.Namespace) -> None:
                     return
                 session_id = event_id
                 if not hydrated.get("session_complete"):
-                    # As the live path: a running session has no trajectory; its
-                    # completing pass writes one.
+                    # A running session's copy is the worker's (live, then final):
+                    # the backfill writes only final copies of ended sessions.
                     counts["not_ended"] += 1
                     return
                 events = list(hydrated.get("events") or [])

@@ -3,7 +3,8 @@
 What must hold, whatever the tenant's render mode:
   * the indexed text is exactly what the event renderer produced before this
     module existed (pinned below as a literal);
-  * only a completing pass builds a trajectory; it writes `trajectory.json`,
+  * a completing pass writes the final `trajectory.json` and a live pass a
+    throttled live copy (`extra.session_ended` says which); either is written
     without the engine's render provenance, scrubbed the way the index is, in
     the session's own folder (so deletion owns it);
   * a session that resumes, or whose newer trajectory cannot be written, has
@@ -142,8 +143,10 @@ def builds(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Any, ...]]:
 @pytest.fixture(autouse=True)
 def _fresh_live_throttle() -> Any:
     cc_mod._LIVE_WRITES.clear()
+    cc_mod._LIVE_TOO_LARGE.clear()
     yield
     cc_mod._LIVE_WRITES.clear()
+    cc_mod._LIVE_TOO_LARGE.clear()
 
 
 def _use_mode(monkeypatch: pytest.MonkeyPatch, mode: str = "legacy", **kw: Any) -> None:
@@ -470,3 +473,86 @@ async def test_the_off_switch_writes_nothing_and_removes_the_old_trajectory(
     assert result.documents[0].body == EXPECTED_BODY
     assert store.objects == {} and store.deleted == [KEY]
     assert len(builds) == (0 if mode == "legacy" else 1), "legacy skips the build entirely"
+
+
+async def _normalize_events(events: list[dict[str, Any]], complete: bool, **hydrated: Any) -> Any:
+    c = ClaudeCodeConnector(make_default_context())
+    return await c.normalize(_event(), {"session_id": "s-1", "events": events,
+                                        "session_complete": complete, "cwd": "/p", **hydrated})
+
+
+async def test_a_reply_that_ends_its_turn_is_written_live_inside_the_interval(
+    monkeypatch: pytest.MonkeyPatch, store: FakeStore, mined: list, builds: list
+) -> None:
+    _use_mode(monkeypatch, trajectory_live_interval_s=3600)
+    await _normalize(complete=False)
+    ended_turn = [*EVENTS[:3], {"line_no": 3, "raw": {"type": "assistant", "message": {
+        "content": [{"type": "text", "text": "it failed"}], "stop_reason": "end_turn"}}}]
+    await _normalize_events(ended_turn, complete=False)
+    assert len(builds) == 2, "the newest answer is never held back by the throttle"
+
+
+async def test_a_completing_pass_resets_the_throttle_so_a_resume_is_live_at_once(
+    monkeypatch: pytest.MonkeyPatch, store: FakeStore, mined: list, builds: list
+) -> None:
+    _use_mode(monkeypatch, trajectory_live_interval_s=3600)
+    await _normalize(complete=False)
+    await _normalize(complete=True)
+    await _normalize(complete=False, ended_before=True)
+    stored = orjson.loads(store.objects[("bucket-cust-1", KEY)])
+    assert stored["extra"] == {"session_ended": False} and len(builds) == 3
+
+
+async def test_a_deleted_session_gets_no_trajectory(
+    monkeypatch: pytest.MonkeyPatch, store: FakeStore, mined: list
+) -> None:
+    async def deleted(*_a: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(cc_mod, "is_session_deleted", deleted)
+    _use_mode(monkeypatch)
+    await _normalize(complete=True)
+    await _normalize(complete=False)
+    assert store.objects == {}
+
+
+async def test_a_pool_outage_on_a_live_pass_keeps_the_previous_copy(
+    monkeypatch: pytest.MonkeyPatch, store: FakeStore, mined: list
+) -> None:
+    from engine.shared.exceptions import CpuPoolUnavailable
+
+    async def down(*_a: Any, **_k: Any) -> Any:
+        raise CpuPoolUnavailable("pool restarting")
+
+    store.objects[("bucket-cust-1", KEY)] = b'{"previous": true}'
+    monkeypatch.setattr(cc_mod.cpu_pool, "run_cpu", down)
+    _use_mode(monkeypatch)
+    result = await _normalize(complete=False)
+    assert result.documents[0].body == EXPECTED_BODY
+    assert store.objects[("bucket-cust-1", KEY)] == b'{"previous": true}' and store.deleted == []
+    assert cc_mod._LIVE_WRITES == {}, "the next pass retries"
+
+
+async def test_a_failed_live_write_keeps_the_previous_copy(
+    monkeypatch: pytest.MonkeyPatch, mined: list
+) -> None:
+    fake = FakeStore(fail_put=True)
+    fake.objects[("bucket-cust-1", KEY)] = b'{"previous": true}'
+    monkeypatch.setattr(cc_mod, "get_store", lambda: fake)
+    _use_mode(monkeypatch)
+    await _normalize(complete=False)
+    assert fake.deleted == [] and fake.objects[("bucket-cust-1", KEY)] == b'{"previous": true}'
+
+
+async def test_a_live_copy_past_its_cap_is_dropped_and_not_rebuilt_until_the_end(
+    monkeypatch: pytest.MonkeyPatch, store: FakeStore, mined: list, builds: list
+) -> None:
+    store.objects[("bucket-cust-1", KEY)] = b'{"previous": true}'
+    _use_mode(monkeypatch, trajectory_live_max_bytes=10, trajectory_live_interval_s=1)
+    await _normalize(complete=False)
+    assert store.objects == {} and store.deleted == [KEY]
+    cc_mod._LIVE_WRITES.clear()
+    await _normalize(complete=False)
+    assert len(builds) == 1, "remembered as too large: no rebuild every interval"
+    await _normalize(complete=True)
+    assert orjson.loads(store.objects[("bucket-cust-1", KEY)])["extra"] == {"session_ended": True}

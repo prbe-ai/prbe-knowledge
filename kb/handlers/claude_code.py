@@ -111,10 +111,31 @@ def _live_write_due(key: tuple[str, str, str], interval_s: int) -> bool:
 
 
 def _live_written(key: tuple[str, str, str]) -> None:
-    _LIVE_WRITES[key] = time.monotonic()
-    _LIVE_WRITES.move_to_end(key)
-    while len(_LIVE_WRITES) > _LIVE_WRITES_MAX:
-        _LIVE_WRITES.popitem(last=False)
+    _remember(_LIVE_WRITES, key)
+
+
+def _remember(table: OrderedDict[tuple[str, str, str], float], key: tuple[str, str, str]) -> None:
+    table[key] = time.monotonic()
+    table.move_to_end(key)
+    while len(table) > _LIVE_WRITES_MAX:
+        table.popitem(last=False)
+
+
+#: Running sessions whose live copy is over SESSION_TRAJECTORY_LIVE_MAX_BYTES:
+#: no live builds until their completing pass. Same bound as _LIVE_WRITES.
+_LIVE_TOO_LARGE: OrderedDict[tuple[str, str, str], float] = OrderedDict()
+
+#: Stop reasons that end the model's turn (Claude Code / Anthropic, OpenAI-style).
+_TURN_ENDS = frozenset({"end_turn", "stop", "stop_sequence"})
+
+
+def _ends_turn(events: list[dict[str, Any]]) -> bool:
+    """The newest event is a model reply that ends its turn."""
+    raw = (events[-1] or {}).get("raw") if events else None
+    if not isinstance(raw, dict) or raw.get("type") != "assistant":
+        return False
+    message = raw.get("message")
+    return isinstance(message, dict) and message.get("stop_reason") in _TURN_ENDS
 
 _FETCH_SUPP_R2_CONCURRENCY = 16
 
@@ -593,7 +614,10 @@ class ClaudeCodeConnector(Connector):
         if built is not None and settings.session_trajectory_store:
             await self._store_trajectory(event, session_id, built, ended=complete)
         elif complete or (
-            hydrated.get("ended_before") and settings.session_trajectory_live_interval_s <= 0
+            hydrated.get("ended_before")
+            and not (
+                settings.session_trajectory_store and settings.session_trajectory_live_interval_s > 0
+            )
         ):
             # A completing pass that built nothing, or (with no live copies) a
             # session that ended and then resumed: whatever trajectory.json holds
@@ -1085,19 +1109,28 @@ class ClaudeCodeConnector(Connector):
         """
         legacy = lines_from_events(events)
         settings = get_settings()
+        live_key = (event.customer_id, self.source_system.value, session_id)
         if not complete:
             # A live pass serves the events' Lines whatever the mode. It builds
-            # only to refresh the stored live trajectory, throttled per process.
-            live_key = (event.customer_id, self.source_system.value, session_id)
+            # only to refresh the stored live trajectory: at most once per
+            # interval per process, and always when the newest event ends a
+            # turn, so a pause never hides the latest answer.
             if not (
                 settings.session_trajectory_store
                 and settings.session_trajectory_live_interval_s > 0
-                and _live_write_due(live_key, settings.session_trajectory_live_interval_s)
+                and live_key not in _LIVE_TOO_LARGE
+                and (
+                    _live_write_due(live_key, settings.session_trajectory_live_interval_s)
+                    or _ends_turn(events)
+                )
             ):
                 return legacy, None, False
             _live_written(live_key)
             mode, compare = None, False
         else:
+            # The final copy replaces any live one; a resume starts afresh.
+            _LIVE_WRITES.pop(live_key, None)
+            _LIVE_TOO_LARGE.pop(live_key, None)
             mode = render_mode(event.customer_id)
             compare = mode is not RenderMode.LEGACY
             if not compare and not settings.session_trajectory_store:
@@ -1114,6 +1147,12 @@ class ClaudeCodeConnector(Connector):
                 size=sum(len(line.text) for line in legacy),
             )
         except CpuPoolUnavailable:
+            if not complete:
+                # Optional work: keep the previous live copy, retry next pass.
+                _LIVE_WRITES.pop(live_key, None)
+                log.info("trajectory.live_skipped_pool", customer=event.customer_id,
+                         source=self.source_system.value, session_id=session_id)
+                return legacy, None, False
             # The pool's transient failure: the row retries, as the body scrub's
             # does, rather than leave an ended session without its trajectory.
             raise
@@ -1126,6 +1165,13 @@ class ClaudeCodeConnector(Connector):
                 exc_info=True,
             )
             return legacy, None, False
+        if not complete:
+            # One line per live build, not one per event: live builds repeat.
+            if built.unparsed:
+                log.info("atif.live_unparsed", customer=event.customer_id,
+                         source=self.source_system.value, session_id=session_id,
+                         unparsed=built.unparsed)
+            return legacy, built, False
         for line_no, ev_type, error in built.unparsed_events:
             log.warning(
                 "atif.event_unparsed",
@@ -1205,7 +1251,8 @@ class ClaudeCodeConnector(Connector):
                 )
                 return
         except Exception:
-            log.warning("trajectory.deleted_check_failed", exc_info=True)
+            log.warning("trajectory.deleted_check_failed", customer=event.customer_id,
+                        source=self.source_system.value, session_id=session_id, exc_info=True)
         document = {
             **built.trajectory,
             "extra": {**(built.trajectory.get("extra") or {}), "session_ended": ended},
@@ -1218,7 +1265,11 @@ class ClaudeCodeConnector(Connector):
                 bucket,
                 key,
                 document,
-                max_bytes=get_settings().session_trajectory_max_bytes,
+                max_bytes=(
+                    get_settings().session_trajectory_max_bytes
+                    if ended
+                    else get_settings().session_trajectory_live_max_bytes
+                ),
             )
         except TrajectoryTooLarge as exc:
             log.info(
@@ -1226,22 +1277,33 @@ class ClaudeCodeConnector(Connector):
                 customer=event.customer_id,
                 source=self.source_system.value,
                 session_id=session_id,
+                ended=ended,
                 bytes=exc.size,
                 limit=exc.limit,
             )
+            if not ended:
+                # No more live builds for it until it ends (each would scrub megabytes).
+                _remember(_LIVE_TOO_LARGE, (event.customer_id, self.source_system.value, session_id))
             await self._discard_trajectory(event, session_id, why="too_large")
             return
         except CpuPoolUnavailable:
-            raise
+            if ended:
+                raise
+            _LIVE_WRITES.pop((event.customer_id, self.source_system.value, session_id), None)
+            log.info("trajectory.live_skipped_pool", customer=event.customer_id,
+                     source=self.source_system.value, session_id=session_id)
+            return
         except Exception as exc:
             log.warning(
                 "trajectory.store_failed",
                 customer=event.customer_id,
                 source=self.source_system.value,
                 session_id=session_id,
+                ended=ended,
                 error=type(exc).__name__,
             )
-            await self._discard_trajectory(event, session_id, why="store_failed")
+            if ended:
+                await self._discard_trajectory(event, session_id, why="store_failed")
             return
         log.info(
             "trajectory.stored",
