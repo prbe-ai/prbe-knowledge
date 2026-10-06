@@ -41,7 +41,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 
-from engine.ingest.atif.store import read_trajectory, trajectory_key
+from engine.ingest.atif.store import read_trajectory, strip_provenance, trajectory_key
 from engine.retrieval.auth import authenticate_query
 from engine.retrieval.direct import DirectRetrieveRequest, DirectRetrieveResponse, retrieve_direct
 from engine.retrieval.graph_explore import (
@@ -1187,35 +1187,12 @@ def _source_grep_view(
 
 
 #: Steps per page of GET /trajectory. A long session runs to thousands of
-#: steps and several MB; readers page, the export walks every page.
+#: steps and several MB; readers page, the export walks every page. A page also
+#: stops at a byte budget, so one call never hands a reader (an agent's context
+#: included) the whole session.
 _TRAJECTORY_DEFAULT_STEPS = 200
 _TRAJECTORY_MAX_STEPS = 2000
-
-
-def _public_trajectory(trajectory: dict[str, Any]) -> dict[str, Any]:
-    """The ATIF document without the engine's render provenance.
-
-    `extra.probe` and each step's `extra.probe_parts` exist so the engine can
-    rebuild the indexed text (engine/ingest/atif/build.py); no reader needs
-    them, and they are most of a step's extra.
-    """
-    out = dict(trajectory)
-    extra = {k: v for k, v in (out.get("extra") or {}).items() if k != "probe"}
-    if extra:
-        out["extra"] = extra
-    else:
-        out.pop("extra", None)
-    steps = []
-    for step in out.get("steps") or []:
-        step = dict(step)
-        step_extra = {k: v for k, v in (step.get("extra") or {}).items() if k != "probe_parts"}
-        if step_extra:
-            step["extra"] = step_extra
-        else:
-            step.pop("extra", None)
-        steps.append(step)
-    out["steps"] = steps
-    return out
+_TRAJECTORY_PAGE_MAX_BYTES = 1_000_000
 
 
 @app.get("/trajectory/{doc_id:path}")
@@ -1231,8 +1208,8 @@ async def get_trajectory(
     Same tenancy as /source-view: the document is read under the caller's
     tenant, so another tenant's doc id is a 404, and only a live, approved
     agent-session document resolves. The trajectory is written when a session
-    ends, so a session still running answers 404 with `reason: not_built` and
-    the reader falls back to /source-view text.
+    ends and removed while it runs again, so a session with none answers 404
+    with `reason: not_built` and the reader falls back to /source-view text.
     """
     step_limit = min(step_limit, _TRAJECTORY_MAX_STEPS)
     request.state.customer_id = customer_id
@@ -1243,7 +1220,7 @@ async def get_trajectory(
     async with with_tenant(customer_id) as conn:
         doc = await conn.fetchrow(
             """
-            SELECT source_system, source_id, metadata
+            SELECT source_system, source_id
             FROM documents
             WHERE customer_id = $1 AND doc_id = $2 AND valid_to IS NULL
               AND visibility = 'approved' AND deleted_at IS NULL
@@ -1267,19 +1244,23 @@ async def get_trajectory(
             status_code=404,
             content={"detail": "trajectory not built", "reason": "not_built"},
         )
-    metadata = doc["metadata"] or {}
-    if isinstance(metadata, str):
-        metadata = json.loads(metadata)
-    public = _public_trajectory(trajectory)
+    # Documents stored before provenance was stripped at write time still carry it.
+    public = strip_provenance(trajectory)
     steps = public["steps"]
-    page = steps[step_from - 1 : step_from - 1 + step_limit]
+    page: list[Any] = []
+    budget = _TRAJECTORY_PAGE_MAX_BYTES
+    for step in steps[step_from - 1 : step_from - 1 + step_limit]:
+        size = len(json.dumps(step, separators=(",", ":"), ensure_ascii=False))
+        if page and size > budget:
+            break
+        page.append(step)
+        budget -= size
     following = step_from + len(page)
     public["steps"] = page
     return {
         "doc_id": doc_id,
         "session_id": doc["source_id"],
         "source": doc["source_system"],
-        "session_complete": bool(metadata.get("session_complete")),
         "total_steps": len(steps),
         "step_from": step_from,
         "next_step_from": following if following <= len(steps) else None,

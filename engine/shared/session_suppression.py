@@ -231,8 +231,9 @@ def session_folder(source: str, customer_id: str, session_id: str) -> str:
 def is_own_folder_key(key: str, folder: str) -> bool:
     """Is `key`, listed under `folder`, this session's own object?
 
-    Both writers build the folder from the RAW session id, and protocol 1
-    accepts `/` in one: session `X/y` keeps its marker and cache under
+    Every writer (the idle sweep's marker, the extraction cache,
+    trajectory.json) builds the folder from the RAW session id, and protocol 1
+    accepts `/` in one: session `X/y` keeps its objects under
     `raw/<src>/<customer>/X/y/`, which is inside session `X`'s folder. Only the
     shapes this session writes itself are its own.
     """

@@ -387,3 +387,9 @@ def _render_assistant(raw: dict[str, Any]) -> str:
     if parts and renders_stop(stop_reason):
         parts.append(format_stop(stop_reason))
     return "\n".join(parts)
+
+
+# Public names for the two rules the trajectory path (engine/ingest/atif) shares
+# with this renderer; the underscored names stay for the connector's re-export.
+strip_harness = _strip_harness
+format_tool_call = _render_tool_use

@@ -64,7 +64,8 @@ async def _customer(customer_id: str) -> str:
 
 
 async def _doc(customer_id: str, doc_id: str, *, doc_type: str = "claude_code.session",
-               source: str = "claude_code", deleted: bool = False) -> None:
+               source: str = "claude_code", deleted: bool = False,
+               visibility: str = "approved", superseded: bool = False) -> None:
     now = datetime.now(UTC)
     async with raw_conn() as conn:
         await conn.execute(
@@ -73,12 +74,13 @@ async def _doc(customer_id: str, doc_id: str, *, doc_type: str = "claude_code.se
                 doc_id, version, customer_id, source_system, source_id, source_url,
                 doc_class, doc_type, content_type, content_hash, title,
                 body_size_bytes, body_token_count, created_at, updated_at,
-                valid_from, ingested_at, acl, metadata, deleted_at
+                valid_from, ingested_at, acl, metadata, deleted_at, visibility, valid_to
             ) VALUES ($1, 1, $2, $3, $4, 'https://x', 'raw_source', $5,
                       'application/json', 'h', 't', 1, 0, $6, $6, $6, $6, '{}'::jsonb,
-                      '{"session_complete": true}'::jsonb, $7)
+                      '{}'::jsonb, $7, $8, $9)
             """,
             doc_id, customer_id, source, SESSION, doc_type, now, now if deleted else None,
+            visibility, now if superseded else None,
         )
 
 
@@ -121,7 +123,7 @@ async def test_pages_steps_and_hides_render_provenance(live_db, settings, store)
     assert first.status_code == 200, first.text
     body = first.json()
     assert (body["total_steps"], body["step_from"], body["next_step_from"]) == (5, 1, 3)
-    assert body["session_complete"] is True and body["session_id"] == SESSION
+    assert body["session_id"] == SESSION and "session_complete" not in body
     steps = body["trajectory"]["steps"]
     assert [s["message"] for s in steps] == ["turn 0", "turn 1"]
     assert "extra" not in body["trajectory"], "render provenance is engine-internal"
@@ -141,7 +143,7 @@ async def test_not_built_is_a_404_with_a_reason(live_db, settings, store) -> Non
 
 
 @pytest.mark.parametrize(
-    "case", ["other tenant", "deleted", "not a session", "unknown"]
+    "case", ["other tenant", "deleted", "not a session", "unknown", "draft", "superseded"]
 )
 async def test_unreadable_documents_never_reach_storage(live_db, settings, store, case) -> None:
     key = await _customer("cust-c")
@@ -155,8 +157,39 @@ async def test_unreadable_documents_never_reach_storage(live_db, settings, store
     elif case == "not a session":
         doc_id = "slack:T:C:1"
         await _doc("cust-c", doc_id, doc_type="slack_message", source="slack")
+    elif case in ("draft", "superseded"):
+        doc_id = f"claude_code:cust-c:{SESSION}"
+        await _doc("cust-c", doc_id, visibility="draft" if case == "draft" else "approved",
+                   superseded=case == "superseded")
     resp = await _get(f"/trajectory/{doc_id}", key)
     await init_pool(settings)
     assert resp.status_code == 404
     assert "reason" not in resp.json()
     assert store.gets == []
+
+
+async def test_an_unreadable_object_is_not_built(live_db, settings, store) -> None:
+    key = await _customer("cust-e")
+    doc_id = f"claude_code:cust-e:{SESSION}"
+    await _doc("cust-e", doc_id)
+    store.objects[("bucket-cust-e", trajectory_key("claude_code", "cust-e", SESSION))] = b"{oops"
+    resp = await _get(f"/trajectory/{doc_id}", key)
+    await init_pool(settings)
+    assert resp.status_code == 404 and resp.json()["reason"] == "not_built"
+
+
+async def test_a_page_stops_at_its_byte_budget(live_db, settings, store, monkeypatch) -> None:
+    import engine.retrieval.main as retrieval_main
+
+    monkeypatch.setattr(retrieval_main, "_TRAJECTORY_PAGE_MAX_BYTES", 150)
+    key = await _customer("cust-f")
+    doc_id = f"claude_code:cust-f:{SESSION}"
+    await _doc("cust-f", doc_id)
+    store.objects[("bucket-cust-f", trajectory_key("claude_code", "cust-f", SESSION))] = (
+        orjson.dumps(_trajectory(5))
+    )
+    resp = await _get(f"/trajectory/{doc_id}?step_limit=5", key)
+    await init_pool(settings)
+    body = resp.json()
+    shown = len(body["trajectory"]["steps"])
+    assert 1 <= shown < 5 and body["next_step_from"] == 1 + shown

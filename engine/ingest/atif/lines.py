@@ -30,12 +30,12 @@ from engine.ingest.atif.build import (
 )
 from engine.shared.transcript_render import (
     Line,
-    _render_tool_use,
     format_assistant_text,
     format_other_event,
     format_stop,
     format_system,
     format_thinking,
+    format_tool_call,
     format_tool_result,
     format_user_text,
 )
@@ -96,7 +96,7 @@ def _render_part(kind: str, step: dict[str, Any], part: list[Any]) -> str:
     if kind == PART_CALL:
         call = step["tool_calls"][part[3]]
         call_extra = call.get("extra") or {}
-        return _render_tool_use(
+        return format_tool_call(
             {
                 "name": call["function_name"],
                 "summary": call_extra.get("summary"),

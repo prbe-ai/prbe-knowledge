@@ -105,7 +105,7 @@ def event_type_for(endpoint: str, body: BaseModel | None = None) -> str:
         return EVENT_TYPE_RETRIEVE
     if endpoint.startswith("/query"):
         return EVENT_TYPE_QUERY
-    if endpoint.startswith("/sources") or endpoint.startswith("/source-view"):
+    if endpoint.startswith(("/sources", "/source-view", "/trajectory")):
         return EVENT_TYPE_GET_SOURCE
     return EVENT_TYPE_UNKNOWN
 

@@ -19,9 +19,10 @@ lets `engine.ingest.atif.lines` rebuild the exact text the search index holds:
 one record per source event, in order, and for every rendered piece the event
 it came from and its position inside it. That is what keeps evidence spans
 (one per event) and the extraction cache (keyed on rendered text) byte-for-byte
-unchanged when the trajectory is the source. The ingest pass checks it on every
-pass (kb/handlers/claude_code.py), so a gap here costs a fallback, never a
-changed index.
+unchanged when the trajectory is the source. In `shadow` and `atif` modes the
+ingest pass compares the two on every completing pass (kb/handlers/claude_code.py),
+so a gap here costs a fallback, never a changed index. The provenance is
+engine-internal: the stored copy and the API carry the ATIF fields only.
 
   root extra.probe.lines   [[line_no, flags], ...]    one per source event
   step extra.probe_parts   [[line, seq, kind, *args]] line = index into lines
@@ -52,7 +53,7 @@ from datetime import datetime
 from typing import Any
 
 from engine.shared.logging import get_logger
-from engine.shared.transcript_render import _strip_harness, renders_stop, speaker_for
+from engine.shared.transcript_render import renders_stop, speaker_for, strip_harness
 
 log = get_logger(__name__)
 
@@ -74,11 +75,18 @@ FLAG_USER_TURN = 1
 FLAG_COMPACT_BOUNDARY = 2
 FLAG_COMPACT_SUMMARY = 4
 
-SPEAKER_USER = "USER"
-SPEAKER_SUMMARY = "COMPACTION SUMMARY"
-
 #: Harness-only fields the sanitizers carry, kept verbatim on the step.
 _HARNESS_EXTRAS = ("_codex_extras", "_pi_extras", "_kimi_extras")
+
+#: Bounds on what a client-controlled value may put into a document readers
+#: are served (GET /trajectory). Upload is the trust boundary: a patched or
+#: compromised tap posts whatever it likes, and before this module nothing
+#: served these fields to anyone.
+_EXTRA_MAX_KEYS = 64
+_EXTRA_KEY_CHARS = 64
+_EXTRA_VALUE_CHARS = 256
+_TYPE_NAME_CHARS = 64
+_DROPPED_BLOCKS_MAX = 32
 
 _USAGE_KEYS = (
     "input_tokens",
@@ -108,6 +116,23 @@ def build_trajectory(
     return BuildResult(builder.finish(session_id=session_id, agent_name=agent_name), builder.unparsed)
 
 
+def build_and_render(
+    events: list[dict[str, Any]], session_id: str, agent_name: str, render: bool
+) -> tuple[BuildResult, list[Any] | None, str | None]:
+    """`build_trajectory`, and when `render` its Lines too: one plain-data call
+    the ingest pass can run in `cpu_pool`'s processes. Returns (build, lines or
+    None, the rendering error's class name or None)."""
+    from engine.ingest.atif.lines import lines_from_trajectory
+
+    built = build_trajectory(events, session_id=session_id, agent_name=agent_name)
+    if not render:
+        return built, None, None
+    try:
+        return built, lines_from_trajectory(built.trajectory), None
+    except Exception as exc:
+        return built, None, type(exc).__name__
+
+
 def _int(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
@@ -128,6 +153,43 @@ def _usage(raw: dict[str, Any], msg: dict[str, Any]) -> dict[str, int] | None:
     if not isinstance(source, dict):
         return None
     out = {k: v for k in _USAGE_KEYS if (v := _int(source.get(k))) is not None}
+    return out or None
+
+
+def _short(value: Any, limit: int) -> str | None:
+    return value[:limit] if isinstance(value, str) and value else None
+
+
+def _safe_extras(value: dict[str, Any]) -> dict[str, Any]:
+    """A harness's extras as flat scalars: strings capped, nested values gone.
+
+    The sanitizers stash harness-only metadata under `_codex_extras` /
+    `_pi_extras` / `_kimi_extras`; older taps put whole tool-call inputs there
+    (Codex `action`, with `env`). Only short scalars reach a reader.
+    """
+    out: dict[str, Any] = {}
+    for key, item in value.items():
+        if len(out) >= _EXTRA_MAX_KEYS:
+            break
+        if not isinstance(key, str) or not key:
+            continue
+        if isinstance(item, bool | int | float):
+            out[key[:_EXTRA_KEY_CHARS]] = item
+        elif isinstance(item, str):
+            out[key[:_EXTRA_KEY_CHARS]] = item[:_EXTRA_VALUE_CHARS]
+    return out
+
+
+def _call_stats(stats: Any) -> dict[str, Any] | None:
+    """Exactly what the renderer reads from `stats` (transcript_render
+    `_render_tool_use`): integer line counts and a literal True `replace_all`."""
+    if not isinstance(stats, dict):
+        return None
+    out: dict[str, Any] = {
+        k: stats[k] for k in ("added_lines", "removed_lines") if isinstance(stats.get(k), int)
+    }
+    if stats.get("replace_all") is True:
+        out["replace_all"] = True
     return out or None
 
 
@@ -163,6 +225,10 @@ class _Builder:
         self.unparsed = 0
         self.agent_version: str | None = None
         self.model_name: str | None = None
+        #: Per agent step: its thinking blocks, and the length they will have
+        #: once joined with blank lines.
+        self.reasoning: dict[int, list[str]] = {}
+        self.reasoning_len: dict[int, int] = {}
 
     # -- per event ---------------------------------------------------------
 
@@ -228,10 +294,10 @@ class _Builder:
         if not isinstance(msg, dict):
             return
         speaker = speaker_for(raw)
-        summary = speaker == SPEAKER_SUMMARY
+        summary = bool(raw.get("isCompactSummary"))
         content = msg.get("content")
         if isinstance(content, str) and content:
-            cleaned = _strip_harness(content)
+            cleaned = strip_harness(content)
             if cleaned:
                 step = self._prompt_step(raw, summary, cleaned)
                 self._part(step, line, 0, PART_USER, None, speaker)
@@ -248,7 +314,7 @@ class _Builder:
                 continue
             bt = b.get("type")
             if bt == "text":
-                cleaned = _strip_harness(b.get("text") or "")
+                cleaned = strip_harness(b.get("text") or "")
                 if not cleaned:
                     continue
                 if step is None:
@@ -270,8 +336,8 @@ class _Builder:
                     target = orphan
                 index = self._add_result(target, b, linked=target != orphan)
                 self._part(target, line, seq, PART_RESULT, index)
-            elif isinstance(bt, str):
-                other_blocks.append(bt)
+            elif isinstance(bt, str) and len(other_blocks) < _DROPPED_BLOCKS_MAX:
+                other_blocks.append(bt[:_TYPE_NAME_CHARS])
         if other_blocks and step is not None:
             self.steps[step]["extra"]["dropped_blocks"] = other_blocks
 
@@ -293,7 +359,7 @@ class _Builder:
         msg = raw.get("message")
         if not isinstance(msg, dict):
             return
-        inference = raw.get("inference_id") if isinstance(raw.get("inference_id"), str) else None
+        inference = _short(raw.get("inference_id"), _EXTRA_VALUE_CHARS)
         step = self._agent_step(raw, msg, inference)
         record = self.steps[step]
 
@@ -314,9 +380,12 @@ class _Builder:
             elif bt == "thinking":
                 text = b.get("thinking") or ""
                 if isinstance(text, str) and text.strip():
-                    current = record.get("reasoning_content") or ""
-                    start = len(current) + (2 if current else 0)
-                    record["reasoning_content"] = f"{current}\n\n{text}" if current else text
+                    # Joined once in finish(): appending to one growing string
+                    # copied it per block, quadratic in a long inference.
+                    blocks = self.reasoning.setdefault(step, [])
+                    start = self.reasoning_len.get(step, -2) + 2
+                    blocks.append(text)
+                    self.reasoning_len[step] = start + len(text)
                     self._part(step, line, seq, PART_THINKING, start, start + len(text))
             elif bt == "tool_use":
                 calls = record.setdefault("tool_calls", [])
@@ -328,9 +397,14 @@ class _Builder:
                     # Capture never ships a tool's input; the summary is in extra.
                     "arguments": {},
                 }
-                call_extra = {
-                    k: b[k] for k in ("summary", "stats") if b.get(k) is not None
-                }
+                call_extra: dict[str, Any] = {}
+                summary = b.get("summary")
+                if summary:
+                    # As the renderer prints it; a non-string never reaches a reader.
+                    call_extra["summary"] = summary if isinstance(summary, str) else f"{summary}"
+                stats = _call_stats(b.get("stats"))
+                if stats:
+                    call_extra["stats"] = stats
                 if call_extra:
                     call["extra"] = call_extra
                 calls.append(call)
@@ -339,6 +413,7 @@ class _Builder:
                 self._part(step, line, seq, PART_CALL, len(calls) - 1)
         stop = msg.get("stop_reason")
         if renders_stop(stop):
+            stop = stop if isinstance(stop, str) else f"{stop}"
             record["extra"]["stop_reason"] = stop
             self._part(step, line, len(content), PART_STOP, stop)
 
@@ -368,8 +443,8 @@ class _Builder:
         record = self.steps[step]
         if inference:
             self.seen_inferences.add(inference)
-        model = msg.get("model")
-        if isinstance(model, str) and model:
+        model = _short(msg.get("model"), _EXTRA_VALUE_CHARS)
+        if model:
             record.setdefault("model_name", model)
             self.model_name = self.model_name or model
         usage = _usage(raw, msg)
@@ -389,8 +464,10 @@ class _Builder:
     def _system(self, line: int, raw: dict[str, Any]) -> None:
         content = raw.get("content")
         extra: dict[str, Any] = {"probe_parts": []}
-        if raw.get("subtype") is not None:
-            extra["subtype"] = raw.get("subtype")
+        subtype = raw.get("subtype")
+        if subtype:
+            # As the renderer prints it (`SYSTEM (<subtype>)`).
+            extra["subtype"] = subtype if isinstance(subtype, str) else f"{subtype}"
         self._harness_extras(extra, raw)
         step = self._add_step(
             {
@@ -402,15 +479,18 @@ class _Builder:
         )
         self._part(step, line, 0, PART_SYSTEM)
         codex = raw.get("_codex_extras")
-        if isinstance(codex, dict) and isinstance(codex.get("cli_version"), str):
-            self.agent_version = self.agent_version or codex["cli_version"]
+        if isinstance(codex, dict):
+            self.agent_version = self.agent_version or _short(codex.get("cli_version"), _TYPE_NAME_CHARS)
 
     def _other(self, line: int, raw: dict[str, Any]) -> None:
         content = raw.get("content")
-        extra: dict[str, Any] = {"event_type": raw.get("type"), "probe_parts": []}
+        extra: dict[str, Any] = {"probe_parts": []}
+        event_type = _short(raw.get("type"), _TYPE_NAME_CHARS)
+        if event_type:
+            extra["event_type"] = event_type
         attachment = raw.get("attachment")
-        if isinstance(attachment, dict) and isinstance(attachment.get("type"), str):
-            extra["attachment_type"] = attachment["type"]
+        if isinstance(attachment, dict) and _short(attachment.get("type"), _TYPE_NAME_CHARS):
+            extra["attachment_type"] = attachment["type"][:_TYPE_NAME_CHARS]
         self._harness_extras(extra, raw)
         step = self._add_step(
             {
@@ -437,9 +517,11 @@ class _Builder:
         extra: dict[str, Any] = {"is_error": bool(block.get("is_error"))}
         if linked:
             result["source_call_id"] = tool_use_id
-        elif tool_use_id is not None:
-            extra["tool_use_id"] = tool_use_id
-        if block.get("result_bytes") is not None:
+        elif tool_use_id:
+            # As the renderer prints it (`TOOL_RESULT (<id>)`).
+            extra["tool_use_id"] = tool_use_id if isinstance(tool_use_id, str) else f"{tool_use_id}"
+        if isinstance(block.get("result_bytes"), int):
+            # The renderer prints a size only for an int; anything else is noise.
             extra["result_bytes"] = block.get("result_bytes")
         result["extra"] = extra
         observation = self.steps[step].setdefault("observation", {"results": []})
@@ -465,7 +547,9 @@ class _Builder:
         for key in _HARNESS_EXTRAS:
             value = raw.get(key)
             if isinstance(value, dict):
-                extra.setdefault(key.strip("_"), []).append(value)
+                safe = _safe_extras(value)
+                if safe:
+                    extra.setdefault(key.strip("_"), []).append(safe)
 
     # -- the document ---------------------------------------------------------
 
@@ -479,6 +563,9 @@ class _Builder:
         steps: list[dict[str, Any]] = []
         totals = {"prompt": 0, "completion": 0, "cached": 0}
         any_metrics = False
+        for index, step in enumerate(self.steps):
+            if index in self.reasoning:
+                step["reasoning_content"] = "\n\n".join(self.reasoning[index])
         for number, step in enumerate(self.steps, start=1):
             out = {"step_id": number, **step}
             if out["source"] == "agent" and not out["message"]:

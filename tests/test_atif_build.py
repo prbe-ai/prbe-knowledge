@@ -327,3 +327,46 @@ def test_generated_sessions_round_trip(seed: int) -> None:
         line_no = n if rng.random() < 0.95 else None
         events.append(_ev(_random_event(rng, ids), line_no))
     _round_trip(events)
+
+
+# -- what a reader can be served ---------------------------------------------------
+
+
+def test_client_supplied_values_reach_a_reader_only_as_short_scalars() -> None:
+    """Upload is the trust boundary: a patched or compromised tap posts whatever
+    it likes, and GET /trajectory serves these fields."""
+    big = "x" * 5000
+    events = [
+        _ev({"type": "system", "subtype": {"nested": "subtype"},
+             "_codex_extras": {"action": {"command": ["sh"], "env": {"TOKEN": "s3cr3t"}},
+                               "cli_version": "0.99.0", "note": big, "n": 3, "ok": True}}, 0),
+        _ev(_assistant([{"type": "tool_use", "id": "t", "name": "Edit", "summary": {"k": "v"},
+                         "stats": {"added_lines": "3", "removed_lines": 2, "replace_all": "yes",
+                                   "content": big}}],
+                       msg={"stop_reason": {"why": "x"}}), 1),
+        _ev(_user([{"type": "tool_result", "tool_use_id": ["a"], "is_error": True,
+                    "result_bytes": {"n": 1}}]), 2),
+    ]
+    trajectory = _round_trip(events, agent="codex")
+    system, agent, orphan = trajectory["steps"]
+    [extras] = system["extra"]["codex_extras"]
+    assert extras == {"cli_version": "0.99.0", "note": "x" * 256, "n": 3, "ok": True}
+    assert isinstance(system["extra"]["subtype"], str)
+    [call] = agent["tool_calls"]
+    assert call["arguments"] == {}
+    assert call["extra"] == {"summary": "{'k': 'v'}", "stats": {"removed_lines": 2}}
+    assert isinstance(agent["extra"]["stop_reason"], str)
+    [result] = orphan["observation"]["results"]
+    assert result["extra"] == {"is_error": True, "tool_use_id": "['a']"}
+
+
+def test_a_long_inference_builds_in_linear_time() -> None:
+    import time
+
+    events = [_ev(_assistant([{"type": "thinking", "thinking": "t" * 1000}]), i)
+              for i in range(20_000)]
+    started = time.perf_counter()
+    built = build_trajectory(events, session_id="s", agent_name="claude_code")
+    assert time.perf_counter() - started < 5
+    [step] = built.trajectory["steps"]
+    assert len(step["reasoning_content"]) == 20_000 * 1000 + 19_999 * 2
