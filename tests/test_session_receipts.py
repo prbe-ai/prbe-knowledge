@@ -775,7 +775,7 @@ def fragments_batch(*, with_events: bool = False, **changes):
     if not with_events:
         del body["events"]
     body["fragments"] = [
-        {sr.FRAGMENT_ORDINAL: i, "source": "user", "message": f"turn {i}"} for i in range(2)
+        {"line": {"line_no": i}, "source": "user", "message": f"turn {i}"} for i in range(2)
     ]
     body.update(changes)
     return body
@@ -869,14 +869,14 @@ def test_valid_protocol_3_envelopes_pass(changes):
 @pytest.mark.parametrize(
     ("changes", "reason"),
     [
-        ({"fragments": [{"n": 0}, {"n": 2}]}, "fragment ordinals are not contiguous"),
-        ({"fragments": [{"n": 1}, {"n": 0}]}, "fragment ordinals are not contiguous"),
-        ({"fragments": [{"n": 0}]}, "fragment coverage does not match payload"),
+        ({"fragments": [{"line": {"line_no": 0}}, {"line": {"line_no": 2}}]}, "fragment ordinals are not contiguous"),
+        ({"fragments": [{"line": {"line_no": 1}}, {"line": {"line_no": 0}}]}, "fragment ordinals are not contiguous"),
+        ({"fragments": [{"line": {"line_no": 0}}]}, "fragment coverage does not match payload"),
         ({"event_end": 3}, "fragment coverage does not match payload"),
         ({"fragments": None}, "fragment coverage does not match payload"),
-        ({"fragments": [{"n": 0}, "turn 1"]}, "not an object with an integer ordinal"),
-        ({"fragments": [{"n": 0}, {"n": "1"}]}, "not an object with an integer ordinal"),
-        ({"fragments": [{"n": False}, {"n": True}]}, "not an object with an integer ordinal"),
+        ({"fragments": [{"line": {"line_no": 0}}, "turn 1"]}, "not an object with an integer ordinal"),
+        ({"fragments": [{"line": {"line_no": 0}}, {"line": {"line_no": "1"}}]}, "not an object with an integer ordinal"),
+        ({"fragments": [{"line": {"line_no": False}}, {"line": {"line_no": True}}]}, "not an object with an integer ordinal"),
         ({"fragment_version": 99}, "unsupported fragment version"),
         ({"fragment_version": "1"}, "unsupported fragment version"),
         ({"fragment_version": True}, "unsupported fragment version"),
@@ -1039,7 +1039,7 @@ async def test_a_batch_on_the_other_protocol_than_its_stream_is_refused(database
     await sr.accept(v2, "tenant-a", SourceSystem.CLAUDE_CODE, store)
     await sr.accept(v3, "tenant-a", SourceSystem.CLAUDE_CODE, store)
     onto_v2 = _next(
-        v2, protocol_version=3, fragment_version=1, fragments=[{sr.FRAGMENT_ORDINAL: 2}]
+        v2, protocol_version=3, fragment_version=1, fragments=[{"line": {"line_no": 2}}]
     )
     onto_v3 = _next(v3, protocol_version=2, events=[{"line_no": 2, "raw": {"type": "user"}}])
     for wrong in (onto_v2, onto_v3):
@@ -1059,7 +1059,7 @@ async def test_an_open_protocol_3_stream_outlives_the_kill_switch(database, prot
     first = fragments_batch()
     await sr.accept(first, "tenant-a", SourceSystem.CLAUDE_CODE, store)
     protocol3(session_protocol3_customers="")
-    later = _next(first, fragments=[{sr.FRAGMENT_ORDINAL: 2, "message": "still running"}])
+    later = _next(first, fragments=[{"line": {"line_no": 2}, "message": "still running"}])
     accepted = await sr.accept(later, "tenant-a", SourceSystem.CLAUDE_CODE, store)
     assert accepted["status"] == "accepted" and accepted["protocol_version"] == 3
     read = await sr.receipts("claude_code", first["session_id"], "tenant-a", -1, 200)

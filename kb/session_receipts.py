@@ -43,10 +43,16 @@ _SOURCES = {"claude_code", "codex", "pi", "kimi_code"}
 PROTOCOL_EVENTS = 2
 PROTOCOL_FRAGMENTS = 3
 SESSION_PROTOCOLS = (PROTOCOL_EVENTS, PROTOCOL_FRAGMENTS)
-#: The key a fragment carries its event ordinal under. The fragment schema is
-#: engine/ingest/atif's; this door checks only that the ordinals are
-#: contiguous, and `fold` validates everything else.
-FRAGMENT_ORDINAL = "n"
+
+
+def fragment_ordinal(fragment: object) -> int | None:
+    """The event ordinal a fragment covers: its Line's `line_no`
+    (engine/ingest/atif/fragment.py). This door checks only that the ordinals
+    are contiguous; `fold` validates everything else."""
+    line = fragment.get("line") if isinstance(fragment, dict) else None
+    ordinal = line.get("line_no") if isinstance(line, dict) else None
+    return ordinal if type(ordinal) is int else None
+
 _FIELDS = (
     "session_id",
     "batch_seq",
@@ -139,9 +145,11 @@ def _validate_fragments(payload: dict) -> None:
         raise ValueError("fragment coverage does not match payload")
     if payload.get("finalize") and fragments:
         raise ValueError("finalize cannot carry fragments")
-    if not all(isinstance(f, dict) and type(f.get(FRAGMENT_ORDINAL)) is int for f in fragments):
+    ordinals = [fragment_ordinal(f) for f in fragments]
+    if None in ordinals:
         raise ValueError("fragment is not an object with an integer ordinal")
-    _check_ordinals(fragments, FRAGMENT_ORDINAL, start, end, "fragment")
+    if ordinals != list(range(start, end)):
+        raise ValueError("fragment ordinals are not contiguous")
     if fragments and "fragment_version" not in payload:
         raise ValueError("fragments carry no fragment_version")
     if "fragment_version" in payload:
