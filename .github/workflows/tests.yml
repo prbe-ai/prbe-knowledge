@@ -391,6 +391,7 @@ jobs:
           tests/test_chunk_diff.py
           tests/test_chunk_open_ended_last_seen.py
           tests/test_migration_chain.py
+          tests/test_session_streams_protocol_3_migration.py
           tests/test_workflow_memory_dropped.py
           tests/test_backfill_custom_doc_types.py
           tests/test_retire_experiment_nodes.py
