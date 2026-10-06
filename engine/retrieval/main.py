@@ -1250,7 +1250,7 @@ async def get_trajectory(
     page: list[Any] = []
     budget = _TRAJECTORY_PAGE_MAX_BYTES
     for step in steps[step_from - 1 : step_from - 1 + step_limit]:
-        size = len(json.dumps(step, separators=(",", ":"), ensure_ascii=False))
+        size = len(json.dumps(step, separators=(",", ":"), ensure_ascii=False).encode())
         if page and size > budget:
             break
         page.append(step)

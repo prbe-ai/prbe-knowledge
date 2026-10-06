@@ -50,7 +50,11 @@ from engine.shared.constants import (
     agent_session_canonical_id,
     agent_session_display_name,
 )
-from engine.shared.exceptions import InvalidWebhookPayload, NotSupportedByConnector
+from engine.shared.exceptions import (
+    CpuPoolUnavailable,
+    InvalidWebhookPayload,
+    NotSupportedByConnector,
+)
 from engine.shared.logging import get_logger
 from engine.shared.models import (
     ACLPrincipal,
@@ -1068,6 +1072,10 @@ class ClaudeCodeConnector(Connector):
                 compare,
                 size=sum(len(line.text) for line in legacy),
             )
+        except CpuPoolUnavailable:
+            # The pool's transient failure: the row retries, as the body scrub's
+            # does, rather than leave an ended session without its trajectory.
+            raise
         except Exception:
             log.warning(
                 "atif.build_failed",
@@ -1077,6 +1085,16 @@ class ClaudeCodeConnector(Connector):
                 exc_info=True,
             )
             return legacy, None, False
+        for line_no, ev_type, error in built.unparsed_events:
+            log.warning(
+                "atif.event_unparsed",
+                customer=event.customer_id,
+                source=self.source_system.value,
+                session_id=session_id,
+                line_no=line_no,
+                event_type=ev_type,
+                error=error,
+            )
         if not compare:
             return legacy, built, False
         if render_error is not None:
@@ -1152,6 +1170,8 @@ class ClaudeCodeConnector(Connector):
             )
             await self._discard_trajectory(event, session_id, why="too_large")
             return
+        except CpuPoolUnavailable:
+            raise
         except Exception as exc:
             log.warning(
                 "trajectory.store_failed",

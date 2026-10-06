@@ -193,3 +193,24 @@ async def test_a_page_stops_at_its_byte_budget(live_db, settings, store, monkeyp
     body = resp.json()
     shown = len(body["trajectory"]["steps"])
     assert 1 <= shown < 5 and body["next_step_from"] == 1 + shown
+
+
+async def test_the_page_budget_counts_utf8_bytes(live_db, settings, store, monkeypatch) -> None:
+    import engine.retrieval.main as retrieval_main
+
+    trajectory = _trajectory(4)
+    for step in trajectory["steps"]:
+        step["message"] = "漢" * 100  # 100 characters, 300 bytes
+    from engine.ingest.atif.store import strip_provenance
+
+    one = len(orjson.dumps(strip_provenance(trajectory)["steps"][0]))
+    monkeypatch.setattr(retrieval_main, "_TRAJECTORY_PAGE_MAX_BYTES", one * 2)
+    key = await _customer("cust-g")
+    doc_id = f"claude_code:cust-g:{SESSION}"
+    await _doc("cust-g", doc_id)
+    store.objects[("bucket-cust-g", trajectory_key("claude_code", "cust-g", SESSION))] = (
+        orjson.dumps(trajectory)
+    )
+    resp = await _get(f"/trajectory/{doc_id}?step_limit=4", key)
+    await init_pool(settings)
+    assert len(resp.json()["trajectory"]["steps"]) == 2

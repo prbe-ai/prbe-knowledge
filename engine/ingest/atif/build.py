@@ -48,14 +48,11 @@ every one is a line, and one it cannot map becomes an `unparsed` system step
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from engine.shared.logging import get_logger
 from engine.shared.transcript_render import renders_stop, speaker_for, strip_harness
-
-log = get_logger(__name__)
 
 SCHEMA_VERSION = "ATIF-v1.8"
 #: Version of the provenance encoding in `extra.probe`. A reader that sees any
@@ -86,6 +83,8 @@ _EXTRA_MAX_KEYS = 64
 _EXTRA_KEY_CHARS = 64
 _EXTRA_VALUE_CHARS = 256
 _TYPE_NAME_CHARS = 64
+#: Unparsed events reported per build; the count covers the rest.
+_UNPARSED_LOGGED = 20
 _DROPPED_BLOCKS_MAX = 32
 
 _USAGE_KEYS = (
@@ -101,6 +100,10 @@ class BuildResult:
     trajectory: dict[str, Any]
     #: Events that could not be mapped. Any at all makes the pass degraded.
     unparsed: int
+    #: (line_no, event type, error class) of the first few, for the caller to
+    #: log: the build may run in a pool process, whose logging is not the
+    #: worker's.
+    unparsed_events: list[tuple[int, str | None, str]] = field(default_factory=list)
 
 
 def build_trajectory(
@@ -113,7 +116,11 @@ def build_trajectory(
     for ev in events:
         if isinstance(ev, dict):
             builder.add(ev)
-    return BuildResult(builder.finish(session_id=session_id, agent_name=agent_name), builder.unparsed)
+    return BuildResult(
+        builder.finish(session_id=session_id, agent_name=agent_name),
+        builder.unparsed,
+        builder.unparsed_events,
+    )
 
 
 def build_and_render(
@@ -223,6 +230,7 @@ class _Builder:
         #: inference_id -> the step that carries its metrics.
         self.metrics_step: dict[str, int] = {}
         self.unparsed = 0
+        self.unparsed_events: list[tuple[int, str | None, str]] = []
         self.agent_version: str | None = None
         self.model_name: str | None = None
         #: Per agent step: its thinking blocks, and the length they will have
@@ -268,12 +276,11 @@ class _Builder:
                     },
                 }
             )
-            log.warning(
-                "atif.event_unparsed",
-                line_no=line_no,
-                event_type=raw.get("type") if isinstance(raw.get("type"), str) else None,
-                error=type(exc).__name__,
-            )
+            if len(self.unparsed_events) < _UNPARSED_LOGGED:
+                ev_type = raw.get("type")
+                self.unparsed_events.append(
+                    (line_no, _short(ev_type, _TYPE_NAME_CHARS), type(exc).__name__)
+                )
 
     def _map(self, line: int, raw: dict[str, Any]) -> None:
         ev_type = raw.get("type")
@@ -485,8 +492,9 @@ class _Builder:
     def _other(self, line: int, raw: dict[str, Any]) -> None:
         content = raw.get("content")
         extra: dict[str, Any] = {"probe_parts": []}
-        event_type = _short(raw.get("type"), _TYPE_NAME_CHARS)
-        if event_type:
+        # Uncapped: the renderer prints the whole type into the index.
+        event_type = raw.get("type")
+        if isinstance(event_type, str) and event_type:
             extra["event_type"] = event_type
         attachment = raw.get("attachment")
         if isinstance(attachment, dict) and _short(attachment.get("type"), _TYPE_NAME_CHARS):

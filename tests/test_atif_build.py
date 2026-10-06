@@ -370,3 +370,28 @@ def test_a_long_inference_builds_in_linear_time() -> None:
     assert time.perf_counter() - started < 5
     [step] = built.trajectory["steps"]
     assert len(step["reasoning_content"]) == 20_000 * 1000 + 19_999 * 2
+
+
+def test_a_long_unknown_event_type_renders_byte_identically() -> None:
+    events = [_ev({"type": "Z" * 100, "content": "hello"}, 0)]
+    built = build_trajectory(events, session_id="s", agent_name="claude_code")
+    assert lines_from_trajectory(built.trajectory) == lines_from_events(events)
+
+
+def test_unparsed_events_are_reported_to_the_caller_not_logged_by_the_build() -> None:
+    from structlog.testing import capture_logs
+
+    import engine.ingest.atif.build as build_mod
+
+    def broken(self: Any, line: int, raw: dict[str, Any]) -> None:
+        raise KeyError("x")
+
+    original = build_mod._Builder._map
+    build_mod._Builder._map = broken
+    try:
+        with capture_logs() as logs:
+            built = build_trajectory([_ev(_user("hi"), 0)], session_id="s", agent_name="claude_code")
+    finally:
+        build_mod._Builder._map = original
+    assert built.unparsed == 1 and built.unparsed_events == [(0, "user", "KeyError")]
+    assert logs == []

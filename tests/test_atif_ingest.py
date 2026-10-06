@@ -380,3 +380,37 @@ def test_the_trajectory_is_its_own_sessions_object_only() -> None:
 def test_trajectory_reads_are_logged_as_source_reads() -> None:
     assert _should_log("/trajectory/claude_code:c:s")
     assert event_type_for("/trajectory/claude_code:c:s") == EVENT_TYPE_GET_SOURCE
+
+
+async def test_a_pool_outage_retries_the_row_and_keeps_the_trajectory(
+    monkeypatch: pytest.MonkeyPatch, store: FakeStore, mined: list
+) -> None:
+    from engine.shared.exceptions import CpuPoolUnavailable
+
+    async def down(*_a: Any, **_k: Any) -> Any:
+        raise CpuPoolUnavailable("pool restarting")
+
+    monkeypatch.setattr(cc_mod.cpu_pool, "run_cpu", down)
+    store.objects[("bucket-cust-1", KEY)] = b'{"old": true}'
+    _use_mode(monkeypatch, "atif")
+    with pytest.raises(CpuPoolUnavailable):
+        await _normalize(complete=True)
+    assert store.deleted == [], "a transient outage never deletes an ended session's trajectory"
+
+
+async def test_unparsed_events_are_logged_by_the_pass(
+    monkeypatch: pytest.MonkeyPatch, store: FakeStore, mined: list
+) -> None:
+    real = cc_mod.build_and_render
+
+    def degraded(*args: Any) -> Any:
+        built, lines, error = real(*args)
+        built.unparsed, built.unparsed_events = 1, [(2, "user", "KeyError")]
+        return built, lines, error
+
+    monkeypatch.setattr(cc_mod, "build_and_render", degraded)
+    _use_mode(monkeypatch)
+    with capture_logs() as logs:
+        await _normalize(complete=True)
+    [entry] = [e for e in logs if e["event"] == "atif.event_unparsed"]
+    assert (entry["session_id"], entry["line_no"], entry["error"]) == ("s-1", 2, "KeyError")
