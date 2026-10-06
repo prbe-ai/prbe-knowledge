@@ -83,6 +83,8 @@ _EXTRA_MAX_KEYS = 64
 _EXTRA_KEY_CHARS = 64
 _EXTRA_VALUE_CHARS = 256
 _TYPE_NAME_CHARS = 64
+#: probe-events/1 `origin` of a command the researcher typed, not the model.
+USER_SHELL = "user_shell"
 #: Unparsed events reported per build; the count covers the rest.
 _UNPARSED_LOGGED = 20
 _DROPPED_BLOCKS_MAX = 32
@@ -367,8 +369,18 @@ class _Builder:
         if not isinstance(msg, dict):
             return
         inference = _short(raw.get("inference_id"), _EXTRA_VALUE_CHARS)
+        # A command the researcher typed (pi's `!`, Kimi's shell mode) arrives
+        # shaped as an assistant tool call with no inference id. ATIF keeps tool
+        # calls on agent steps, so it gets one of its own, marked, and never
+        # joins a model call's step on either side.
+        user_shell = raw.get("origin") == USER_SHELL
+        if user_shell:
+            self.open_agent = None
         step = self._agent_step(raw, msg, inference)
         record = self.steps[step]
+        if user_shell:
+            record["extra"]["origin"] = USER_SHELL
+            self.open_agent = None
 
         content = msg.get("content")
         if isinstance(content, str) and content:

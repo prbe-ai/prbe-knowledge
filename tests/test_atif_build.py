@@ -395,3 +395,29 @@ def test_unparsed_events_are_reported_to_the_caller_not_logged_by_the_build() ->
         build_mod._Builder._map = original
     assert built.unparsed == 1 and built.unparsed_events == [(0, "user", "KeyError")]
     assert logs == []
+
+
+def test_a_command_the_researcher_typed_is_its_own_step_never_the_models() -> None:
+    """pi's `!git status` (probe-events/1 `origin: user_shell`, tap 0.9.11): an
+    assistant-shaped tool call with no inference id. It must not join the
+    model's open step before it, and the model's next reply must not join it."""
+    shell = {"origin": "user_shell"}
+    events = [
+        _ev(_user("look at the repo"), 0),
+        _ev(_assistant([{"type": "text", "text": "sure"}], inference_id="m1"), 1),
+        _ev(_assistant([{"type": "tool_use", "id": "bash-b1", "name": "bash",
+                         "summary": "git status --short"}], **shell), 2),
+        _ev(_user([{"type": "tool_result", "tool_use_id": "bash-b1", "result_bytes": 12}],
+                  **shell), 3),
+        _ev(_assistant([{"type": "text", "text": "clean tree"}]), 4),
+    ]
+    trajectory = _round_trip(events, agent="pi")
+    agent_steps = [s for s in trajectory["steps"] if s["source"] == "agent"]
+    assert len(agent_steps) == 3
+    model, typed, reply = agent_steps
+    assert "tool_calls" not in model and model["extra"].get("origin") is None
+    assert typed["extra"]["origin"] == "user_shell"
+    assert [c["function_name"] for c in typed["tool_calls"]] == ["bash"]
+    [result] = typed["observation"]["results"]
+    assert result["source_call_id"] == "bash-b1"
+    assert reply["extra"].get("origin") is None and "tool_calls" not in reply
