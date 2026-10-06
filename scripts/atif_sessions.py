@@ -473,15 +473,20 @@ async def backfill(args: argparse.Namespace) -> None:
                     counts["busy"] += 1
                     return
                 bucket = await store.bucket_for(customer_id)
+                # Before the read: a rerun must not download every batch of every
+                # session it already wrote.
+                key = trajectory_key(source, customer_id, event_id)
+                if not args.force and await store.exists(bucket, key):
+                    counts["already_present"] += 1
+                    return
                 if await _deleted(customer_id, source, event_id):
                     counts["deleted"] += 1
                     return
                 hydrated = await _read_session(normalizer, store, {**row, **fresh})
-                session_id = hydrated.get("session_id") or event_id
-                key = trajectory_key(source, customer_id, session_id)
-                if not args.force and await store.exists(bucket, key):
-                    counts["already_present"] += 1
+                if (hydrated.get("session_id") or event_id) != event_id:
+                    counts["skipped:id_mismatch"] += 1
                     return
+                session_id = event_id
                 if not hydrated.get("session_complete"):
                     # As the live path: a running session has no trajectory; its
                     # completing pass writes one.
@@ -506,14 +511,26 @@ async def backfill(args: argparse.Namespace) -> None:
                 # (version), a deletion or purge (the row goes before their R2
                 # sweep), a closed tenant -- may have run its own pass or sweep
                 # already, so the object is removed: "not built", never stale.
-                after = await _queue_row(customer_id, source, event_id)
-                if (
-                    after is None
-                    or after["version"] != fresh["version"]
-                    or await _deleted(customer_id, source, event_id)
-                    or await refusal_for(customer_id) is not None
-                ):
-                    await store.delete(bucket, key)
+                try:
+                    after = await _queue_row(customer_id, source, event_id)
+                    overtaken = (
+                        after is None
+                        or after["version"] != fresh["version"]
+                        or await _deleted(customer_id, source, event_id)
+                        or await refusal_for(customer_id) is not None
+                    )
+                except Exception as exc:
+                    # Unchecked is treated as overtaken: a rerun rebuilds it.
+                    overtaken = True
+                    _emit({"kind": "session", **ident, "unverified": type(exc).__name__})
+                if overtaken:
+                    try:
+                        await store.delete(bucket, key)
+                    except Exception as exc:
+                        counts["delete_failed"] += 1
+                        _emit({"kind": "session", **ident, "delete_failed": type(exc).__name__,
+                               "key": key})
+                        return
                     counts["overtaken"] += 1
                     _emit({"kind": "session", **ident, "overtaken": True})
                     return

@@ -187,7 +187,9 @@ async def test_backfill_removes_a_write_something_overtook(
 
 
 @pytest.mark.asyncio
-async def test_backfill_leaves_a_row_the_worker_is_about_to_run(env, capsys) -> None:  # noqa: F811
+async def test_backfill_leaves_a_row_the_worker_is_about_to_run(
+    env, capsys, monkeypatch  # noqa: F811
+) -> None:
     (a, _b), store = env
     sid = _sid()
     await v2_session(a, sid)
@@ -195,10 +197,17 @@ async def test_backfill_leaves_a_row_the_worker_is_about_to_run(env, capsys) -> 
     await store.delete(bucket, trajectory_key(CC.value, a, sid))
     from engine.shared import db as db_module
 
+    # The tenant's list says `done` (a snapshot); the row went pending since.
+    snapshot = await atif_sessions._queue_rows(a, [CC.value])
     async with db_module.with_tenant(a) as conn:
         await conn.execute(
             "UPDATE ingestion_queue SET status = 'pending' WHERE customer_id = $1", a
         )
+
+    async def stale(_customer, _sources):
+        return [{**r, "status": "done"} for r in snapshot]
+
+    monkeypatch.setattr(atif_sessions, "_queue_rows", stale)
     summary = (await _run(capsys, ["backfill", "--customer", a, "--write"]))[-1]
-    assert "written" not in summary and summary.get("would_write") is None, summary
+    assert summary.get("busy") == 1 and "written" not in summary, summary
     assert await read_trajectory(store, bucket, trajectory_key(CC.value, a, sid)) is None

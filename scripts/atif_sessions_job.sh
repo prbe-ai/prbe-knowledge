@@ -27,8 +27,9 @@ name="atif-sessions-${mode}-$(date -u +%Y%m%d%H%M%S)"
 cmd=$(python3 -c 'import json, sys; print(json.dumps(["python", "-m", "scripts.atif_sessions", *sys.argv[1:]]))' "$@")
 selector=$(kubectl --context "$ctx" -n "$ns" get deploy "$deploy" -o json \
   | jq -r '.spec.selector.matchLabels | to_entries | map("\(.key)=\(.value)") | join(",")')
+container=$(kubectl --context "$ctx" -n "$ns" get deploy "$deploy" -o jsonpath='{.spec.template.spec.containers[0].name}')
 image=$(kubectl --context "$ctx" -n "$ns" get pods -l "$selector" --field-selector=status.phase=Running -o json \
-  | jq -r '[.items[].status.containerStatuses[0].imageID] | unique | if length == 1 then .[0] else error("worker pods run \(length) different images: \(.)") end' \
+  | jq -r --arg c "$container" '[.items[].status.containerStatuses[] | select(.name == $c) | .imageID] | unique | if length == 1 then .[0] else error("worker pods run \(length) different images: \(.)") end' \
   | sed 's#^docker-pullable://##')
 case "$image" in *@sha256:*) ;; *) echo "no image digest from $deploy pods: '$image'" >&2; exit 1 ;; esac
 echo "image: $image"
