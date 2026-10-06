@@ -13,7 +13,75 @@ shape before rendering.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Any
+
+
+@dataclass(frozen=True, slots=True)
+class Line:
+    """One source event of a transcript, as the renderer and the extractor see it.
+
+    Two sources produce these: `lines_from_events` (the uploaded events, the
+    original path) and `engine.ingest.atif.lines.lines_from_trajectory` (the
+    session's ATIF trajectory). The ingest pass compares the two lists before
+    trusting the second, so the text that is chunked, embedded and mined is the
+    same whichever one produced it.
+
+    `text` is the event's block BEFORE terminal-colour stripping, and "" when
+    the event renders nothing. The flags are the facts segmentation cuts on:
+    they exist for events that render nothing too, because a user turn made of
+    nothing but successful tool results is still a place a segment may start.
+    """
+
+    line_no: int | None
+    text: str
+    user_turn: bool = False
+    compact_boundary: bool = False
+    compact_summary: bool = False
+
+
+def line_from_event(ev: dict[str, Any]) -> Line:
+    """The `Line` for one merged event (`{"line_no", "raw"}`)."""
+    raw = ev.get("raw")
+    line_no = ev.get("line_no")
+    # Segmentation reads the wrapper itself when there is no raw dict; so do we.
+    facts = raw if isinstance(raw, dict) else ev
+    return Line(
+        line_no=line_no if isinstance(line_no, int) else None,
+        text=_render_event(raw) if isinstance(raw, dict) else "",
+        user_turn=facts.get("type") == "user" and not facts.get("isCompactSummary"),
+        compact_boundary=(
+            facts.get("type") == "system" and facts.get("subtype") == "compact_boundary"
+        ),
+        compact_summary=bool(facts.get("isCompactSummary")),
+    )
+
+
+def lines_from_events(events: list[dict[str, Any]]) -> list[Line]:
+    return [line_from_event(ev) for ev in events if isinstance(ev, dict)]
+
+
+def render_lines_indexed(lines: list[Line]) -> tuple[str, list[tuple[int, int, int]]]:
+    """`render_indexed` over `Line`s: the one place blocks are joined and spanned."""
+    blocks: list[str] = []
+    spans: list[tuple[int, int, int]] = []
+    cursor = 0
+    for line in lines:
+        rendered = _ANSI_RE.sub("", line.text)
+        if not rendered:
+            continue
+        if blocks:
+            cursor += 2  # the "\n\n" join between blocks
+        spans.append(
+            (cursor, cursor + len(rendered), line.line_no if line.line_no is not None else -1)
+        )
+        cursor += len(rendered)
+        blocks.append(rendered)
+    return "\n\n".join(blocks), spans
+
+
+def render_lines(lines: list[Line]) -> str:
+    return render_lines_indexed(lines)[0]
 
 
 def _events_to_text(events: list[dict[str, Any]]) -> str:
@@ -60,25 +128,7 @@ def render_indexed(
     returned text. ANSI is stripped per-block so offsets stay valid; stripping
     it afterwards would shift every span left of the escape.
     """
-    blocks: list[str] = []
-    spans: list[tuple[int, int, int]] = []
-    cursor = 0
-    for ev in events:
-        raw = ev.get("raw") if isinstance(ev, dict) else None
-        if not isinstance(raw, dict):
-            continue
-        rendered = _ANSI_RE.sub("", _render_event(raw))
-        if not rendered:
-            continue
-        if blocks:
-            cursor += 2  # the "\n\n" join between blocks
-        line_no = ev.get("line_no") if isinstance(ev, dict) else None
-        spans.append(
-            (cursor, cursor + len(rendered), line_no if isinstance(line_no, int) else -1)
-        )
-        cursor += len(rendered)
-        blocks.append(rendered)
-    return "\n\n".join(blocks), spans
+    return render_lines_indexed(lines_from_events(events))
 
 
 def line_for_offset(spans: list[tuple[int, int, int]], offset: int) -> int | None:
@@ -96,21 +146,68 @@ def _render_event(raw: dict[str, Any]) -> str:
     if ev_type == "assistant":
         return _render_assistant(raw)
     if ev_type == "system":
-        sub = raw.get("subtype") or ""
-        content = raw.get("content")
-        if isinstance(content, str) and content:
-            return f"SYSTEM ({sub}): {content}" if sub else f"SYSTEM: {content}"
-        # System event with no string content — note the subtype but skip
-        # dumping the rest. Keeps the conversation flow readable.
-        return f"SYSTEM ({sub})" if sub else ""
+        return format_system(raw.get("subtype"), raw.get("content"))
+    return format_other_event(ev_type, raw.get("content"))
 
+
+# The formatting rules, one function each. Both renderers call these -- the
+# event renderer below and the trajectory one in engine/ingest/atif/lines.py --
+# so a wording change cannot reach one and miss the other.
+
+
+def format_system(subtype: Any, content: Any) -> str:
+    sub = subtype or ""
+    if isinstance(content, str) and content:
+        return f"SYSTEM ({sub}): {content}" if sub else f"SYSTEM: {content}"
+    # System event with no string content — note the subtype but skip
+    # dumping the rest. Keeps the conversation flow readable.
+    return f"SYSTEM ({sub})" if sub else ""
+
+
+def format_other_event(ev_type: Any, content: Any) -> str:
     # Top-level string `content` for unknown event types — preserve
     # forward-compat without leaking raw JSON into embeddings.
-    content = raw.get("content")
     if isinstance(content, str) and content:
         label = (ev_type or "EVENT").upper()
         return f"{label}: {content}"
     return ""
+
+
+def speaker_for(raw: dict[str, Any]) -> str:
+    return "COMPACTION SUMMARY" if raw.get("isCompactSummary") else "USER"
+
+
+def format_user_text(speaker: str, cleaned: str) -> str:
+    return f"{speaker}: {cleaned}" if cleaned else ""
+
+
+def format_tool_result(tool_use_id: Any, is_error: Any, result_bytes: Any) -> str:
+    """"" for a successful result; see _render_user for why those are not rendered."""
+    if not is_error:
+        return ""
+    tool_id = tool_use_id or ""
+    label = f"TOOL_RESULT ({tool_id})" if tool_id else "TOOL_RESULT"
+    if isinstance(result_bytes, int) and result_bytes > 0:
+        return f"{label}: error ({result_bytes} bytes)"
+    return f"{label}: error"
+
+
+def format_assistant_text(text: Any) -> str:
+    return f"ASSISTANT: {text}" if text else ""
+
+
+def format_thinking(text: str) -> str:
+    return f"ASSISTANT (thinking): {text}"
+
+
+def renders_stop(stop_reason: Any) -> bool:
+    # Note non-default stop_reasons (max_tokens, refusal, …); end_turn is
+    # the boring case and noting it would just clutter every assistant turn.
+    return bool(stop_reason) and stop_reason not in ("end_turn", "tool_use")
+
+
+def format_stop(stop_reason: Any) -> str:
+    return f"[stop: {stop_reason}]"
 
 
 # Terminal colour codes reach the transcript whenever a user pastes coloured
@@ -221,12 +318,11 @@ def _render_user(raw: dict[str, Any]) -> str:
     # dropping it: it is the single densest statement of intent in a long
     # session, and for the early parts of a session that fall outside the
     # extractor's 2,000-event window it is the ONLY surviving record.
-    speaker = "COMPACTION SUMMARY" if raw.get("isCompactSummary") else "USER"
+    speaker = speaker_for(raw)
 
     content = msg.get("content")
     if isinstance(content, str) and content:
-        cleaned = _strip_harness(content)
-        return f"{speaker}: {cleaned}" if cleaned else ""
+        return format_user_text(speaker, _strip_harness(content))
     if not isinstance(content, list):
         return ""
 
@@ -238,7 +334,7 @@ def _render_user(raw: dict[str, Any]) -> str:
         if bt == "text":
             text = _strip_harness(b.get("text") or "")
             if text:
-                parts.append(f"{speaker}: {text}")
+                parts.append(format_user_text(speaker, text))
         elif bt == "tool_result":
             # SUCCESSFUL results are not rendered at all. Measured over a real
             # session, `TOOL_RESULT (toolu_x): ok` accounted for 1,660 lines and
@@ -253,15 +349,11 @@ def _render_user(raw: dict[str, Any]) -> str:
             # FAILURES still render — a failed call is a real event in the
             # session's story, and there are two orders of magnitude fewer of
             # them (53 of 1,660 here).
-            if not b.get("is_error"):
-                continue
-            tool_id = b.get("tool_use_id") or ""
-            label = f"TOOL_RESULT ({tool_id})" if tool_id else "TOOL_RESULT"
-            size = b.get("result_bytes")
-            if isinstance(size, int) and size > 0:
-                parts.append(f"{label}: error ({size} bytes)")
-            else:
-                parts.append(f"{label}: error")
+            rendered = format_tool_result(
+                b.get("tool_use_id"), b.get("is_error"), b.get("result_bytes")
+            )
+            if rendered:
+                parts.append(rendered)
     return "\n".join(parts)
 
 
@@ -271,7 +363,7 @@ def _render_assistant(raw: dict[str, Any]) -> str:
         return ""
     content = msg.get("content")
     if isinstance(content, str) and content:
-        return f"ASSISTANT: {content}"
+        return format_assistant_text(content)
     if not isinstance(content, list):
         return ""
 
@@ -283,17 +375,15 @@ def _render_assistant(raw: dict[str, Any]) -> str:
         if bt == "text":
             text = b.get("text") or ""
             if text:
-                parts.append(f"ASSISTANT: {text}")
+                parts.append(format_assistant_text(text))
         elif bt == "thinking":
             text = b.get("thinking") or ""
             if text and text.strip():
-                parts.append(f"ASSISTANT (thinking): {text}")
+                parts.append(format_thinking(text))
         elif bt == "tool_use":
             parts.append(_render_tool_use(b))
 
-    # Note non-default stop_reasons (max_tokens, refusal, …); end_turn is
-    # the boring case and noting it would just clutter every assistant turn.
     stop_reason = msg.get("stop_reason")
-    if stop_reason and stop_reason not in ("end_turn", "tool_use") and parts:
-        parts.append(f"[stop: {stop_reason}]")
+    if parts and renders_stop(stop_reason):
+        parts.append(format_stop(stop_reason))
     return "\n".join(parts)

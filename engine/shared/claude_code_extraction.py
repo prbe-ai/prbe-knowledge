@@ -23,9 +23,11 @@ from engine.shared.llm import gateway_url
 from engine.shared.llm_tools import ToolCallParseError, forced_tool_call
 from engine.shared.logging import get_logger
 from engine.shared.transcript_render import (
-    _events_to_text,
+    Line,
     line_for_offset,
-    render_indexed,
+    line_from_event,
+    render_lines,
+    render_lines_indexed,
 )
 
 
@@ -709,24 +711,34 @@ _DECIDED_BY = (
 log = get_logger(__name__)
 
 
-def _is_compact_boundary(event: dict[str, Any]) -> bool:
-    raw = event.get("raw")
-    raw = raw if isinstance(raw, dict) else event
-    return raw.get("type") == "system" and raw.get("subtype") == "compact_boundary"
+#: What segmentation walks: the merged events, or the `Line`s a session's ATIF
+#: trajectory renders to (engine.ingest.atif.lines). Every fact it cuts on is
+#: read through `_line`, so both give the same segments.
+Item = dict[str, Any] | Line
 
 
-def _is_compact_summary(event: dict[str, Any]) -> bool:
-    raw = event.get("raw")
-    raw = raw if isinstance(raw, dict) else event
-    return bool(raw.get("isCompactSummary"))
+def _line(item: Item) -> Line:
+    return item if isinstance(item, Line) else line_from_event(item)
+
+
+def _as_lines(items: list[Item]) -> list[Line]:
+    return [_line(item) for item in items if isinstance(item, (Line, dict))]
+
+
+def _is_compact_boundary(event: Item) -> bool:
+    return _line(event).compact_boundary
+
+
+def _is_compact_summary(event: Item) -> bool:
+    return _line(event).compact_summary
 
 
 def _split_on_compaction(
-    events: list[dict[str, Any]],
-) -> list[tuple[list[dict[str, Any]], str]]:
+    events: list[Item],
+) -> list[tuple[list[Item], str]]:
     """One segment per stretch between compactions, tagged with what opened it."""
-    segments: list[tuple[list[dict[str, Any]], str]] = []
-    current: list[dict[str, Any]] = []
+    segments: list[tuple[list[Item], str]] = []
+    current: list[Item] = []
     boundary = "session_start"
     for event in events:
         if _is_compact_boundary(event) and current:
@@ -738,7 +750,7 @@ def _split_on_compaction(
     return segments or [([], "session_start")]
 
 
-def _split_to_budget(segment: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+def _split_to_budget(segment: list[Item]) -> list[list[Item]]:
     """Sub-split a segment that is still too large to send in one call.
 
     Splits on USER turns where possible: a request and the work it produced
@@ -748,8 +760,8 @@ def _split_to_budget(segment: list[dict[str, Any]]) -> list[list[dict[str, Any]]
     if _rendered_size(segment) <= _SEGMENT_CHAR_BUDGET:
         return [segment]
 
-    out: list[list[dict[str, Any]]] = []
-    current: list[dict[str, Any]] = []
+    out: list[list[Item]] = []
+    current: list[Item] = []
     size = 0
     for event in segment:
         one = _rendered_size([event])
@@ -769,19 +781,17 @@ def _split_to_budget(segment: list[dict[str, Any]]) -> list[list[dict[str, Any]]
     return out
 
 
-def _renders_as_user_turn(event: dict[str, Any]) -> bool:
-    raw = event.get("raw")
-    raw = raw if isinstance(raw, dict) else event
-    return raw.get("type") == "user" and not raw.get("isCompactSummary")
+def _renders_as_user_turn(event: Item) -> bool:
+    return _line(event).user_turn
 
 
-def _rendered_size(events: list[dict[str, Any]]) -> int:
-    return len(_events_to_text(events))
+def _rendered_size(events: list[Item]) -> int:
+    return len(render_lines(_as_lines(events)))
 
 
 def _segment_session(
-    events: list[dict[str, Any]],
-) -> tuple[list[tuple[list[dict[str, Any]], str]], bool]:
+    events: list[Item],
+) -> tuple[list[tuple[list[Item], str]], bool]:
     """(segments, capped) — every part of the session, oldest first.
 
     Each segment is paired with the reason it began, so a downstream reader can
@@ -789,7 +799,7 @@ def _segment_session(
     window. Sub-splits of one compaction stretch are `size`; only the first
     inherits the real boundary.
     """
-    segments: list[tuple[list[dict[str, Any]], str]] = []
+    segments: list[tuple[list[Item], str]] = []
     for chunk, boundary in _split_on_compaction(events):
         for offset, piece in enumerate(_split_to_budget(chunk)):
             segments.append((piece, boundary if offset == 0 else "size"))
@@ -800,14 +810,14 @@ def _segment_session(
     return segments, capped
 
 
-def _line_bounds(events: list[dict[str, Any]]) -> tuple[int | None, int | None]:
+def _line_bounds(events: list[Item]) -> tuple[int | None, int | None]:
     """First and last transcript line numbers in a segment, when present.
 
     These are the anchors that let a unit be located back in the transcript it
     came from — without them a unit says which PART of a session it belongs to
     but not where.
     """
-    nums = [e.get("line_no") for e in events if isinstance(e.get("line_no"), int)]
+    nums = [n for n in (_line(e).line_no for e in events) if n is not None]
     return (min(nums), max(nums)) if nums else (None, None)
 
 
@@ -976,13 +986,19 @@ async def extract_units_from_session(
     cwd: str | None = None,
     agent: str = "claude_code",
     cache: _cache.SegmentCache | None = None,
+    lines: list[Line] | None = None,
 ) -> UnitBundle:
     """Mine every part of the session, not just its tail.
 
     With a `cache`, a segment this session already mined, unchanged, is answered
     from it instead of the model (engine/shared/extraction_cache.py).
+
+    `lines`, when given, is what gets segmented and rendered instead of
+    `events`: the session's trajectory, already proven to render the same
+    (kb/handlers/claude_code.py). Either way the events become `Line`s once,
+    here, rather than being re-rendered by every segmentation check.
     """
-    segments, capped = _segment_session(events)
+    segments, capped = _segment_session(lines if lines is not None else _as_lines(events))
 
     # With the originals of every segment in hand, the compaction summaries are
     # a second telling of conversation we are already reading — drop them from
@@ -1005,7 +1021,7 @@ async def extract_units_from_session(
     )
     semaphore = asyncio.Semaphore(_SEGMENT_CONCURRENCY)
 
-    async def _run(index: int, segment: list[dict[str, Any]], boundary: str) -> UnitBundle:
+    async def _run(index: int, segment: list[Item], boundary: str) -> UnitBundle:
         start, end = _line_bounds(segment)
         ref = SegmentRef(
             index=index + 1,
@@ -1266,7 +1282,7 @@ _PART_TEMPLATE = " (part {index} of {total})"
 async def _extract_one(
     *,
     session_id: str,
-    events: list[dict[str, Any]],
+    events: list[Item],
     cwd: str | None,
     agent: str,
     part: tuple[int, int],
@@ -1275,7 +1291,7 @@ async def _extract_one(
 ) -> UnitBundle:
     if drop_summaries:
         events = [e for e in events if not _is_compact_summary(e)]
-    transcript, spans = render_indexed(events)
+    transcript, spans = render_lines_indexed(_as_lines(events))
     if not transcript.strip():
         return UnitBundle()
     segment_hash = hashlib.sha256(transcript.encode("utf-8")).hexdigest()[:16]
