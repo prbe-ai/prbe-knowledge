@@ -100,7 +100,7 @@ async def test_backfill_is_a_dry_run_until_told_and_skips_deleted(env, capsys) -
 
 @pytest.mark.asyncio
 async def test_replay_fails_the_gate_when_the_trajectory_lines_differ(
-    env, capsys, monkeypatch
+    env, capsys, monkeypatch  # noqa: F811
 ) -> None:
     (a, _b), _store = env
     await v2_session(a, _sid())
@@ -151,7 +151,7 @@ async def _done(customer: str) -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("overtaker", ["new_batch", "deletion"])
 async def test_backfill_removes_a_write_something_overtook(
-    env, capsys, monkeypatch, overtaker
+    env, capsys, monkeypatch, overtaker  # noqa: F811
 ) -> None:
     (a, _b), store = env
     sid = _sid()
