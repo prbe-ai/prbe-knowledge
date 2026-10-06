@@ -114,8 +114,10 @@ def _live_written(key: tuple[str, str, str]) -> None:
     _remember(_LIVE_WRITES, key)
 
 
-def _remember(table: OrderedDict[tuple[str, str, str], float], key: tuple[str, str, str]) -> None:
-    table[key] = time.monotonic()
+def _remember(
+    table: OrderedDict[tuple[str, str, str], Any], key: tuple[str, str, str], value: Any = None
+) -> None:
+    table[key] = time.monotonic() if value is None else value
     table.move_to_end(key)
     while len(table) > _LIVE_WRITES_MAX:
         table.popitem(last=False)
@@ -128,9 +130,7 @@ _LIVE_TOO_LARGE: OrderedDict[tuple[str, str, str], float] = OrderedDict()
 #: Stop reasons that end the model's turn (Claude Code / Anthropic, pi).
 _TURN_ENDS = frozenset({"end_turn", "stop", "stop_sequence"})
 #: (customer, source, session) -> line_no of the turn-ending reply last written live.
-_LIVE_TURNS: OrderedDict[tuple[str, str, str], float] = OrderedDict()
-#: Even a new turn-ending reply waits this long after the last live write.
-_TURN_BYPASS_MIN_S = 10
+_LIVE_TURNS: OrderedDict[tuple[str, str, str], int] = OrderedDict()
 
 
 def _turn_end_line(events: list[dict[str, Any]]) -> int | None:
@@ -156,19 +156,18 @@ def _turn_end_line(events: list[dict[str, Any]]) -> int | None:
     return None
 
 
-def _turn_bypass_due(
-    key: tuple[str, str, str], events: list[dict[str, Any]], interval_s: int
-) -> bool:
-    """A NEW turn-ending reply, at least a little after the last live write."""
+def _turn_bypass_due(key: tuple[str, str, str], events: list[dict[str, Any]]) -> bool:
+    """A turn-ending reply the live copy does not have yet. Once per reply: a
+    turn ends only when the model waits for the researcher, so this is paced by
+    their prompts, never by the throttle."""
     line = _turn_end_line(events)
-    if line is None or _LIVE_TURNS.get(key) == line:
-        return False
-    last = _LIVE_WRITES.get(key)
-    if last is not None and time.monotonic() - last < max(_TURN_BYPASS_MIN_S, interval_s // 6):
-        return False
-    _remember(_LIVE_TURNS, key)
-    _LIVE_TURNS[key] = line
-    return True
+    return line is not None and _LIVE_TURNS.get(key) != line
+
+
+def _turn_written(key: tuple[str, str, str], events: list[dict[str, Any]]) -> None:
+    line = _turn_end_line(events)
+    if line is not None:
+        _remember(_LIVE_TURNS, key, line)
 
 
 _FETCH_SUPP_R2_CONCURRENCY = 16
@@ -1162,21 +1161,20 @@ class ClaudeCodeConnector(Connector):
         if not complete:
             # A live pass serves the events' Lines whatever the mode. It builds
             # only to refresh the stored live trajectory: at most once per
-            # interval per process, and always when the newest event ends a
-            # turn, so a pause never hides the latest answer.
+            # interval per process, and once for each reply that ends a turn,
+            # so a pause never hides the latest answer.
             if not (
                 settings.session_trajectory_store
                 and settings.session_trajectory_live_interval_s > 0
                 and live_key not in _LIVE_TOO_LARGE
                 and (
                     _live_write_due(live_key, settings.session_trajectory_live_interval_s)
-                    or _turn_bypass_due(
-                        live_key, events, settings.session_trajectory_live_interval_s
-                    )
+                    or _turn_bypass_due(live_key, events)
                 )
             ):
                 return legacy, None, False
             _live_written(live_key)
+            _turn_written(live_key, events)
             mode, compare = None, False
         else:
             # The final copy replaces any live one; a resume starts afresh.
@@ -1212,7 +1210,7 @@ class ClaudeCodeConnector(Connector):
             # The pool's transient failure: the row retries, as the body scrub's
             # does, rather than leave an ended session without its trajectory.
             raise
-        except Exception:
+        except Exception as exc:
             # A live build repeats every interval: one quiet line; the
             # completing pass logs the traceback.
             (log.warning if complete else log.info)(
@@ -1221,6 +1219,7 @@ class ClaudeCodeConnector(Connector):
                 source=self.source_system.value,
                 session_id=session_id,
                 live=not complete,
+                error=type(exc).__name__,
                 exc_info=complete,
             )
             return legacy, None, False

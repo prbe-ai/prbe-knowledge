@@ -489,27 +489,22 @@ async def test_a_reply_that_ends_its_turn_is_written_live_inside_the_interval(
     ended_turn = [*EVENTS[:3], {"line_no": 3, "raw": {"type": "assistant", "message": {
         "content": [{"type": "text", "text": "it failed"}], "stop_reason": "end_turn"}}},
         {"line_no": 4, "raw": {"type": "queue-operation", "content": "x"}}]
-    # A sixth of the interval after the last live write (at least 10 s), a NEW
-    # turn-ending reply is written, even behind trailing bookkeeping; the same
-    # reply again is not.
-    for key in cc_mod._LIVE_WRITES:
-        cc_mod._LIVE_WRITES[key] -= 601
+    # A NEW turn-ending reply is written at once, even behind trailing
+    # bookkeeping; the same reply again is not.
     await _normalize_events(ended_turn, complete=False)
     assert len(builds) == 2, "the newest answer is not held back by the throttle"
-    for key in cc_mod._LIVE_WRITES:
-        cc_mod._LIVE_WRITES[key] -= 601
-    await _normalize_events(ended_turn, complete=False)
+    await _normalize_events([*ended_turn, {"line_no": 5, "raw": {"type": "system"}}], complete=False)
     assert len(builds) == 2, "the same reply is not rewritten"
 
 
-async def test_a_turn_ending_reply_right_after_a_live_write_waits(
+async def test_a_turn_end_the_interval_write_already_has_is_not_rebuilt(
     monkeypatch: pytest.MonkeyPatch, store: FakeStore, mined: list, builds: list
 ) -> None:
     _use_mode(monkeypatch, trajectory_live_interval_s=3600)
-    await _normalize(complete=False)
     ended_turn = [*EVENTS[:3], {"line_no": 3, "raw": {"type": "assistant", "message": {
         "content": [{"type": "text", "text": "done"}], "stop_reason": "end_turn"}}}]
     await _normalize_events(ended_turn, complete=False)
+    await _normalize_events([*ended_turn, {"line_no": 4, "raw": {"type": "system"}}], complete=False)
     assert len(builds) == 1
 
 
