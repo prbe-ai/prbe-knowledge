@@ -2517,7 +2517,8 @@ CREATE TABLE IF NOT EXISTS session_streams (
     source_system TEXT NOT NULL,
     session_id TEXT NOT NULL,
     stream_id TEXT NOT NULL,
-    protocol_version INTEGER NOT NULL CHECK (protocol_version = 2),
+    protocol_version INTEGER NOT NULL
+        CONSTRAINT session_streams_protocol_version_check CHECK (protocol_version IN (2, 3)),
     last_seq BIGINT NOT NULL DEFAULT -1,
     source_byte_end BIGINT NOT NULL DEFAULT 0,
     source_line_end BIGINT NOT NULL DEFAULT 0,
