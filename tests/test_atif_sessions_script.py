@@ -3,7 +3,8 @@
 
 replay must read a session the way the worker does and pass the gate on it;
 backfill must be a dry run unless told otherwise, write only trajectory.json,
-and never write one for a deleted session.
+and never write one for a deleted session or one still running (as the live
+path: only a session's completing pass writes it).
 """
 
 from __future__ import annotations
@@ -16,12 +17,26 @@ import pytest
 from engine.ingest.atif.store import read_trajectory, trajectory_key
 from scripts import atif_sessions
 from tests.test_session_deletion import (  # the deletion suite's real-pipeline sessions
+    ALICE,
+    ALICE_EMAIL,
     CC,
+    _mine,
     _sid,
+    _v2_batches,
     env,  # noqa: F401  # pytest fixture, used by name
+    sr,
     v1_session,
     v2_session,
 )
+
+
+async def running_session(customer: str, sid: str) -> None:
+    """A protocol-2 session that has not ended: its batches, no finalize."""
+    from engine.shared.storage import get_store
+
+    for payload in _v2_batches(sid, ALICE, ALICE_EMAIL)[:-1]:
+        assert (await sr.accept(payload, customer, CC, get_store()))["status"] == "accepted"
+    await _mine(customer, CC, sid)
 
 
 async def _run(capsys: pytest.CaptureFixture[str], argv: list[str]) -> list[dict[str, Any]]:
@@ -50,9 +65,10 @@ async def test_replay_passes_the_gate_on_real_sessions(env, capsys) -> None:  # 
 @pytest.mark.asyncio
 async def test_backfill_is_a_dry_run_until_told_and_skips_deleted(env, capsys) -> None:  # noqa: F811
     (a, _b), store = env
-    keep, gone = _sid(), _sid()
+    keep, gone, running = _sid(), _sid(), _sid()
     await v2_session(a, keep)
     await v2_session(a, gone)
+    await running_session(a, running)
     bucket = await store.bucket_for(a)
     for sid in (keep, gone):  # as if they ended before the engine wrote trajectories
         await store.delete(bucket, trajectory_key(CC.value, a, sid))
@@ -72,7 +88,8 @@ async def test_backfill_is_a_dry_run_until_told_and_skips_deleted(env, capsys) -
     assert await read_trajectory(store, bucket, trajectory_key(CC.value, a, keep)) is None
 
     summary = (await _run(capsys, ["backfill", "--customer", a, "--write"]))[-1]
-    assert (summary["written"], summary["deleted"]) == (1, 1), summary
+    assert (summary["written"], summary["deleted"], summary["not_ended"]) == (1, 1, 1), summary
+    assert await read_trajectory(store, bucket, trajectory_key(CC.value, a, running)) is None
     written = await read_trajectory(store, bucket, trajectory_key(CC.value, a, keep))
     assert written is not None and written["session_id"] == keep
     assert await read_trajectory(store, bucket, trajectory_key(CC.value, a, gone)) is None

@@ -46,7 +46,7 @@ import orjson
 from engine.ingest.atif.build import build_trajectory
 from engine.ingest.atif.lines import lines_from_trajectory
 from engine.ingest.atif.models import Trajectory
-from engine.ingest.atif.store import trajectory_key, write_trajectory
+from engine.ingest.atif.store import TrajectoryTooLarge, trajectory_key, write_trajectory
 from engine.ingest.handlers.base import make_default_context
 from engine.ingest.normalizer import Normalizer
 from engine.shared import claude_code_extraction as _ext
@@ -110,8 +110,9 @@ async def _events_by_key(store: Any, customer_id: str, keys: list[str]) -> dict[
 
 async def _read_session(
     normalizer: Normalizer, store: Any, row: dict[str, Any]
-) -> list[dict[str, Any]]:
-    """The worker's read: first readable payload -> parse -> fetch_supplementary."""
+) -> tuple[list[dict[str, Any]], bool]:
+    """The worker's read: first readable payload -> parse -> fetch_supplementary.
+    Returns the merged events and whether the session has ended."""
     customer_id, source = row["customer_id"], SourceSystem(row["source_system"])
     keys = [k for k in (row["payload_s3_keys"] or []) if k]
     if not keys:
@@ -148,7 +149,7 @@ async def _read_session(
         headers=headers,
     )
     hydrated = await connector.fetch_supplementary(event, None)
-    return list(hydrated.get("events") or [])
+    return list(hydrated.get("events") or []), bool(hydrated.get("session_complete"))
 
 
 def _segment_digest(lines: list[Any]) -> list[tuple[str, str, int | None, int | None]]:
@@ -315,7 +316,7 @@ async def replay(args: argparse.Namespace) -> None:
                  "session_id": row["source_event_id"],
                  "keys": len(row["payload_s3_keys"] or [])}
         try:
-            events = await _read_session(normalizer, store, row)
+            events, _ended = await _read_session(normalizer, store, row)
             record = {**ident, **_compare(events, row["source_event_id"], row["source_system"])}
             if (row["customer_id"], row["source_event_id"]) in batchwise_ids:
                 keys = [k for k in row["payload_s3_keys"] or [] if k]
@@ -378,6 +379,12 @@ async def replay(args: argparse.Namespace) -> None:
     _emit(summary)
 
 
+def _settings() -> Any:
+    from engine.shared.config import get_settings
+
+    return get_settings()
+
+
 async def _deleted(customer_id: str, source: str, session_id: str) -> bool:
     async with with_tenant(customer_id) as conn:
         return bool(await deleted_sessions(conn, customer_id, source, [session_id]))
@@ -404,7 +411,12 @@ async def backfill(args: argparse.Namespace) -> None:
                 if await _deleted(customer_id, source, session_id):
                     counts["deleted"] += 1
                     return
-                events = await _read_session(normalizer, store, row)
+                events, ended = await _read_session(normalizer, store, row)
+                if not ended:
+                    # As the live path: a running session has no trajectory; its
+                    # completing pass writes one.
+                    counts["not_ended"] += 1
+                    return
                 built = build_trajectory(events, session_id=session_id, agent_name=source)
                 if not args.write:
                     counts["would_write"] += 1
@@ -412,7 +424,8 @@ async def backfill(args: argparse.Namespace) -> None:
                            "steps": len(built.trajectory["steps"]), "unparsed": built.unparsed})
                     return
                 size, invalid = await write_trajectory(
-                    store, bucket, key, built.trajectory, max_bytes=args.max_bytes
+                    store, bucket, key, built.trajectory,
+                    max_bytes=args.max_bytes or _settings().session_trajectory_max_bytes,
                 )
                 if await _deleted(customer_id, source, session_id):
                     # A deletion finished while we wrote: its sweep has run, so
@@ -426,6 +439,8 @@ async def backfill(args: argparse.Namespace) -> None:
                        "unparsed": built.unparsed})
             except Skip as skip:
                 counts[f"skipped:{skip}"] += 1
+            except TrajectoryTooLarge:
+                counts["skipped:too_large"] += 1
             except Exception as exc:
                 counts[f"error:{type(exc).__name__}"] += 1
                 _emit({"kind": "session", **ident, "error": type(exc).__name__})
@@ -461,7 +476,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             p.add_argument("--force", action="store_true",
                            help="rewrite trajectories that already exist")
             p.add_argument("--concurrency", type=int, default=4)
-            p.add_argument("--max-bytes", type=int, default=64_000_000)
+            p.add_argument("--max-bytes", type=int, default=None,
+                           help="skip larger trajectories (default: SESSION_TRAJECTORY_MAX_BYTES)")
     return parser.parse_args(argv)
 
 
