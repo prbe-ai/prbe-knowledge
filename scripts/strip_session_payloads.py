@@ -105,6 +105,17 @@ async def _blocked(customer_id: str, source: str, session_id: str) -> str | None
     return None
 
 
+async def _blocked_after_put(customer_id: str, source: str, session_id: str) -> str | None:
+    """`_blocked` after a put, retried; "unverified" when it cannot be read, so
+    the key is reported for an operator to recheck rather than silently kept."""
+    for attempt in range(3):
+        try:
+            return await _blocked(customer_id, source, session_id)
+        except Exception:
+            await asyncio.sleep(0.5 * (attempt + 1))
+    return "unverified"
+
+
 async def strip(args: argparse.Namespace) -> None:
     store = storage.get_store()
     counts: dict[str, int] = defaultdict(int)
@@ -142,8 +153,11 @@ async def strip(args: argparse.Namespace) -> None:
             # the session's data is gone now -- its deletion or purge swept while
             # we wrote -- remove what we put back. A legal hold or a terminated
             # tenant keeps the stripped copy: that state is reversible.
-            after = await _blocked(customer_id, source, session_id)
-            if after in ("deleted", "purged", *_GONE_STATUSES):
+            after = await _blocked_after_put(customer_id, source, session_id)
+            if after == "unverified":
+                counts["unverified"] += 1
+                _emit({"kind": "batch", **ident, "put_ok": put_ok, "post_put_unverified": True})
+            elif after in ("deleted", "purged", *_GONE_STATUSES):
                 await store.delete(bucket, key)
                 counts["overtaken"] += 1
                 _emit({"kind": "batch", **ident, "overtaken": after})
@@ -194,6 +208,13 @@ async def strip(args: argparse.Namespace) -> None:
            "dropped_paths": dict(paths.most_common(60)), **dict(sorted(counts.items()))})
 
 
+def _positive(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return number
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -203,7 +224,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     scope.add_argument("--all-tenants", action="store_true")
     p.add_argument("--sources", nargs="*", default=sorted(s.value for s in AGENT_SESSION_SOURCES))
     p.add_argument("--write", action="store_true")
-    p.add_argument("--concurrency", type=int, default=8)
+    p.add_argument("--concurrency", type=_positive, default=8)
     return parser.parse_args(argv)
 
 

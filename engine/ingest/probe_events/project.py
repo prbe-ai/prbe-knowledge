@@ -10,7 +10,10 @@ reference), a media block its media type and size. A kept value is never
 rewritten or truncated.
 
 The schema is closed at every level (`additionalProperties: false`), so "what
-it allows" is exactly what tap 0.9.11 uploads.
+it allows" is what tap 0.9.11 uploads, with ONE deliberate difference: an
+attachment that is not a compact file reference keeps `{type}` (tap 0.9.11
+drops the whole event). Only the type name survives, and the ATIF builder
+reads it; the event's Line stays, so the indexed text cannot move.
 """
 
 from __future__ import annotations
@@ -123,7 +126,7 @@ def _value(value: Any, node: dict[str, Any]) -> Any:
         for variant in node["oneOf"]:
             variant = _resolve(variant)
             if variant.get("type") == "array" and isinstance(value, list):
-                return [_value(item, variant["items"]) for item in value]
+                return _items(value, variant["items"])
             if variant.get("type") == "object" and isinstance(value, dict):
                 return _object(value, variant)
             if variant.get("type") not in ("array", "object") and _allowed(value, variant):
@@ -135,8 +138,13 @@ def _value(value: Any, node: dict[str, Any]) -> Any:
         if not isinstance(value, list):
             return _DROP
         items = node.get("items")
-        return [_value(item, items) for item in value] if items else value
+        return _items(value, items) if items else value
     return value if _allowed(value, node) else _DROP
+
+
+def _items(value: list[Any], node: dict[str, Any]) -> list[Any]:
+    """A list's items, each projected; an item the schema allows nothing for goes."""
+    return [kept for kept in (_value(item, node) for item in value) if kept is not _DROP]
 
 
 def _object(value: dict[str, Any], node: dict[str, Any]) -> dict[str, Any]:

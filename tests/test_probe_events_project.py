@@ -155,3 +155,12 @@ def test_projected_old_events_validate_against_the_schema() -> None:
                                  "message": {"role": "user", "content": "x"}}):
         errors = list(validator.iter_errors(project_event(event)))
         assert errors == [], [e.message for e in errors]
+    # The one deliberate difference: a non-compact attachment keeps its type.
+    held = project_event({"type": "attachment", "attachment": {"type": "file", "content": "F"}})
+    assert [e.json_path for e in validator.iter_errors(held)] == ["$.attachment.type"]
+
+
+def test_a_list_item_the_schema_allows_nothing_for_is_dropped() -> None:
+    event = {"type": "user", "message": {"role": "user", "content": [
+        {"type": "text", "text": "kept"}, "a stray string", 7]}}
+    assert project_event(event)["message"]["content"] == [{"type": "text", "text": "kept"}]
