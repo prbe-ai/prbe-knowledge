@@ -1,0 +1,43 @@
+{"type": "system", "subtype": "session_meta", "timestamp": "2026-10-05T03:11:13.750Z", "_kimi_extras": {"protocol_version": "1.5", "created_at": 1791169873750}}
+null
+{"type": "user", "timestamp": "2026-10-05T03:11:13.798Z", "message": {"role": "user", "content": [{"type": "text", "text": "RUN: echo hello-from-kimi\nWRITE: notes.txt :: lr sweep notes\nSAY: Both steps ran."}]}, "_kimi_extras": {"prompt_id": "msg_01M450PHVQE1Z9P0NVVK5A03YH"}}
+null
+null
+null
+null
+null
+{"type": "assistant", "timestamp": "2026-10-05T03:11:13.854Z", "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "Run: echo hello-from-kimi"}]}, "_kimi_extras": {"turn_id": "0", "step": 1}, "inference_id": "0:1"}
+{"type": "assistant", "timestamp": "2026-10-05T03:11:13.854Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "Running a command."}]}, "_kimi_extras": {"turn_id": "0", "step": 1}, "inference_id": "0:1"}
+{"type": "assistant", "timestamp": "2026-10-05T03:11:13.882Z", "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "call_1", "name": "Bash", "summary": "echo hello-from-kimi"}]}, "_kimi_extras": {"turn_id": "0", "step": 1}, "inference_id": "0:1"}
+{"type": "user", "timestamp": "2026-10-05T03:11:13.894Z", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1", "result_bytes": 16}]}}
+null
+null
+{"type": "assistant", "timestamp": "2026-10-05T03:11:13.914Z", "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "Write notes.txt"}]}, "_kimi_extras": {"turn_id": "0", "step": 2}, "inference_id": "0:2"}
+{"type": "assistant", "timestamp": "2026-10-05T03:11:13.915Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "Writing a file."}]}, "_kimi_extras": {"turn_id": "0", "step": 2}, "inference_id": "0:2"}
+null
+{"type": "assistant", "timestamp": "2026-10-05T03:11:13.923Z", "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "call_2", "name": "Write", "summary": "notes.txt", "stats": {"op": "write", "added_lines": 1, "added_bytes": 14}}]}, "_kimi_extras": {"turn_id": "0", "step": 2}, "inference_id": "0:2"}
+{"type": "user", "timestamp": "2026-10-05T03:11:13.926Z", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_2", "result_bytes": 27}]}}
+null
+null
+{"type": "assistant", "timestamp": "2026-10-05T03:11:13.946Z", "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "Every step ran; wrap up."}]}, "_kimi_extras": {"turn_id": "0", "step": 3}, "inference_id": "0:3"}
+{"type": "assistant", "timestamp": "2026-10-05T03:11:13.946Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "Both steps ran."}]}, "_kimi_extras": {"turn_id": "0", "step": 3}, "inference_id": "0:3"}
+null
+{"type": "user", "timestamp": "2026-10-05T03:11:22.792Z", "message": {"role": "user", "content": [{"type": "text", "text": "RUN: ls\nSAY: Listed."}]}, "_kimi_extras": {"prompt_id": "msg_01M450PTN1R8918MF3H5524V7J"}}
+null
+null
+{"type": "assistant", "timestamp": "2026-10-05T03:11:22.838Z", "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "Run: ls"}]}, "_kimi_extras": {"turn_id": "1", "step": 1}, "inference_id": "1:1"}
+{"type": "assistant", "timestamp": "2026-10-05T03:11:22.838Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "Running a command."}]}, "_kimi_extras": {"turn_id": "1", "step": 1}, "inference_id": "1:1"}
+{"type": "assistant", "timestamp": "2026-10-05T03:11:22.866Z", "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "call_7", "name": "Bash", "summary": "ls"}]}, "_kimi_extras": {"turn_id": "1", "step": 1}, "inference_id": "1:1"}
+{"type": "user", "timestamp": "2026-10-05T03:11:22.881Z", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_7", "result_bytes": 10}]}}
+null
+null
+{"type": "assistant", "timestamp": "2026-10-05T03:11:22.897Z", "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "Every step ran; wrap up."}]}, "_kimi_extras": {"turn_id": "1", "step": 2}, "inference_id": "1:2"}
+{"type": "assistant", "timestamp": "2026-10-05T03:11:22.898Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "Listed."}]}, "_kimi_extras": {"turn_id": "1", "step": 2}, "inference_id": "1:2"}
+null
+{"type": "system", "subtype": "compaction", "timestamp": "2026-10-05T03:12:28.096Z", "content": "Hello from the mock model.", "_kimi_extras": {"compacted_count": 9, "tokens_before": 21366, "tokens_after": 21793, "kept_user_message_count": 2}}
+{"type": "user", "timestamp": "2026-10-05T03:25:00.001Z", "message": {"role": "user", "content": [{"type": "text", "text": "<bash-input>git log --oneline -3</bash-input>"}]}, "_kimi_extras": {"origin": "shell_command"}, "origin": "user_shell"}
+{"type": "system", "subtype": "shell_output", "timestamp": "2026-10-05T03:25:00.002Z", "_kimi_extras": {"result_bytes": 39}}
+{"type": "user", "timestamp": "2026-10-05T03:25:00.003Z", "message": {"role": "user", "content": [{"type": "text", "text": "/probe-research:probe status"}]}, "_kimi_extras": {"origin": "plugin_command"}}
+{"type": "system", "subtype": "skill_activation", "timestamp": "2026-10-05T03:25:00.004Z", "_kimi_extras": {"skill_name": "track-work", "trigger": "model-tool"}}
+{"type": "system", "subtype": "undo", "timestamp": "2026-10-05T03:25:00.005Z", "_kimi_extras": {"count": 2}}
+{"type": "system", "subtype": "clear", "timestamp": "2026-10-05T03:25:00.006Z"}

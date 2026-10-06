@@ -254,6 +254,8 @@ jobs:
           tests/test_atif_ingest.py
           tests/test_atif_endpoint.py
           tests/test_atif_sessions_script.py
+          tests/test_probe_events_project.py
+          tests/test_strip_session_payloads_script.py
           tests/handlers/test_claude_code_parse_webhook_event.py
           tests/handlers/test_claude_code_fetch_supplementary.py
           tests/handlers/test_claude_code_normalize.py

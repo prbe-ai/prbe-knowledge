@@ -1,0 +1,323 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://prbe.ai/schemas/probe-events-1.schema.json",
+  "title": "probe-events/1",
+  "description": "One sanitized coding-agent session event: the `raw` of each `{line_no, raw}` in a protocol-2 session batch. All four tap sanitizers emit it (tap_core/sanitize.py for Claude Code, codex_sanitize.py, pi_sanitize.py, kimi_sanitize.py) in Claude Code's user / assistant / system shape. It describes exactly what they emit from tap 0.9.11 on, not what a harness writes: every key is allow-listed and typed, and anything else stays on the researcher's machine. Optional fields are absent, never null, unless their type says null. Out of contract: a transcript line that is not a JSON object. The Claude Code and Codex sanitizers return it unchanged (the legacy batch builder keeps an unparseable line as a raw string on purpose; the protocol-2 journal drops lines that do not parse), and real transcripts have none. Clients from before 0.9.11 send no `inference_id`, `usage` or `origin`, and clients from before 0.9.9 sent more keys than this schema allows; a reader must accept both. Held by agent/tests/test_probe_events_contract.py.",
+  "type": "object",
+  "required": ["type"],
+  "additionalProperties": false,
+  "properties": {
+    "type": {
+      "type": "string",
+      "description": "Codex, pi and Kimi emit `user`, `assistant` or `system`. Claude Code also forwards its own other event types (`attachment`, `queue-operation`, `mode`, ...) reduced to the keys below; the renderer shows only a string `content` for those."
+    },
+    "subtype": {
+      "type": "string",
+      "description": "On `system` events. Harness-defined and open: Claude Code's own (`compact_boundary`, `local_command`, `away_summary`, ...); Codex `session_start`, `turn_context`, `compaction`; pi `session_meta`, `compaction`, `branch_summary`, `label`, `model_change`, `thinking_level_change`, `session_info`, `custom:<customType>`, `unknown:<type>`, `unknown:message:<role>`, `unparsed`; Kimi `session_meta`, `compaction`, `shell_output`, `skill_activation`, `clear`, `undo`."
+    },
+    "timestamp": {
+      "type": ["string", "null"],
+      "description": "ISO-8601 as the harness wrote it (Kimi's epoch milliseconds converted to UTC). null when the line had none."
+    },
+    "content": {
+      "type": "string",
+      "description": "Top-level text of a `system` event (a compaction or branch summary, a local command line) or of a forwarded Claude Code event such as `queue-operation`. Conversation text: uncapped."
+    },
+    "message": { "$ref": "#/$defs/message" },
+    "isCompactSummary": {
+      "type": "boolean",
+      "description": "Claude Code: this `user` event is the model's own summary written at a compaction, not something the researcher said."
+    },
+    "uuid": { "type": "string", "description": "Claude Code's event id." },
+    "parentUuid": { "type": ["string", "null"], "description": "Claude Code: the event before this one; null on the first." },
+    "logicalParentUuid": { "type": ["string", "null"], "description": "Claude Code: on a `compact_boundary`, the event before the compaction." },
+    "attachment": { "$ref": "#/$defs/attachment" },
+    "inference_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "The model call this `assistant` event came from: Claude Code's Anthropic message id (every line of one call shares it), pi's entry id (one entry per response), Kimi's `<turn_id>:<step>`. Codex: never set. Absent also on events from clients before 0.9.11."
+    },
+    "usage": { "$ref": "#/$defs/usage" },
+    "origin": {
+      "const": "user_shell",
+      "description": "Set when the researcher's own shell command produced the event (pi's `!` bashExecution, both halves; Kimi shell-mode input), so no reader takes it for model output or counts it as an inference. Absent otherwise."
+    },
+    "_codex_extras": { "$ref": "#/$defs/codex_extras" },
+    "_pi_extras": { "$ref": "#/$defs/pi_extras" },
+    "_kimi_extras": { "$ref": "#/$defs/kimi_extras" }
+  },
+  "allOf": [
+    {
+      "if": { "required": ["attachment"] },
+      "then": { "properties": { "type": { "const": "attachment" } } }
+    },
+    {
+      "if": { "anyOf": [{ "required": ["inference_id"] }, { "required": ["usage"] }] },
+      "then": { "properties": { "type": { "const": "assistant" } } }
+    }
+  ],
+  "$defs": {
+    "message": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "role": { "type": "string", "description": "`user` or `assistant`." },
+        "content": {
+          "oneOf": [
+            { "type": "string", "description": "A plain-text turn (Claude Code)." },
+            { "type": "array", "items": { "$ref": "#/$defs/block" } }
+          ]
+        },
+        "model": { "type": "string", "description": "Claude Code: the model that wrote this turn. pi puts it in `_pi_extras.model`." },
+        "stop_reason": { "type": ["string", "null"], "description": "Claude Code: why the call stopped; null while it is still streaming." }
+      }
+    },
+    "block": {
+      "oneOf": [
+        { "$ref": "#/$defs/text_block" },
+        { "$ref": "#/$defs/thinking_block" },
+        { "$ref": "#/$defs/tool_use_block" },
+        { "$ref": "#/$defs/tool_result_block" },
+        { "$ref": "#/$defs/media_block" },
+        { "$ref": "#/$defs/media_url_block" },
+        { "$ref": "#/$defs/dropped_block" },
+        { "$ref": "#/$defs/unknown_block" }
+      ]
+    },
+    "text_block": {
+      "type": "object",
+      "required": ["type", "text"],
+      "additionalProperties": false,
+      "properties": { "type": { "const": "text" }, "text": { "type": "string" } }
+    },
+    "thinking_block": {
+      "type": "object",
+      "required": ["type", "thinking"],
+      "additionalProperties": false,
+      "properties": { "type": { "const": "thinking" }, "thinking": { "type": "string" } },
+      "description": "Reasoning text. Signatures and encrypted reasoning never ship."
+    },
+    "tool_use_block": {
+      "type": "object",
+      "required": ["type", "id", "name"],
+      "additionalProperties": false,
+      "description": "A tool call as a summary and counts. The arguments never ship.",
+      "properties": {
+        "type": { "const": "tool_use" },
+        "id": { "type": ["string", "null"], "maxLength": 200 },
+        "name": { "type": ["string", "null"], "maxLength": 200 },
+        "summary": {
+          "type": "string",
+          "maxLength": 4000,
+          "description": "The full shell command (capped at 4,000 characters), else the first line (capped at 200) of the first of command / file_path / path / pattern / url / query / description. Absent for a tool whose arguments match none."
+        },
+        "stats": { "$ref": "#/$defs/edit_stats" },
+        "edit_stats": { "$ref": "#/$defs/edit_stats", "description": "pi's name for `stats`." }
+      }
+    },
+    "edit_stats": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op"],
+      "description": "Shape of a file change: counts, never content.",
+      "properties": {
+        "op": { "enum": ["edit", "write"] },
+        "edits": { "type": "integer", "minimum": 0 },
+        "added_lines": { "type": "integer", "minimum": 0 },
+        "removed_lines": { "type": "integer", "minimum": 0 },
+        "added_bytes": { "type": "integer", "minimum": 0 },
+        "removed_bytes": { "type": "integer", "minimum": 0 },
+        "replace_all": { "const": true },
+        "mode": { "type": "string", "maxLength": 32, "description": "Kimi's Write mode." }
+      }
+    },
+    "tool_result_block": {
+      "type": "object",
+      "required": ["type", "tool_use_id"],
+      "additionalProperties": false,
+      "description": "A tool's result as its size. The output never ships.",
+      "properties": {
+        "type": { "const": "tool_result" },
+        "tool_use_id": { "type": ["string", "null"], "maxLength": 200 },
+        "is_error": { "const": true, "description": "Present only on a failed call." },
+        "result_bytes": { "type": "integer", "minimum": 0, "description": "Characters of text in the result." }
+      }
+    },
+    "media_block": {
+      "type": "object",
+      "required": ["type", "mimeType", "bytes"],
+      "additionalProperties": false,
+      "description": "A pasted image (Kimi also audio, video): its media type and encoded size, never the bytes.",
+      "properties": {
+        "type": { "enum": ["image", "audio", "video"] },
+        "mimeType": { "type": "string", "maxLength": 200 },
+        "bytes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "media_url_block": {
+      "type": "object",
+      "required": ["type", "source"],
+      "additionalProperties": false,
+      "description": "Media given as a remote link: the link is a pointer, not content.",
+      "properties": {
+        "type": { "enum": ["image", "audio", "video"] },
+        "source": {
+          "type": "object",
+          "required": ["type", "url"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "url" },
+            "url": { "type": "string", "pattern": "^https?://", "maxLength": 2048 }
+          }
+        }
+      }
+    },
+    "dropped_block": {
+      "type": "object",
+      "required": ["type", "dropped"],
+      "additionalProperties": false,
+      "description": "Claude Code: a content block of a type the sanitizer does not name (a document, a server tool's call or result, redacted thinking, ...). Its type only.",
+      "properties": {
+        "type": { "type": "string", "maxLength": 128 },
+        "dropped": { "const": true }
+      }
+    },
+    "unknown_block": {
+      "type": "object",
+      "required": ["type", "block_type"],
+      "additionalProperties": false,
+      "description": "pi and Kimi: a content part of a type the sanitizer does not name. Its type only.",
+      "properties": {
+        "type": { "const": "unknown_block" },
+        "block_type": { "type": "string", "maxLength": 200 }
+      }
+    },
+    "attachment": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": false,
+      "description": "Claude Code attachment events ship only for allow-listed types, with only their named keys. Every other attachment, including any that holds a file's contents, is not sent.",
+      "properties": {
+        "type": { "const": "compact_file_reference" },
+        "filename": { "type": "string", "maxLength": 200 },
+        "displayPath": { "type": "string", "maxLength": 200 }
+      }
+    },
+    "usage": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": false,
+      "description": "Token counts of the call named by `inference_id`, as reported with this event: Claude Code repeats a growing snapshot on each line of a call, so the last one is the call's total. Counts the harness did not report are absent. Claude Code and pi only.",
+      "properties": {
+        "input_tokens": { "type": "integer", "minimum": 0 },
+        "output_tokens": { "type": "integer", "minimum": 0 },
+        "cache_read_input_tokens": { "type": "integer", "minimum": 0 },
+        "cache_creation_input_tokens": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "codex_extras": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Codex-only facts, by allow-list. Values marked verbatim are copied from Codex's own record unchanged.",
+      "properties": {
+        "cli_version": { "description": "session_meta, verbatim." },
+        "originator": { "description": "session_meta, verbatim." },
+        "model_provider": { "description": "session_meta, verbatim." },
+        "source": { "description": "session_meta, verbatim." },
+        "forked_from_id": { "description": "session_meta, verbatim." },
+        "agent_role": { "description": "session_meta, verbatim." },
+        "agent_nickname": { "description": "session_meta, verbatim." },
+        "agent_path": { "description": "session_meta, verbatim." },
+        "dynamic_tools": { "description": "session_meta, verbatim: tool definitions." },
+        "memory_mode": { "description": "session_meta, verbatim." },
+        "git": { "description": "session_meta, verbatim: commit, branch, repository URL." },
+        "timestamp": { "description": "session_meta, verbatim." },
+        "turn_id": { "description": "turn_context, verbatim." },
+        "trace_id": { "description": "turn_context, verbatim." },
+        "cwd": { "description": "turn_context, verbatim." },
+        "current_date": { "description": "turn_context, verbatim." },
+        "timezone": { "description": "turn_context, verbatim." },
+        "approval_policy": { "description": "turn_context, verbatim." },
+        "sandbox_policy": { "description": "turn_context, verbatim." },
+        "permission_profile": { "description": "turn_context, verbatim." },
+        "network": { "description": "turn_context, verbatim." },
+        "file_system_sandbox_policy": { "description": "turn_context, verbatim." },
+        "model": { "description": "turn_context, verbatim." },
+        "personality": { "description": "turn_context, verbatim." },
+        "realtime_active": { "description": "turn_context, verbatim." },
+        "effort": { "description": "turn_context, verbatim." },
+        "final_output_json_schema": { "description": "turn_context, verbatim." },
+        "truncation_policy": { "description": "turn_context, verbatim." },
+        "replacement_history_count": { "type": "integer", "minimum": 0, "description": "compacted." },
+        "had_encrypted_content": { "type": "boolean", "description": "response_item.compaction." },
+        "phase": { "enum": ["commentary", "final_answer"], "description": "response_item.message." },
+        "reasoning_summary": { "description": "response_item.reasoning, verbatim: the model's reasoning summary." },
+        "namespace": { "description": "response_item.function_call, verbatim." },
+        "status": { "type": "string", "maxLength": 64, "description": "response_item.local_shell_call." }
+      }
+    },
+    "pi_extras": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "pi-only facts. pi is an untrusted producer (forks, SDK embeds): every value is type-checked and capped.",
+      "properties": {
+        "id": { "type": "string", "maxLength": 200, "description": "The entry's tree id." },
+        "parentId": { "type": "string", "maxLength": 200 },
+        "version": { "type": ["integer", "null"], "description": "session_meta: session format version; null when not an integer." },
+        "cwd": { "type": ["string", "null"], "maxLength": 4096 },
+        "session_uuid": { "type": ["string", "null"], "maxLength": 200 },
+        "parent_session": { "type": "string", "maxLength": 4096, "description": "session_meta: the file a /fork or /clone came from." },
+        "unsupported_version": { "const": true },
+        "raw_type": { "type": ["string", "null"], "maxLength": 200, "description": "unknown:<type> and unparsed events." },
+        "role": { "type": ["string", "null"], "maxLength": 200, "description": "unknown:message:<role> events." },
+        "provider": { "type": "string", "maxLength": 200 },
+        "model": { "type": "string", "maxLength": 200 },
+        "api": { "type": "string", "maxLength": 200 },
+        "stop_reason": { "type": "string", "maxLength": 200 },
+        "error_message": { "type": "string", "maxLength": 200 },
+        "tool_name": { "type": "string", "maxLength": 200 },
+        "exit_code": { "type": ["number", "boolean"] },
+        "cancelled": { "type": ["number", "boolean"] },
+        "truncated": { "type": ["number", "boolean"] },
+        "excluded_from_context": { "const": true },
+        "tokens_before": { "type": ["number", "boolean"] },
+        "first_kept_entry_id": { "type": "string", "maxLength": 200 },
+        "retained_tail_count": { "type": "integer", "minimum": 0 },
+        "from_extension": { "const": true },
+        "from_id": { "type": "string", "maxLength": 200 },
+        "target_id": { "type": "string", "maxLength": 200 },
+        "label": { "type": "string", "maxLength": 200 },
+        "model_id": { "type": "string", "maxLength": 200 },
+        "thinking_level": { "type": "string", "maxLength": 200 },
+        "name": { "type": "string", "maxLength": 200 },
+        "custom_type": { "type": "string", "maxLength": 200 },
+        "display": { "type": "boolean" },
+        "data_keys": { "type": "array", "items": { "type": "string" }, "description": "custom: the names an extension stored, never the values." }
+      }
+    },
+    "kimi_extras": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Kimi-only facts, typed and capped.",
+      "properties": {
+        "protocol_version": { "type": "string", "maxLength": 32 },
+        "created_at": { "type": "number" },
+        "prompt_id": { "type": "string", "maxLength": 200 },
+        "origin": { "enum": ["plugin_command", "shell_command"], "description": "Kimi's own origin kind for a user event that is not a typed prompt." },
+        "result_bytes": { "type": "integer", "minimum": 0, "description": "shell_output: size of the output, never the output." },
+        "is_error": { "const": true },
+        "skill_name": { "type": "string", "maxLength": 200 },
+        "trigger": { "type": "string", "maxLength": 200 },
+        "turn_id": { "type": "string", "maxLength": 64 },
+        "step": { "type": "integer" },
+        "compacted_count": { "type": "integer" },
+        "tokens_before": { "type": "integer" },
+        "tokens_after": { "type": "integer" },
+        "kept_user_message_count": { "type": "integer" },
+        "dropped_count": { "type": "integer" },
+        "count": { "type": "integer", "description": "undo: messages undone." }
+      }
+    }
+  }
+}
