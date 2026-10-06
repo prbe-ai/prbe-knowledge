@@ -216,10 +216,15 @@ async def is_session_deleted(customer_id: str, source: str, queue_event_id: str)
         return bool(await deleted_sessions(conn, customer_id, source, [session_id]))
 
 
+#: The session's ATIF document (engine/ingest/atif/store.py), in its folder.
+TRAJECTORY_FILE = "trajectory.json"
+
+
 def session_folder(source: str, customer_id: str, session_id: str) -> str:
     """`raw/<src>/<customer>/<session>/`: the idle sweep's `finalize.marker`
-    (session_signals.cron_marker_key) and the extraction cache
-    (extraction_cache.SegmentCache). Trailing `/` is load-bearing."""
+    (session_signals.cron_marker_key), the extraction cache
+    (extraction_cache.SegmentCache) and `trajectory.json`
+    (engine/ingest/atif/store.py). Trailing `/` is load-bearing."""
     return f"raw/{source}/{customer_id}/{session_id}/"
 
 
@@ -229,12 +234,12 @@ def is_own_folder_key(key: str, folder: str) -> bool:
     Both writers build the folder from the RAW session id, and protocol 1
     accepts `/` in one: session `X/y` keeps its marker and cache under
     `raw/<src>/<customer>/X/y/`, which is inside session `X`'s folder. Only the
-    two shapes this session writes itself are its own.
+    shapes this session writes itself are its own.
     """
     if not key.startswith(folder):
         return False
     rest = key[len(folder):]
-    if rest == "finalize.marker":
+    if rest in ("finalize.marker", TRAJECTORY_FILE):
         return True
     cache = rest.removeprefix("extraction-cache/")
     return cache != rest and cache.endswith(".json") and "/" not in cache

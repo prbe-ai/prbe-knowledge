@@ -28,6 +28,10 @@ from typing import Any, ClassVar
 
 import orjson
 
+from engine.ingest.atif.build import BuildResult, build_trajectory
+from engine.ingest.atif.lines import lines_from_trajectory
+from engine.ingest.atif.mode import RenderMode, render_mode
+from engine.ingest.atif.store import TrajectoryTooLarge, trajectory_key, write_trajectory
 from engine.ingest.handlers.base import Connector
 from engine.ingest.handlers.registry import register_connector
 from engine.shared import claude_code_extraction as _ext
@@ -68,11 +72,14 @@ from engine.shared.storage import get_store
 # use it too (it needs the same prose, not raw event JSON). Import site kept
 # stable for the connector and its tests.
 from engine.shared.transcript_render import (  # noqa: F401
+    Line,
     _events_to_text,
     _render_assistant,
     _render_event,
     _render_tool_use,
     _render_user,
+    lines_from_events,
+    render_lines,
 )
 
 # Cap on simultaneous R2 GETs per fetch_supplementary call. With WORKER
@@ -530,6 +537,7 @@ class ClaudeCodeConnector(Connector):
             employee_name = employee_email = employee_hostname = None
 
         now = datetime.now(UTC)
+        lines, built, served_atif = self._session_lines(event, session_id, events, complete)
         session_doc = self._build_session_doc(
             event=event,
             session_id=session_id,
@@ -539,10 +547,13 @@ class ClaudeCodeConnector(Connector):
             employee_email=employee_email,
             employee_hostname=employee_hostname,
             events=events,
+            lines=lines,
             complete=complete,
             completed_by=hydrated.get("completed_by"),
             now=now,
         )
+        if complete and built is not None:
+            await self._store_trajectory(event, session_id, built)
 
         documents: list[Document] = [session_doc]
         if unverified_author:
@@ -679,6 +690,9 @@ class ClaudeCodeConnector(Connector):
             cwd=cwd,
             agent=self._agent_label,
             cache=cache,
+            # Only when the trajectory's text is served: otherwise extraction
+            # renders the events itself, exactly as it did before.
+            **({"lines": lines} if served_atif else {}),
         )
         # One line per mining pass: the only record of what a pass cost and
         # why it ran. `segment_hashes` repeat across passes of one session
@@ -1005,6 +1019,138 @@ class ClaudeCodeConnector(Connector):
             captured_at=datetime.now(UTC),
         )
 
+    def _session_lines(
+        self,
+        event: WebhookEvent,
+        session_id: str,
+        events: list[dict[str, Any]],
+        complete: bool,
+    ) -> tuple[list[Line], BuildResult | None, bool]:
+        """The Lines this pass indexes and mines, the trajectory if built, and
+        whether the Lines are the trajectory's.
+
+        Legacy Lines are always computed: they are the reference. The
+        trajectory is built when it will be stored (a completing pass) or
+        compared (shadow / atif). Its Lines are served only in `atif` mode, only
+        when they equal the reference and no event went unparsed -- so whatever
+        the mode, the index, the evidence spans and the extraction cache see
+        exactly the text they saw before this module existed.
+        """
+        mode = render_mode(event.customer_id)
+        legacy = lines_from_events(events)
+        if mode is RenderMode.LEGACY and not complete:
+            return legacy, None, False
+        built = self._build_trajectory(event, session_id, events)
+        if mode is RenderMode.LEGACY or built is None:
+            return legacy, built, False
+        try:
+            atif: list[Line] | None = lines_from_trajectory(built.trajectory)
+        except Exception as exc:
+            log.warning(
+                "session_render.unrenderable",
+                customer=event.customer_id,
+                source=self.source_system.value,
+                session_id=session_id,
+                error=type(exc).__name__,
+            )
+            atif = None
+        same = atif == legacy
+        first_diff = None
+        if not same and atif is not None:
+            first_diff = next(
+                (i for i, (a, b) in enumerate(zip(atif, legacy, strict=False)) if a != b),
+                min(len(atif), len(legacy)),
+            )
+        (log.info if same else log.warning)(
+            "session_render.compared",
+            customer=event.customer_id,
+            source=self.source_system.value,
+            session_id=session_id,
+            mode=mode.value,
+            same=same,
+            first_diff=first_diff,
+            lines=len(legacy),
+            unparsed=built.unparsed,
+            complete=complete,
+        )
+        if mode is RenderMode.ATIF and same and atif is not None and built.unparsed == 0:
+            return atif, built, True
+        return legacy, built, False
+
+    def _build_trajectory(
+        self, event: WebhookEvent, session_id: str, events: list[dict[str, Any]]
+    ) -> BuildResult | None:
+        """Never raises: a trajectory that cannot be built costs the readers of
+        `trajectory.json`, never the session's indexing."""
+        try:
+            return build_trajectory(
+                events, session_id=session_id, agent_name=self._agent_label
+            )
+        except Exception:
+            log.warning(
+                "atif.build_failed",
+                customer=event.customer_id,
+                source=self.source_system.value,
+                session_id=session_id,
+                exc_info=True,
+            )
+            return None
+
+    async def _store_trajectory(
+        self, event: WebhookEvent, session_id: str, built: BuildResult
+    ) -> None:
+        """Write `trajectory.json` (engine/ingest/atif/store.py). Never raises."""
+        started = datetime.now(UTC)
+        key = trajectory_key(self.source_system.value, event.customer_id, session_id)
+        try:
+            store = get_store()
+            bucket = await store.bucket_for(event.customer_id)
+            size, invalid = await write_trajectory(
+                store,
+                bucket,
+                key,
+                built.trajectory,
+                max_bytes=get_settings().session_trajectory_max_bytes,
+            )
+        except TrajectoryTooLarge as exc:
+            log.info(
+                "trajectory.skipped_too_large",
+                customer=event.customer_id,
+                source=self.source_system.value,
+                session_id=session_id,
+                bytes=exc.size,
+                limit=exc.limit,
+            )
+            return
+        except Exception as exc:
+            log.warning(
+                "trajectory.store_failed",
+                customer=event.customer_id,
+                source=self.source_system.value,
+                session_id=session_id,
+                error=type(exc).__name__,
+            )
+            return
+        log.info(
+            "trajectory.stored",
+            customer=event.customer_id,
+            source=self.source_system.value,
+            session_id=session_id,
+            bytes=size,
+            steps=len(built.trajectory.get("steps") or []),
+            unparsed=built.unparsed,
+            atif_invalid=invalid is not None,
+            ms=int((datetime.now(UTC) - started).total_seconds() * 1000),
+        )
+        if invalid is not None:
+            log.warning(
+                "atif_invalid",
+                customer=event.customer_id,
+                source=self.source_system.value,
+                session_id=session_id,
+                error=invalid,
+            )
+
     def _build_session_doc(
         self,
         *,
@@ -1019,8 +1165,9 @@ class ClaudeCodeConnector(Connector):
         complete: bool,
         now: datetime,
         completed_by: str | None = None,
+        lines: list[Line] | None = None,
     ) -> Document:
-        rendered_body = _events_to_text(events)
+        rendered_body = render_lines(lines if lines is not None else lines_from_events(events))
         body_bytes = rendered_body.encode("utf-8")
         # Body only. A completing pass that adds no text is therefore skipped
         # as unchanged, so `session_complete` / `completed_by` on the stored

@@ -377,11 +377,14 @@ async def test_dry_run_counts_everything_and_changes_nothing(env) -> None:
                   "inferred_edges_queue"):
         assert v2["rows"].get(table, 0) > 0, (table, v2["rows"])
     assert v2["rows"]["session_batch_receipts"] == 3
-    # 3 v2 batches + marker + cache are listed; the opaque object is referenced.
-    assert v2["r2_objects"] == 5
+    # 3 v2 batches + marker + cache + the completing pass's trajectory.json
+    # (engine/ingest/atif/store.py) are listed; the opaque object is referenced.
+    assert v2["r2_objects"] == 6
     assert v2["r2_referenced_keys"] == 1
     v1 = by_sid[s2]
-    assert v1["r2_objects"] == 0 and v1["r2_referenced_keys"] == 3
+    # A protocol-1 session's batches are shared date-folder objects, found by
+    # reference; its own folder holds only the trajectory its last pass wrote.
+    assert v1["r2_objects"] == 1 and v1["r2_referenced_keys"] == 3
     assert "session_streams" not in v1["rows"]
     async with db_module.with_tenant(a) as conn:
         assert await conn.fetchval("SELECT count(*) FROM session_deletions") == 0
