@@ -354,6 +354,10 @@ class _Builder:
         extra: dict[str, Any] = {"probe_parts": []}
         if summary:
             extra["subtype"] = "compaction_summary"
+        elif raw.get("origin") == USER_SHELL:
+            # Kimi's shell mode: the researcher typed a command, which arrives as
+            # their own turn. Marked so readers can tell it from a prompt.
+            extra["origin"] = USER_SHELL
         self._harness_extras(extra, raw)
         return self._add_step(
             {
@@ -369,8 +373,8 @@ class _Builder:
         if not isinstance(msg, dict):
             return
         inference = _short(raw.get("inference_id"), _EXTRA_VALUE_CHARS)
-        # A command the researcher typed (pi's `!`, Kimi's shell mode) arrives
-        # shaped as an assistant tool call with no inference id. ATIF keeps tool
+        # A command the researcher typed (pi's `!`) arrives shaped as an
+        # assistant tool call with no inference id. ATIF keeps tool
         # calls on agent steps, so it gets one of its own, marked, and never
         # joins a model call's step on either side.
         user_shell = raw.get("origin") == USER_SHELL

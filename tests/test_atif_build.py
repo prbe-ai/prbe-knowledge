@@ -421,3 +421,19 @@ def test_a_command_the_researcher_typed_is_its_own_step_never_the_models() -> No
     [result] = typed["observation"]["results"]
     assert result["source_call_id"] == "bash-b1"
     assert reply["extra"].get("origin") is None and "tool_calls" not in reply
+
+
+def test_a_kimi_shell_command_is_the_researchers_turn_marked_as_typed() -> None:
+    """Kimi's shell mode (probe-events/1 `origin: user_shell`, tap 0.9.11) sends
+    the command as a `user` event and its output as a `shell_output` system
+    event carrying only its size."""
+    events = [
+        _ev(_user("check the history"), 0),
+        _ev(_user([{"type": "text", "text": "<bash-input>git log --oneline -3</bash-input>"}],
+                  origin="user_shell"), 1),
+        _ev({"type": "system", "subtype": "shell_output", "_kimi_extras": {"result_bytes": 39}}, 2),
+    ]
+    trajectory = _round_trip(events, agent="kimi_code")
+    prompt, typed = [s for s in trajectory["steps"] if s["source"] == "user"]
+    assert prompt["extra"].get("origin") is None
+    assert typed["extra"]["origin"] == "user_shell"
