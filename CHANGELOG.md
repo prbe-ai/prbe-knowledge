@@ -8,6 +8,7 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Security
 
+- **`scripts/strip_session_payloads.py` strips stored session batches down to probe-events/1.** Taps before 0.9.10 uploaded a second copy of every tool's output, file and CLAUDE.md attachments, unknown blocks and pasted images; each stored batch is rewritten with every event projected onto the probe-events/1 schema (a vendored copy of research-os's, `engine/ingest/probe_events/`), only when its rendered Lines are identical before and after. Receipts are untouched (they pin the client's request, not the stored copy); a session deleted mid-run is never resurrected. Dry run unless `--write`; run as a Job with `MODULE=scripts.strip_session_payloads scripts/atif_sessions_job.sh strip ...`.
 - **`redactd`'s Go dependencies carry the x/crypto, rardecode and xz fixes (supersedes #599).**
   `golang.org/x/crypto` 0.35.0 -> 0.52.0 (15 ssh advisories), `nwaples/rardecode/v2` 2.1.0 ->
   2.3.0 (CVE-2025-11579; 2.3.0 restores the `WriteTo` that `mholt/archives` v0.1.2 needs, which

@@ -22,9 +22,12 @@ set -euo pipefail
 ctx="${KUBE_CONTEXT:-do-sfo3-probe-research}"
 ns="${NAMESPACE:-research}"
 deploy="${SOURCE_DEPLOYMENT:-research-os-engine-worker}"
-mode="${1:?usage: $0 <replay|backfill> [args...]}"
+mode="${1:?usage: $0 <replay|backfill|strip> [args...]}"
+# The script it runs: scripts.atif_sessions (replay, backfill) by default,
+# MODULE=scripts.strip_session_payloads for `strip`.
+module="${MODULE:-scripts.atif_sessions}"
 name="atif-sessions-${mode}-$(date -u +%Y%m%d%H%M%S)"
-cmd=$(python3 -c 'import json, sys; print(json.dumps(["python", "-m", "scripts.atif_sessions", *sys.argv[1:]]))' "$@")
+cmd=$(python3 -c 'import json, sys; print(json.dumps(["python", "-m", sys.argv[1], *sys.argv[2:]]))' "$module" "$@")
 selector=$(kubectl --context "$ctx" -n "$ns" get deploy "$deploy" -o json \
   | jq -r '.spec.selector.matchLabels | to_entries | map("\(.key)=\(.value)") | join(",")')
 container=$(kubectl --context "$ctx" -n "$ns" get deploy "$deploy" -o jsonpath='{.spec.template.spec.containers[0].name}')
