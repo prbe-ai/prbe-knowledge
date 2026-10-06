@@ -1187,13 +1187,15 @@ class ClaudeCodeConnector(Connector):
                 return legacy, None, False
         try:
             # Pure-Python over the whole session: off the event loop, in the
-            # process pool when large, like every other large CPU pass.
+            # process pool when large, like every other large CPU pass. The
+            # builder is chosen here: a pool process has its own settings.
             built, atif, render_error = await cpu_pool.run_cpu(
                 build_and_render,
                 events,
                 session_id,
                 self._agent_label,
                 compare,
+                settings.session_atif_builder,
                 size=sum(len(line.text) for line in legacy),
             )
         except CpuPoolUnavailable:

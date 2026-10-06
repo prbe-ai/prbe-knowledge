@@ -7,13 +7,21 @@
               identical, plus timings and trajectory sizes. A long-session
               subsample is replayed batch by batch, as live ingestion runs.
               This is the gate before any tenant's SESSION_RENDER is `atif`.
+              --compare-builders also builds each session with BOTH builders
+              (engine/ingest/atif/build.py: the frozen `reference` and
+              `fold(map(fragment, events))`), reports whether they agree and
+              where they first differ, at every sampled batch prefix too, and
+              compares both with the session's stored final trajectory.json
+              when there is one. This is the gate before SESSION_ATIF_BUILDER
+              is `fold` and before any client uploads fragments.
 
     backfill  Writes `trajectory.json` for ENDED stored sessions that have
               none (they ended before the engine wrote it on completion). DRY
               RUN unless --write. Writes nothing else: no documents, chunks,
               units, queue rows, and no LLM call. Skips a deleted session, a
               running one, one whose queue row is pending or processing, and a
-              tenant that is not active. After each write it re-reads the
+              tenant that is not active. Builds with SESSION_ATIF_BUILDER,
+              as the worker does. After each write it re-reads the
               queue row: if the row moved on (a new batch or end marker), is
               gone (deletion, purge) or the session or tenant was closed
               meanwhile, the object is removed -- a reader then gets "not
@@ -30,6 +38,7 @@ into a serving pod -- an exec'd process shares the container's memory limit and
 the OOM killer takes the server):
 
     scripts/atif_sessions_job.sh replay --all-tenants --sample 500
+    scripts/atif_sessions_job.sh replay --all-tenants --sample 2000 --compare-builders
     scripts/atif_sessions_job.sh backfill --all-tenants            # dry run
     scripts/atif_sessions_job.sh backfill --all-tenants --write
 """
@@ -41,17 +50,26 @@ import asyncio
 import hashlib
 import json
 import random
+import re
 import statistics
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
+from enum import StrEnum
 from typing import Any
 
 import orjson
 
-from engine.ingest.atif.build import build_trajectory
+from engine.ingest.atif.build import Builder, BuildResult, build_trajectory, builder_for
 from engine.ingest.atif.lines import lines_from_trajectory
 from engine.ingest.atif.models import Trajectory
-from engine.ingest.atif.store import TrajectoryTooLarge, trajectory_key, write_trajectory
+from engine.ingest.atif.store import (
+    TrajectoryTooLarge,
+    read_trajectory,
+    scrub_trajectory,
+    strip_provenance,
+    trajectory_key,
+    write_trajectory,
+)
 from engine.ingest.handlers.base import make_default_context
 from engine.ingest.normalizer import Normalizer
 from engine.shared import claude_code_extraction as _ext
@@ -80,6 +98,98 @@ _ROW_SQL = """
     WHERE customer_id = $1 AND source_system = $2 AND source_event_id = $3
 """
 _BUSY = ("pending", "processing")
+
+#: Root `extra` keys of a stored trajectory.json that stamp the WRITE rather
+#: than come out of the build, so a rebuild is compared without them:
+#:   session_ended     final or live copy; the writer adds it (claude_code.py)
+#:   validation_error  the writer's validator message, only on an invalid
+#:                     document, worded by whichever pydantic that image had
+#: The render provenance (`extra.probe`: format, lines, unparsed; each step's
+#: `extra.probe_parts`) is never stored (store.strip_provenance), so the
+#: rebuild goes through the same strip and the same credential scrub as the
+#: write before it is compared. Between the two builders nothing is ignored:
+#: the whole BuildResult, provenance included, must be equal.
+_WRITE_STAMPS = ("session_ended", "validation_error")
+
+#: Keys a difference path may name: the document's own vocabulary (ATIF, the
+#: render provenance, BuildResult). Any other key -- a harness extra's name,
+#: anything a client chose -- prints as `*`, so a report carries ids, counts
+#: and schema names, never transcript content.
+_PATH_KEYS = frozenset(
+    {
+        "trajectory",
+        "unparsed",
+        "unparsed_events",
+        "schema_version",
+        "session_id",
+        "agent",
+        "name",
+        "version",
+        "model_name",
+        "steps",
+        "step_id",
+        "source",
+        "message",
+        "type",
+        "text",
+        "timestamp",
+        "reasoning_content",
+        "tool_calls",
+        "tool_call_id",
+        "function_name",
+        "arguments",
+        "observation",
+        "results",
+        "source_call_id",
+        "metrics",
+        "prompt_tokens",
+        "completion_tokens",
+        "cached_tokens",
+        "cache_creation_input_tokens",
+        "final_metrics",
+        "total_prompt_tokens",
+        "total_completion_tokens",
+        "total_cached_tokens",
+        "total_steps",
+        "extra",
+        "probe",
+        "format",
+        "lines",
+        "probe_parts",
+        "subtype",
+        "event_type",
+        "attachment_type",
+        "inference_id",
+        "continues_inference",
+        "origin",
+        "stop_reason",
+        "dropped_blocks",
+        "summary",
+        "stats",
+        "added_lines",
+        "removed_lines",
+        "replace_all",
+        "is_error",
+        "tool_use_id",
+        "result_bytes",
+        "codex_extras",
+        "pi_extras",
+        "kimi_extras",
+        *_WRITE_STAMPS,
+    }
+)
+
+
+class StoredCopy(StrEnum):
+    """What a session's stored trajectory.json was, for --compare-builders."""
+
+    #: The session has not ended: only a live copy can exist, of other events.
+    NOT_ENDED = "not_ended"
+    ABSENT = "absent"
+    #: An ended session whose final copy is not written yet.
+    LIVE = "live"
+    FINAL = "final"
+    ERROR = "error"
 
 
 class Skip(Exception):
@@ -180,12 +290,14 @@ def _segment_digest(lines: list[Any]) -> list[tuple[str, str, int | None, int | 
     return out
 
 
-def _compare(events: list[dict[str, Any]], session_id: str, agent: str) -> dict[str, Any]:
+def _compare(
+    events: list[dict[str, Any]], session_id: str, agent: str, builder: Builder = Builder.REFERENCE
+) -> dict[str, Any]:
     t0 = time.perf_counter()
     legacy = lines_from_events(events)
     t1 = time.perf_counter()
     try:
-        built = build_trajectory(events, session_id=session_id, agent_name=agent)
+        built = build_trajectory(events, session_id=session_id, agent_name=agent, builder=builder)
     except Exception as exc:  # a builder crash on a real shape fails the gate
         return {"events": len(events), "same": False, "build_error": type(exc).__name__}
     t2 = time.perf_counter()
@@ -240,6 +352,135 @@ def _compare(events: list[dict[str, Any]], session_id: str, agent: str) -> dict[
     }
 
 
+def _first_difference(left: Any, right: Any, path: str = "") -> dict[str, Any] | None:
+    """Where two JSON values first differ: a path of schema keys and indexes
+    and what differs (`type`, `missing_left` / `missing_right`, `length` with
+    both lengths, `value`). Never a value."""
+    here = path or "$"
+    if type(left) is not type(right):
+        return {
+            "path": here,
+            "kind": "type",
+            "left": type(left).__name__,
+            "right": type(right).__name__,
+        }
+    if isinstance(left, dict):
+        for key in left:
+            name = key if key in _PATH_KEYS else "*"
+            sub = f"{path}.{name}" if path else name
+            if key not in right:
+                return {"path": sub, "kind": "missing_right"}
+            if (diff := _first_difference(left[key], right[key], sub)) is not None:
+                return diff
+        for key in right:
+            if key not in left:
+                name = key if key in _PATH_KEYS else "*"
+                return {"path": f"{path}.{name}" if path else name, "kind": "missing_left"}
+        return None
+    if isinstance(left, list):
+        for i, (a, b) in enumerate(zip(left, right, strict=False)):
+            if (diff := _first_difference(a, b, f"{path}[{i}]")) is not None:
+                return diff
+        if len(left) != len(right):
+            return {"path": here, "kind": "length", "left": len(left), "right": len(right)}
+        return None
+    return None if left == right else {"path": here, "kind": "value"}
+
+
+def _result_data(built: BuildResult) -> dict[str, Any]:
+    return {
+        "trajectory": built.trajectory,
+        "unparsed": built.unparsed,
+        "unparsed_events": [list(e) for e in built.unparsed_events],
+    }
+
+
+def _builders(
+    events: list[dict[str, Any]], session_id: str, agent: str
+) -> tuple[dict[str, Any], BuildResult | None, BuildResult | None]:
+    """Both builders over the same events: (record, reference, fold)."""
+    built: dict[Builder, BuildResult] = {}
+    for builder in (Builder.REFERENCE, Builder.FOLD):
+        try:
+            built[builder] = build_trajectory(
+                events, session_id=session_id, agent_name=agent, builder=builder
+            )
+        except Exception as exc:  # a crash on a real shape fails the gate
+            return (
+                {
+                    "builders_same": False,
+                    "builders_diff": None,
+                    "builders_error": f"{builder.value}:{type(exc).__name__}",
+                },
+                None,
+                None,
+            )
+    reference, folded = built[Builder.REFERENCE], built[Builder.FOLD]
+    diff = _first_difference(_result_data(reference), _result_data(folded))
+    return (
+        {"builders_same": diff is None, "builders_diff": diff, "builders_error": None},
+        reference,
+        folded,
+    )
+
+
+def _without_stamps(document: dict[str, Any]) -> dict[str, Any]:
+    out = dict(document)
+    extra = {k: v for k, v in (out.get("extra") or {}).items() if k not in _WRITE_STAMPS}
+    if extra:
+        out["extra"] = extra
+    else:
+        out.pop("extra", None)
+    return out
+
+
+async def _as_stored(trajectory: dict[str, Any]) -> dict[str, Any]:
+    """What the worker's final write stores for this build (store.write_trajectory:
+    the final stamp, strip, scrub), less the write stamps."""
+    final = {**trajectory, "extra": {**(trajectory.get("extra") or {}), "session_ended": True}}
+    clean = await scrub_trajectory(strip_provenance(final))
+    return _without_stamps(orjson.loads(orjson.dumps(clean)))
+
+
+async def _compare_builders(
+    store: Any, row: dict[str, Any], events: list[dict[str, Any]], session_id: str, complete: bool
+) -> dict[str, Any]:
+    """--compare-builders for one session: the two builders, then each against
+    the stored final copy. Ids, counts and schema paths only."""
+    source = row["source_system"]
+    record, reference, folded = _builders(events, session_id, source)
+    if reference is None or folded is None:
+        return record
+    if not complete:
+        return {**record, "stored": StoredCopy.NOT_ENDED.value}
+    try:
+        bucket = await store.bucket_for(row["customer_id"])
+        stored = await read_trajectory(
+            store, bucket, trajectory_key(source, row["customer_id"], session_id)
+        )
+        if stored is None:
+            return {**record, "stored": StoredCopy.ABSENT.value}
+        if (stored.get("extra") or {}).get("session_ended") is False:
+            return {**record, "stored": StoredCopy.LIVE.value}
+        actual = _without_stamps(stored)
+        fold_diff = _first_difference(actual, await _as_stored(folded.trajectory))
+        reference_diff = (
+            fold_diff
+            if record["builders_same"]
+            else _first_difference(actual, await _as_stored(reference.trajectory))
+        )
+    except Exception as exc:
+        return {**record, "stored": StoredCopy.ERROR.value, "stored_error": type(exc).__name__}
+    return {
+        **record,
+        "stored": StoredCopy.FINAL.value,
+        "stored_fold_same": fold_diff is None,
+        "stored_fold_diff": fold_diff,
+        "stored_reference_same": reference_diff is None,
+        "stored_reference_diff": reference_diff,
+    }
+
+
 def _merge_prefix(bodies: dict[str, bytes], keys: list[str]) -> list[dict[str, Any]]:
     """fetch_supplementary's merge over the first `keys` (dedupe by line_no, sort)."""
     seen: set[int] = set()
@@ -266,14 +507,22 @@ def _merge_prefix(bodies: dict[str, bytes], keys: list[str]) -> list[dict[str, A
     return merged
 
 
-def _batchwise(bodies: dict[str, bytes], keys: list[str], session_id: str, agent: str,
-               points: int) -> dict[str, Any]:
+def _batchwise(
+    bodies: dict[str, bytes],
+    keys: list[str],
+    session_id: str,
+    agent: str,
+    points: int,
+    builder: Builder = Builder.REFERENCE,
+    compare_builders: bool = False,
+) -> dict[str, Any]:
     """Replay the session as live ingestion did: one pass per batch prefix.
 
     Sampled at `points` evenly spaced prefixes (a 2,485-key session would be
     millions of re-reads otherwise). Reports cumulative milliseconds for the
     legacy path alone and for legacy + build + trajectory lines, and whether
-    every prefix agreed.
+    every prefix agreed; with `compare_builders`, whether both builders agree
+    on every prefix (what a live pass folds mid-session).
     """
     readable = [k for k in keys if bodies.get(k)]
     n = len(readable)
@@ -282,22 +531,28 @@ def _batchwise(bodies: dict[str, bytes], keys: list[str], session_id: str, agent
     cuts = sorted({max(1, round(n * (i + 1) / points)) for i in range(points)})
     legacy_ms = atif_ms = 0.0
     disagreements = 0
+    builder_disagreements = 0
     for cut in cuts:
         events = _merge_prefix(bodies, readable[:cut])
-        r = _compare(events, session_id, agent)
+        if compare_builders and not _builders(events, session_id, agent)[0]["builders_same"]:
+            builder_disagreements += 1
+        r = _compare(events, session_id, agent, builder)
         if r.get("build_error"):
             disagreements += 1
             continue
         legacy_ms += r["ms_legacy"]
         atif_ms += r["ms_legacy"] + r["ms_build"] + r["ms_atif"]
         disagreements += 0 if r["same"] else 1
-    return {
+    out = {
         "prefixes": len(cuts),
         "keys": n,
         "cumulative_ms_legacy": round(legacy_ms, 1),
         "cumulative_ms_with_atif": round(atif_ms, 1),
         "prefix_disagreements": disagreements,
     }
+    if compare_builders:
+        out["prefix_builder_disagreements"] = builder_disagreements
+    return out
 
 
 def _strata(rows: list[dict[str, Any]]) -> dict[tuple[str, str], list[dict[str, Any]]]:
@@ -342,6 +597,7 @@ async def replay(args: argparse.Namespace) -> None:
     results: list[dict[str, Any]] = []
     by_keys = sorted(sample, key=lambda r: len(r["payload_s3_keys"] or []), reverse=True)
     batchwise_ids = {(r["customer_id"], r["source_event_id"]) for r in by_keys[: args.batchwise]}
+    builder = builder_for(_settings().session_atif_builder)
     for row in sample:
         ident = {"customer": row["customer_id"], "source": row["source_system"],
                  "session_id": row["source_event_id"],
@@ -349,9 +605,13 @@ async def replay(args: argparse.Namespace) -> None:
         try:
             hydrated = await _read_session(normalizer, store, row)
             session_id = hydrated.get("session_id") or row["source_event_id"]
-            record = {**ident, **_compare(list(hydrated.get("events") or []), session_id,
-                                          row["source_system"])}
+            complete = bool(hydrated.get("session_complete"))
+            events = list(hydrated.get("events") or [])
             del hydrated
+            record = {**ident, **_compare(events, session_id, row["source_system"], builder)}
+            if args.compare_builders:
+                record.update(await _compare_builders(store, row, events, session_id, complete))
+            del events
         except Skip as skip:
             record = {**ident, "skipped": str(skip)}
         except Exception as exc:
@@ -362,6 +622,7 @@ async def replay(args: argparse.Namespace) -> None:
                 bodies = await _events_by_key(store, row["customer_id"], keys)
                 record["batchwise"] = _batchwise(
                     bodies, keys, row["source_event_id"], row["source_system"], args.points,
+                    builder, args.compare_builders,
                 )
                 del bodies
             except Exception as exc:
@@ -432,7 +693,57 @@ async def replay(args: argparse.Namespace) -> None:
     }
     if ratio:
         summary["render_ratio_mean"] = round(statistics.fmean(ratio), 2)
+    if args.compare_builders:
+        summary.update(_builders_summary(compared, batch))
     _emit(summary)
+
+
+def _builders_summary(
+    compared: list[dict[str, Any]], batch: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """--compare-builders over the run: counts, and where differences start
+    (paths with their indexes folded, e.g. `trajectory.steps[].metrics`)."""
+    errors = [r for r in compared if r.get("builders_error")]
+    paths = Counter(
+        re.sub(r"\[\d+\]", "[]", r["builders_diff"]["path"])
+        for r in compared
+        if r.get("builders_diff")
+    )
+    stored = Counter(r.get("stored") for r in compared if r.get("stored"))
+    final = [r for r in compared if r.get("stored") == StoredCopy.FINAL]
+    stored_paths = Counter(
+        re.sub(r"\[\d+\]", "[]", r["stored_fold_diff"]["path"])
+        for r in final
+        if r.get("stored_fold_diff")
+    )
+    prefix_disagreements = sum(b.get("prefix_builder_disagreements", 0) for b in batch)
+    # Wherever the reference reproduces the stored copy, fold must too.
+    fold_lost_stored = sum(
+        1 for r in final if r["stored_reference_same"] and not r["stored_fold_same"]
+    )
+    return {
+        "builders_compared": len(compared),
+        "builders_identical": sum(1 for r in compared if r.get("builders_same")),
+        "builders_errors": len(errors),
+        "builders_error_kinds": sorted({r["builders_error"] for r in errors}),
+        "builders_diff_paths": dict(paths.most_common(20)),
+        "builders_prefix_disagreements": prefix_disagreements,
+        "stored": dict(sorted(stored.items())),
+        "stored_fold_identical": sum(1 for r in final if r["stored_fold_same"]),
+        "stored_reference_identical": sum(1 for r in final if r["stored_reference_same"]),
+        "stored_fold_diff_paths": dict(stored_paths.most_common(20)),
+        "stored_fold_lost": fold_lost_stored,
+        # Strict, as gate_passed: every compared session and sampled prefix
+        # agrees, nothing crashed, and fold reproduces every stored copy the
+        # reference does. Stored copies the reference no longer reproduces
+        # (written before a builder fix, or by an older scanner) are counted,
+        # not failed.
+        "builders_gate_passed": bool(compared)
+        and all(r.get("builders_same") for r in compared)
+        and not errors
+        and not prefix_disagreements
+        and not fold_lost_stored,
+    }
 
 
 def _settings() -> Any:
@@ -497,7 +808,12 @@ async def backfill(args: argparse.Namespace) -> None:
                 if not events:
                     counts["no_events"] += 1  # normalize() writes nothing for these either
                     return
-                built = build_trajectory(events, session_id=session_id, agent_name=source)
+                built = build_trajectory(
+                    events,
+                    session_id=session_id,
+                    agent_name=source,
+                    builder=_settings().session_atif_builder,
+                )
                 if not args.write:
                     counts["would_write"] += 1
                     _emit({"kind": "session", **ident, "would_write": True,
@@ -577,6 +893,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                            help="replay this many of the sample's longest sessions batch by batch")
             p.add_argument("--points", type=int, default=50,
                            help="prefixes per batchwise session")
+            p.add_argument(
+                "--compare-builders",
+                action="store_true",
+                help="also build with both builders (reference, fold) and compare "
+                "them with each other and with the stored final trajectory",
+            )
         else:
             p.add_argument("--write", action="store_true")
             p.add_argument("--force", action="store_true",

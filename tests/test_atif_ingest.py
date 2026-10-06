@@ -598,3 +598,31 @@ async def test_a_resume_known_too_large_removes_the_old_final_copy(
 def test_which_replies_end_a_turn(raw: dict[str, Any], ends: bool) -> None:
     events = [{"line_no": 7, "raw": raw}, {"line_no": 8, "raw": {"type": "system"}}]
     assert cc_mod._turn_end_line(events) == (7 if ends else None)
+
+
+async def test_the_pass_builds_with_the_configured_builder_and_stores_the_same_document(
+    monkeypatch: pytest.MonkeyPatch, store: FakeStore, mined: list
+) -> None:
+    """SESSION_ATIF_BUILDER is read by the worker and handed to the pool call
+    (a pool process has its own settings); both builders store one document."""
+    seen: list[Any] = []
+    real = cc_mod.build_and_render
+
+    def spy(*args: Any) -> Any:
+        seen.append(args[4])
+        return real(*args)
+
+    monkeypatch.setattr(cc_mod, "build_and_render", spy)
+    stored: dict[str, Any] = {}
+    for builder in ("fold", "reference"):
+        _use_mode(monkeypatch, "atif", atif_builder=builder)
+        result = await _normalize(complete=True)
+        assert result.documents[0].body == EXPECTED_BODY
+        stored[builder] = orjson.loads(store.objects[("bucket-cust-1", KEY)])
+    assert seen == ["fold", "reference"]
+    assert stored["fold"] == stored["reference"]
+    assert mined[0]["lines"] == lines_from_events(EVENTS), "fold's Lines are served in atif mode"
+
+
+def test_the_default_builder_is_the_reference() -> None:
+    assert Settings().session_atif_builder == "reference"

@@ -216,3 +216,119 @@ async def test_backfill_leaves_a_row_the_worker_is_about_to_run(
     summary = (await _run(capsys, ["backfill", "--customer", a, "--write"]))[-1]
     assert summary.get("busy") == 1 and "written" not in summary, summary
     assert await read_trajectory(store, bucket, trajectory_key(CC.value, a, sid)) is None
+
+
+@pytest.mark.asyncio
+async def test_replay_compare_builders_agrees_with_itself_and_the_stored_copy(
+    env,  # noqa: F811
+    capsys,
+) -> None:
+    (a, _b), _store = env
+    await v2_session(a, _sid())
+    await v1_session(a, _sid())
+    records = await _run(
+        capsys,
+        [
+            "replay",
+            "--customer",
+            a,
+            "--sample",
+            "10",
+            "--batchwise",
+            "2",
+            "--points",
+            "3",
+            "--compare-builders",
+        ],
+    )
+    sessions = [r for r in records if r["kind"] == "session"]
+    summary = records[-1]
+    assert len(sessions) == 2, sessions
+    for r in sessions:
+        assert (r["builders_same"], r["builders_diff"], r["builders_error"]) == (True, None, None)
+        # Both ended through the pipeline, so the worker wrote their final copies.
+        assert (r["stored"], r["stored_fold_same"], r["stored_reference_same"]) == (
+            "final",
+            True,
+            True,
+        ), r
+        assert r["batchwise"]["prefix_builder_disagreements"] == 0
+    assert summary["builders_gate_passed"] is True and summary["gate_passed"] is True
+    assert (summary["builders_compared"], summary["builders_identical"]) == (2, 2)
+    assert summary["stored"] == {"final": 2} and summary["stored_fold_identical"] == 2
+    assert summary["builders_prefix_disagreements"] == 0 and summary["stored_fold_lost"] == 0
+    assert "hello" not in json.dumps(records).lower()
+
+
+@pytest.mark.asyncio
+async def test_replay_compare_builders_names_where_fold_differs_and_no_content(
+    env,  # noqa: F811
+    capsys,
+    monkeypatch,
+) -> None:
+    (a, _b), _store = env
+    await v2_session(a, _sid())
+    import engine.ingest.atif.build as build_mod
+
+    real = build_mod.fold
+
+    def tampered(fragments, **kwargs):
+        built = real(fragments, **kwargs)
+        built.trajectory["steps"][0]["message"] = "TAMPERED-TEXT"
+        return built
+
+    monkeypatch.setattr(build_mod, "fold", tampered)
+    records = await _run(
+        capsys,
+        [
+            "replay",
+            "--customer",
+            a,
+            "--sample",
+            "5",
+            "--batchwise",
+            "1",
+            "--points",
+            "2",
+            "--compare-builders",
+        ],
+    )
+    [session] = [r for r in records if r["kind"] == "session"]
+    summary = records[-1]
+    assert session["builders_same"] is False
+    assert session["builders_diff"] == {"path": "trajectory.steps[0].message", "kind": "value"}
+    assert (session["stored_fold_same"], session["stored_reference_same"]) == (False, True)
+    assert session["stored_fold_diff"] == {"path": "steps[0].message", "kind": "value"}
+    assert session["batchwise"]["prefix_builder_disagreements"] == 2
+    assert summary["builders_gate_passed"] is False and summary["stored_fold_lost"] == 1
+    assert summary["builders_diff_paths"] == {"trajectory.steps[].message": 1}
+    assert summary["gate_passed"] is True, "the render gate runs the configured (reference) builder"
+    assert "TAMPERED" not in json.dumps(records) and "hello" not in json.dumps(records).lower()
+
+
+def test_a_difference_is_reported_by_schema_path_and_counts_only() -> None:
+    diff = atif_sessions._first_difference
+    assert diff({"a": 1}, {"a": 1}) is None
+    assert diff({"steps": [1, 2]}, {"steps": [1]}) == {
+        "path": "steps",
+        "kind": "length",
+        "left": 2,
+        "right": 1,
+    }
+    assert diff({"steps": [{"text": "x"}]}, {"steps": [{"text": 5}]}) == {
+        "path": "steps[0].text",
+        "kind": "type",
+        "left": "str",
+        "right": "int",
+    }
+    # A key outside the document's vocabulary (a harness extra, anything a
+    # client chose) never reaches the report.
+    assert diff(
+        {"extra": {"codex_extras": [{"api_token_9f": "a"}]}},
+        {"extra": {"codex_extras": [{"api_token_9f": "b"}]}},
+    ) == {"path": "extra.codex_extras[0].*", "kind": "value"}
+    assert diff({"extra": {}}, {"extra": {"my secret key": 1}}) == {
+        "path": "extra.*",
+        "kind": "missing_left",
+    }
+    assert diff({"x-secret": 1}, {}) == {"path": "*", "kind": "missing_right"}

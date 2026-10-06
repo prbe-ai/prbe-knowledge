@@ -165,6 +165,13 @@ class Settings(BaseSettings):
     session_render_default: str = Field(default="legacy")
     session_render_shadow_customers: str = Field(default="")
     session_render_atif_customers: str = Field(default="")
+    #: Which builder turns a session's events into its trajectory
+    #: (engine/ingest/atif/build.py), for the ingest pass and the backfill:
+    #: `reference`, the frozen builder every stored trajectory was written by,
+    #: or `fold`, the same document from per-event fragments (the shape
+    #: clients will upload) folded as untrusted input. Any other value means
+    #: `reference`. Read in the worker, never inside a pool process.
+    session_atif_builder: str = Field(default="reference")
     #: Largest `trajectory.json` a completing pass writes. The write runs the
     #: credential scrub over the whole document (0.4-2.5 s per MB measured), so
     #: a session past this is skipped with a log line and its readers fall back

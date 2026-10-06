@@ -381,7 +381,7 @@ def test_a_long_unknown_event_type_renders_byte_identically() -> None:
 def test_unparsed_events_are_reported_to_the_caller_not_logged_by_the_build() -> None:
     from structlog.testing import capture_logs
 
-    import engine.ingest.atif.build as build_mod
+    import engine.ingest.atif.build_reference as build_mod
 
     def broken(self: Any, line: int, raw: dict[str, Any]) -> None:
         raise KeyError("x")
