@@ -88,14 +88,19 @@ async def test_backfill_is_a_dry_run_until_told_and_skips_deleted(env, capsys) -
     assert await read_trajectory(store, bucket, trajectory_key(CC.value, a, keep)) is None
 
     summary = (await _run(capsys, ["backfill", "--customer", a, "--write"]))[-1]
-    assert (summary["written"], summary["deleted"], summary["not_ended"]) == (1, 1, 1), summary
-    assert await read_trajectory(store, bucket, trajectory_key(CC.value, a, running)) is None
+    assert (summary["written"], summary["deleted"]) == (1, 1), summary
+    # The running session: the backfill never writes it. With live copies on, the
+    # worker's own live pass already did (session_ended false).
+    live = await read_trajectory(store, bucket, trajectory_key(CC.value, a, running))
+    assert live is None or live["extra"]["session_ended"] is False
     written = await read_trajectory(store, bucket, trajectory_key(CC.value, a, keep))
     assert written is not None and written["session_id"] == keep
     assert await read_trajectory(store, bucket, trajectory_key(CC.value, a, gone)) is None
 
+    assert written["extra"]["session_ended"] is True
     again = (await _run(capsys, ["backfill", "--customer", a, "--write"]))[-1]
-    assert again["already_present"] == 1, "a second run rewrites nothing"
+    assert again["already_present"] == 1 + (live is not None), "a second run rewrites nothing"
+    assert "written" not in again
 
 
 @pytest.mark.asyncio

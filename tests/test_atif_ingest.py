@@ -139,6 +139,13 @@ def builds(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Any, ...]]:
     return seen
 
 
+@pytest.fixture(autouse=True)
+def _fresh_live_throttle() -> Any:
+    cc_mod._LIVE_WRITES.clear()
+    yield
+    cc_mod._LIVE_WRITES.clear()
+
+
 def _use_mode(monkeypatch: pytest.MonkeyPatch, mode: str = "legacy", **kw: Any) -> None:
     settings = _settings(render_default=mode, **kw)
     monkeypatch.setattr(cc_mod, "render_mode", lambda customer: render_mode(customer, settings))
@@ -194,12 +201,39 @@ async def test_indexed_text_is_main_s_text_in_every_mode(
 
 
 @pytest.mark.parametrize("mode", ["legacy", "shadow", "atif"])
-async def test_a_live_pass_builds_and_stores_nothing_in_any_mode(
+async def test_with_live_copies_off_a_live_pass_builds_and_stores_nothing(
     monkeypatch: pytest.MonkeyPatch, store: FakeStore, builds: list, mode: str
 ) -> None:
-    _use_mode(monkeypatch, mode)
+    _use_mode(monkeypatch, mode, trajectory_live_interval_s=0)
     await _normalize(complete=False)
     assert builds == [] and store.objects == {} and store.deleted == []
+
+
+@pytest.mark.parametrize("mode", ["legacy", "shadow", "atif"])
+async def test_a_live_pass_keeps_a_live_copy_and_serves_the_events_text(
+    monkeypatch: pytest.MonkeyPatch, store: FakeStore, mined: list, builds: list, mode: str
+) -> None:
+    _use_mode(monkeypatch, mode)
+    with capture_logs() as logs:
+        result = await _normalize(complete=False)
+    assert result.documents[0].body == EXPECTED_BODY
+    assert not any(e["event"] == "session_render.compared" for e in logs), "only at the end"
+    stored = orjson.loads(store.objects[("bucket-cust-1", KEY)])
+    assert stored["extra"] == {"session_ended": False}
+    assert len(builds) == 1
+
+
+async def test_live_copies_are_throttled_per_session_and_the_final_one_never_is(
+    monkeypatch: pytest.MonkeyPatch, store: FakeStore, mined: list, builds: list
+) -> None:
+    _use_mode(monkeypatch, trajectory_live_interval_s=3600)
+    await _normalize(complete=False)
+    await _normalize(complete=False)
+    assert len(builds) == 1, "the second live pass inside the interval builds nothing"
+    await _normalize(complete=True)
+    assert len(builds) == 2
+    stored = orjson.loads(store.objects[("bucket-cust-1", KEY)])
+    assert stored["extra"] == {"session_ended": True}
 
 
 async def test_atif_mode_serves_the_trajectory_lines_when_they_match(
@@ -290,7 +324,7 @@ async def test_a_completing_pass_stores_a_scrubbed_trajectory_in_the_session_fol
     stored = orjson.loads(store.objects[(bucket, key)])
     assert SECRET not in orjson.dumps(stored).decode()
     assert stored["agent"]["name"] == "codex"
-    assert "extra" not in stored, "render provenance is engine-internal"
+    assert stored["extra"] == {"session_ended": True}, "render provenance is engine-internal"
     assert all("probe_parts" not in (s.get("extra") or {}) for s in stored["steps"])
     assert [s["source"] for s in stored["steps"]] == ["user", "agent", "agent"]
     # Scrubbed the way the index is: the finding costs its line, never the field.
@@ -341,13 +375,23 @@ async def test_a_failed_build_never_fails_the_pass_and_removes_the_old_trajector
     assert store.objects == {} and store.deleted == [KEY]
 
 
-async def test_a_resumed_session_s_old_trajectory_is_removed(
+async def test_with_live_copies_off_a_resumed_session_s_old_trajectory_is_removed(
     monkeypatch: pytest.MonkeyPatch, store: FakeStore, builds: list
+) -> None:
+    store.objects[("bucket-cust-1", KEY)] = b'{"old": true}'
+    _use_mode(monkeypatch, trajectory_live_interval_s=0)
+    await _normalize(complete=False, ended_before=True)
+    assert builds == [] and store.objects == {} and store.deleted == [KEY]
+
+
+async def test_a_resumed_session_s_final_copy_is_replaced_by_a_live_one(
+    monkeypatch: pytest.MonkeyPatch, store: FakeStore, mined: list, builds: list
 ) -> None:
     store.objects[("bucket-cust-1", KEY)] = b'{"old": true}'
     _use_mode(monkeypatch)
     await _normalize(complete=False, ended_before=True)
-    assert builds == [] and store.objects == {} and store.deleted == [KEY]
+    stored = orjson.loads(store.objects[("bucket-cust-1", KEY)])
+    assert stored["extra"] == {"session_ended": False} and len(builds) == 1
 
 
 async def test_an_invalid_trajectory_is_written_with_its_error() -> None:

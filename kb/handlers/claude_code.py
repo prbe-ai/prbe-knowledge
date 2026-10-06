@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import time
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any, ClassVar
@@ -70,6 +72,7 @@ from engine.shared.models import (
     WebhookParseResult,
     make_named_entity,
 )
+from engine.shared.session_suppression import is_session_deleted
 from engine.shared.storage import get_store
 
 # Re-exported: the renderer moved to engine.shared so the unit extractor can
@@ -92,6 +95,26 @@ from engine.shared.transcript_render import (  # noqa: F401
 # is enough to drain a typical session in ~1.5s while keeping in-flight
 # envelopes bounded to a few MB.
 log = get_logger(__name__)
+
+#: (customer, source, session) -> when this process last wrote that session's
+#: live trajectory (time.monotonic). Bounded; an evicted session just gets its
+#: next live write sooner. Per process: with N workers a session can be written
+#: up to N times per interval, and after a resume a final copy written by
+#: another worker can stand for up to one interval before this one replaces it.
+_LIVE_WRITES: OrderedDict[tuple[str, str, str], float] = OrderedDict()
+_LIVE_WRITES_MAX = 10_000
+
+
+def _live_write_due(key: tuple[str, str, str], interval_s: int) -> bool:
+    last = _LIVE_WRITES.get(key)
+    return last is None or time.monotonic() - last >= interval_s
+
+
+def _live_written(key: tuple[str, str, str]) -> None:
+    _LIVE_WRITES[key] = time.monotonic()
+    _LIVE_WRITES.move_to_end(key)
+    while len(_LIVE_WRITES) > _LIVE_WRITES_MAX:
+        _LIVE_WRITES.popitem(last=False)
 
 _FETCH_SUPP_R2_CONCURRENCY = 16
 
@@ -566,12 +589,15 @@ class ClaudeCodeConnector(Connector):
             completed_by=hydrated.get("completed_by"),
             now=now,
         )
-        if complete and built is not None and get_settings().session_trajectory_store:
-            await self._store_trajectory(event, session_id, built)
-        elif complete or hydrated.get("ended_before"):
-            # A completing pass that built nothing, or a session that ended and
-            # then resumed: whatever trajectory.json holds no longer describes
-            # this session, and a reader must get "not built" instead of it.
+        settings = get_settings()
+        if built is not None and settings.session_trajectory_store:
+            await self._store_trajectory(event, session_id, built, ended=complete)
+        elif complete or (
+            hydrated.get("ended_before") and settings.session_trajectory_live_interval_s <= 0
+        ):
+            # A completing pass that built nothing, or (with no live copies) a
+            # session that ended and then resumed: whatever trajectory.json holds
+            # no longer describes this session; a reader gets "not built".
             await self._discard_trajectory(event, session_id, why="stale")
 
         documents: list[Document] = [session_doc]
@@ -1048,21 +1074,34 @@ class ClaudeCodeConnector(Connector):
         """The Lines this pass indexes and mines, the trajectory if built, and
         whether the Lines are the trajectory's.
 
-        Legacy Lines are always computed: they are the reference. Only a
-        completing pass builds the trajectory (to store it) and, in `shadow` and
-        `atif`, compares its Lines with the reference; a live pass does exactly
-        what it did before this module existed. The trajectory's Lines are served
+        Legacy Lines are always computed: they are the reference. A completing
+        pass builds the trajectory (to store it) and, in `shadow` and `atif`,
+        compares its Lines with the reference. A live pass serves the reference
+        whatever the mode, and builds only to refresh the stored live copy, at
+        most once per `session_trajectory_live_interval_s` per process. The trajectory's Lines are served
         only in `atif`, only when equal and with nothing unparsed -- so whatever
         the mode, the index, the evidence spans and the extraction cache see the
         same text.
         """
         legacy = lines_from_events(events)
+        settings = get_settings()
         if not complete:
-            return legacy, None, False
-        mode = render_mode(event.customer_id)
-        compare = mode is not RenderMode.LEGACY
-        if not compare and not get_settings().session_trajectory_store:
-            return legacy, None, False
+            # A live pass serves the events' Lines whatever the mode. It builds
+            # only to refresh the stored live trajectory, throttled per process.
+            live_key = (event.customer_id, self.source_system.value, session_id)
+            if not (
+                settings.session_trajectory_store
+                and settings.session_trajectory_live_interval_s > 0
+                and _live_write_due(live_key, settings.session_trajectory_live_interval_s)
+            ):
+                return legacy, None, False
+            _live_written(live_key)
+            mode, compare = None, False
+        else:
+            mode = render_mode(event.customer_id)
+            compare = mode is not RenderMode.LEGACY
+            if not compare and not settings.session_trajectory_store:
+                return legacy, None, False
         try:
             # Pure-Python over the whole session: off the event loop, in the
             # process pool when large, like every other large CPU pass.
@@ -1097,7 +1136,7 @@ class ClaudeCodeConnector(Connector):
                 event_type=ev_type,
                 error=error,
             )
-        if not compare:
+        if not compare or mode is None:
             return legacy, built, False
         if render_error is not None:
             log.warning(
@@ -1146,11 +1185,31 @@ class ClaudeCodeConnector(Connector):
             )
 
     async def _store_trajectory(
-        self, event: WebhookEvent, session_id: str, built: BuildResult
+        self, event: WebhookEvent, session_id: str, built: BuildResult, *, ended: bool
     ) -> None:
-        """Write `trajectory.json` (engine/ingest/atif/store.py). Never raises."""
+        """Write `trajectory.json` (engine/ingest/atif/store.py). Never raises.
+
+        `extra.session_ended` tells a reader whether this is the final copy or a
+        live one that the session's next passes will replace."""
         started = datetime.now(UTC)
         key = trajectory_key(self.source_system.value, event.customer_id, session_id)
+        try:
+            if await is_session_deleted(event.customer_id, self.source_system.value, session_id):
+                # A pass that read the session before its deletion: write nothing.
+                # (A deletion landing after this check is the worker's late sweep's.)
+                log.info(
+                    "trajectory.skipped_deleted",
+                    customer=event.customer_id,
+                    source=self.source_system.value,
+                    session_id=session_id,
+                )
+                return
+        except Exception:
+            log.warning("trajectory.deleted_check_failed", exc_info=True)
+        document = {
+            **built.trajectory,
+            "extra": {**(built.trajectory.get("extra") or {}), "session_ended": ended},
+        }
         try:
             store = get_store()
             bucket = await store.bucket_for(event.customer_id)
@@ -1158,7 +1217,7 @@ class ClaudeCodeConnector(Connector):
                 store,
                 bucket,
                 key,
-                built.trajectory,
+                document,
                 max_bytes=get_settings().session_trajectory_max_bytes,
             )
         except TrajectoryTooLarge as exc:
@@ -1189,6 +1248,7 @@ class ClaudeCodeConnector(Connector):
             customer=event.customer_id,
             source=self.source_system.value,
             session_id=session_id,
+            ended=ended,
             bytes=size,
             steps=len(built.trajectory.get("steps") or []),
             unparsed=built.unparsed,

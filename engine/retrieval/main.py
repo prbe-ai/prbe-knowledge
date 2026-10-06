@@ -1208,8 +1208,9 @@ async def get_trajectory(
     Same tenancy as /source-view: the document is read under the caller's
     tenant, so another tenant's doc id is a 404, and only a live, approved
     agent-session document resolves. The trajectory is written when a session
-    ends and removed while it runs again, so a session with none answers 404
-    with `reason: not_built` and the reader falls back to /source-view text.
+    ends and refreshed while it runs (`extra.session_ended` says which); a
+    session with none yet answers 404 with `reason: not_built` and the reader
+    falls back to /source-view text.
     """
     step_limit = min(step_limit, _TRAJECTORY_MAX_STEPS)
     request.state.customer_id = customer_id
