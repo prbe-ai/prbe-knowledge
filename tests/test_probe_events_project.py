@@ -71,7 +71,7 @@ def test_an_old_event_keeps_only_what_probe_events_1_names() -> None:
                            "result_bytes": 9}
     assert text == {"type": "text", "text": "and here"}
     assert image == {"type": "image", "mimeType": "image/png", "bytes": 110}
-    assert unknown == {"type": "unknown_block", "block_type": "server_tool_use"}
+    assert unknown == {"type": "server_tool_use", "dropped": True}
 
 
 def test_a_tool_call_keeps_its_summary_and_stats_never_its_input() -> None:
@@ -114,8 +114,9 @@ def _batch(events: list[dict[str, Any]]) -> bytes:
 def test_a_stripped_batch_renders_exactly_as_before() -> None:
     body = _batch([OLD_CC_EVENT, {"type": "assistant", "message": {"role": "assistant",
                   "content": [{"type": "text", "text": "done"}], "stop_reason": "max_tokens"}}])
-    new, outcome, saved = strip_batch(body)
+    new, outcome, saved, dropped = strip_batch(body)
     assert outcome == "stripped" and saved > 0
+    assert "toolUseResult" in dropped and "message.content[].input" in dropped
     before = [e for e in json.loads(body)["payload"]["events"]]
     after = json.loads(new)["payload"]["events"]
     assert lines_from_events(after) == lines_from_events(before)
@@ -131,3 +132,26 @@ def test_current_uploads_are_already_clean(path: Path) -> None:
 def test_unreadable_and_empty_batches_are_left_alone() -> None:
     assert strip_batch(b"{not json")[:2] == (None, "unreadable")
     assert strip_batch(json.dumps({"payload": {"finalize": True}}).encode())[:2] == (None, "no_events")
+
+
+def test_a_named_key_with_a_value_the_schema_does_not_allow_is_dropped() -> None:
+    """Claude Code's own `origin` object (a peer message can carry another
+    session's text) is not probe-events/1's `origin: "user_shell"`."""
+    event = {"type": "user", "message": {"role": "user", "content": "hi"},
+             "origin": {"kind": "peer", "body": "ANOTHER-SESSION-TEXT"}}
+    out = project_event(event)
+    assert "origin" not in out and "ANOTHER-SESSION-TEXT" not in json.dumps(out)
+    assert project_event({**event, "origin": "user_shell"})["origin"] == "user_shell"
+    pi = {"type": "assistant", "_pi_extras": {"model": {"leaked": 1}, "provider": "anthropic"}}
+    assert project_event(pi)["_pi_extras"] == {"provider": "anthropic"}
+
+
+def test_projected_old_events_validate_against_the_schema() -> None:
+    import jsonschema
+
+    schema = json.loads((Path(__file__).parents[1] / "engine/ingest/probe_events/probe-events-1.schema.json").read_text())
+    validator = jsonschema.Draft202012Validator(schema)
+    for event in (OLD_CC_EVENT, {"type": "user", "origin": {"kind": "human"},
+                                 "message": {"role": "user", "content": "x"}}):
+        errors = list(validator.iter_errors(project_event(event)))
+        assert errors == [], [e.message for e in errors]

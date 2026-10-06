@@ -17,10 +17,14 @@ Safe by construction, checked per batch:
   * The receipt is not touched: it pins the hash of the client's original
     request (kb/session_receipts.py), never the stored representation, which
     the server already rewrites when it redacts.
-  * A session deleted, purged or closed while its batch was being rewritten has
-    the rewritten object removed again: the strip never resurrects a sweep.
+  * Nothing is rewritten for a tenant under legal hold or not active, nor for a
+    deleted session (engine/shared/legal_hold.purge_blocked_reason, checked per
+    tenant and again per batch). A session deleted or purged while its batch
+    was being rewritten has the rewritten object removed again: the strip
+    never resurrects a sweep.
 
-DRY RUN unless --write. Output is keys, counts and byte sizes, never content.
+DRY RUN unless --write. Output is keys, counts, byte sizes and the key paths
+dropped (a histogram per tenant), never content. Review it before --write.
 
     scripts/atif_sessions_job.sh is the runner (MODULE=scripts.strip_session_payloads):
     MODULE=scripts.strip_session_payloads scripts/atif_sessions_job.sh strip --customer probe
@@ -33,121 +37,161 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Any
 
 import orjson
 
-from engine.ingest.probe_events import project_event
+from engine.ingest.probe_events.project import dropped_paths, project_event
 from engine.shared import storage
 from engine.shared.constants import AGENT_SESSION_SOURCES
-from engine.shared.db import close_pool, init_pool, with_tenant
+from engine.shared.db import close_pool, get_pool, init_pool, with_tenant
 from engine.shared.exceptions import StorageNotFound
+from engine.shared.legal_hold import purge_blocked_reason
 from engine.shared.session_signals import is_cron_marker_key
 from engine.shared.session_suppression import deleted_sessions, session_of_event_id
-from engine.shared.tenant_status import refusal_for
 from engine.shared.transcript_render import lines_from_events
 from scripts.atif_sessions import _emit, _queue_row, _queue_rows, _tenants
 
+#: A tenant or session a background job must not rewrite (legal hold, not
+#: active, missing) is skipped; one whose data is GONE (deleted, purged) also
+#: has a copy we put back removed again.
+_GONE_STATUSES = ("missing", "status:deleted")
 
-def strip_batch(body: bytes) -> tuple[bytes | None, str, int]:
-    """(new body or None, outcome, bytes removed) for one stored batch."""
+
+def strip_batch(body: bytes) -> tuple[bytes | None, str, int, list[str]]:
+    """(new body or None, outcome, bytes removed, dropped key paths) for one batch."""
     try:
         envelope = orjson.loads(body)
     except orjson.JSONDecodeError:
-        return None, "unreadable", 0
+        return None, "unreadable", 0, []
     if not isinstance(envelope, dict):
-        return None, "unreadable", 0
+        return None, "unreadable", 0, []
     payload = envelope.get("payload", envelope)
     events = payload.get("events") if isinstance(payload, dict) else None
     if not isinstance(events, list) or not events:
-        return None, "no_events", 0
-    stripped = [
-        {**e, "raw": project_event(e["raw"])} if isinstance(e, dict) and "raw" in e else e
-        for e in events
-    ]
+        return None, "no_events", 0, []
+    stripped = []
+    dropped: list[str] = []
+    for e in events:
+        if isinstance(e, dict) and isinstance(e.get("raw"), dict):
+            raw = project_event(e["raw"])
+            dropped.extend(dropped_paths(e["raw"], raw))
+            stripped.append({**e, "raw": raw})
+        else:
+            stripped.append(e)
     if stripped == events:
-        return None, "clean", 0
+        return None, "clean", 0, []
     if lines_from_events(stripped) != lines_from_events(events):
-        return None, "lines_changed", 0
+        return None, "lines_changed", 0, dropped
     new_payload = {**payload, "events": stripped}
     new_envelope = {**envelope, "payload": new_payload} if "payload" in envelope else new_payload
     new_body = json.dumps(new_envelope, sort_keys=True, separators=(",", ":")).encode()
-    return new_body, "stripped", len(body) - len(new_body)
+    return new_body, "stripped", len(body) - len(new_body), dropped
 
 
-async def _closed(customer_id: str, source: str, session_id: str) -> bool:
-    """Deleted, purged (queue row gone) or tenant no longer active."""
-    if await refusal_for(customer_id) is not None:
-        return True
+async def _blocked(customer_id: str, source: str, session_id: str) -> str | None:
+    """Why this session must not be rewritten now (legal hold, tenant not
+    active or missing, session deleted, queue row gone), or None."""
+    async with get_pool().acquire() as conn:
+        reason = await purge_blocked_reason(conn, customer_id)
+    if reason is not None:
+        return reason
     if await _queue_row(customer_id, source, session_id) is None:
-        return True
+        return "purged"
     async with with_tenant(customer_id) as conn:
-        return bool(await deleted_sessions(conn, customer_id, source, [session_id]))
+        if await deleted_sessions(conn, customer_id, source, [session_id]):
+            return "deleted"
+    return None
 
 
 async def strip(args: argparse.Namespace) -> None:
     store = storage.get_store()
     counts: dict[str, int] = defaultdict(int)
+    paths: Counter[str] = Counter()
     removed = 0
-    sem = asyncio.Semaphore(args.concurrency)
 
     async def one_key(customer_id: str, bucket: str, row: dict[str, Any], key: str) -> None:
         nonlocal removed
         source, session_id = row["source_system"], row["source_event_id"]
         ident = {"customer": customer_id, "source": source, "session_id": session_id, "key": key}
-        async with sem:
-            try:
-                try:
-                    body = await store.get(bucket, key)
-                except StorageNotFound:
-                    counts["missing"] += 1
-                    return
-                new_body, outcome, saved = strip_batch(body)
-                counts[outcome] += 1
-                if outcome == "lines_changed":
-                    _emit({"kind": "batch", **ident, "lines_changed": True})
-                if new_body is None:
-                    return
-                removed += saved
-                if not args.write:
-                    return
-                if await _closed(customer_id, source, session_id):
-                    counts["closed"] += 1
-                    return
-                await store.put(bucket, key, new_body)
-                if await _closed(customer_id, source, session_id):
-                    # Its deletion or purge swept the folder while we wrote:
-                    # remove the copy we put back, as the sweep would have.
-                    await store.delete(bucket, key)
-                    counts["overtaken"] += 1
-                    _emit({"kind": "batch", **ident, "overtaken": True})
-                    return
+        try:
+            body = await store.get(bucket, key)
+        except StorageNotFound:
+            counts["missing"] += 1
+            return
+        new_body, outcome, saved, dropped = strip_batch(body)
+        counts[outcome] += 1
+        paths.update(dropped)
+        if outcome == "lines_changed":
+            _emit({"kind": "batch", **ident, "lines_changed": True})
+        if new_body is None:
+            return
+        removed += saved
+        if not args.write:
+            return
+        if (reason := await _blocked(customer_id, source, session_id)) is not None:
+            counts[f"skipped:{reason}"] += 1
+            return
+        put_ok = False
+        try:
+            await store.put(bucket, key, new_body)
+            put_ok = True
+        finally:
+            # Whatever the put did (a timed-out put may still have landed): if
+            # the session's data is gone now -- its deletion or purge swept while
+            # we wrote -- remove what we put back. A legal hold or a terminated
+            # tenant keeps the stripped copy: that state is reversible.
+            after = await _blocked(customer_id, source, session_id)
+            if after in ("deleted", "purged", *_GONE_STATUSES):
+                await store.delete(bucket, key)
+                counts["overtaken"] += 1
+                _emit({"kind": "batch", **ident, "overtaken": after})
+            elif put_ok:
                 counts["written"] += 1
+
+    async def drain(customer_id: str, bucket: str, work: asyncio.Queue) -> None:
+        while True:
+            item = await work.get()
+            if item is None:
+                return
+            row, key = item
+            try:
+                await one_key(customer_id, bucket, row, key)
             except Exception as exc:
                 counts[f"error:{type(exc).__name__}"] += 1
-                _emit({"kind": "batch", **ident, "error": type(exc).__name__})
+                _emit({"kind": "batch", "customer": customer_id, "key": key,
+                       "error": type(exc).__name__})
 
     for customer_id in await _tenants(args.customer, args.all_tenants):
-        if (refusal := await refusal_for(customer_id)) is not None:
-            _emit({"kind": "tenant", "customer": customer_id, "skipped": refusal["status"]})
+        async with get_pool().acquire() as conn:
+            reason = await purge_blocked_reason(conn, customer_id)
+        if reason is not None:
+            _emit({"kind": "tenant", "customer": customer_id, "skipped": reason})
             continue
         bucket = await store.bucket_for(customer_id)
-        before = dict(counts)
-        rows = [
-            r for r in await _queue_rows(customer_id, args.sources)
-            if session_of_event_id(r["source_event_id"]) == r["source_event_id"]
-        ]
-        await asyncio.gather(*(
-            one_key(customer_id, bucket, row, key)
-            for row in rows
-            for key in dict.fromkeys(k for k in (row["payload_s3_keys"] or []) if k)
-            if not is_cron_marker_key(key)
-        ))
-        _emit({"kind": "tenant", "customer": customer_id, "sessions": len(rows),
-               **{k: counts[k] - before.get(k, 0) for k in counts if counts[k] - before.get(k, 0)}})
+        before, before_removed, before_paths = dict(counts), removed, Counter(paths)
+        all_rows = await _queue_rows(customer_id, args.sources)
+        rows = [r for r in all_rows if session_of_event_id(r["source_event_id"]) == r["source_event_id"]]
+        work: asyncio.Queue = asyncio.Queue(maxsize=args.concurrency * 4)
+        workers = [asyncio.create_task(drain(customer_id, bucket, work)) for _ in range(args.concurrency)]
+        for row in rows:
+            for key in dict.fromkeys(k for k in (row["payload_s3_keys"] or []) if k):
+                if not is_cron_marker_key(key):
+                    await work.put((row, key))
+        for _ in workers:
+            await work.put(None)
+        await asyncio.gather(*workers)
+        tenant_paths = paths - before_paths
+        _emit({
+            "kind": "tenant", "customer": customer_id, "sessions": len(rows),
+            "legacy_event_rows": len(all_rows) - len(rows),
+            "bytes_removed": removed - before_removed,
+            "dropped_paths": dict(tenant_paths.most_common(40)),
+            **{k: counts[k] - before.get(k, 0) for k in counts if counts[k] - before.get(k, 0)},
+        })
     _emit({"kind": "summary", "write": args.write, "bytes_removed": removed,
-           **dict(sorted(counts.items()))})
+           "dropped_paths": dict(paths.most_common(60)), **dict(sorted(counts.items()))})
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:

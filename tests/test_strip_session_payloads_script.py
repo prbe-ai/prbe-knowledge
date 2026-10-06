@@ -9,6 +9,7 @@ from typing import Any
 import orjson
 import pytest
 
+import tests.test_session_deletion as deletion_suite
 from engine.shared.transcript_render import lines_from_events
 from scripts import strip_session_payloads as strip_mod
 from tests.test_session_deletion import (  # the deletion suite's real-pipeline sessions
@@ -20,6 +21,7 @@ from tests.test_session_deletion import (  # the deletion suite's real-pipeline 
     _v2_batches,
     env,  # noqa: F401  # pytest fixture, used by name
     sr,
+    v1_session,
 )
 
 LEAK = "TOOL-OUTPUT-9b2c"
@@ -111,5 +113,81 @@ async def test_a_deleted_session_is_never_rewritten(env, capsys) -> None:  # noq
             a, CC.value, sid,
         )
     summary = (await _run(capsys, ["strip", "--customer", a, "--write"]))[-1]
-    assert summary.get("closed", 0) >= 1 and "written" not in summary
+    assert summary.get("skipped:deleted", 0) >= 1 and "written" not in summary
     assert await _stored(store, a) == before
+
+
+@pytest.mark.asyncio
+async def test_a_tenant_under_legal_hold_is_never_rewritten(env, capsys) -> None:  # noqa: F811
+    (a, _b), store = env
+    await old_tap_session(a, _sid())
+    before = await _stored(store, a)
+    from engine.shared import db as db_module
+
+    async with db_module.raw_conn() as conn:
+        await conn.execute(
+            "UPDATE customers SET metadata = coalesce(metadata, '{}'::jsonb) "
+            "|| '{\"legal_hold\": \"litigation\"}'::jsonb WHERE customer_id = $1", a)
+    try:
+        records = await _run(capsys, ["strip", "--customer", a, "--write"])
+    finally:
+        async with db_module.raw_conn() as conn:
+            await conn.execute(
+                "UPDATE customers SET metadata = metadata - 'legal_hold' WHERE customer_id = $1", a)
+    assert any(r.get("skipped") == "legal_hold" for r in records if r["kind"] == "tenant")
+    assert "written" not in records[-1]
+    assert await _stored(store, a) == before
+
+
+@pytest.mark.asyncio
+async def test_a_deletion_landing_during_the_write_gets_its_copy_removed(
+    env, capsys, monkeypatch  # noqa: F811
+) -> None:
+    (a, _b), store = env
+    sid = _sid()
+    await old_tap_session(a, sid)
+    from engine.shared import db as db_module
+
+    real_put = store.put
+
+    async def put_then_delete(bucket: str, key: str, body: bytes, *args: Any, **kw: Any) -> None:
+        await real_put(bucket, key, body, *args, **kw)
+        async with db_module.with_tenant(a) as conn:
+            await conn.execute(
+                "INSERT INTO session_deletions "
+                "(customer_id, source_system, session_id, deletion_id, reason, status) "
+                "VALUES ($1, $2, $3, gen_random_uuid(), 'test', 'done') ON CONFLICT DO NOTHING",
+                a, CC.value, sid,
+            )
+
+    before = await _stored(store, a)
+    monkeypatch.setattr(store, "put", put_then_delete)
+    summary = (await _run(capsys, ["strip", "--customer", a, "--write"]))[-1]
+    overtaken = summary.get("overtaken", 0)
+    assert overtaken >= 1 and "written" not in summary, summary
+    after = await _stored(store, a)
+    # Batches written as the deletion landed (several can be in flight) are
+    # removed again; the rest are left exactly as they were for its sweep.
+    assert len(after) == len(before) - overtaken
+    assert all(after[k] == before[k] for k in after)
+
+
+@pytest.mark.asyncio
+async def test_a_protocol_1_session_is_stripped_too(env, capsys, monkeypatch) -> None:  # noqa: F811
+    (a, _b), store = env
+    real_event = deletion_suite._event
+
+    def leaky(i: int, text: str) -> dict:
+        event = real_event(i, text)
+        event["raw"]["toolUseResult"] = {"stdout": LEAK}
+        return event
+
+    monkeypatch.setattr(deletion_suite, "_event", leaky)
+    keys = await v1_session(a, _sid())
+    bucket = await store.bucket_for(a)
+    before = {k: await store.get(bucket, k) for k in keys}
+    assert any(LEAK.encode() in b for b in before.values())
+    summary = (await _run(capsys, ["strip", "--customer", a, "--write"]))[-1]
+    assert summary.get("written", 0) >= 1, summary
+    after = {k: await store.get(bucket, k) for k in keys}
+    assert not any(LEAK.encode() in b for b in after.values())
