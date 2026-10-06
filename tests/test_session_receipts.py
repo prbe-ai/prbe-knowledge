@@ -1,7 +1,8 @@
 """Protocol transaction/race tests on a dedicated, local Postgres database.
 
-Set PRBE_RECEIPT_TEST_DATABASE_URL to an isolated database named
-session_receipts_test. This fixture never truncates a shared engine database.
+Set PRBE_RECEIPT_TEST_DATABASE_URL to an isolated local database whose name
+ends in `receipts_test` (CI: session_receipts_test). This fixture drops its
+schema, so it never runs against a shared engine database.
 """
 
 from __future__ import annotations
@@ -56,7 +57,7 @@ async def database(monkeypatch):
     from urllib.parse import urlsplit
 
     parsed = urlsplit(dsn)
-    assert parsed.hostname in {"localhost", "127.0.0.1"} and parsed.path == "/session_receipts_test"
+    assert parsed.hostname in {"localhost", "127.0.0.1"} and parsed.path.endswith("receipts_test")
     admin = await asyncpg.connect(dsn)
     await admin.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public")
     await admin.execute("""
@@ -761,3 +762,381 @@ async def test_copied_history_projects_native_provenance_and_uploader_without_au
         # author. The uploader still reads the document, by being in the tenant.
         assert doc.acl.principals[0].principal_type == PrincipalType.WORKSPACE
         assert doc.acl.principals[0].principal_id == "tenant-a"
+
+
+# ---- protocol 3: ATIF fragments ---------------------------------------------
+# A batch carries one fragment per event ordinal instead of the events. These
+# pin the door: what is advertised, what is accepted, how a stream is pinned
+# and what the kill switch does to an open stream.
+
+
+def fragments_batch(*, with_events: bool = False, **changes):
+    body = batch(protocol_version=3, fragment_version=1)
+    if not with_events:
+        del body["events"]
+    body["fragments"] = [
+        {sr.FRAGMENT_ORDINAL: i, "source": "user", "message": f"turn {i}"} for i in range(2)
+    ]
+    body.update(changes)
+    return body
+
+
+@pytest.fixture
+def protocol3(monkeypatch):
+    """Point the door at these settings; returns the setter."""
+    from engine.shared.config import Settings
+
+    def configure(**values):
+        settings = Settings(**values)
+        monkeypatch.setattr(sr, "get_settings", lambda: settings)
+        return settings
+
+    configure(session_protocol3_customers="tenant-a")
+    return configure
+
+
+def test_a_protocol_2_receipt_digest_is_unchanged_by_the_protocol_3_fields():
+    """Every protocol-2 client holds receipts digested before `fragments` and
+    `fragment_version` joined the canonical fields. Pinned from main (e1632b2)."""
+    body = batch(
+        session_id="5b0c8a3e-4f1d-4c2a-9e7b-1d2f3a4b5c6d",
+        stream_id="0f9e8d7c-6b5a-4938-8271-605f4e3d2c1b",
+        device_id="device",
+    )
+    assert hashlib.sha256(sr.canonical_payload(body)).hexdigest() == (
+        "e28b506f1db4c619a0963503edad51927e8f15f3137ae268d3604ac3691e6e1f"
+    )
+
+
+def test_the_receipt_digest_covers_fragments_and_their_version():
+    import copy
+
+    body = fragments_batch()
+    digest = hashlib.sha256(sr.canonical_payload(body)).hexdigest()
+    changed = copy.deepcopy(body)
+    changed["fragments"][1]["message"] = "altered"
+    assert hashlib.sha256(sr.canonical_payload(changed)).hexdigest() != digest
+    other_version = dict(body, fragment_version=2)
+    assert hashlib.sha256(sr.canonical_payload(other_version)).hexdigest() != digest
+
+
+@pytest.mark.parametrize(
+    ("values", "customer", "expected"),
+    [
+        ({}, "tenant-a", {"protocols": [2], "fragment_versions": [1], "events": True}),
+        (
+            {"session_protocol3_customers": "tenant-z, tenant-a"},
+            "tenant-a",
+            {"protocols": [2, 3], "fragment_versions": [1], "events": True},
+        ),
+        (
+            {"session_protocol3_customers": "tenant-z"},
+            "tenant-a",
+            {"protocols": [2], "fragment_versions": [1], "events": True},
+        ),
+        (
+            {"session_protocol3_all": True, "session_protocol3_events": False},
+            "tenant-a",
+            {"protocols": [2, 3], "fragment_versions": [1], "events": False},
+        ),
+        (
+            # A typo drops its entry; it never takes the receipts read down.
+            {"session_protocol3_all": True, "session_fragment_versions": "2, 1,x,\u00b2,"},
+            "tenant-a",
+            {"protocols": [2, 3], "fragment_versions": [1, 2], "events": True},
+        ),
+    ],
+)
+def test_accepts_advertises_protocol_3_only_to_enabled_customers(values, customer, expected):
+    from engine.shared.config import Settings
+
+    assert sr.accepts(customer, Settings(**values)) == expected
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {},
+        {"with_events": True},
+        # A cursor-only batch: no event, so nothing to carry.
+        {"event_end": 0, "fragments": [], "fragment_version": 1},
+    ],
+)
+def test_valid_protocol_3_envelopes_pass(changes):
+    sr.validate_payload(fragments_batch(**changes))
+
+
+@pytest.mark.parametrize(
+    ("changes", "reason"),
+    [
+        ({"fragments": [{"n": 0}, {"n": 2}]}, "fragment ordinals are not contiguous"),
+        ({"fragments": [{"n": 1}, {"n": 0}]}, "fragment ordinals are not contiguous"),
+        ({"fragments": [{"n": 0}]}, "fragment coverage does not match payload"),
+        ({"event_end": 3}, "fragment coverage does not match payload"),
+        ({"fragments": None}, "fragment coverage does not match payload"),
+        ({"fragments": [{"n": 0}, "turn 1"]}, "not an object with an integer ordinal"),
+        ({"fragments": [{"n": 0}, {"n": "1"}]}, "not an object with an integer ordinal"),
+        ({"fragments": [{"n": False}, {"n": True}]}, "not an object with an integer ordinal"),
+        ({"fragment_version": 99}, "unsupported fragment version"),
+        ({"fragment_version": "1"}, "unsupported fragment version"),
+        ({"fragment_version": True}, "unsupported fragment version"),
+        ({"protocol_version": 3.0}, "unsupported codec"),
+        ({"protocol_version": 4}, "unsupported codec"),
+        (
+            {"events": [{"line_no": 0}, {"line_no": 2}]},
+            "retained-event ordinals are not contiguous",
+        ),
+        ({"events": [{"line_no": 0}]}, "event coverage does not match payload"),
+        ({"events": []}, "event coverage does not match payload"),
+    ],
+)
+def test_invalid_protocol_3_envelopes_never_reach_storage(changes, reason):
+    with pytest.raises(HTTPException) as error:
+        sr.validate_payload(fragments_batch(**changes))
+    assert error.value.status_code == 422 and reason in error.value.detail
+
+
+def test_fragments_without_a_version_are_refused():
+    body = fragments_batch()
+    del body["fragment_version"]
+    with pytest.raises(HTTPException) as error:
+        sr.validate_payload(body)
+    assert error.value.status_code == 422 and "no fragment_version" in error.value.detail
+
+
+def test_a_protocol_3_finalize_carries_no_fragments_or_events():
+    final = fragments_batch(
+        finalize=True, batch_seq=1, source_byte_start=30, source_line_start=3, event_start=2
+    )
+    with pytest.raises(HTTPException) as error:
+        sr.validate_payload(dict(final, event_end=2))
+    assert "fragment coverage" in error.value.detail
+    with pytest.raises(HTTPException) as error:
+        sr.validate_payload(dict(final, event_end=2, fragments=[], events=[{"line_no": 2}]))
+    assert "event coverage" in error.value.detail
+    del final["fragments"]
+    sr.validate_payload(dict(final, event_end=2))
+
+
+def test_the_fragment_versions_accepted_follow_the_setting(protocol3):
+    protocol3(session_fragment_versions="2")
+    with pytest.raises(HTTPException) as error:
+        sr.validate_payload(fragments_batch())
+    assert "unsupported fragment version" in error.value.detail
+    sr.validate_payload(fragments_batch(fragment_version=2))
+
+
+@pytest.mark.asyncio
+async def test_a_protocol_3_stream_is_pinned_receipted_and_stores_its_fragments(
+    database, protocol3
+):
+    import json
+
+    _tenant, admin = database
+    store = Store()
+    body = fragments_batch(with_events=True)
+    digest = hashlib.sha256(sr.canonical_payload(body)).hexdigest()
+    accepted = await sr.accept(body, "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    assert accepted["status"] == "accepted" and accepted["protocol_version"] == 3
+    assert accepted["receipt"]["body_sha256"] == digest
+    assert await admin.fetchval("SELECT protocol_version FROM session_streams") == 3
+    stored = json.loads(next(iter(store.blobs.values())))["payload"]
+    assert stored["fragments"] == body["fragments"] and stored["fragment_version"] == 1
+    assert stored["events"] == body["events"]
+    # Same key layout as protocol 2: the completer and deletion find it by key.
+    assert "/sessions-v2/" in next(iter(store.blobs))[1]
+
+    repeat = await sr.accept(body, "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    assert repeat == {**accepted, "status": "duplicate"} and store.writes == 1
+
+    end = {k: v for k, v in body.items() if k not in ("fragments", "events", "cwd")}
+    end.update(finalize=True, batch_seq=1, source_byte_start=30, source_line_start=3, event_start=2)
+    finalized = await sr.accept(end, "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    assert finalized["protocol_version"] == 3 and finalized["receipt"]["finalized"] is True
+
+    read = await sr.receipts("claude_code", body["session_id"], "tenant-a", -1, 200)
+    assert read["state"] == "ready" and read["protocol_version"] == 3
+    assert read["accepts"]["protocols"] == [2, 3]
+    assert [r["body_sha256"] for r in read["receipts"]] == [
+        digest,
+        finalized["receipt"]["body_sha256"],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_receipts_read_advertises_accepts_in_every_state(database, protocol3):
+    _tenant, admin = database
+    store = Store()
+    v2 = batch()
+    await sr.accept(v2, "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    legacy, deleted, absent = (str(uuid4()) for _ in range(3))
+    await admin.execute(
+        "INSERT INTO documents VALUES('tenant-a',$1)", f"claude_code:tenant-a:{legacy}"
+    )
+    await admin.execute(
+        "INSERT INTO session_deletions(customer_id,source_system,session_id,deletion_id,reason) "
+        "VALUES('tenant-a','claude_code',$1,$2,'request')",
+        deleted,
+        uuid4(),
+    )
+    states = {}
+    for customer in ("tenant-a", "tenant-b"):
+        for sid in (v2["session_id"], legacy, deleted, absent):
+            read = await sr.receipts("claude_code", sid, customer, -1, 200)
+            states[customer, read["state"]] = read
+    expected = {"tenant-a": [2, 3], "tenant-b": [2]}
+    assert {state for _customer, state in states} == {"ready", "legacy", "deleted", "absent"}
+    for (customer, state), read in states.items():
+        # Old taps refuse any other protocol_version, so only `ready` names the pin.
+        assert read["protocol_version"] == 2, state
+        assert read["accepts"] == {
+            "protocols": expected[customer],
+            "fragment_versions": [1],
+            "events": True,
+        }
+
+
+@pytest.mark.asyncio
+async def test_a_new_protocol_3_stream_needs_the_customer_enabled(database, protocol3):
+    _tenant, admin = database
+    store = Store()
+    with pytest.raises(HTTPException) as error:
+        await sr.accept(fragments_batch(), "tenant-b", SourceSystem.CLAUDE_CODE, store)
+    assert error.value.status_code == 409 and error.value.detail == "protocol 3 not enabled"
+    assert store.writes == 0
+    assert await admin.fetchval("SELECT count(*) FROM session_streams") == 0
+    protocol3(session_protocol3_all=True)
+    assert (await sr.accept(fragments_batch(), "tenant-b", SourceSystem.CLAUDE_CODE, store))[
+        "protocol_version"
+    ] == 3
+
+
+def _next(body, **changes):
+    """The batch after `body` in the same stream, carrying one more event."""
+    following = dict(
+        body,
+        batch_seq=body["batch_seq"] + 1,
+        source_byte_start=body["source_byte_end"],
+        source_byte_end=body["source_byte_end"] + 10,
+        source_line_start=body["source_line_end"],
+        source_line_end=body["source_line_end"] + 1,
+        event_start=body["event_end"],
+        event_end=body["event_end"] + 1,
+        prefix_sha256="c" * 64,
+    )
+    following.pop("events", None)
+    following.pop("fragments", None)
+    following.update(changes)
+    return following
+
+
+@pytest.mark.asyncio
+async def test_a_batch_on_the_other_protocol_than_its_stream_is_refused(database, protocol3):
+    _tenant, admin = database
+    store = Store()
+    v2 = batch()
+    v3 = fragments_batch()
+    await sr.accept(v2, "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    await sr.accept(v3, "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    onto_v2 = _next(
+        v2, protocol_version=3, fragment_version=1, fragments=[{sr.FRAGMENT_ORDINAL: 2}]
+    )
+    onto_v3 = _next(v3, protocol_version=2, events=[{"line_no": 2, "raw": {"type": "user"}}])
+    for wrong in (onto_v2, onto_v3):
+        with pytest.raises(HTTPException) as error:
+            await sr.accept(wrong, "tenant-a", SourceSystem.CLAUDE_CODE, store)
+        assert error.value.status_code == 409 and error.value.detail == "protocol mismatch"
+    assert store.writes == 2
+    assert await admin.fetchval("SELECT count(*) FROM session_batch_receipts") == 2
+
+
+@pytest.mark.asyncio
+async def test_an_open_protocol_3_stream_outlives_the_kill_switch(database, protocol3):
+    """Withdrawing protocol 3 stops NEW protocol-3 sessions only: a running one
+    holds batches it can never re-send as protocol 2."""
+    _tenant, admin = database
+    store = Store()
+    first = fragments_batch()
+    await sr.accept(first, "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    protocol3(session_protocol3_customers="")
+    later = _next(first, fragments=[{sr.FRAGMENT_ORDINAL: 2, "message": "still running"}])
+    accepted = await sr.accept(later, "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    assert accepted["status"] == "accepted" and accepted["protocol_version"] == 3
+    read = await sr.receipts("claude_code", first["session_id"], "tenant-a", -1, 200)
+    assert read["protocol_version"] == 3 and read["accepts"]["protocols"] == [2]
+    with pytest.raises(HTTPException) as error:
+        await sr.accept(fragments_batch(), "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    assert error.value.detail == "protocol 3 not enabled"
+    assert await admin.fetchval("SELECT event_end FROM session_streams") == 3
+
+
+@pytest.mark.asyncio
+async def test_credentials_inside_fragments_are_redacted_before_storage(
+    database, protocol3, tmp_path
+):
+    _tenant, admin = database
+    secret = "ghp_" + hashlib.sha256(b"synthetic fragment secret").hexdigest()[:36]
+    body = fragments_batch()
+    body["fragments"][0]["message"] = "copied " + secret
+    body["fragments"][1]["tool_calls"] = [
+        {"arguments": {"command": f"export GITHUB_TOKEN={secret}", "env": {"password": "Harbor7!"}}}
+    ]
+    digest = hashlib.sha256(sr.canonical_payload(body)).hexdigest()
+    store = filesystem_store(tmp_path)
+    accepted = await sr.accept(body, "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    # The receipt names the request the client sent; only the stored copy changes.
+    assert accepted["receipt"]["body_sha256"] == digest
+    key = await admin.fetchval("SELECT payload_s3_key FROM ingestion_queue")
+    data = await store.get("tenant-a", key)
+    assert secret.encode() not in data and b"Harbor7!" not in data
+    assert b"copied " in data and b"turn 1" in data
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", [2, 3])
+async def test_the_webhook_sends_protocol_2_and_3_batches_to_the_receipt_door(
+    monkeypatch, protocol
+):
+    """A protocol-3 batch that missed the receipt door would be stored as a
+    protocol-1 batch of a brand-new session."""
+    import httpx
+    from httpx import ASGITransport
+
+    from engine.shared.config import get_settings
+    from kb import ingestion_app
+
+    key = "test-internal-key-32bytes-padding-padding"
+    monkeypatch.setenv("INTERNAL_KNOWLEDGE_API_KEY", key)
+    get_settings.cache_clear()
+    seen = []
+
+    async def door(payload, customer, source, store):
+        seen.append((payload["protocol_version"], customer, source))
+        return {"status": "accepted", "protocol_version": payload["protocol_version"]}
+
+    async def switch_on():
+        return type("Switch", (), {"enabled": True, "reason": None})()
+
+    async def active(customer):
+        return None
+
+    monkeypatch.setattr(sr, "accept", door)
+    monkeypatch.setattr(ingestion_app, "get_ingestion_killswitch", switch_on)
+    monkeypatch.setattr(ingestion_app, "refusal_for", active)
+    monkeypatch.setattr(ingestion_app.app.state, "ctx", make_default_context(), raising=False)
+    monkeypatch.setattr(ingestion_app.app.state, "store", Store(), raising=False)
+    body = fragments_batch(with_events=True) if protocol == 3 else batch()
+    try:
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=ingestion_app.app), base_url="http://t"
+        ) as client:
+            response = await client.post(
+                "/webhooks/claude_code",
+                json=body,
+                headers={"x-internal-knowledge-key": key, "x-prbe-customer": "tenant-a"},
+            )
+    finally:
+        get_settings.cache_clear()
+    assert response.status_code == 200, response.text
+    assert response.json()["protocol_version"] == protocol
+    assert seen == [(protocol, "tenant-a", SourceSystem.CLAUDE_CODE)]

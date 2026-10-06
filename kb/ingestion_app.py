@@ -83,6 +83,7 @@ from kb.github_control_routes import router as github_control_router
 from kb.internal_devices import router as devices_router
 from kb.purge_routes import router as purge_router
 from kb.session_deletion import router as session_deletion_router
+from kb.session_receipts import SESSION_PROTOCOLS
 from kb.session_receipts import router as session_receipts_router
 from kb.slack_lifecycle import handle_slack_lifecycle_event
 from kb.stats_routes import router as stats_router
@@ -575,7 +576,14 @@ async def webhook(
             lifecycle["trace_id"] = trace_id
             return JSONResponse(lifecycle)
 
-    if source_enum in _COALESCING_AGENT_SOURCES and isinstance(payload, dict) and payload.get("protocol_version") == 2:
+    # Protocol 2 and 3 batches go to the receipt door; anything else is a
+    # protocol-1 batch. A protocol-3 batch let through here would be stored as
+    # a legacy batch of a brand-new session.
+    if (
+        source_enum in _COALESCING_AGENT_SOURCES
+        and isinstance(payload, dict)
+        and payload.get("protocol_version") in SESSION_PROTOCOLS
+    ):
         from kb.session_receipts import accept
 
         return JSONResponse(await accept(payload, customer_id, source_enum, request.app.state.store))

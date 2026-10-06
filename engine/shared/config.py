@@ -190,6 +190,24 @@ class Settings(BaseSettings):
     #: write pays a full credential scrub; past this a running session has no
     #: live copy until it ends. p95 trajectory measured 326 KB.
     session_trajectory_live_max_bytes: int = Field(default=2_000_000)
+    #: Session upload protocol 3: a capture client sends each event as an ATIF
+    #: fragment and the engine folds them into the trajectory
+    #: (kb/session_receipts.py). The receipts response advertises it, so these
+    #: decide which clients START a protocol-3 session. Withdrawing it stops
+    #: new protocol-3 sessions only: an open one keeps being accepted.
+    #: Comma-separated customer ids (the canary); off for everyone by default.
+    session_protocol3_customers: str = Field(default="")
+    #: Advertise protocol 3 to every customer (the flip).
+    session_protocol3_all: bool = Field(default=False)
+    #: Ask a protocol-3 client to send the sanitized events beside the
+    #: fragments, so a wrong client fragment can be refolded from them.
+    session_protocol3_events: bool = Field(default=True)
+    #: Compare the fragment fold with the reference builder on completing
+    #: passes and log whether they agree.
+    session_fragment_shadow: bool = Field(default=True)
+    #: Comma-separated fragment versions this engine's fold reads. A protocol-3
+    #: batch of any other version is refused with a 422.
+    session_fragment_versions: str = Field(default="1")
     #: Reuse a segment's extraction when the same session re-ends with that
     #: segment unchanged (engine/shared/extraction_cache.py). Off = no cache
     #: read or write; every segment is mined, as before.
