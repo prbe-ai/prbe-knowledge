@@ -170,6 +170,10 @@ class Settings(BaseSettings):
     #: a session past this is skipped with a log line and its readers fall back
     #: to its text.
     session_trajectory_max_bytes: int = Field(default=8_000_000)
+    #: Off switch for building and writing `trajectory.json` (the render modes'
+    #: comparison still builds in `shadow` and `atif`). Off, a completing pass
+    #: removes the stored one instead, so a reader never gets a stale copy.
+    session_trajectory_store: bool = Field(default=True)
     #: Reuse a segment's extraction when the same session re-ends with that
     #: segment unchanged (engine/shared/extraction_cache.py). Off = no cache
     #: read or write; every segment is mined, as before.

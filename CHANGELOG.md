@@ -104,7 +104,8 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   the event loop and writes it to `raw/<source>/<customer>/<session>/trajectory.json`, which session
   deletion, the late sweep and the tenant purge already own: free text scrubbed line by line as the
   index is, the rest as uploaded payloads, both off the event loop; past
-  `SESSION_TRAJECTORY_MAX_BYTES` (8 MB) it is skipped. A resumed session, or one whose newer
+  `SESSION_TRAJECTORY_MAX_BYTES` (8 MB) it is skipped, and `SESSION_TRAJECTORY_STORE=false` turns
+  building and writing it off. A resumed session, or one whose newer
   trajectory cannot be written, has its old one removed. New `GET /trajectory/{doc_id}` serves it
   paged by step (and by a 1 MB page budget) under the caller's tenant, logged as a source read; 404
   `reason: not_built` when there is none. The indexed text does not change: the renderer and the

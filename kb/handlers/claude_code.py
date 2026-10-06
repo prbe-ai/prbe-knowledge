@@ -566,7 +566,7 @@ class ClaudeCodeConnector(Connector):
             completed_by=hydrated.get("completed_by"),
             now=now,
         )
-        if complete and built is not None:
+        if complete and built is not None and get_settings().session_trajectory_store:
             await self._store_trajectory(event, session_id, built)
         elif complete or hydrated.get("ended_before"):
             # A completing pass that built nothing, or a session that ended and
@@ -1061,6 +1061,8 @@ class ClaudeCodeConnector(Connector):
             return legacy, None, False
         mode = render_mode(event.customer_id)
         compare = mode is not RenderMode.LEGACY
+        if not compare and not get_settings().session_trajectory_store:
+            return legacy, None, False
         try:
             # Pure-Python over the whole session: off the event loop, in the
             # process pool when large, like every other large CPU pass.

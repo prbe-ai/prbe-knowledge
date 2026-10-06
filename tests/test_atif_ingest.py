@@ -414,3 +414,15 @@ async def test_unparsed_events_are_logged_by_the_pass(
         await _normalize(complete=True)
     [entry] = [e for e in logs if e["event"] == "atif.event_unparsed"]
     assert (entry["session_id"], entry["line_no"], entry["error"]) == ("s-1", 2, "KeyError")
+
+
+@pytest.mark.parametrize("mode", ["legacy", "shadow"])
+async def test_the_off_switch_writes_nothing_and_removes_the_old_trajectory(
+    monkeypatch: pytest.MonkeyPatch, store: FakeStore, mined: list, builds: list, mode: str
+) -> None:
+    store.objects[("bucket-cust-1", KEY)] = b'{"old": true}'
+    _use_mode(monkeypatch, mode, trajectory_store=False)
+    result = await _normalize(complete=True)
+    assert result.documents[0].body == EXPECTED_BODY
+    assert store.objects == {} and store.deleted == [KEY]
+    assert len(builds) == (0 if mode == "legacy" else 1), "legacy skips the build entirely"
