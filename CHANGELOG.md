@@ -123,6 +123,7 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   sessions and removes an object a deletion overtook). Both print ids, counts and timings only.
 
 ### Fixed
+- **A command the researcher typed is its own trajectory step.** A probe-events/1 event with `origin: user_shell` (pi's `!` command, Kimi Code's shell mode; tap 0.9.11) became part of the model's step around it. It is now a separate agent step marked `extra.origin: user_shell`. Indexed text is unchanged.
 
 - **A large live session no longer stalls every other ingest on its worker.** Re-planning a
   5.5 MB session (21.5k events, re-run on every append) took ~50 s, of which ~26 s was the
