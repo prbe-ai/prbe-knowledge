@@ -47,6 +47,7 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   runs in the storage lane.
 
 ### Added
+- **A running session has a live trajectory.** While a session runs, a live pass refreshes its `trajectory.json` at most once per `SESSION_TRAJECTORY_LIVE_INTERVAL_S` (default 60 s) per worker process; the completing pass still writes the final copy, and `extra.session_ended` says which (a copy without it is a final one written before this). A live copy is capped at `SESSION_TRAJECTORY_LIVE_MAX_BYTES` (2 MB) and also written once for each reply that ends its turn (Claude Code, pi and Codex; Kimi has no turn-end marker and waits for the interval). A resumed session's final copy is replaced by a live one instead of removed. Live passes still index the events' text in every mode and never run the comparison. A pass that read a session before its deletion writes no trajectory. `0` restores the old behaviour.
 
 - **Kimi Code is a session source (`kimi_code`), beside Claude Code, Codex and pi.**
   `SourceSystem.KIMI_CODE` ("Kimi Code") and `KimiCodeConnector`, a subclass of

@@ -205,6 +205,10 @@ def _embed_requests(texts: int) -> int:
     return math.ceil(texts / GeminiEmbedder._SUBBATCH_GROUP_SIZE)
 
 
+
+async def _no_trajectory_write(*_args: object, **_kwargs: object) -> None:
+    return None
+
 async def _tenants(customers: list[str] | None, all_tenants: bool) -> list[str]:
     if not all_tenants:
         return list(dict.fromkeys(customers or []))
@@ -284,6 +288,11 @@ async def _render(
     # pass mines it, and mining is a paid LLM call this repair must not make.
     hydrated["session_complete"] = False
     hydrated["completed_by"] = None
+    hydrated["ended_before"] = False
+    # A repair re-renders text only: it must never write or remove a session's
+    # trajectory.json (the live pass it imitates would mark a final copy live).
+    connector._store_trajectory = _no_trajectory_write  # type: ignore[method-assign]
+    connector._discard_trajectory = _no_trajectory_write  # type: ignore[method-assign]
     result = await connector.normalize(event, hydrated)
     if (
         result.extraction_outcome is not None

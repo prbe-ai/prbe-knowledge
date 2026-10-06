@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import time
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any, ClassVar
@@ -70,6 +72,7 @@ from engine.shared.models import (
     WebhookParseResult,
     make_named_entity,
 )
+from engine.shared.session_suppression import is_session_deleted
 from engine.shared.storage import get_store
 
 # Re-exported: the renderer moved to engine.shared so the unit extractor can
@@ -92,6 +95,80 @@ from engine.shared.transcript_render import (  # noqa: F401
 # is enough to drain a typical session in ~1.5s while keeping in-flight
 # envelopes bounded to a few MB.
 log = get_logger(__name__)
+
+#: (customer, source, session) -> when this process last wrote that session's
+#: live trajectory (time.monotonic). Bounded; an evicted session just gets its
+#: next live write sooner. Per process: with N workers a session can be written
+#: up to N times per interval, and after a resume a final copy written by
+#: another worker can stand for up to one interval before this one replaces it.
+_LIVE_WRITES: OrderedDict[tuple[str, str, str], float] = OrderedDict()
+_LIVE_WRITES_MAX = 10_000
+
+
+def _live_write_due(key: tuple[str, str, str], interval_s: int) -> bool:
+    last = _LIVE_WRITES.get(key)
+    return last is None or time.monotonic() - last >= interval_s
+
+
+def _live_written(key: tuple[str, str, str]) -> None:
+    _remember(_LIVE_WRITES, key)
+
+
+def _remember(
+    table: OrderedDict[tuple[str, str, str], Any], key: tuple[str, str, str], value: Any = None
+) -> None:
+    table[key] = time.monotonic() if value is None else value
+    table.move_to_end(key)
+    while len(table) > _LIVE_WRITES_MAX:
+        table.popitem(last=False)
+
+
+#: Running sessions whose live copy is over SESSION_TRAJECTORY_LIVE_MAX_BYTES:
+#: no live builds until their completing pass. Same bound as _LIVE_WRITES.
+_LIVE_TOO_LARGE: OrderedDict[tuple[str, str, str], float] = OrderedDict()
+
+#: Stop reasons that end the model's turn (Claude Code / Anthropic, pi).
+_TURN_ENDS = frozenset({"end_turn", "stop", "stop_sequence"})
+#: (customer, source, session) -> line_no of the turn-ending reply last written live.
+_LIVE_TURNS: OrderedDict[tuple[str, str, str], int] = OrderedDict()
+
+
+def _turn_end_line(events: list[dict[str, Any]]) -> int | None:
+    """line_no of the newest reply when it ends its turn, else None. Looks past
+    trailing bookkeeping (queue operations, system notes) to the newest
+    user/assistant event."""
+    for event in reversed(events):
+        raw = (event or {}).get("raw")
+        if not isinstance(raw, dict) or raw.get("type") not in ("user", "assistant"):
+            continue
+        if raw.get("type") != "assistant":
+            return None
+        message = raw.get("message") if isinstance(raw.get("message"), dict) else {}
+        pi = raw.get("_pi_extras") if isinstance(raw.get("_pi_extras"), dict) else {}
+        codex = raw.get("_codex_extras") if isinstance(raw.get("_codex_extras"), dict) else {}
+        ended = (
+            message.get("stop_reason") in _TURN_ENDS
+            or pi.get("stop_reason") in _TURN_ENDS
+            or codex.get("phase") == "final_answer"
+        )
+        line = event.get("line_no")
+        return line if ended and isinstance(line, int) else None
+    return None
+
+
+def _turn_bypass_due(key: tuple[str, str, str], events: list[dict[str, Any]]) -> bool:
+    """A turn-ending reply the live copy does not have yet. Once per reply: a
+    turn ends only when the model waits for the researcher, so this is paced by
+    their prompts, never by the throttle."""
+    line = _turn_end_line(events)
+    return line is not None and _LIVE_TURNS.get(key) != line
+
+
+def _turn_written(key: tuple[str, str, str], events: list[dict[str, Any]]) -> None:
+    line = _turn_end_line(events)
+    if line is not None:
+        _remember(_LIVE_TURNS, key, line)
+
 
 _FETCH_SUPP_R2_CONCURRENCY = 16
 
@@ -174,8 +251,11 @@ def _late_deliveries_after_client_finalize(
     are small for that reason.
     """
     fin = max(
-        (i for i, (signal, _, _) in enumerate(trail)
-         if signal == _signals.CompletedBy.V1_CLIENT_FINALIZE),
+        (
+            i
+            for i, (signal, _, _) in enumerate(trail)
+            if signal == _signals.CompletedBy.V1_CLIENT_FINALIZE
+        ),
         default=None,
     )
     if fin is None or fin == len(trail) - 1:
@@ -183,12 +263,19 @@ def _late_deliveries_after_client_finalize(
     said_goodbye = _when(trail[fin][1])
     if said_goodbye is None:
         return False
-    for signal, arrived, events in trail[fin + 1:]:
+    for signal, arrived, events in trail[fin + 1 :]:
         if signal is not None or not events:
             return False
         written = [
-            w for e in events
-            if (w := _when((e.get("raw") or {}).get("timestamp") if isinstance(e.get("raw"), dict) else None))
+            w
+            for e in events
+            if (
+                w := _when(
+                    (e.get("raw") or {}).get("timestamp")
+                    if isinstance(e.get("raw"), dict)
+                    else None
+                )
+            )
         ]
         if written:
             if max(written) > said_goodbye + _CLIENT_CLOCK_SKEW:
@@ -566,12 +653,22 @@ class ClaudeCodeConnector(Connector):
             completed_by=hydrated.get("completed_by"),
             now=now,
         )
-        if complete and built is not None and get_settings().session_trajectory_store:
-            await self._store_trajectory(event, session_id, built)
-        elif complete or hydrated.get("ended_before"):
-            # A completing pass that built nothing, or a session that ended and
-            # then resumed: whatever trajectory.json holds no longer describes
-            # this session, and a reader must get "not built" instead of it.
+        settings = get_settings()
+        if built is not None and settings.session_trajectory_store:
+            await self._store_trajectory(event, session_id, built, ended=complete)
+        elif complete or (
+            hydrated.get("ended_before")
+            and (
+                not (
+                    settings.session_trajectory_store
+                    and settings.session_trajectory_live_interval_s > 0
+                )
+                or (event.customer_id, self.source_system.value, session_id) in _LIVE_TOO_LARGE
+            )
+        ):
+            # A completing pass that built nothing, or (with no live copies) a
+            # session that ended and then resumed: whatever trajectory.json holds
+            # no longer describes this session; a reader gets "not built".
             await self._discard_trajectory(event, session_id, why="stale")
 
         documents: list[Document] = [session_doc]
@@ -911,7 +1008,8 @@ class ClaudeCodeConnector(Connector):
                 now,
                 authoritative=bundle.authoritative,
                 reason=(
-                    OUTCOME_OK if bundle.authoritative
+                    OUTCOME_OK
+                    if bundle.authoritative
                     else ",".join(sorted(set(bundle.problems))) or "partial"
                 ),
                 units=len(documents) - 1,
@@ -1048,21 +1146,45 @@ class ClaudeCodeConnector(Connector):
         """The Lines this pass indexes and mines, the trajectory if built, and
         whether the Lines are the trajectory's.
 
-        Legacy Lines are always computed: they are the reference. Only a
-        completing pass builds the trajectory (to store it) and, in `shadow` and
-        `atif`, compares its Lines with the reference; a live pass does exactly
-        what it did before this module existed. The trajectory's Lines are served
+        Legacy Lines are always computed: they are the reference. A completing
+        pass builds the trajectory (to store it) and, in `shadow` and `atif`,
+        compares its Lines with the reference. A live pass serves the reference
+        whatever the mode, and builds only to refresh the stored live copy, at
+        most once per `session_trajectory_live_interval_s` per process. The trajectory's Lines are served
         only in `atif`, only when equal and with nothing unparsed -- so whatever
         the mode, the index, the evidence spans and the extraction cache see the
         same text.
         """
         legacy = lines_from_events(events)
+        settings = get_settings()
+        live_key = (event.customer_id, self.source_system.value, session_id)
         if not complete:
-            return legacy, None, False
-        mode = render_mode(event.customer_id)
-        compare = mode is not RenderMode.LEGACY
-        if not compare and not get_settings().session_trajectory_store:
-            return legacy, None, False
+            # A live pass serves the events' Lines whatever the mode. It builds
+            # only to refresh the stored live trajectory: at most once per
+            # interval per process, and once for each reply that ends a turn,
+            # so a pause never hides the latest answer.
+            if not (
+                settings.session_trajectory_store
+                and settings.session_trajectory_live_interval_s > 0
+                and live_key not in _LIVE_TOO_LARGE
+                and (
+                    _live_write_due(live_key, settings.session_trajectory_live_interval_s)
+                    or _turn_bypass_due(live_key, events)
+                )
+            ):
+                return legacy, None, False
+            _live_written(live_key)
+            _turn_written(live_key, events)
+            mode, compare = None, False
+        else:
+            # The final copy replaces any live one; a resume starts afresh.
+            _LIVE_WRITES.pop(live_key, None)
+            _LIVE_TOO_LARGE.pop(live_key, None)
+            _LIVE_TURNS.pop(live_key, None)
+            mode = render_mode(event.customer_id)
+            compare = mode is not RenderMode.LEGACY
+            if not compare and not settings.session_trajectory_store:
+                return legacy, None, False
         try:
             # Pure-Python over the whole session: off the event loop, in the
             # process pool when large, like every other large CPU pass.
@@ -1075,18 +1197,43 @@ class ClaudeCodeConnector(Connector):
                 size=sum(len(line.text) for line in legacy),
             )
         except CpuPoolUnavailable:
+            if not complete:
+                # Optional work: keep the previous live copy, retry next pass.
+                _LIVE_WRITES.pop(live_key, None)
+                log.info(
+                    "trajectory.live_skipped_pool",
+                    customer=event.customer_id,
+                    source=self.source_system.value,
+                    session_id=session_id,
+                )
+                return legacy, None, False
             # The pool's transient failure: the row retries, as the body scrub's
             # does, rather than leave an ended session without its trajectory.
             raise
-        except Exception:
-            log.warning(
+        except Exception as exc:
+            # A live build repeats every interval: one quiet line; the
+            # completing pass logs the traceback.
+            (log.warning if complete else log.info)(
                 "atif.build_failed",
                 customer=event.customer_id,
                 source=self.source_system.value,
                 session_id=session_id,
-                exc_info=True,
+                live=not complete,
+                error=type(exc).__name__,
+                exc_info=complete,
             )
             return legacy, None, False
+        if not complete:
+            # One line per live build, not one per event: live builds repeat.
+            if built.unparsed:
+                log.info(
+                    "atif.live_unparsed",
+                    customer=event.customer_id,
+                    source=self.source_system.value,
+                    session_id=session_id,
+                    unparsed=built.unparsed,
+                )
+            return legacy, built, False
         for line_no, ev_type, error in built.unparsed_events:
             log.warning(
                 "atif.event_unparsed",
@@ -1097,7 +1244,7 @@ class ClaudeCodeConnector(Connector):
                 event_type=ev_type,
                 error=error,
             )
-        if not compare:
+        if not compare or mode is None:
             return legacy, built, False
         if render_error is not None:
             log.warning(
@@ -1146,11 +1293,37 @@ class ClaudeCodeConnector(Connector):
             )
 
     async def _store_trajectory(
-        self, event: WebhookEvent, session_id: str, built: BuildResult
+        self, event: WebhookEvent, session_id: str, built: BuildResult, *, ended: bool
     ) -> None:
-        """Write `trajectory.json` (engine/ingest/atif/store.py). Never raises."""
+        """Write `trajectory.json` (engine/ingest/atif/store.py). Never raises.
+
+        `extra.session_ended` tells a reader whether this is the final copy or a
+        live one that the session's next passes will replace."""
         started = datetime.now(UTC)
         key = trajectory_key(self.source_system.value, event.customer_id, session_id)
+        try:
+            if await is_session_deleted(event.customer_id, self.source_system.value, session_id):
+                # A pass that read the session before its deletion: write nothing.
+                # (A deletion landing after this check is the worker's late sweep's.)
+                log.info(
+                    "trajectory.skipped_deleted",
+                    customer=event.customer_id,
+                    source=self.source_system.value,
+                    session_id=session_id,
+                )
+                return
+        except Exception:
+            log.warning(
+                "trajectory.deleted_check_failed",
+                customer=event.customer_id,
+                source=self.source_system.value,
+                session_id=session_id,
+                exc_info=True,
+            )
+        document = {
+            **built.trajectory,
+            "extra": {**(built.trajectory.get("extra") or {}), "session_ended": ended},
+        }
         try:
             store = get_store()
             bucket = await store.bucket_for(event.customer_id)
@@ -1158,8 +1331,12 @@ class ClaudeCodeConnector(Connector):
                 store,
                 bucket,
                 key,
-                built.trajectory,
-                max_bytes=get_settings().session_trajectory_max_bytes,
+                document,
+                max_bytes=(
+                    get_settings().session_trajectory_max_bytes
+                    if ended
+                    else get_settings().session_trajectory_live_max_bytes
+                ),
             )
         except TrajectoryTooLarge as exc:
             log.info(
@@ -1167,28 +1344,46 @@ class ClaudeCodeConnector(Connector):
                 customer=event.customer_id,
                 source=self.source_system.value,
                 session_id=session_id,
+                ended=ended,
                 bytes=exc.size,
                 limit=exc.limit,
             )
+            if not ended:
+                # No more live builds for it until it ends (each would scrub megabytes).
+                _remember(
+                    _LIVE_TOO_LARGE, (event.customer_id, self.source_system.value, session_id)
+                )
             await self._discard_trajectory(event, session_id, why="too_large")
             return
         except CpuPoolUnavailable:
-            raise
+            if ended:
+                raise
+            _LIVE_WRITES.pop((event.customer_id, self.source_system.value, session_id), None)
+            log.info(
+                "trajectory.live_skipped_pool",
+                customer=event.customer_id,
+                source=self.source_system.value,
+                session_id=session_id,
+            )
+            return
         except Exception as exc:
             log.warning(
                 "trajectory.store_failed",
                 customer=event.customer_id,
                 source=self.source_system.value,
                 session_id=session_id,
+                ended=ended,
                 error=type(exc).__name__,
             )
-            await self._discard_trajectory(event, session_id, why="store_failed")
+            if ended:
+                await self._discard_trajectory(event, session_id, why="store_failed")
             return
         log.info(
             "trajectory.stored",
             customer=event.customer_id,
             source=self.source_system.value,
             session_id=session_id,
+            ended=ended,
             bytes=size,
             steps=len(built.trajectory.get("steps") or []),
             unparsed=built.unparsed,

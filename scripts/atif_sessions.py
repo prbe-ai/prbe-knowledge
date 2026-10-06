@@ -488,8 +488,8 @@ async def backfill(args: argparse.Namespace) -> None:
                     return
                 session_id = event_id
                 if not hydrated.get("session_complete"):
-                    # As the live path: a running session has no trajectory; its
-                    # completing pass writes one.
+                    # A running session's copy is the worker's (live, then final):
+                    # the backfill writes only final copies of ended sessions.
                     counts["not_ended"] += 1
                     return
                 events = list(hydrated.get("events") or [])
@@ -503,8 +503,11 @@ async def backfill(args: argparse.Namespace) -> None:
                     _emit({"kind": "session", **ident, "would_write": True,
                            "steps": len(built.trajectory["steps"]), "unparsed": built.unparsed})
                     return
+                # Only ended sessions are backfilled: this is the final copy.
+                final = {**built.trajectory,
+                         "extra": {**(built.trajectory.get("extra") or {}), "session_ended": True}}
                 size, invalid = await write_trajectory(
-                    store, bucket, key, built.trajectory,
+                    store, bucket, key, final,
                     max_bytes=args.max_bytes or _settings().session_trajectory_max_bytes,
                 )
                 # Anything that overtook the write -- a new batch or end marker

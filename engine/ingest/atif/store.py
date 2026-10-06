@@ -6,8 +6,10 @@ session's objects already removes that folder's own keys
 (engine/shared/session_suppression.is_own_folder_key): session deletion, the
 worker's late sweep of a session deleted mid-pass, and the tenant purge.
 
-WHEN: on a COMPLETING pass only, and deleted again when the session resumes or a
-later completing pass cannot replace it, so a reader never gets an old one.
+WHEN: on every completing pass (the final copy), and while the session runs on a
+live pass at most once per SESSION_TRAJECTORY_LIVE_INTERVAL_S per worker process
+(a live copy; `extra.session_ended` says which). Deleted when a later pass cannot
+replace it, so a reader never gets an old one.
 Writing it is not free: it goes through the credential scrub (0.4-2.5 s per MB
 measured), off the event loop as every large scrub is.
 

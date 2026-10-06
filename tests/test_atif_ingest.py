@@ -3,7 +3,8 @@
 What must hold, whatever the tenant's render mode:
   * the indexed text is exactly what the event renderer produced before this
     module existed (pinned below as a literal);
-  * only a completing pass builds a trajectory; it writes `trajectory.json`,
+  * a completing pass writes the final `trajectory.json` and a live pass a
+    throttled live copy (`extra.session_ended` says which); either is written
     without the engine's render provenance, scrubbed the way the index is, in
     the session's own folder (so deletion owns it);
   * a session that resumes, or whose newer trajectory cannot be written, has
@@ -139,6 +140,15 @@ def builds(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Any, ...]]:
     return seen
 
 
+@pytest.fixture(autouse=True)
+def _fresh_live_throttle() -> Any:
+    for table in (cc_mod._LIVE_WRITES, cc_mod._LIVE_TOO_LARGE, cc_mod._LIVE_TURNS):
+        table.clear()
+    yield
+    for table in (cc_mod._LIVE_WRITES, cc_mod._LIVE_TOO_LARGE, cc_mod._LIVE_TURNS):
+        table.clear()
+
+
 def _use_mode(monkeypatch: pytest.MonkeyPatch, mode: str = "legacy", **kw: Any) -> None:
     settings = _settings(render_default=mode, **kw)
     monkeypatch.setattr(cc_mod, "render_mode", lambda customer: render_mode(customer, settings))
@@ -194,12 +204,39 @@ async def test_indexed_text_is_main_s_text_in_every_mode(
 
 
 @pytest.mark.parametrize("mode", ["legacy", "shadow", "atif"])
-async def test_a_live_pass_builds_and_stores_nothing_in_any_mode(
+async def test_with_live_copies_off_a_live_pass_builds_and_stores_nothing(
     monkeypatch: pytest.MonkeyPatch, store: FakeStore, builds: list, mode: str
 ) -> None:
-    _use_mode(monkeypatch, mode)
+    _use_mode(monkeypatch, mode, trajectory_live_interval_s=0)
     await _normalize(complete=False)
     assert builds == [] and store.objects == {} and store.deleted == []
+
+
+@pytest.mark.parametrize("mode", ["legacy", "shadow", "atif"])
+async def test_a_live_pass_keeps_a_live_copy_and_serves_the_events_text(
+    monkeypatch: pytest.MonkeyPatch, store: FakeStore, mined: list, builds: list, mode: str
+) -> None:
+    _use_mode(monkeypatch, mode)
+    with capture_logs() as logs:
+        result = await _normalize(complete=False)
+    assert result.documents[0].body == EXPECTED_BODY
+    assert not any(e["event"] == "session_render.compared" for e in logs), "only at the end"
+    stored = orjson.loads(store.objects[("bucket-cust-1", KEY)])
+    assert stored["extra"] == {"session_ended": False}
+    assert len(builds) == 1
+
+
+async def test_live_copies_are_throttled_per_session_and_the_final_one_never_is(
+    monkeypatch: pytest.MonkeyPatch, store: FakeStore, mined: list, builds: list
+) -> None:
+    _use_mode(monkeypatch, trajectory_live_interval_s=3600)
+    await _normalize(complete=False)
+    await _normalize(complete=False)
+    assert len(builds) == 1, "the second live pass inside the interval builds nothing"
+    await _normalize(complete=True)
+    assert len(builds) == 2
+    stored = orjson.loads(store.objects[("bucket-cust-1", KEY)])
+    assert stored["extra"] == {"session_ended": True}
 
 
 async def test_atif_mode_serves_the_trajectory_lines_when_they_match(
@@ -290,7 +327,7 @@ async def test_a_completing_pass_stores_a_scrubbed_trajectory_in_the_session_fol
     stored = orjson.loads(store.objects[(bucket, key)])
     assert SECRET not in orjson.dumps(stored).decode()
     assert stored["agent"]["name"] == "codex"
-    assert "extra" not in stored, "render provenance is engine-internal"
+    assert stored["extra"] == {"session_ended": True}, "render provenance is engine-internal"
     assert all("probe_parts" not in (s.get("extra") or {}) for s in stored["steps"])
     assert [s["source"] for s in stored["steps"]] == ["user", "agent", "agent"]
     # Scrubbed the way the index is: the finding costs its line, never the field.
@@ -341,13 +378,23 @@ async def test_a_failed_build_never_fails_the_pass_and_removes_the_old_trajector
     assert store.objects == {} and store.deleted == [KEY]
 
 
-async def test_a_resumed_session_s_old_trajectory_is_removed(
+async def test_with_live_copies_off_a_resumed_session_s_old_trajectory_is_removed(
     monkeypatch: pytest.MonkeyPatch, store: FakeStore, builds: list
+) -> None:
+    store.objects[("bucket-cust-1", KEY)] = b'{"old": true}'
+    _use_mode(monkeypatch, trajectory_live_interval_s=0)
+    await _normalize(complete=False, ended_before=True)
+    assert builds == [] and store.objects == {} and store.deleted == [KEY]
+
+
+async def test_a_resumed_session_s_final_copy_is_replaced_by_a_live_one(
+    monkeypatch: pytest.MonkeyPatch, store: FakeStore, mined: list, builds: list
 ) -> None:
     store.objects[("bucket-cust-1", KEY)] = b'{"old": true}'
     _use_mode(monkeypatch)
     await _normalize(complete=False, ended_before=True)
-    assert builds == [] and store.objects == {} and store.deleted == [KEY]
+    stored = orjson.loads(store.objects[("bucket-cust-1", KEY)])
+    assert stored["extra"] == {"session_ended": False} and len(builds) == 1
 
 
 async def test_an_invalid_trajectory_is_written_with_its_error() -> None:
@@ -426,3 +473,128 @@ async def test_the_off_switch_writes_nothing_and_removes_the_old_trajectory(
     assert result.documents[0].body == EXPECTED_BODY
     assert store.objects == {} and store.deleted == [KEY]
     assert len(builds) == (0 if mode == "legacy" else 1), "legacy skips the build entirely"
+
+
+async def _normalize_events(events: list[dict[str, Any]], complete: bool, **hydrated: Any) -> Any:
+    c = ClaudeCodeConnector(make_default_context())
+    return await c.normalize(_event(), {"session_id": "s-1", "events": events,
+                                        "session_complete": complete, "cwd": "/p", **hydrated})
+
+
+async def test_a_reply_that_ends_its_turn_is_written_live_inside_the_interval(
+    monkeypatch: pytest.MonkeyPatch, store: FakeStore, mined: list, builds: list
+) -> None:
+    _use_mode(monkeypatch, trajectory_live_interval_s=3600)
+    await _normalize(complete=False)
+    ended_turn = [*EVENTS[:3], {"line_no": 3, "raw": {"type": "assistant", "message": {
+        "content": [{"type": "text", "text": "it failed"}], "stop_reason": "end_turn"}}},
+        {"line_no": 4, "raw": {"type": "queue-operation", "content": "x"}}]
+    # A NEW turn-ending reply is written at once, even behind trailing
+    # bookkeeping; the same reply again is not.
+    await _normalize_events(ended_turn, complete=False)
+    assert len(builds) == 2, "the newest answer is not held back by the throttle"
+    await _normalize_events([*ended_turn, {"line_no": 5, "raw": {"type": "system"}}], complete=False)
+    assert len(builds) == 2, "the same reply is not rewritten"
+
+
+async def test_a_turn_end_the_interval_write_already_has_is_not_rebuilt(
+    monkeypatch: pytest.MonkeyPatch, store: FakeStore, mined: list, builds: list
+) -> None:
+    _use_mode(monkeypatch, trajectory_live_interval_s=3600)
+    ended_turn = [*EVENTS[:3], {"line_no": 3, "raw": {"type": "assistant", "message": {
+        "content": [{"type": "text", "text": "done"}], "stop_reason": "end_turn"}}}]
+    await _normalize_events(ended_turn, complete=False)
+    await _normalize_events([*ended_turn, {"line_no": 4, "raw": {"type": "system"}}], complete=False)
+    assert len(builds) == 1
+
+
+async def test_a_completing_pass_resets_the_throttle_so_a_resume_is_live_at_once(
+    monkeypatch: pytest.MonkeyPatch, store: FakeStore, mined: list, builds: list
+) -> None:
+    _use_mode(monkeypatch, trajectory_live_interval_s=3600)
+    await _normalize(complete=False)
+    await _normalize(complete=True)
+    await _normalize(complete=False, ended_before=True)
+    stored = orjson.loads(store.objects[("bucket-cust-1", KEY)])
+    assert stored["extra"] == {"session_ended": False} and len(builds) == 3
+
+
+async def test_a_deleted_session_gets_no_trajectory(
+    monkeypatch: pytest.MonkeyPatch, store: FakeStore, mined: list
+) -> None:
+    async def deleted(*_a: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(cc_mod, "is_session_deleted", deleted)
+    _use_mode(monkeypatch)
+    await _normalize(complete=True)
+    await _normalize(complete=False)
+    assert store.objects == {}
+
+
+async def test_a_pool_outage_on_a_live_pass_keeps_the_previous_copy(
+    monkeypatch: pytest.MonkeyPatch, store: FakeStore, mined: list
+) -> None:
+    from engine.shared.exceptions import CpuPoolUnavailable
+
+    async def down(*_a: Any, **_k: Any) -> Any:
+        raise CpuPoolUnavailable("pool restarting")
+
+    store.objects[("bucket-cust-1", KEY)] = b'{"previous": true}'
+    monkeypatch.setattr(cc_mod.cpu_pool, "run_cpu", down)
+    _use_mode(monkeypatch)
+    result = await _normalize(complete=False)
+    assert result.documents[0].body == EXPECTED_BODY
+    assert store.objects[("bucket-cust-1", KEY)] == b'{"previous": true}' and store.deleted == []
+    assert cc_mod._LIVE_WRITES == {}, "the next pass retries"
+
+
+async def test_a_failed_live_write_keeps_the_previous_copy(
+    monkeypatch: pytest.MonkeyPatch, mined: list
+) -> None:
+    fake = FakeStore(fail_put=True)
+    fake.objects[("bucket-cust-1", KEY)] = b'{"previous": true}'
+    monkeypatch.setattr(cc_mod, "get_store", lambda: fake)
+    _use_mode(monkeypatch)
+    await _normalize(complete=False)
+    assert fake.deleted == [] and fake.objects[("bucket-cust-1", KEY)] == b'{"previous": true}'
+
+
+async def test_a_live_copy_past_its_cap_is_dropped_and_not_rebuilt_until_the_end(
+    monkeypatch: pytest.MonkeyPatch, store: FakeStore, mined: list, builds: list
+) -> None:
+    store.objects[("bucket-cust-1", KEY)] = b'{"previous": true}'
+    _use_mode(monkeypatch, trajectory_live_max_bytes=10, trajectory_live_interval_s=1)
+    await _normalize(complete=False)
+    assert store.objects == {} and store.deleted == [KEY]
+    cc_mod._LIVE_WRITES.clear()
+    await _normalize(complete=False)
+    assert len(builds) == 1, "remembered as too large: no rebuild every interval"
+    await _normalize(complete=True)
+    assert orjson.loads(store.objects[("bucket-cust-1", KEY)])["extra"] == {"session_ended": True}
+
+
+async def test_a_resume_known_too_large_removes_the_old_final_copy(
+    monkeypatch: pytest.MonkeyPatch, store: FakeStore, mined: list, builds: list
+) -> None:
+    """Another process found the live copy too large; this one sees the resume
+    after the old final copy was put back: the stale final copy goes, as it
+    did before live copies existed."""
+    store.objects[("bucket-cust-1", KEY)] = b'{"final": true}'
+    _use_mode(monkeypatch)
+    cc_mod._LIVE_TOO_LARGE[("cust-1", "claude_code", "s-1")] = 0.0
+    await _normalize(complete=False, ended_before=True)
+    assert builds == [] and store.deleted == [KEY]
+
+
+@pytest.mark.parametrize(("raw", "ends"), [
+    ({"type": "assistant", "message": {"stop_reason": "end_turn"}}, True),
+    ({"type": "assistant", "message": {"stop_reason": "tool_use"}}, False),
+    ({"type": "assistant", "_pi_extras": {"stop_reason": "stop"}}, True),
+    ({"type": "assistant", "_codex_extras": {"phase": "final_answer"}}, True),
+    ({"type": "assistant", "_codex_extras": {"phase": "commentary"}}, False),
+    ({"type": "user", "message": {"content": "next"}}, False),
+])
+def test_which_replies_end_a_turn(raw: dict[str, Any], ends: bool) -> None:
+    events = [{"line_no": 7, "raw": raw}, {"line_no": 8, "raw": {"type": "system"}}]
+    assert cc_mod._turn_end_line(events) == (7 if ends else None)
