@@ -114,6 +114,14 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   whether a completing pass compares the trajectory's Lines with the events' (`shadow`) or serves
   them when equal (`atif`); a mismatch or an unparsed event always serves the events' text.
 
+- **`scripts/atif_sessions.py replay|backfill`, run as a Job by `scripts/atif_sessions_job.sh`.**
+  `replay` (read-only) re-renders a stratified sample of stored sessions both ways and reports
+  whether Lines, text, evidence spans and extraction segment inputs match, with timings and
+  trajectory sizes, and replays the longest sessions batch by batch as live ingestion did: the
+  gate before any tenant's `SESSION_RENDER` is `atif`. `backfill` writes `trajectory.json` for
+  sessions that ended before the engine wrote it (dry run unless `--write`; skips deleted
+  sessions and removes an object a deletion overtook). Both print ids, counts and timings only.
+
 ### Fixed
 
 - **A large live session no longer stalls every other ingest on its worker.** Re-planning a
