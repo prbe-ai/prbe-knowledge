@@ -96,3 +96,109 @@ async def test_backfill_is_a_dry_run_until_told_and_skips_deleted(env, capsys) -
 
     again = (await _run(capsys, ["backfill", "--customer", a, "--write"]))[-1]
     assert again["already_present"] == 1, "a second run rewrites nothing"
+
+
+@pytest.mark.asyncio
+async def test_replay_fails_the_gate_when_the_trajectory_lines_differ(
+    env, capsys, monkeypatch
+) -> None:
+    (a, _b), _store = env
+    await v2_session(a, _sid())
+    real = atif_sessions.lines_from_trajectory
+
+    def one_line_off(trajectory):
+        lines = real(trajectory)
+        return [lines[0].__class__(line_no=lines[0].line_no, text="USER: something else"),
+                *lines[1:]]
+
+    monkeypatch.setattr(atif_sessions, "lines_from_trajectory", one_line_off)
+    records = await _run(capsys, ["replay", "--customer", a, "--sample", "5", "--batchwise", "0"])
+    [session] = [r for r in records if r["kind"] == "session"]
+    assert (session["same"], session["diff_kind"]) == (False, "text")
+    assert records[-1]["gate_passed"] is False
+
+
+@pytest.mark.asyncio
+async def test_replay_counts_a_builder_crash_against_the_gate(env, capsys, monkeypatch) -> None:  # noqa: F811
+    (a, _b), _store = env
+    await v2_session(a, _sid())
+
+    def crash(*_a, **_k):
+        raise TypeError("a shape the builder never saw")
+
+    monkeypatch.setattr(atif_sessions, "build_trajectory", crash)
+    summary = (await _run(capsys, ["replay", "--customer", a, "--sample", "5",
+                                   "--batchwise", "0"]))[-1]
+    assert summary["build_errors"] == 1 and summary["build_error_kinds"] == ["TypeError"]
+    assert summary["gate_passed"] is False
+
+
+def test_every_stratum_is_sampled_even_when_the_sample_is_small() -> None:
+    rows = [{"customer_id": f"t{i % 22}", "source_system": "claude_code", "source_event_id": str(i)}
+            for i in range(400)]
+    picked = atif_sessions._sample(rows, 10, seed=1)
+    assert {r["customer_id"] for r in picked} == {f"t{i}" for i in range(22)}
+
+
+async def _done(customer: str) -> None:
+    from engine.shared import db as db_module
+
+    async with db_module.with_tenant(customer) as conn:
+        await conn.execute("UPDATE ingestion_queue SET status = 'done' WHERE customer_id = $1",
+                           customer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("overtaker", ["new_batch", "deletion"])
+async def test_backfill_removes_a_write_something_overtook(
+    env, capsys, monkeypatch, overtaker
+) -> None:
+    (a, _b), store = env
+    sid = _sid()
+    await v2_session(a, sid)
+    bucket = await store.bucket_for(a)
+    key = trajectory_key(CC.value, a, sid)
+    await store.delete(bucket, key)
+    await _done(a)
+    real_write = atif_sessions.write_trajectory
+
+    async def write_then_overtake(*args, **kwargs):
+        result = await real_write(*args, **kwargs)
+        from engine.shared import db as db_module
+
+        async with db_module.with_tenant(a) as conn:
+            if overtaker == "new_batch":  # what the ingestion door does on a new batch
+                await conn.execute(
+                    "UPDATE ingestion_queue SET version = version + 1 WHERE customer_id = $1", a
+                )
+            else:
+                await conn.execute(
+                    "INSERT INTO session_deletions "
+                    "(customer_id, source_system, session_id, deletion_id, reason, status) "
+                    "VALUES ($1, $2, $3, gen_random_uuid(), 'test', 'done')",
+                    a, CC.value, sid,
+                )
+        return result
+
+    monkeypatch.setattr(atif_sessions, "write_trajectory", write_then_overtake)
+    summary = (await _run(capsys, ["backfill", "--customer", a, "--write"]))[-1]
+    assert summary.get("overtaken") == 1 and "written" not in summary, summary
+    assert await read_trajectory(store, bucket, key) is None
+
+
+@pytest.mark.asyncio
+async def test_backfill_leaves_a_row_the_worker_is_about_to_run(env, capsys) -> None:  # noqa: F811
+    (a, _b), store = env
+    sid = _sid()
+    await v2_session(a, sid)
+    bucket = await store.bucket_for(a)
+    await store.delete(bucket, trajectory_key(CC.value, a, sid))
+    from engine.shared import db as db_module
+
+    async with db_module.with_tenant(a) as conn:
+        await conn.execute(
+            "UPDATE ingestion_queue SET status = 'pending' WHERE customer_id = $1", a
+        )
+    summary = (await _run(capsys, ["backfill", "--customer", a, "--write"]))[-1]
+    assert "written" not in summary and summary.get("would_write") is None, summary
+    assert await read_trajectory(store, bucket, trajectory_key(CC.value, a, sid)) is None
