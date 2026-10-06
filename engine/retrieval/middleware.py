@@ -64,6 +64,7 @@ _LOGGED_PREFIXES: tuple[str, ...] = (
     "/query",
     "/sources",
     "/source-view",
+    "/trajectory",
 )
 _SKIPPED_PREFIXES: tuple[str, ...] = ("/health", "/usage")
 

@@ -88,6 +88,9 @@ dev = [
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# Vendored verbatim from Harbor (engine/ingest/atif/models/VENDORED.md); kept
+# byte-close to upstream so a refresh is a diff of their changes, not ours.
+extend-exclude = ["engine/ingest/atif/models"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]

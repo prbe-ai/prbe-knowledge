@@ -28,6 +28,10 @@ from typing import Any, ClassVar
 
 import orjson
 
+from engine.ingest import cpu_pool
+from engine.ingest.atif.build import BuildResult, build_and_render
+from engine.ingest.atif.mode import RenderMode, render_mode
+from engine.ingest.atif.store import TrajectoryTooLarge, trajectory_key, write_trajectory
 from engine.ingest.handlers.base import Connector
 from engine.ingest.handlers.registry import register_connector
 from engine.shared import claude_code_extraction as _ext
@@ -46,7 +50,11 @@ from engine.shared.constants import (
     agent_session_canonical_id,
     agent_session_display_name,
 )
-from engine.shared.exceptions import InvalidWebhookPayload, NotSupportedByConnector
+from engine.shared.exceptions import (
+    CpuPoolUnavailable,
+    InvalidWebhookPayload,
+    NotSupportedByConnector,
+)
 from engine.shared.logging import get_logger
 from engine.shared.models import (
     ACLPrincipal,
@@ -68,11 +76,14 @@ from engine.shared.storage import get_store
 # use it too (it needs the same prose, not raw event JSON). Import site kept
 # stable for the connector and its tests.
 from engine.shared.transcript_render import (  # noqa: F401
+    Line,
     _events_to_text,
     _render_assistant,
     _render_event,
     _render_tool_use,
     _render_user,
+    lines_from_events,
+    render_lines,
 )
 
 # Cap on simultaneous R2 GETs per fetch_supplementary call. With WORKER
@@ -403,6 +414,7 @@ class ClaudeCodeConnector(Connector):
 
         last_v2_batch = -1
         last_v2_finalized = False
+        v2_finalized_seqs: list[int] = []
         # What the NEWEST key on the row says, in arrival order. Set on every
         # key, so after the loop it describes the last one only.
         last_signal: _signals.CompletedBy | None = None
@@ -431,6 +443,8 @@ class ClaudeCodeConnector(Connector):
                 envelope.get("received_at") if isinstance(envelope, dict) else None,
                 [e for e in payload.get("events") or [] if isinstance(e, dict)],
             )
+            if payload.get("protocol_version") == 2 and payload.get("finalize") is True:
+                v2_finalized_seqs.append(payload.get("batch_seq", -1))
             if (
                 payload.get("protocol_version") == 2
                 and payload.get("batch_seq", -1) > last_v2_batch
@@ -470,9 +484,16 @@ class ClaudeCodeConnector(Connector):
         else:
             completed_by = None
 
+        # An end signal that is not the newest one: the session ended once and
+        # resumed. Its trajectory.json describes the earlier ending only.
+        ended_before = any(signal is not None for signal, _, _ in trail[:-1]) or any(
+            seq < last_v2_batch for seq in v2_finalized_seqs
+        )
+
         return {
             "session_id": session_id,
             "events": merged_events,
+            "ended_before": ended_before,
             "session_complete": completed_by is not None,
             "completed_by": completed_by.value if completed_by else None,
             "cwd": event.raw_payload.get("cwd"),
@@ -530,6 +551,7 @@ class ClaudeCodeConnector(Connector):
             employee_name = employee_email = employee_hostname = None
 
         now = datetime.now(UTC)
+        lines, built, served_atif = await self._session_lines(event, session_id, events, complete)
         session_doc = self._build_session_doc(
             event=event,
             session_id=session_id,
@@ -539,10 +561,18 @@ class ClaudeCodeConnector(Connector):
             employee_email=employee_email,
             employee_hostname=employee_hostname,
             events=events,
+            lines=lines,
             complete=complete,
             completed_by=hydrated.get("completed_by"),
             now=now,
         )
+        if complete and built is not None and get_settings().session_trajectory_store:
+            await self._store_trajectory(event, session_id, built)
+        elif complete or hydrated.get("ended_before"):
+            # A completing pass that built nothing, or a session that ended and
+            # then resumed: whatever trajectory.json holds no longer describes
+            # this session, and a reader must get "not built" instead of it.
+            await self._discard_trajectory(event, session_id, why="stale")
 
         documents: list[Document] = [session_doc]
         if unverified_author:
@@ -679,6 +709,9 @@ class ClaudeCodeConnector(Connector):
             cwd=cwd,
             agent=self._agent_label,
             cache=cache,
+            # Only when the trajectory's text is served: otherwise extraction
+            # renders the events itself, exactly as it did before.
+            **({"lines": lines} if served_atif else {}),
         )
         # One line per mining pass: the only record of what a pass cost and
         # why it ran. `segment_hashes` repeat across passes of one session
@@ -1005,6 +1038,172 @@ class ClaudeCodeConnector(Connector):
             captured_at=datetime.now(UTC),
         )
 
+    async def _session_lines(
+        self,
+        event: WebhookEvent,
+        session_id: str,
+        events: list[dict[str, Any]],
+        complete: bool,
+    ) -> tuple[list[Line], BuildResult | None, bool]:
+        """The Lines this pass indexes and mines, the trajectory if built, and
+        whether the Lines are the trajectory's.
+
+        Legacy Lines are always computed: they are the reference. Only a
+        completing pass builds the trajectory (to store it) and, in `shadow` and
+        `atif`, compares its Lines with the reference; a live pass does exactly
+        what it did before this module existed. The trajectory's Lines are served
+        only in `atif`, only when equal and with nothing unparsed -- so whatever
+        the mode, the index, the evidence spans and the extraction cache see the
+        same text.
+        """
+        legacy = lines_from_events(events)
+        if not complete:
+            return legacy, None, False
+        mode = render_mode(event.customer_id)
+        compare = mode is not RenderMode.LEGACY
+        if not compare and not get_settings().session_trajectory_store:
+            return legacy, None, False
+        try:
+            # Pure-Python over the whole session: off the event loop, in the
+            # process pool when large, like every other large CPU pass.
+            built, atif, render_error = await cpu_pool.run_cpu(
+                build_and_render,
+                events,
+                session_id,
+                self._agent_label,
+                compare,
+                size=sum(len(line.text) for line in legacy),
+            )
+        except CpuPoolUnavailable:
+            # The pool's transient failure: the row retries, as the body scrub's
+            # does, rather than leave an ended session without its trajectory.
+            raise
+        except Exception:
+            log.warning(
+                "atif.build_failed",
+                customer=event.customer_id,
+                source=self.source_system.value,
+                session_id=session_id,
+                exc_info=True,
+            )
+            return legacy, None, False
+        for line_no, ev_type, error in built.unparsed_events:
+            log.warning(
+                "atif.event_unparsed",
+                customer=event.customer_id,
+                source=self.source_system.value,
+                session_id=session_id,
+                line_no=line_no,
+                event_type=ev_type,
+                error=error,
+            )
+        if not compare:
+            return legacy, built, False
+        if render_error is not None:
+            log.warning(
+                "session_render.unrenderable",
+                customer=event.customer_id,
+                source=self.source_system.value,
+                session_id=session_id,
+                error=render_error,
+            )
+        same = atif == legacy
+        first_diff = None
+        if not same and atif is not None:
+            first_diff = next(
+                (i for i, (a, b) in enumerate(zip(atif, legacy, strict=False)) if a != b),
+                min(len(atif), len(legacy)),
+            )
+        (log.info if same else log.warning)(
+            "session_render.compared",
+            customer=event.customer_id,
+            source=self.source_system.value,
+            session_id=session_id,
+            mode=mode.value,
+            same=same,
+            first_diff=first_diff,
+            lines=len(legacy),
+            unparsed=built.unparsed,
+        )
+        if mode is RenderMode.ATIF and same and atif is not None and built.unparsed == 0:
+            return atif, built, True
+        return legacy, built, False
+
+    async def _discard_trajectory(self, event: WebhookEvent, session_id: str, *, why: str) -> None:
+        """Delete `trajectory.json` so readers get "not built". Never raises."""
+        key = trajectory_key(self.source_system.value, event.customer_id, session_id)
+        try:
+            store = get_store()
+            await store.delete(await store.bucket_for(event.customer_id), key)
+        except Exception as exc:
+            log.warning(
+                "trajectory.discard_failed",
+                customer=event.customer_id,
+                source=self.source_system.value,
+                session_id=session_id,
+                why=why,
+                error=type(exc).__name__,
+            )
+
+    async def _store_trajectory(
+        self, event: WebhookEvent, session_id: str, built: BuildResult
+    ) -> None:
+        """Write `trajectory.json` (engine/ingest/atif/store.py). Never raises."""
+        started = datetime.now(UTC)
+        key = trajectory_key(self.source_system.value, event.customer_id, session_id)
+        try:
+            store = get_store()
+            bucket = await store.bucket_for(event.customer_id)
+            size, invalid = await write_trajectory(
+                store,
+                bucket,
+                key,
+                built.trajectory,
+                max_bytes=get_settings().session_trajectory_max_bytes,
+            )
+        except TrajectoryTooLarge as exc:
+            log.info(
+                "trajectory.skipped_too_large",
+                customer=event.customer_id,
+                source=self.source_system.value,
+                session_id=session_id,
+                bytes=exc.size,
+                limit=exc.limit,
+            )
+            await self._discard_trajectory(event, session_id, why="too_large")
+            return
+        except CpuPoolUnavailable:
+            raise
+        except Exception as exc:
+            log.warning(
+                "trajectory.store_failed",
+                customer=event.customer_id,
+                source=self.source_system.value,
+                session_id=session_id,
+                error=type(exc).__name__,
+            )
+            await self._discard_trajectory(event, session_id, why="store_failed")
+            return
+        log.info(
+            "trajectory.stored",
+            customer=event.customer_id,
+            source=self.source_system.value,
+            session_id=session_id,
+            bytes=size,
+            steps=len(built.trajectory.get("steps") or []),
+            unparsed=built.unparsed,
+            atif_invalid=invalid is not None,
+            ms=int((datetime.now(UTC) - started).total_seconds() * 1000),
+        )
+        if invalid is not None:
+            log.warning(
+                "atif_invalid",
+                customer=event.customer_id,
+                source=self.source_system.value,
+                session_id=session_id,
+                error=invalid,
+            )
+
     def _build_session_doc(
         self,
         *,
@@ -1019,8 +1218,9 @@ class ClaudeCodeConnector(Connector):
         complete: bool,
         now: datetime,
         completed_by: str | None = None,
+        lines: list[Line] | None = None,
     ) -> Document:
-        rendered_body = _events_to_text(events)
+        rendered_body = render_lines(lines if lines is not None else lines_from_events(events))
         body_bytes = rendered_body.encode("utf-8")
         # Body only. A completing pass that adds no text is therefore skipped
         # as unchanged, so `session_complete` / `completed_by` on the stored

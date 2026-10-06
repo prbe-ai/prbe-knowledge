@@ -63,49 +63,64 @@ def _scrub(value: Any, key: str = "") -> Any:
     return _WHOLE_VALUE
 
 
+def _collect_strings(node: Any, texts: list[str]) -> None:
+    """Every string in `node`, keys included, in walk order."""
+    if isinstance(node, str):
+        texts.append(node)
+    elif isinstance(node, dict):
+        for key, item in node.items():
+            texts.append(key)
+            _collect_strings(item, texts)
+    elif isinstance(node, list):
+        for item in node:
+            _collect_strings(item, texts)
+
+
+def _rebuild(node: Any, replacements: dict[str, str]) -> Any:
+    if isinstance(node, str):
+        return replacements[node]
+    if isinstance(node, dict):
+        result = {}
+        reserved = set(node)
+        for key, item in node.items():
+            cleaned_key = replacements[key]
+            candidate = cleaned_key
+            suffix = 2
+            while candidate in result or (candidate != key and candidate in reserved):
+                candidate = f"{cleaned_key}#{suffix}"
+                suffix += 1
+            result[candidate] = _rebuild(item, replacements)
+        return result
+    if isinstance(node, list):
+        return [_rebuild(item, replacements) for item in node]
+    return node
+
+
 def redact_payload(value: Any) -> Any:
     clean = _scrub(value)
     texts: list[str] = []
-
-    def collect(node):
-        if isinstance(node, str):
-            texts.append(node)
-        elif isinstance(node, dict):
-            for key, item in node.items():
-                texts.append(key)
-                collect(item)
-        elif isinstance(node, list):
-            for item in node:
-                collect(item)
-
-    collect(clean)
+    _collect_strings(clean, texts)
     redacted, _ = redact_documents(texts)
-    replacements = dict(zip(texts, redacted, strict=True))
-
-    def rebuild(node):
-        if isinstance(node, str):
-            return replacements[node]
-        if isinstance(node, dict):
-            result = {}
-            reserved = set(node)
-            for key, item in node.items():
-                cleaned_key = replacements[key]
-                candidate = cleaned_key
-                suffix = 2
-                while candidate in result or (candidate != key and candidate in reserved):
-                    candidate = f"{cleaned_key}#{suffix}"
-                    suffix += 1
-                result[candidate] = rebuild(item)
-            return result
-        if isinstance(node, list):
-            return [rebuild(item) for item in node]
-        return node
-
-    return rebuild(clean)
+    return _rebuild(clean, dict(zip(texts, redacted, strict=True)))
 
 
 async def redact_payload_async(value: Any) -> Any:
     return await asyncio.to_thread(redact_payload, value)
+
+
+async def redact_payload_offloaded(value: Any, *, size: int) -> Any:
+    """`redact_payload`, with each pass where it does not stall the event loop.
+
+    Same two passes and output; placed as `redact_texts_async` places them: the
+    pure-Python scrub holds the GIL, so a large payload (`size` characters) runs
+    it in `cpu_pool`'s processes; the gitleaks pass waits on redactd's socket on
+    a thread.
+    """
+    clean = await cpu_pool.run_cpu(_scrub, value, size=size)
+    texts: list[str] = []
+    _collect_strings(clean, texts)
+    redacted, _ = await asyncio.to_thread(redact_documents, texts)
+    return _rebuild(clean, dict(zip(texts, redacted, strict=True)))
 
 
 def _scrub_free_text(text: str) -> str:

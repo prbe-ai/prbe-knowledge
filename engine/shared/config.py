@@ -154,6 +154,26 @@ class Settings(BaseSettings):
     #: (engine/shared/session_signals.py), so turning it back on does NOT
     #: re-mine it by itself -- that session is mined again when it next ends.
     claude_code_extraction_enabled: bool = Field(default=True)
+    #: Where an agent session's indexed text comes from, per tenant
+    #: (engine/ingest/atif). Every mode builds and stores the session's ATIF
+    #: trajectory on a completing pass. `legacy` renders the uploaded events;
+    #: `shadow` also renders the trajectory on a completing pass and logs whether
+    #: the two agree, serving legacy; `atif` serves the trajectory's text when it
+    #: agrees and legacy (with a warning) when it does not. The text is the same
+    #: in every mode by construction; the modes exist to prove it before the
+    #: event renderer is deleted. Comma-separated customer ids; atif wins.
+    session_render_default: str = Field(default="legacy")
+    session_render_shadow_customers: str = Field(default="")
+    session_render_atif_customers: str = Field(default="")
+    #: Largest `trajectory.json` a completing pass writes. The write runs the
+    #: credential scrub over the whole document (0.4-2.5 s per MB measured), so
+    #: a session past this is skipped with a log line and its readers fall back
+    #: to its text.
+    session_trajectory_max_bytes: int = Field(default=8_000_000)
+    #: Off switch for building and writing `trajectory.json` (the render modes'
+    #: comparison still builds in `shadow` and `atif`). Off, a completing pass
+    #: removes the stored one instead, so a reader never gets a stale copy.
+    session_trajectory_store: bool = Field(default=True)
     #: Reuse a segment's extraction when the same session re-ends with that
     #: segment unchanged (engine/shared/extraction_cache.py). Off = no cache
     #: read or write; every segment is mined, as before.

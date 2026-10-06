@@ -400,6 +400,8 @@ async def test_a_batch_after_a_client_finalize_reopens_the_session(stub_store: _
     resumed = await _hydrate(customer, session, [b0, fin, b1])
     assert resumed["session_complete"] is False
     assert resumed["completed_by"] is None
+    # It ended once and resumed: its stored trajectory describes the old end.
+    assert (ended["ended_before"], resumed["ended_before"]) == (False, True)
     # The events of every batch still reach the live document.
     assert [e["line_no"] for e in resumed["events"]] == [0, 1]
 
@@ -598,3 +600,24 @@ async def test_an_undatable_late_batch_counts_as_a_resume(stub_store: _StubStore
     fin = await _put_timed_finalize(stub_store, bucket, customer, session, "2026-04-29T10:05:00+00:00")
     undated = await _put_batch(stub_store, bucket, customer, session, 1, "no timestamp")
     assert (await _hydrate(customer, session, [b0, fin, undated]))["session_complete"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_protocol_2_finalize_below_the_newest_batch_means_it_ended_before(
+    stub_store: _StubStore,
+) -> None:
+    customer, session = "fs-v2-resume-cust", "11111111-2222-3333-4444-555555555555"
+    bucket = await stub_store.bucket_for(customer)
+    keys = []
+    for seq, finalize in ((0, False), (1, True), (2, False)):
+        key = f"raw/claude_code/{customer}/sessions-v2/{session}/{seq}-x.json"
+        body = {"protocol_version": 2, "session_id": session, "batch_seq": seq}
+        body.update({"finalize": True} if finalize else
+                    {"events": [{"line_no": seq, "raw": {"type": "user", "content": "x"}}]})
+        await stub_store.put(bucket, key, orjson.dumps({"payload": body}))
+        keys.append(key)
+
+    ended = await _hydrate(customer, session, keys[:2])
+    resumed = await _hydrate(customer, session, keys)
+    assert (ended["session_complete"], ended["ended_before"]) == (True, False)
+    assert (resumed["session_complete"], resumed["ended_before"]) == (False, True)

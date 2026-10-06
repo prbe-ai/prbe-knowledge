@@ -95,6 +95,25 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   /api/session-deletions/{deletion_id}/resume`, which works after an author request's rows are
   gone.
 
+- **Agent sessions as ATIF trajectories (`engine/ingest/atif/`).** Every captured coding-agent
+  session (Claude Code, Codex, pi, Kimi Code) is built into an ATIF v1.8 document (Harbor's Agent
+  Trajectory Interchange Format; Harbor's pydantic models vendored at a pinned commit): user steps,
+  one agent step per model inference with its reasoning, tool calls (summary only, never
+  arguments), tool results (error flag and size, never output) and token usage, and system steps.
+  Client-supplied harness extras reach it only as short scalars. A completing pass builds it off
+  the event loop and writes it to `raw/<source>/<customer>/<session>/trajectory.json`, which session
+  deletion, the late sweep and the tenant purge already own: free text scrubbed line by line as the
+  index is, the rest as uploaded payloads, both off the event loop; past
+  `SESSION_TRAJECTORY_MAX_BYTES` (8 MB) it is skipped, and `SESSION_TRAJECTORY_STORE=false` turns
+  building and writing it off. A resumed session, or one whose newer
+  trajectory cannot be written, has its old one removed. New `GET /trajectory/{doc_id}` serves it
+  paged by step (and by a 1 MB page budget) under the caller's tenant, logged as a source read; 404
+  `reason: not_built` when there is none. The indexed text does not change: the renderer and the
+  extractor now read one `Line` per source event, and `SESSION_RENDER_DEFAULT` /
+  `SESSION_RENDER_SHADOW_CUSTOMERS` / `SESSION_RENDER_ATIF_CUSTOMERS` (default `legacy`) choose
+  whether a completing pass compares the trajectory's Lines with the events' (`shadow`) or serves
+  them when equal (`atif`); a mismatch or an unparsed event always serves the events' text.
+
 ### Fixed
 
 - **A large live session no longer stalls every other ingest on its worker.** Re-planning a
