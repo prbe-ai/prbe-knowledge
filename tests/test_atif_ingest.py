@@ -142,11 +142,11 @@ def builds(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Any, ...]]:
 
 @pytest.fixture(autouse=True)
 def _fresh_live_throttle() -> Any:
-    cc_mod._LIVE_WRITES.clear()
-    cc_mod._LIVE_TOO_LARGE.clear()
+    for table in (cc_mod._LIVE_WRITES, cc_mod._LIVE_TOO_LARGE, cc_mod._LIVE_TURNS):
+        table.clear()
     yield
-    cc_mod._LIVE_WRITES.clear()
-    cc_mod._LIVE_TOO_LARGE.clear()
+    for table in (cc_mod._LIVE_WRITES, cc_mod._LIVE_TOO_LARGE, cc_mod._LIVE_TURNS):
+        table.clear()
 
 
 def _use_mode(monkeypatch: pytest.MonkeyPatch, mode: str = "legacy", **kw: Any) -> None:
@@ -487,9 +487,30 @@ async def test_a_reply_that_ends_its_turn_is_written_live_inside_the_interval(
     _use_mode(monkeypatch, trajectory_live_interval_s=3600)
     await _normalize(complete=False)
     ended_turn = [*EVENTS[:3], {"line_no": 3, "raw": {"type": "assistant", "message": {
-        "content": [{"type": "text", "text": "it failed"}], "stop_reason": "end_turn"}}}]
+        "content": [{"type": "text", "text": "it failed"}], "stop_reason": "end_turn"}}},
+        {"line_no": 4, "raw": {"type": "queue-operation", "content": "x"}}]
+    # A sixth of the interval after the last live write (at least 10 s), a NEW
+    # turn-ending reply is written, even behind trailing bookkeeping; the same
+    # reply again is not.
+    for key in cc_mod._LIVE_WRITES:
+        cc_mod._LIVE_WRITES[key] -= 601
     await _normalize_events(ended_turn, complete=False)
-    assert len(builds) == 2, "the newest answer is never held back by the throttle"
+    assert len(builds) == 2, "the newest answer is not held back by the throttle"
+    for key in cc_mod._LIVE_WRITES:
+        cc_mod._LIVE_WRITES[key] -= 601
+    await _normalize_events(ended_turn, complete=False)
+    assert len(builds) == 2, "the same reply is not rewritten"
+
+
+async def test_a_turn_ending_reply_right_after_a_live_write_waits(
+    monkeypatch: pytest.MonkeyPatch, store: FakeStore, mined: list, builds: list
+) -> None:
+    _use_mode(monkeypatch, trajectory_live_interval_s=3600)
+    await _normalize(complete=False)
+    ended_turn = [*EVENTS[:3], {"line_no": 3, "raw": {"type": "assistant", "message": {
+        "content": [{"type": "text", "text": "done"}], "stop_reason": "end_turn"}}}]
+    await _normalize_events(ended_turn, complete=False)
+    assert len(builds) == 1
 
 
 async def test_a_completing_pass_resets_the_throttle_so_a_resume_is_live_at_once(
@@ -556,3 +577,29 @@ async def test_a_live_copy_past_its_cap_is_dropped_and_not_rebuilt_until_the_end
     assert len(builds) == 1, "remembered as too large: no rebuild every interval"
     await _normalize(complete=True)
     assert orjson.loads(store.objects[("bucket-cust-1", KEY)])["extra"] == {"session_ended": True}
+
+
+async def test_a_resume_known_too_large_removes_the_old_final_copy(
+    monkeypatch: pytest.MonkeyPatch, store: FakeStore, mined: list, builds: list
+) -> None:
+    """Another process found the live copy too large; this one sees the resume
+    after the old final copy was put back: the stale final copy goes, as it
+    did before live copies existed."""
+    store.objects[("bucket-cust-1", KEY)] = b'{"final": true}'
+    _use_mode(monkeypatch)
+    cc_mod._LIVE_TOO_LARGE[("cust-1", "claude_code", "s-1")] = 0.0
+    await _normalize(complete=False, ended_before=True)
+    assert builds == [] and store.deleted == [KEY]
+
+
+@pytest.mark.parametrize(("raw", "ends"), [
+    ({"type": "assistant", "message": {"stop_reason": "end_turn"}}, True),
+    ({"type": "assistant", "message": {"stop_reason": "tool_use"}}, False),
+    ({"type": "assistant", "_pi_extras": {"stop_reason": "stop"}}, True),
+    ({"type": "assistant", "_codex_extras": {"phase": "final_answer"}}, True),
+    ({"type": "assistant", "_codex_extras": {"phase": "commentary"}}, False),
+    ({"type": "user", "message": {"content": "next"}}, False),
+])
+def test_which_replies_end_a_turn(raw: dict[str, Any], ends: bool) -> None:
+    events = [{"line_no": 7, "raw": raw}, {"line_no": 8, "raw": {"type": "system"}}]
+    assert cc_mod._turn_end_line(events) == (7 if ends else None)

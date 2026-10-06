@@ -9,6 +9,7 @@ queue row, without mining, and without printing any of the transcript.
 from __future__ import annotations
 
 import json
+from collections import OrderedDict
 from datetime import UTC, datetime
 
 import orjson
@@ -301,3 +302,40 @@ def test_importing_the_script_registers_the_session_connectors() -> None:
     )
     for source in ("claude_code", "codex", "pi", "kimi_code"):
         assert source in out.stdout, out.stdout
+
+
+
+
+async def test_the_repair_never_writes_or_removes_a_trajectory(collapsed, monkeypatch):
+    """A repair pass is neither live nor final: the stored trajectory.json is
+    left exactly as it is (scripts/rechunk_collapsed_sessions.py), with
+    trajectories on and every pass due a live write."""
+    from engine.ingest.atif.mode import render_mode
+    from engine.ingest.atif.store import trajectory_key
+    from engine.shared.config import get_settings
+    from kb.handlers import claude_code as cc_mod
+
+    settings = get_settings().model_copy(update={
+        "session_render_default": "atif", "session_trajectory_store": True,
+        "session_trajectory_live_interval_s": 60})
+    monkeypatch.setattr(cc_mod, "get_settings", lambda: settings)
+    monkeypatch.setattr(cc_mod, "render_mode", lambda customer: render_mode(customer, settings))
+    for table in ("_LIVE_WRITES", "_LIVE_TOO_LARGE", "_LIVE_TURNS"):
+        monkeypatch.setattr(cc_mod, table, OrderedDict())
+    store = collapsed["store"]
+    key = trajectory_key("claude_code", C, SID)
+    final = b'{"schema_version": "ATIF-v1.8", "extra": {"session_ended": true}}'
+    store.objects[key] = final
+    writes: list[tuple[str, str]] = []
+
+    async def put(bucket, k, body, **_kw):
+        writes.append(("put", k))
+
+    async def delete(bucket, k, **_kw):
+        writes.append(("delete", k))
+
+    store.put, store.delete = put, delete
+    for write in (False, True):
+        await rechunk.run(customers=[C], write=write, store=store, embedder=Embedder(),
+                          emit=lambda _line: None)
+    assert writes == [] and store.objects[key] == final

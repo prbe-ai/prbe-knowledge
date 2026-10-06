@@ -125,17 +125,51 @@ def _remember(table: OrderedDict[tuple[str, str, str], float], key: tuple[str, s
 #: no live builds until their completing pass. Same bound as _LIVE_WRITES.
 _LIVE_TOO_LARGE: OrderedDict[tuple[str, str, str], float] = OrderedDict()
 
-#: Stop reasons that end the model's turn (Claude Code / Anthropic, OpenAI-style).
+#: Stop reasons that end the model's turn (Claude Code / Anthropic, pi).
 _TURN_ENDS = frozenset({"end_turn", "stop", "stop_sequence"})
+#: (customer, source, session) -> line_no of the turn-ending reply last written live.
+_LIVE_TURNS: OrderedDict[tuple[str, str, str], float] = OrderedDict()
+#: Even a new turn-ending reply waits this long after the last live write.
+_TURN_BYPASS_MIN_S = 10
 
 
-def _ends_turn(events: list[dict[str, Any]]) -> bool:
-    """The newest event is a model reply that ends its turn."""
-    raw = (events[-1] or {}).get("raw") if events else None
-    if not isinstance(raw, dict) or raw.get("type") != "assistant":
+def _turn_end_line(events: list[dict[str, Any]]) -> int | None:
+    """line_no of the newest reply when it ends its turn, else None. Looks past
+    trailing bookkeeping (queue operations, system notes) to the newest
+    user/assistant event."""
+    for event in reversed(events):
+        raw = (event or {}).get("raw")
+        if not isinstance(raw, dict) or raw.get("type") not in ("user", "assistant"):
+            continue
+        if raw.get("type") != "assistant":
+            return None
+        message = raw.get("message") if isinstance(raw.get("message"), dict) else {}
+        pi = raw.get("_pi_extras") if isinstance(raw.get("_pi_extras"), dict) else {}
+        codex = raw.get("_codex_extras") if isinstance(raw.get("_codex_extras"), dict) else {}
+        ended = (
+            message.get("stop_reason") in _TURN_ENDS
+            or pi.get("stop_reason") in _TURN_ENDS
+            or codex.get("phase") == "final_answer"
+        )
+        line = event.get("line_no")
+        return line if ended and isinstance(line, int) else None
+    return None
+
+
+def _turn_bypass_due(
+    key: tuple[str, str, str], events: list[dict[str, Any]], interval_s: int
+) -> bool:
+    """A NEW turn-ending reply, at least a little after the last live write."""
+    line = _turn_end_line(events)
+    if line is None or _LIVE_TURNS.get(key) == line:
         return False
-    message = raw.get("message")
-    return isinstance(message, dict) and message.get("stop_reason") in _TURN_ENDS
+    last = _LIVE_WRITES.get(key)
+    if last is not None and time.monotonic() - last < max(_TURN_BYPASS_MIN_S, interval_s // 6):
+        return False
+    _remember(_LIVE_TURNS, key)
+    _LIVE_TURNS[key] = line
+    return True
+
 
 _FETCH_SUPP_R2_CONCURRENCY = 16
 
@@ -218,8 +252,11 @@ def _late_deliveries_after_client_finalize(
     are small for that reason.
     """
     fin = max(
-        (i for i, (signal, _, _) in enumerate(trail)
-         if signal == _signals.CompletedBy.V1_CLIENT_FINALIZE),
+        (
+            i
+            for i, (signal, _, _) in enumerate(trail)
+            if signal == _signals.CompletedBy.V1_CLIENT_FINALIZE
+        ),
         default=None,
     )
     if fin is None or fin == len(trail) - 1:
@@ -227,12 +264,19 @@ def _late_deliveries_after_client_finalize(
     said_goodbye = _when(trail[fin][1])
     if said_goodbye is None:
         return False
-    for signal, arrived, events in trail[fin + 1:]:
+    for signal, arrived, events in trail[fin + 1 :]:
         if signal is not None or not events:
             return False
         written = [
-            w for e in events
-            if (w := _when((e.get("raw") or {}).get("timestamp") if isinstance(e.get("raw"), dict) else None))
+            w
+            for e in events
+            if (
+                w := _when(
+                    (e.get("raw") or {}).get("timestamp")
+                    if isinstance(e.get("raw"), dict)
+                    else None
+                )
+            )
         ]
         if written:
             if max(written) > said_goodbye + _CLIENT_CLOCK_SKEW:
@@ -615,8 +659,12 @@ class ClaudeCodeConnector(Connector):
             await self._store_trajectory(event, session_id, built, ended=complete)
         elif complete or (
             hydrated.get("ended_before")
-            and not (
-                settings.session_trajectory_store and settings.session_trajectory_live_interval_s > 0
+            and (
+                not (
+                    settings.session_trajectory_store
+                    and settings.session_trajectory_live_interval_s > 0
+                )
+                or (event.customer_id, self.source_system.value, session_id) in _LIVE_TOO_LARGE
             )
         ):
             # A completing pass that built nothing, or (with no live copies) a
@@ -961,7 +1009,8 @@ class ClaudeCodeConnector(Connector):
                 now,
                 authoritative=bundle.authoritative,
                 reason=(
-                    OUTCOME_OK if bundle.authoritative
+                    OUTCOME_OK
+                    if bundle.authoritative
                     else ",".join(sorted(set(bundle.problems))) or "partial"
                 ),
                 units=len(documents) - 1,
@@ -1121,7 +1170,9 @@ class ClaudeCodeConnector(Connector):
                 and live_key not in _LIVE_TOO_LARGE
                 and (
                     _live_write_due(live_key, settings.session_trajectory_live_interval_s)
-                    or _ends_turn(events)
+                    or _turn_bypass_due(
+                        live_key, events, settings.session_trajectory_live_interval_s
+                    )
                 )
             ):
                 return legacy, None, False
@@ -1131,6 +1182,7 @@ class ClaudeCodeConnector(Connector):
             # The final copy replaces any live one; a resume starts afresh.
             _LIVE_WRITES.pop(live_key, None)
             _LIVE_TOO_LARGE.pop(live_key, None)
+            _LIVE_TURNS.pop(live_key, None)
             mode = render_mode(event.customer_id)
             compare = mode is not RenderMode.LEGACY
             if not compare and not settings.session_trajectory_store:
@@ -1150,27 +1202,38 @@ class ClaudeCodeConnector(Connector):
             if not complete:
                 # Optional work: keep the previous live copy, retry next pass.
                 _LIVE_WRITES.pop(live_key, None)
-                log.info("trajectory.live_skipped_pool", customer=event.customer_id,
-                         source=self.source_system.value, session_id=session_id)
+                log.info(
+                    "trajectory.live_skipped_pool",
+                    customer=event.customer_id,
+                    source=self.source_system.value,
+                    session_id=session_id,
+                )
                 return legacy, None, False
             # The pool's transient failure: the row retries, as the body scrub's
             # does, rather than leave an ended session without its trajectory.
             raise
         except Exception:
-            log.warning(
+            # A live build repeats every interval: one quiet line; the
+            # completing pass logs the traceback.
+            (log.warning if complete else log.info)(
                 "atif.build_failed",
                 customer=event.customer_id,
                 source=self.source_system.value,
                 session_id=session_id,
-                exc_info=True,
+                live=not complete,
+                exc_info=complete,
             )
             return legacy, None, False
         if not complete:
             # One line per live build, not one per event: live builds repeat.
             if built.unparsed:
-                log.info("atif.live_unparsed", customer=event.customer_id,
-                         source=self.source_system.value, session_id=session_id,
-                         unparsed=built.unparsed)
+                log.info(
+                    "atif.live_unparsed",
+                    customer=event.customer_id,
+                    source=self.source_system.value,
+                    session_id=session_id,
+                    unparsed=built.unparsed,
+                )
             return legacy, built, False
         for line_no, ev_type, error in built.unparsed_events:
             log.warning(
@@ -1251,8 +1314,13 @@ class ClaudeCodeConnector(Connector):
                 )
                 return
         except Exception:
-            log.warning("trajectory.deleted_check_failed", customer=event.customer_id,
-                        source=self.source_system.value, session_id=session_id, exc_info=True)
+            log.warning(
+                "trajectory.deleted_check_failed",
+                customer=event.customer_id,
+                source=self.source_system.value,
+                session_id=session_id,
+                exc_info=True,
+            )
         document = {
             **built.trajectory,
             "extra": {**(built.trajectory.get("extra") or {}), "session_ended": ended},
@@ -1283,15 +1351,21 @@ class ClaudeCodeConnector(Connector):
             )
             if not ended:
                 # No more live builds for it until it ends (each would scrub megabytes).
-                _remember(_LIVE_TOO_LARGE, (event.customer_id, self.source_system.value, session_id))
+                _remember(
+                    _LIVE_TOO_LARGE, (event.customer_id, self.source_system.value, session_id)
+                )
             await self._discard_trajectory(event, session_id, why="too_large")
             return
         except CpuPoolUnavailable:
             if ended:
                 raise
             _LIVE_WRITES.pop((event.customer_id, self.source_system.value, session_id), None)
-            log.info("trajectory.live_skipped_pool", customer=event.customer_id,
-                     source=self.source_system.value, session_id=session_id)
+            log.info(
+                "trajectory.live_skipped_pool",
+                customer=event.customer_id,
+                source=self.source_system.value,
+                session_id=session_id,
+            )
             return
         except Exception as exc:
             log.warning(
