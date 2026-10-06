@@ -8,8 +8,6 @@ answers 404 with `reason: not_built` (the reader falls back to text).
 
 from __future__ import annotations
 
-import hashlib
-import secrets
 from datetime import UTC, datetime
 from typing import Any
 
@@ -23,6 +21,7 @@ from engine.ingest.atif.store import trajectory_key
 from engine.shared.config import Settings, get_settings
 from engine.shared.db import close_pool, init_pool, raw_conn
 from engine.shared.storage import StorageNotFound
+from tests.test_sources import _seed_customer
 
 SESSION = "11111111-2222-3333-4444-555555555555"
 
@@ -60,14 +59,8 @@ def store(monkeypatch: pytest.MonkeyPatch) -> FakeStore:
 
 
 async def _customer(customer_id: str) -> str:
-    api_key = secrets.token_urlsafe(32)
-    async with raw_conn() as conn:
-        await conn.execute(
-            "INSERT INTO customers (customer_id, display_name, api_key_hash) VALUES ($1, 'test', $2)",
-            customer_id,
-            hashlib.sha256(api_key.encode()).hexdigest(),
-        )
-    return api_key
+    # The /sources suite's seeding: a customer row and its plaintext api key.
+    return await _seed_customer(customer_id)
 
 
 async def _doc(customer_id: str, doc_id: str, *, doc_type: str = "claude_code.session",
