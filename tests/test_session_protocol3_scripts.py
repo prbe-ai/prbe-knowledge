@@ -302,3 +302,114 @@ async def test_rechunk_renders_a_protocol_3_body_from_its_fragments(env) -> None
     doc = await rechunk._render(normalizer, store, a, CC, list(keys))
     assert doc.body == render_lines(lines_from_events(_numbered(EVENTS)))
     assert doc.metadata["event_count"] == len(EVENTS)
+
+
+
+# -- scripts/strip_session_payloads.py --drop-protocol3-events --------------------------
+# `_bodies` / `_strip` above: payload per stored key, and the run's summary line.
+
+
+def _of(bodies: dict[str, dict[str, Any]], sid: str) -> dict[str, dict[str, Any]]:
+    return {k: p for k, p in bodies.items() if f"/{sid}/" in k}
+
+
+@pytest.mark.asyncio
+async def test_dropping_the_canary_events_keeps_every_fragment(env, capsys) -> None:  # noqa: F811
+    (a, _b), store = env
+    sid = str(uuid4())
+    await p3_session(a, sid, with_events=True)
+    before = _of(await _bodies(store, a), sid)
+    with_events = sum(1 for p in before.values() if "events" in p)
+    assert with_events >= 1
+
+    dry = await _strip(capsys, ["strip", "--customer", a, "--drop-protocol3-events"])
+    assert _of(await _bodies(store, a), sid) == before, "a dry run writes nothing"
+    assert dry["events_dropped"] == with_events
+
+    done = await _strip(capsys, ["strip", "--customer", a, "--drop-protocol3-events", "--write"])
+    after = _of(await _bodies(store, a), sid)
+    assert done["written"] == done["events_dropped"] == with_events, done
+    assert not any("events" in p for p in after.values())
+    assert {k: p.get("fragments") for k, p in after.items()} == {
+        k: p.get("fragments") for k, p in before.items()
+    }
+    again = await _strip(capsys, ["strip", "--customer", a, "--drop-protocol3-events"])
+    assert again.get("events_dropped", 0) == 0, "a second run finds nothing to drop"
+
+
+@pytest.mark.asyncio
+async def test_a_running_session_keeps_its_events(env, capsys) -> None:  # noqa: F811
+    (a, _b), store = env
+    sid = str(uuid4())
+    await p3_session(a, sid, with_events=True, finalize=False)
+    before = _of(await _bodies(store, a), sid)
+    summary = await _strip(capsys, ["strip", "--customer", a, "--drop-protocol3-events", "--write"])
+    assert _of(await _bodies(store, a), sid) == before
+    assert summary["skipped:running"] >= 1 and "written" not in summary, summary
+
+
+@pytest.mark.asyncio
+async def test_events_that_disagree_with_their_fragments_are_kept(env, capsys) -> None:  # noqa: F811
+    (a, _b), store = env
+    sid = str(uuid4())
+    await p3_session(a, sid, with_events=True, tamper=True)
+    before = _of(await _bodies(store, a), sid)
+    summary = await _strip(capsys, ["strip", "--customer", a, "--drop-protocol3-events", "--write"])
+    after = _of(await _bodies(store, a), sid)
+    tampered = [k for k, p in before.items() if "TAMPERED" in json.dumps(p.get("fragments"))]
+    assert tampered and all("events" in after[k] for k in tampered)
+    assert summary["fragments_differ"] >= 1, summary
+
+
+@pytest.mark.asyncio
+async def test_the_drop_mode_never_touches_a_protocol_2_session(env, capsys) -> None:  # noqa: F811
+    (a, _b), store = env
+    sid = str(uuid4())
+    await v2_session(a, sid)
+    before = _of(await _bodies(store, a), sid)
+    summary = await _strip(capsys, ["strip", "--customer", a, "--drop-protocol3-events", "--write"])
+    assert _of(await _bodies(store, a), sid) == before
+    assert summary["not_protocol3"] >= 1 and "written" not in summary, summary
+
+
+def _p3_batch(**payload: Any) -> bytes:
+    from engine.ingest.atif.fragment import fragment
+
+    events = [{"line_no": i, "raw": raw} for i, raw in enumerate(e["raw"] for e in EVENTS[:2])]
+    body = {"protocol_version": 3, "fragment_version": 1, "events": events,
+            "fragments": [fragment(e) for e in events]}
+    body.update(payload)
+    return orjson.dumps({"payload": body})
+
+
+def test_the_drop_mode_reads_the_declared_protocol_not_the_keys() -> None:
+    """A protocol-2 batch is read from its events whatever else it carries."""
+    body = orjson.loads(_p3_batch())["payload"]
+    assert strip_mod.strip_batch(_p3_batch(), drop_fragment_events=True)[1] == "events_dropped"
+    as_v2 = orjson.dumps({"payload": {**body, "protocol_version": 2}})
+    assert strip_mod.strip_batch(as_v2, drop_fragment_events=True)[:2] == (None, "not_protocol3")
+
+
+def test_the_drop_mode_compares_canonical_json_not_python_equality() -> None:
+    """Python equality says `0 == 0.0` and `1 == True`; the stored bytes do
+    not, and the worker reads the bytes. A flag of `1` is caught earlier, as
+    degraded; a number that only canonical JSON tells apart reaches the compare."""
+    body = orjson.loads(_p3_batch())["payload"]
+    flag = next(k for k, v in body["fragments"][0]["line"].items() if v is True or v is False)
+    body["fragments"][0]["line"][flag] = int(body["fragments"][0]["line"][flag])
+    out = strip_mod.strip_batch(orjson.dumps({"payload": body}), drop_fragment_events=True)
+    assert out[:2] == (None, "degraded")
+    body = orjson.loads(_p3_batch())["payload"]
+    part = next(p for f in body["fragments"] for p in f.get("parts", []) if "seq" in p)
+    part["seq"] = float(part["seq"])
+    out = strip_mod.strip_batch(orjson.dumps({"payload": body}), drop_fragment_events=True)
+    assert out[:2] == (None, "fragments_differ")
+
+
+def test_the_drop_mode_keeps_the_events_of_degraded_fragments() -> None:
+    body = orjson.loads(_p3_batch())["payload"]
+    body["fragments"][0]["line_error"] = "ValueError"
+    out = strip_mod.strip_batch(orjson.dumps({"payload": body}), drop_fragment_events=True)
+    assert out[:2] == (None, "degraded")
+    empty = strip_mod.strip_batch(_p3_batch(events=[], fragments=[]), drop_fragment_events=True)
+    assert empty[:2] == (None, "no_events")

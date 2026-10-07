@@ -24,6 +24,13 @@ Safe by construction, checked per batch:
     fragments to what it did, since they are the evidence the fragment shadow
     compares the client's fragments with (`fragments_changed` otherwise). One
     with no `events` reads `no_events`: nothing to strip.
+  * `--drop-protocol3-events` instead REMOVES a protocol-3 batch's `events`
+    (the canary's duplicate of its fragments, sent only while
+    SESSION_PROTOCOL3_EVENTS was on): only for a batch DECLARED protocol 3, of
+    an ENDED session, whose events fragment to byte-identical fragments
+    (`fragments_differ` otherwise) and whose fragments are not degraded
+    (`degraded`). What is lost is canary evidence only: the worker reads a
+    protocol-3 session from its fragments. Protocol-2 batches are untouched.
   * Nothing is rewritten for a tenant under legal hold or not active, nor for a
     deleted session (engine/shared/legal_hold.purge_blocked_reason, checked per
     tenant and again per batch). A session deleted or purged while its batch
@@ -37,6 +44,8 @@ dropped (a histogram per tenant), never content. Review it before --write.
     MODULE=scripts.strip_session_payloads scripts/atif_sessions_job.sh strip --customer probe
     MODULE=scripts.strip_session_payloads scripts/atif_sessions_job.sh strip --customer probe --write
     MODULE=scripts.strip_session_payloads scripts/atif_sessions_job.sh strip --all-tenants --write
+    MODULE=scripts.strip_session_payloads scripts/atif_sessions_job.sh strip --all-tenants \
+        --drop-protocol3-events --write
 """
 
 from __future__ import annotations
@@ -50,13 +59,14 @@ from typing import Any
 import orjson
 
 from engine.ingest.atif.fragment import fragment
+from engine.ingest.atif.uploaded import fragment_lines
 from engine.ingest.probe_events.project import dropped_paths, project_event
 from engine.shared import storage
 from engine.shared.constants import AGENT_SESSION_SOURCES
 from engine.shared.db import close_pool, get_pool, init_pool, with_tenant
 from engine.shared.exceptions import StorageNotFound
 from engine.shared.legal_hold import purge_blocked_reason
-from engine.shared.session_signals import is_cron_marker_key
+from engine.shared.session_signals import SessionProtocol, is_cron_marker_key
 from engine.shared.session_suppression import deleted_sessions, session_of_event_id
 from engine.shared.transcript_render import lines_from_events
 from scripts.atif_sessions import _emit, _queue_row, _queue_rows, _tenants
@@ -67,7 +77,9 @@ from scripts.atif_sessions import _emit, _queue_row, _queue_rows, _tenants
 _GONE_STATUSES = ("missing", "status:deleted")
 
 
-def strip_batch(body: bytes) -> tuple[bytes | None, str, int, list[str]]:
+def strip_batch(
+    body: bytes, *, drop_fragment_events: bool = False
+) -> tuple[bytes | None, str, int, list[str]]:
     """(new body or None, outcome, bytes removed, dropped key paths) for one batch."""
     try:
         envelope = orjson.loads(body)
@@ -76,6 +88,8 @@ def strip_batch(body: bytes) -> tuple[bytes | None, str, int, list[str]]:
     if not isinstance(envelope, dict):
         return None, "unreadable", 0, []
     payload = envelope.get("payload", envelope)
+    if drop_fragment_events:
+        return _drop_fragment_events(envelope, payload, body)
     events = payload.get("events") if isinstance(payload, dict) else None
     if not isinstance(events, list) or not events:
         return None, "no_events", 0, []
@@ -100,6 +114,49 @@ def strip_batch(body: bytes) -> tuple[bytes | None, str, int, list[str]]:
     new_envelope = {**envelope, "payload": new_payload} if "payload" in envelope else new_payload
     new_body = json.dumps(new_envelope, sort_keys=True, separators=(",", ":")).encode()
     return new_body, "stripped", len(body) - len(new_body), dropped
+
+
+def _drop_fragment_events(
+    envelope: dict[str, Any], payload: Any, body: bytes
+) -> tuple[bytes | None, str, int, list[str]]:
+    """A protocol-3 batch without its canary `events`, when they add nothing.
+
+    Protocol 3 is the batch's DECLARED protocol (the worker reads a protocol-2
+    batch from its events whatever else it carries). The events go only when
+    they fragment to byte-identical fragments (canonical JSON: `1` is not
+    `true`) and no fragment is degraded -- a degraded line's events are the copy
+    a fixed renderer could still re-render."""
+    if not isinstance(payload, dict) or SessionProtocol.of(payload) is not SessionProtocol.FRAGMENTS:
+        return None, "not_protocol3", 0, []
+    fragments = payload.get("fragments")
+    events = payload.get("events")
+    if not isinstance(events, list) or not events:
+        return None, "no_events", 0, []
+    if not isinstance(fragments, list) or fragment_lines(fragments).degraded:
+        return None, "degraded", 0, []
+    if _canonical(_fragments_of(events)) != _canonical(fragments):
+        return None, "fragments_differ", 0, []
+    new_payload = {k: v for k, v in payload.items() if k != "events"}
+    new_envelope = {**envelope, "payload": new_payload} if "payload" in envelope else new_payload
+    new_body = json.dumps(new_envelope, sort_keys=True, separators=(",", ":")).encode()
+    return new_body, "events_dropped", len(body) - len(new_body), ["events"]
+
+
+async def _stream_finalized(customer_id: str, source: str, session_id: str) -> bool:
+    async with with_tenant(customer_id) as conn:
+        return bool(
+            await conn.fetchval(
+                "SELECT finalized FROM session_streams WHERE customer_id=$1 "
+                "AND source_system=$2 AND session_id=$3",
+                customer_id,
+                source,
+                session_id,
+            )
+        )
+
+
+def _canonical(value: Any) -> bytes:
+    return orjson.dumps(value, option=orjson.OPT_SORT_KEYS)
 
 
 def _fragments_of(events: list[Any]) -> list[dict[str, Any]]:
@@ -147,7 +204,15 @@ async def strip(args: argparse.Namespace) -> None:
         except StorageNotFound:
             counts["missing"] += 1
             return
-        new_body, outcome, saved, dropped = strip_batch(body)
+        new_body, outcome, saved, dropped = strip_batch(
+            body, drop_fragment_events=args.drop_protocol3_events
+        )
+        if outcome == "events_dropped" and not await _stream_finalized(
+            customer_id, source, session_id
+        ):
+            # A running session: its events may still be compared on its
+            # completing pass. Left for a later run.
+            new_body, outcome, saved, dropped = None, "skipped:running", 0, []
         counts[outcome] += 1
         paths.update(dropped)
         if outcome == "lines_changed":
@@ -241,6 +306,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--sources", nargs="*", default=sorted(s.value for s in AGENT_SESSION_SOURCES))
     p.add_argument("--write", action="store_true")
     p.add_argument("--concurrency", type=_positive, default=8)
+    p.add_argument("--drop-protocol3-events", action="store_true",
+                   help="remove ended protocol-3 sessions' canary events (see module doc)")
     return parser.parse_args(argv)
 
 
