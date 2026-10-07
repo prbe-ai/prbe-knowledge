@@ -26,10 +26,11 @@ Safe by construction, checked per batch:
     with no `events` reads `no_events`: nothing to strip.
   * `--drop-protocol3-events` instead REMOVES a protocol-3 batch's `events`
     (the canary's duplicate of its fragments, sent only while
-    SESSION_PROTOCOL3_EVENTS was on): only for an ENDED session, and only if
-    those events still fragment to exactly the fragments stored beside them
-    (`fragments_differ` otherwise), so nothing a comparison ever disagreed on
-    is thrown away. Protocol-2 batches are untouched in this mode.
+    SESSION_PROTOCOL3_EVENTS was on): only for a batch DECLARED protocol 3, of
+    an ENDED session, whose events fragment to byte-identical fragments
+    (`fragments_differ` otherwise) and whose fragments are not degraded
+    (`degraded`). What is lost is canary evidence only: the worker reads a
+    protocol-3 session from its fragments. Protocol-2 batches are untouched.
   * Nothing is rewritten for a tenant under legal hold or not active, nor for a
     deleted session (engine/shared/legal_hold.purge_blocked_reason, checked per
     tenant and again per batch). A session deleted or purged while its batch
@@ -58,13 +59,14 @@ from typing import Any
 import orjson
 
 from engine.ingest.atif.fragment import fragment
+from engine.ingest.atif.uploaded import fragment_lines
 from engine.ingest.probe_events.project import dropped_paths, project_event
 from engine.shared import storage
 from engine.shared.constants import AGENT_SESSION_SOURCES
 from engine.shared.db import close_pool, get_pool, init_pool, with_tenant
 from engine.shared.exceptions import StorageNotFound
 from engine.shared.legal_hold import purge_blocked_reason
-from engine.shared.session_signals import is_cron_marker_key
+from engine.shared.session_signals import SessionProtocol, is_cron_marker_key
 from engine.shared.session_suppression import deleted_sessions, session_of_event_id
 from engine.shared.transcript_render import lines_from_events
 from scripts.atif_sessions import _emit, _queue_row, _queue_rows, _tenants
@@ -117,13 +119,22 @@ def strip_batch(
 def _drop_fragment_events(
     envelope: dict[str, Any], payload: Any, body: bytes
 ) -> tuple[bytes | None, str, int, list[str]]:
-    """A protocol-3 batch without its canary `events`, when they add nothing."""
-    if not isinstance(payload, dict) or not isinstance(payload.get("fragments"), list):
+    """A protocol-3 batch without its canary `events`, when they add nothing.
+
+    Protocol 3 is the batch's DECLARED protocol (the worker reads a protocol-2
+    batch from its events whatever else it carries). The events go only when
+    they fragment to byte-identical fragments (canonical JSON: `1` is not
+    `true`) and no fragment is degraded -- a degraded line's events are the copy
+    a fixed renderer could still re-render."""
+    if not isinstance(payload, dict) or SessionProtocol.of(payload) is not SessionProtocol.FRAGMENTS:
         return None, "not_protocol3", 0, []
-    if "events" not in payload:
+    fragments = payload.get("fragments")
+    events = payload.get("events")
+    if not isinstance(events, list) or not events:
         return None, "no_events", 0, []
-    events = payload["events"]
-    if not isinstance(events, list) or _fragments_of(events) != payload["fragments"]:
+    if not isinstance(fragments, list) or fragment_lines(fragments).degraded:
+        return None, "degraded", 0, []
+    if _canonical(_fragments_of(events)) != _canonical(fragments):
         return None, "fragments_differ", 0, []
     new_payload = {k: v for k, v in payload.items() if k != "events"}
     new_envelope = {**envelope, "payload": new_payload} if "payload" in envelope else new_payload
@@ -142,6 +153,10 @@ async def _stream_finalized(customer_id: str, source: str, session_id: str) -> b
                 session_id,
             )
         )
+
+
+def _canonical(value: Any) -> bytes:
+    return orjson.dumps(value, option=orjson.OPT_SORT_KEYS)
 
 
 def _fragments_of(events: list[Any]) -> list[dict[str, Any]]:

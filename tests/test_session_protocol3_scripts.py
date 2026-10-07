@@ -370,3 +370,46 @@ async def test_the_drop_mode_never_touches_a_protocol_2_session(env, capsys) -> 
     summary = await _strip(capsys, ["strip", "--customer", a, "--drop-protocol3-events", "--write"])
     assert _of(await _bodies(store, a), sid) == before
     assert summary["not_protocol3"] >= 1 and "written" not in summary, summary
+
+
+def _p3_batch(**payload: Any) -> bytes:
+    from engine.ingest.atif.fragment import fragment
+
+    events = [{"line_no": i, "raw": raw} for i, raw in enumerate(e["raw"] for e in EVENTS[:2])]
+    body = {"protocol_version": 3, "fragment_version": 1, "events": events,
+            "fragments": [fragment(e) for e in events]}
+    body.update(payload)
+    return orjson.dumps({"payload": body})
+
+
+def test_the_drop_mode_reads_the_declared_protocol_not_the_keys() -> None:
+    """A protocol-2 batch is read from its events whatever else it carries."""
+    body = orjson.loads(_p3_batch())["payload"]
+    assert strip_mod.strip_batch(_p3_batch(), drop_fragment_events=True)[1] == "events_dropped"
+    as_v2 = orjson.dumps({"payload": {**body, "protocol_version": 2}})
+    assert strip_mod.strip_batch(as_v2, drop_fragment_events=True)[:2] == (None, "not_protocol3")
+
+
+def test_the_drop_mode_compares_canonical_json_not_python_equality() -> None:
+    """Python equality says `0 == 0.0` and `1 == True`; the stored bytes do
+    not, and the worker reads the bytes. A flag of `1` is caught earlier, as
+    degraded; a number that only canonical JSON tells apart reaches the compare."""
+    body = orjson.loads(_p3_batch())["payload"]
+    flag = next(k for k, v in body["fragments"][0]["line"].items() if v is True or v is False)
+    body["fragments"][0]["line"][flag] = int(body["fragments"][0]["line"][flag])
+    out = strip_mod.strip_batch(orjson.dumps({"payload": body}), drop_fragment_events=True)
+    assert out[:2] == (None, "degraded")
+    body = orjson.loads(_p3_batch())["payload"]
+    part = next(p for f in body["fragments"] for p in f.get("parts", []) if "seq" in p)
+    part["seq"] = float(part["seq"])
+    out = strip_mod.strip_batch(orjson.dumps({"payload": body}), drop_fragment_events=True)
+    assert out[:2] == (None, "fragments_differ")
+
+
+def test_the_drop_mode_keeps_the_events_of_degraded_fragments() -> None:
+    body = orjson.loads(_p3_batch())["payload"]
+    body["fragments"][0]["line_error"] = "ValueError"
+    out = strip_mod.strip_batch(orjson.dumps({"payload": body}), drop_fragment_events=True)
+    assert out[:2] == (None, "degraded")
+    empty = strip_mod.strip_batch(_p3_batch(events=[], fragments=[]), drop_fragment_events=True)
+    assert empty[:2] == (None, "no_events")
