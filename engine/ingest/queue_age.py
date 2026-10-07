@@ -14,7 +14,9 @@ WHY NOT `enqueued_at`
 Every transcript batch bumps `enqueued_at` (session_completer reads it as an
 idle signal), so an actively-batching session looks
 permanently young. Age measured that way reports zero on precisely the workload
-that is filling the queue. `first_enqueued_at` is stamped once on insert.
+that is filling the queue. `first_enqueued_at` is when the CURRENT wait began:
+stamped on insert and again when a finished row is re-enqueued, so a session
+that has been batching for days but drains each batch reads as young.
 
 WHY A SAMPLER AND NOT A QUERY ON /health
 ----------------------------------------

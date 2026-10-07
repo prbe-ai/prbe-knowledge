@@ -15,9 +15,11 @@ For protocol-2 sessions, whose client finalize is recorded in
     sweep_only         the marker is on top and the stream never finalized
     open               neither (still live, or idle less than the sweep window)
 
-Counted over sessions that STARTED in a window ending `--grace-days` ago, so
-each one has had that long to be finalized by its client before it counts as
-a miss. Also summarises `extraction_outcome` (how the last pass went) across
+Counted over sessions whose current queue wait BEGAN in a window ending
+`--grace-days` ago, so each one has had that long to be finalized by its client
+before it counts as a miss. `first_enqueued_at` restarts when a finished row is
+re-enqueued, so a session resumed after it ended -- or a late client finalize
+landing on an ended row -- counts from that later enqueue, not its first. Also summarises `extraction_outcome` (how the last pass went) across
 all rows.
 
     python -m scripts.session_end_report --days 7 --grace-days 7
