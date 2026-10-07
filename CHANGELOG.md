@@ -136,6 +136,8 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   sessions and removes an object a deletion overtook). Both print ids, counts and timings only.
 
 ### Fixed
+
+- **Codex, pi and Kimi Code sessions now split at their compactions.** Their sanitizers mark a compaction as `system`/`compaction`; segmentation, the ATIF builder and the compaction count matched only Claude Code's `compact_boundary`, so those sessions were cut by size alone and a decision could land in one extraction call and its reasons in the next. One check (`transcript_render.is_compaction_marker`) now serves all three, and Codex's two back-to-back markers open one segment. Re-mined Codex/pi/Kimi sessions re-run extraction for the segments whose text moved.
 - **A Kimi Code shell command is marked as typed by the researcher.** Kimi's shell mode sends the command as the researcher's own turn (`origin: user_shell`); its trajectory step now carries `extra.origin: user_shell`, as pi's `!` commands already do. Indexed text is unchanged.
 - **A command the researcher typed is its own trajectory step.** A probe-events/1 event with `origin: user_shell` (pi's `!` command, Kimi Code's shell mode; tap 0.9.11) became part of the model's step around it. It is now a separate agent step marked `extra.origin: user_shell`. Indexed text is unchanged.
 

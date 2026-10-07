@@ -228,6 +228,40 @@ def test_session_splits_at_every_compaction_boundary() -> None:
     assert segments[1][0][0] is events[1]
 
 
+def _agent_compaction(line_no: int, content: str | None = None) -> dict:
+    """The marker the Codex, pi and Kimi Code sanitizers write."""
+    raw: dict = {"type": "system", "subtype": "compaction"}
+    if content:
+        raw["content"] = content
+    return {"line_no": line_no, "raw": raw}
+
+
+def test_other_agents_compactions_split_the_session() -> None:
+    """Codex, pi and Kimi Code mark a compaction as `compaction`, not
+    `compact_boundary`. Matching only Claude Code's name cut their sessions by
+    size alone, so a decision and its reasons could land in different calls."""
+    from engine.shared.claude_code_extraction import _segment_session
+
+    events = [_user("a", 0), _agent_compaction(1, "summary one"), _user("b", 2),
+              _agent_compaction(3), _user("c", 4)]
+    segments, _ = _segment_session(events)
+    assert [why for _, why in segments] == ["session_start", "compaction", "compaction"]
+    assert segments[1][0][0] is events[1]
+
+
+def test_back_to_back_markers_are_one_compaction() -> None:
+    """Codex writes two markers per compaction (the encrypted-history notice,
+    then the replacement summary). They open ONE segment, never a segment of
+    markers alone."""
+    from engine.shared.claude_code_extraction import _segment_session
+
+    events = [_user("a", 0), _agent_compaction(1), _agent_compaction(2, "replacement"),
+              _user("b", 3)]
+    segments, _ = _segment_session(events)
+    assert len(segments) == 2
+    assert segments[1][0] == events[1:]
+
+
 def test_oversized_segment_is_split_on_a_user_turn() -> None:
     """A session that never compacted still needs a size guard — one measured
     session had a single 1.1M-character stretch and no boundary at all."""

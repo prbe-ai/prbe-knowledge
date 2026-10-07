@@ -741,7 +741,10 @@ def _split_on_compaction(
     current: list[Item] = []
     boundary = "session_start"
     for event in events:
-        if _is_compact_boundary(event) and current:
+        # A run of markers is ONE compaction: Codex writes two per compaction
+        # (the encrypted-history notice, then the replacement summary), and
+        # cutting between them would make a segment of markers alone.
+        if _is_compact_boundary(event) and not all(_is_compact_boundary(e) for e in current):
             segments.append((current, boundary))
             current, boundary = [], "compaction"
         current.append(event)

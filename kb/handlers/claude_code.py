@@ -97,6 +97,7 @@ from engine.shared.transcript_render import (  # noqa: F401
     _render_event,
     _render_tool_use,
     _render_user,
+    is_compaction_marker,
     lines_from_events,
     render_lines,
 )
@@ -2113,11 +2114,7 @@ def _count_compactions(events: list[dict[str, Any]]) -> int:
     for event in events:
         raw = event.get("raw") if isinstance(event, dict) else None
         raw = raw if isinstance(raw, dict) else event
-        if (
-            isinstance(raw, dict)
-            and raw.get("type") == "system"
-            and raw.get("subtype") == "compact_boundary"
-        ):
+        if isinstance(raw, dict) and is_compaction_marker(raw):
             total += 1
     return total
 
