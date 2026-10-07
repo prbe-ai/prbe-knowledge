@@ -67,12 +67,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from engine.shared.transcript_render import (
-    is_compaction_marker,
-    renders_stop,
-    speaker_for,
-    strip_harness,
-)
+from engine.shared.transcript_render import renders_stop, speaker_for, strip_harness
 
 SCHEMA_VERSION = "ATIF-v1.8"
 #: Version of the provenance encoding in `extra.probe`. A reader that sees any
@@ -252,7 +247,7 @@ class _Builder:
         flags = 0
         if facts.get("type") == "user" and not facts.get("isCompactSummary"):
             flags |= FLAG_USER_TURN
-        if is_compaction_marker(facts):
+        if facts.get("type") == "system" and facts.get("subtype") == "compact_boundary":
             flags |= FLAG_COMPACT_BOUNDARY
         if facts.get("isCompactSummary"):
             flags |= FLAG_COMPACT_SUMMARY

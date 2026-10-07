@@ -40,21 +40,6 @@ class Line:
     compact_summary: bool = False
 
 
-#: The system-event subtypes that mark a compaction. Claude Code writes
-#: `compact_boundary`; the Codex, pi and Kimi Code sanitizers write `compaction`
-#: (research-os `agent/src/probe/tap_core/*_sanitize.py`). Matching only the first
-#: cut every other agent's sessions by size alone, so a decision could land in one
-#: segment and its reasons in the next.
-COMPACTION_SUBTYPES = frozenset({"compact_boundary", "compaction"})
-
-
-def is_compaction_marker(facts: dict[str, Any]) -> bool:
-    """Whether one uploaded event marks a compaction, for any agent."""
-    subtype = facts.get("subtype")
-    # A client-supplied subtype can be any JSON value; only a string can name one.
-    return facts.get("type") == "system" and isinstance(subtype, str) and subtype in COMPACTION_SUBTYPES
-
-
 def line_from_event(ev: dict[str, Any]) -> Line:
     """The `Line` for one merged event (`{"line_no", "raw"}`)."""
     raw = ev.get("raw")
@@ -65,7 +50,9 @@ def line_from_event(ev: dict[str, Any]) -> Line:
         line_no=line_no if isinstance(line_no, int) else None,
         text=_render_event(raw) if isinstance(raw, dict) else "",
         user_turn=facts.get("type") == "user" and not facts.get("isCompactSummary"),
-        compact_boundary=is_compaction_marker(facts),
+        compact_boundary=(
+            facts.get("type") == "system" and facts.get("subtype") == "compact_boundary"
+        ),
         compact_summary=bool(facts.get("isCompactSummary")),
     )
 

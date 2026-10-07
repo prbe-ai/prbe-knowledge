@@ -97,7 +97,6 @@ from engine.shared.transcript_render import (  # noqa: F401
     _render_event,
     _render_tool_use,
     _render_user,
-    is_compaction_marker,
     lines_from_events,
     render_lines,
 )
@@ -2107,16 +2106,31 @@ def _count_compactions(events: list[dict[str, Any]]) -> int:
     """Compaction boundaries in the merged stream.
 
     Each one is a point where the agent hit its context limit and wrote its own
-    summary of everything so far — a chapter break it chose, and the same
-    boundary the unit extractor segments on.
+    summary of everything so far -- a chapter break it chose. Claude Code writes
+    `compact_boundary`; the tap's Codex, pi and Kimi sanitizers write
+    `compaction`. A run of markers is ONE compaction (Codex writes two), and a
+    marker before the session's first turn is inherited, not had: a Codex
+    subagent fork opens with its parent's `compacted` record.
     """
     total = 0
+    talked = False
+    previous_marker = False
     for event in events:
         raw = event.get("raw") if isinstance(event, dict) else None
         raw = raw if isinstance(raw, dict) else event
-        if isinstance(raw, dict) and is_compaction_marker(raw):
+        if not isinstance(raw, dict):
+            continue
+        marker = raw.get("type") == "system" and raw.get("subtype") in _COMPACTION_SUBTYPES
+        if marker and talked and not previous_marker:
             total += 1
+        if raw.get("type") in ("user", "assistant"):
+            talked = True
+        previous_marker = marker
     return total
+
+
+#: The `system` subtypes that mark a compaction (see `_count_compactions`).
+_COMPACTION_SUBTYPES = frozenset({"compact_boundary", "compaction"})
 
 
 def _format_session_title(

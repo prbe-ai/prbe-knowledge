@@ -132,7 +132,6 @@ CASES: dict[str, list[dict[str, Any]]] = {
         _ev({"type": "attachment", "attachment": {"type": "todo"}}, 4),
         _ev({"type": "queue-operation", "content": "queued text"}, 5),
         _ev({"content": "typeless"}, 6),
-        _ev({"type": "system", "subtype": "compaction", "content": "pi summary"}, 7),
     ],
     "compaction summary in both shapes": [
         _ev(_user("the summary", isCompactSummary=True), 0),
@@ -313,7 +312,7 @@ def _random_event(rng: random.Random, ids: list[str]) -> Any:
             msg["model"] = "m"
         return _assistant(blocks, msg=msg, **extra)
     if kind == "system":
-        return {"type": "system", "subtype": rng.choice([None, "", "compact_boundary", "compaction", "hook"]),
+        return {"type": "system", "subtype": rng.choice([None, "", "compact_boundary", "hook"]),
                 "content": rng.choice([None, "", "text", 3]), **extra}
     return {"type": rng.choice(["attachment", "queue-operation", None]),
             "content": rng.choice([None, "", "body"]), **extra}

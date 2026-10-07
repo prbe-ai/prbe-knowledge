@@ -228,40 +228,6 @@ def test_session_splits_at_every_compaction_boundary() -> None:
     assert segments[1][0][0] is events[1]
 
 
-def _agent_compaction(line_no: int, content: str | None = None) -> dict:
-    """The marker the Codex, pi and Kimi Code sanitizers write."""
-    raw: dict = {"type": "system", "subtype": "compaction"}
-    if content:
-        raw["content"] = content
-    return {"line_no": line_no, "raw": raw}
-
-
-def test_other_agents_compactions_split_the_session() -> None:
-    """Codex, pi and Kimi Code mark a compaction as `compaction`, not
-    `compact_boundary`. Matching only Claude Code's name cut their sessions by
-    size alone, so a decision and its reasons could land in different calls."""
-    from engine.shared.claude_code_extraction import _segment_session
-
-    events = [_user("a", 0), _agent_compaction(1, "summary one"), _user("b", 2),
-              _agent_compaction(3), _user("c", 4)]
-    segments, _ = _segment_session(events)
-    assert [why for _, why in segments] == ["session_start", "compaction", "compaction"]
-    assert segments[1][0][0] is events[1]
-
-
-def test_back_to_back_markers_are_one_compaction() -> None:
-    """Codex writes two markers per compaction (the encrypted-history notice,
-    then the replacement summary). They open ONE segment, never a segment of
-    markers alone."""
-    from engine.shared.claude_code_extraction import _segment_session
-
-    events = [_user("a", 0), _agent_compaction(1), _agent_compaction(2, "replacement"),
-              _user("b", 3)]
-    segments, _ = _segment_session(events)
-    assert len(segments) == 2
-    assert segments[1][0] == events[1:]
-
-
 def test_oversized_segment_is_split_on_a_user_turn() -> None:
     """A session that never compacted still needs a size guard — one measured
     session had a single 1.1M-character stretch and no boundary at all."""
@@ -356,6 +322,72 @@ def test_size_subsplits_do_not_masquerade_as_compactions() -> None:
     assert reasons.count("compaction") == 0, (
         "one compaction must not become several"
     )
+
+
+def _codex_compaction(line_no: int, summary: str = "") -> dict:
+    """What the tap's Codex/pi/Kimi sanitizers upload for a compaction."""
+    raw = {"type": "system", "subtype": "compaction"}
+    if summary:
+        raw["content"] = summary
+    return {"line_no": line_no, "raw": raw}
+
+
+def test_another_agents_compaction_does_not_force_a_cut() -> None:
+    """Codex stretches render to 2k-84k chars against a 260k budget: cutting at
+    every compaction put a replayed 930k-char session at 45 pieces past the
+    16-piece cap, 33% mined. A small session with many compactions is ONE call."""
+    from engine.shared.claude_code_extraction import _segment_session
+
+    events: list[dict] = []
+    for i in range(30):
+        events += [_user(f"step {i}", 2 * i), _codex_compaction(2 * i + 1, "summary")]
+    segments, capped = _segment_session(events)
+    assert (len(segments), capped) == (1, False)
+
+
+def test_a_size_cut_lands_on_another_agents_compaction() -> None:
+    """When a stretch must be cut for size anyway, the cut lands where the agent
+    ran out of context (the first of a run of markers), so the next piece opens
+    with its summary -- and says so."""
+    from engine.shared.claude_code_extraction import _segment_session
+
+    big = "y" * 40_000
+    events = [_user(big, i) for i in range(5)]  # 200k: past half the budget
+    events += [_codex_compaction(5), _codex_compaction(6, "what happened so far")]
+    events += [_user(big, 7 + i) for i in range(3)]  # pushes past the budget
+    segments, _ = _segment_session(events)
+    assert [why for _, why in segments] == ["session_start", "compaction"]
+    first, second = (evs for evs, _ in segments)
+    assert [e["line_no"] for e in second[:2]] == [5, 6]
+    assert all(e["raw"].get("subtype") != "compaction" for e in first)
+
+
+def test_claude_sessions_segment_exactly_as_before() -> None:
+    """Claude Code's boundary still FORCES a cut, and its text is not another
+    agent's marker: a Claude session's pieces (and their cache keys) are unchanged."""
+    from engine.shared.claude_code_extraction import _is_compaction_marker, _segment_session
+
+    events = [_user("a", 0), _boundary(1), _summary(2), _user("b", 3)]
+    segments, _ = _segment_session(events)
+    assert [why for _, why in segments] == ["session_start", "compaction"]
+    assert _is_compaction_marker(_boundary(1)) and not _is_compaction_marker(_user("SYSTEM (compaction)", 4))
+
+
+@pytest.mark.parametrize(
+    "events, expected",
+    [
+        # Codex writes two markers per compaction: one compaction.
+        ([_user("a", 0), _codex_compaction(1), _codex_compaction(2, "s"), _user("b", 3)], 1),
+        # A subagent fork opens with its parent's `compacted` record: inherited, not had.
+        ([_codex_compaction(0), _user("a", 1), _user("b", 2)], 0),
+        # Claude Code, as before.
+        ([_user("a", 0), _boundary(1), _summary(2), _user("b", 3), _boundary(4)], 2),
+    ],
+)
+def test_compactions_are_counted_for_every_agent_once_each(events, expected) -> None:
+    from kb.handlers.claude_code import _count_compactions
+
+    assert _count_compactions(events) == expected
 
 
 @pytest.mark.asyncio

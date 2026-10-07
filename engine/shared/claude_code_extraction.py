@@ -729,6 +729,21 @@ def _is_compact_boundary(event: Item) -> bool:
     return _line(event).compact_boundary
 
 
+#: How a Codex, pi or Kimi compaction renders: the tap's sanitizers emit
+#: `system` subtype `compaction`, and `format_system` writes this prefix on both
+#: line paths (events and ATIF), which `engine.ingest.atif.compare` holds equal.
+#: Read from the TEXT so no new `Line` flag has to ride the trajectory.
+_COMPACTION_TEXT = "SYSTEM (compaction)"
+
+
+def _is_compaction_marker(event: Item) -> bool:
+    """Any agent's compaction: Claude Code's boundary or another agent's
+    `compaction` event. Only Claude's FORCES a cut (`_split_on_compaction`);
+    the rest are where a size cut prefers to land (`_split_to_budget`)."""
+    line = _line(event)
+    return line.compact_boundary or line.text.startswith(_COMPACTION_TEXT)
+
+
 def _is_compact_summary(event: Item) -> bool:
     return _line(event).compact_summary
 
@@ -741,10 +756,7 @@ def _split_on_compaction(
     current: list[Item] = []
     boundary = "session_start"
     for event in events:
-        # A run of markers is ONE compaction: Codex writes two per compaction
-        # (the encrypted-history notice, then the replacement summary), and
-        # cutting between them would make a segment of markers alone.
-        if _is_compact_boundary(event) and not all(_is_compact_boundary(e) for e in current):
+        if _is_compact_boundary(event) and current:
             segments.append((current, boundary))
             current, boundary = [], "compaction"
         current.append(event)
@@ -766,9 +778,21 @@ def _split_to_budget(segment: list[Item]) -> list[list[Item]]:
     out: list[list[Item]] = []
     current: list[Item] = []
     size = 0
+    # Where the latest compaction past half the budget opens: a size cut lands
+    # THERE rather than at the next user turn, so a piece ends where the agent
+    # ran out of context and the next opens with its summary. Never a forced
+    # cut: Codex stretches render to 2k-84k chars, and cutting at every one put
+    # long sessions past `_MAX_SEGMENTS` (one replayed session mined 33%).
+    marker_at: int | None = None
+    previous_marker = False
     for event in segment:
         one = _rendered_size([event])
         starts_turn = _renders_as_user_turn(event)
+        if current and size + one > _SEGMENT_CHAR_BUDGET and marker_at is not None:
+            out.append(current[:marker_at])
+            current = current[marker_at:]
+            size = _rendered_size(current)
+            marker_at = None
         if current and size + one > _SEGMENT_CHAR_BUDGET and starts_turn:
             out.append(current)
             current, size = [], 0
@@ -777,6 +801,12 @@ def _split_to_budget(segment: list[Item]) -> list[list[Item]]:
             # anyway rather than send something the model will refuse.
             out.append(current)
             current, size = [], 0
+            marker_at = None
+        marker = _is_compaction_marker(event)
+        # The FIRST of a run: Codex writes two markers per compaction.
+        if marker and not previous_marker and current and size >= _SEGMENT_CHAR_BUDGET / 2:
+            marker_at = len(current)
+        previous_marker = marker
         current.append(event)
         size += one
     if current:
@@ -805,7 +835,11 @@ def _segment_session(
     segments: list[tuple[list[Item], str]] = []
     for chunk, boundary in _split_on_compaction(events):
         for offset, piece in enumerate(_split_to_budget(chunk)):
-            segments.append((piece, boundary if offset == 0 else "size"))
+            if offset == 0:
+                why = boundary
+            else:
+                why = "compaction" if piece and _is_compaction_marker(piece[0]) else "size"
+            segments.append((piece, why))
     segments = [(evs, why) for evs, why in segments if evs]
     capped = len(segments) > _MAX_SEGMENTS
     if capped:
