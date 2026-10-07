@@ -316,6 +316,11 @@ async def _enqueue_agent(conn, customer, source, sid, key):
         # second worker claim the same session mid-extraction and mine it
         # twice -- the same fix kb/ingestion_app._enqueue already carries.
         "status=CASE WHEN ingestion_queue.status='processing' THEN 'processing' ELSE 'pending' END,"
+        # When the CURRENT wait began (engine/ingest/queue_age.py): a batch on
+        # a finished row starts a new one; a batch on a waiting row does not.
+        # Every agent upload enqueues here, not through ingestion_app._enqueue.
+        "first_enqueued_at=CASE WHEN ingestion_queue.status IN ('pending','processing') "
+        "THEN ingestion_queue.first_enqueued_at ELSE now() END,"
         "version=ingestion_queue.version+1,completed_at=NULL,error=NULL,enqueued_at=now()",
         customer,
         source.value,

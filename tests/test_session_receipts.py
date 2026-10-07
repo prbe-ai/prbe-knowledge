@@ -66,7 +66,8 @@ async def database(monkeypatch):
         CREATE TABLE documents(customer_id TEXT,doc_id TEXT);
         CREATE TABLE ingestion_queue(queue_id BIGSERIAL PRIMARY KEY,customer_id TEXT,source_system TEXT,source_event_id TEXT,
             payload_s3_key TEXT,payload_s3_keys TEXT[],status TEXT,priority INTEGER,version INTEGER,
-            enqueued_at TIMESTAMPTZ,completed_at TIMESTAMPTZ,error TEXT,
+            enqueued_at TIMESTAMPTZ,first_enqueued_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            completed_at TIMESTAMPTZ,error TEXT,
             UNIQUE(customer_id,source_system,source_event_id));
         DO $$ BEGIN CREATE ROLE receipt_app NOLOGIN; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
     """)
@@ -239,6 +240,37 @@ async def test_same_key_retry_race_has_one_blob_receipt_and_queue_reference(data
         assert await conn.fetchval("SELECT count(*) FROM session_batch_receipts") == 0
     read = await sr.receipts("claude_code", body["session_id"], "tenant-a", -1, 200)
     assert read["stream"]["event_end"] == 2 and read["receipts"][0] == first["receipt"]
+
+
+@pytest.mark.asyncio
+async def test_a_batch_on_a_finished_session_starts_a_new_wait_and_one_on_a_waiting_session_does_not(
+    database,
+):
+    """`first_enqueued_at` is the queue-age alert's clock (engine/ingest/queue_age.py),
+    and every agent upload reaches the queue through this door. A session that
+    finished two days ago and gets a batch now has waited seconds, not days; a
+    session still waiting keeps the time its wait began."""
+    _tenant, admin = database
+    store = Store()
+    old = datetime(2026, 10, 5, 21, 21, tzinfo=UTC)
+
+    def turn(line_no: int, text: str) -> list[dict]:
+        return [{"line_no": line_no, "raw": {"type": "user", "message": {"role": "user", "content": text}}}]
+
+    body = batch()
+    await sr.accept(body, "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    await admin.execute("UPDATE ingestion_queue SET status='done', first_enqueued_at=$1", old)
+    second = _next(body, events=turn(2, "back"))
+    await sr.accept(second, "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    row = await admin.fetchrow("SELECT status, first_enqueued_at FROM ingestion_queue")
+    assert row["status"] == "pending"
+    assert row["first_enqueued_at"] > old, "a finished session's new batch is a new wait"
+
+    await admin.execute("UPDATE ingestion_queue SET first_enqueued_at=$1", old)
+    await sr.accept(_next(second, events=turn(3, "more")), "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    assert await admin.fetchval("SELECT first_enqueued_at FROM ingestion_queue") == old, (
+        "a batch landing on a waiting session must not reset its age"
+    )
 
 
 @pytest.mark.asyncio
