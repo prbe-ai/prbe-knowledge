@@ -841,9 +841,10 @@ def test_the_receipt_digest_covers_fragments_and_their_version():
         ),
         (
             # A typo drops its entry; it never takes the receipts read down.
+            # Version 2 is listed but this fold reads only 1: not advertised.
             {"session_protocol3_all": True, "session_fragment_versions": "2, 1,x,\u00b2,"},
             "tenant-a",
-            {"protocols": [2, 3], "fragment_versions": [1, 2], "events": True},
+            {"protocols": [2, 3], "fragment_versions": [1], "events": True},
         ),
     ],
 )
@@ -919,11 +920,14 @@ def test_a_protocol_3_finalize_carries_no_fragments_or_events():
 
 
 def test_the_fragment_versions_accepted_follow_the_setting(protocol3):
+    # Listing only 2 refuses 1; and 2 is refused too while fold reads only 1.
     protocol3(session_fragment_versions="2")
-    with pytest.raises(HTTPException) as error:
-        sr.validate_payload(fragments_batch())
-    assert "unsupported fragment version" in error.value.detail
-    sr.validate_payload(fragments_batch(fragment_version=2))
+    for version in (1, 2):
+        with pytest.raises(HTTPException) as error:
+            sr.validate_payload(fragments_batch(fragment_version=version))
+        assert "unsupported fragment version" in error.value.detail
+    protocol3(session_fragment_versions="1")
+    sr.validate_payload(fragments_batch(fragment_version=1))
 
 
 @pytest.mark.asyncio
@@ -1140,3 +1144,15 @@ async def test_the_webhook_sends_protocol_2_and_3_batches_to_the_receipt_door(
     assert response.status_code == 200, response.text
     assert response.json()["protocol_version"] == protocol
     assert seen == [(protocol, "tenant-a", SourceSystem.CLAUDE_CODE)]
+
+
+def test_the_door_accepts_only_versions_the_fold_reads() -> None:
+    """A version the deploy lists but fold cannot read would be accepted and
+    folded to unparsed steps; the door intersects the two."""
+    from engine.ingest.atif.fold import SUPPORTED_FRAGMENT_VERSIONS
+    from engine.shared.config import Settings
+
+    listed = Settings(session_fragment_versions="1,2,99")
+    assert sr.fragment_versions(listed) == sorted({1, 2, 99} & SUPPORTED_FRAGMENT_VERSIONS)
+    assert 99 not in sr.fragment_versions(listed)
+    assert sr.fragment_versions(Settings(session_fragment_versions="")) == []

@@ -21,6 +21,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 
+from engine.ingest.atif.fold import SUPPORTED_FRAGMENT_VERSIONS
 from engine.ingest.connectedness import is_source_connected
 from engine.ingest.payload_redaction import redact_payload_async
 from engine.shared.config import Settings, get_settings
@@ -86,12 +87,13 @@ def _csv(value: str) -> list[str]:
 
 
 def fragment_versions(settings: Settings | None = None) -> list[int]:
-    """Fragment versions this engine's fold reads. A typo in the deploy drops
-    that entry rather than taking ingestion down."""
+    """Fragment versions this door accepts: those the deploy lists AND this
+    engine's `fold` reads (a version only the setting names would be accepted
+    and then fold to unparsed steps). A typo in the deploy drops that entry
+    rather than taking ingestion down."""
     s = settings or get_settings()
-    return sorted(
-        {int(v) for v in _csv(s.session_fragment_versions) if v.isascii() and v.isdigit()}
-    )
+    listed = {int(v) for v in _csv(s.session_fragment_versions) if v.isascii() and v.isdigit()}
+    return sorted(listed & SUPPORTED_FRAGMENT_VERSIONS)
 
 
 def protocol3_enabled(customer_id: str, settings: Settings | None = None) -> bool:
