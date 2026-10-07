@@ -13,6 +13,7 @@
 #   scripts/atif_sessions_job.sh backfill --all-tenants            # dry run
 #   scripts/atif_sessions_job.sh backfill --all-tenants --write
 #   DRY_RUN=1 scripts/atif_sessions_job.sh replay ...   # server-side validation only
+#   REQUEST_MEMORY=1Gi scripts/atif_sessions_job.sh ...  # reserve more (default 512Mi; limit 2Gi)
 #
 # The script must be in the image the worker runs (merge, then the data-plane
 # image build, then the worker restart). Output is ids, counts and timings only;
@@ -38,7 +39,8 @@ case "$image" in *@sha256:*) ;; *) echo "no image digest from $deploy pods: '$im
 echo "image: $image"
 
 kubectl --context "$ctx" -n "$ns" get deploy "$deploy" -o json | jq \
-  --arg name "$name" --argjson cmd "$cmd" --arg image "$image" '
+  --arg name "$name" --argjson cmd "$cmd" --arg image "$image" \
+  --arg request_memory "${REQUEST_MEMORY:-512Mi}" '
   {
     apiVersion: "batch/v1",
     kind: "Job",
@@ -58,8 +60,16 @@ kubectl --context "$ctx" -n "$ns" get deploy "$deploy" -o json | jq \
                | {env, envFrom, volumeMounts, securityContext}
                + {name: "atif-sessions", image: $image, imagePullPolicy: "IfNotPresent",
                   command: $cmd,
-                  # Request what it may use: the node is packed on requests.
-                  resources: {requests: {cpu: "250m", memory: "2Gi"},
+                  # Request what it USES, cap at what it may use. The research
+                  # worker pool is packed on requests (80-97% of memory reserved
+                  # on 2026-10-07), so a 2Gi request sat Pending on every node
+                  # ("Insufficient memory") while the work needs far less: a
+                  # strip run peaked at 275Mi and the 1,953-session
+                  # --compare-builders replay finished inside 320Mi. Above the
+                  # request a pod is first to go under node memory pressure; a
+                  # rerun is safe (strip and backfill skip what is done).
+                  # REQUEST_MEMORY overrides it for a run known to be heavier.
+                  resources: {requests: {cpu: "250m", memory: $request_memory},
                               limits: {cpu: "1", memory: "2Gi"}}}]})
       }
     }

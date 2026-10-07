@@ -8,6 +8,8 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Fixed
 
+- **`scripts/atif_sessions_job.sh` Jobs schedule on a packed research pool.** They reserved the worker's 2Gi, which no research worker node had free on 2026-10-07 (80-97% of memory reserved), so a strip run sat Pending with "Insufficient memory". They now reserve 512Mi (a strip run peaked at 275Mi; the 1,953-session replay fit in 320Mi) under the same 2Gi limit; `REQUEST_MEMORY` raises it for a heavier run.
+
 - **A live session mined every few minutes no longer reads as days old in `ingestion_queue_age`.** A session whose batches keep landing mid-pass loops pending -> processing -> pending and never reaches `done`, so the reset on re-enqueue never ran for it: after that fix shipped, three such rows still held the alert at 47h while a worker claimed each within minutes. A pass that finished but lost its commit to a newer batch now restarts the clock (the done and skipped CAS-miss releases); a pass that errored keeps it.
 
 - **`ingestion_queue_age` measures the current wait, not a session's whole life.** A finished session row that receives new batches starts a new `first_enqueued_at`; a row still waiting keeps its own, so a backlog that is not draining still reads old (a live session read 46 h old with a 90 s wait, 2026-10-07).
