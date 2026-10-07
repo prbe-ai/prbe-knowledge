@@ -216,7 +216,11 @@ class Settings(BaseSettings):
     #: session again on protocol 3. A stream already on protocol 2 keeps being
     #: accepted to its end. A customer NOT offered protocol 3 (the protocol-3
     #: kill switch) may still start on 2, so withdrawing protocol 3 never leaves
-    #: a new session with no protocol at all.
+    #: a new session with no protocol at all. That holds per CUSTOMER, not per
+    #: machine: while this is false, never drop from SESSION_FRAGMENT_VERSIONS
+    #: a fragment version any live tap still builds -- a tap offered protocol 3
+    #: only at versions it cannot build falls back to protocol 2, is refused,
+    #: and stops capturing new sessions (only its local log says so).
     session_protocol2_new_streams: bool = Field(default=True)
     #: Reuse a segment's extraction when the same session re-ends with that
     #: segment unchanged (engine/shared/extraction_cache.py). Off = no cache
