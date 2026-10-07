@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Mapping
@@ -31,9 +32,19 @@ from typing import Any, ClassVar
 import orjson
 
 from engine.ingest import cpu_pool
+from engine.ingest.atif import compare as _compare
 from engine.ingest.atif.build import BuildResult, build_and_render
+from engine.ingest.atif.fragment import Kind
 from engine.ingest.atif.mode import RenderMode, render_mode
 from engine.ingest.atif.store import TrajectoryTooLarge, trajectory_key, write_trajectory
+from engine.ingest.atif.uploaded import (
+    FragmentLines,
+    first_content,
+    fold_fragments,
+    fragment_lines,
+    fragment_ordinal,
+    session_fragments,
+)
 from engine.ingest.handlers.base import Connector
 from engine.ingest.handlers.registry import register_connector
 from engine.shared import claude_code_extraction as _ext
@@ -72,6 +83,7 @@ from engine.shared.models import (
     WebhookParseResult,
     make_named_entity,
 )
+from engine.shared.session_signals import SessionProtocol
 from engine.shared.session_suppression import is_session_deleted
 from engine.shared.storage import get_store
 
@@ -133,11 +145,25 @@ _TURN_ENDS = frozenset({"end_turn", "stop", "stop_sequence"})
 _LIVE_TURNS: OrderedDict[tuple[str, str, str], int] = OrderedDict()
 
 
-def _turn_end_line(events: list[dict[str, Any]]) -> int | None:
+def _ends_turn(stop_reason: object) -> bool:
+    # A client's value: only a string names a stop reason (and an unhashable
+    # one would raise inside `in`).
+    return isinstance(stop_reason, str) and stop_reason in _TURN_ENDS
+
+
+def _turn_end_line(items: list[Any], *, fragments: bool = False) -> int | None:
     """line_no of the newest reply when it ends its turn, else None. Looks past
     trailing bookkeeping (queue operations, system notes) to the newest
-    user/assistant event."""
-    for event in reversed(events):
+    user/assistant event.
+
+    `fragments`: `items` are a protocol-3 session's fragments (fragment.py),
+    which carry the same facts: the message's `stop_reason` (every one,
+    Claude Code's `end_turn` included, not only those the index prints), and
+    pi's `stop_reason` and Codex's `phase` in `extras`.
+    """
+    if fragments:
+        return _fragment_turn_end_line(items)
+    for event in reversed(items):
         raw = (event or {}).get("raw")
         if not isinstance(raw, dict) or raw.get("type") not in ("user", "assistant"):
             continue
@@ -147,8 +173,8 @@ def _turn_end_line(events: list[dict[str, Any]]) -> int | None:
         pi = raw.get("_pi_extras") if isinstance(raw.get("_pi_extras"), dict) else {}
         codex = raw.get("_codex_extras") if isinstance(raw.get("_codex_extras"), dict) else {}
         ended = (
-            message.get("stop_reason") in _TURN_ENDS
-            or pi.get("stop_reason") in _TURN_ENDS
+            _ends_turn(message.get("stop_reason"))
+            or _ends_turn(pi.get("stop_reason"))
             or codex.get("phase") == "final_answer"
         )
         line = event.get("line_no")
@@ -156,18 +182,69 @@ def _turn_end_line(events: list[dict[str, Any]]) -> int | None:
     return None
 
 
-def _turn_bypass_due(key: tuple[str, str, str], events: list[dict[str, Any]]) -> bool:
-    """A turn-ending reply the live copy does not have yet. Once per reply: a
-    turn ends only when the model waits for the researcher, so this is paced by
-    their prompts, never by the throttle."""
-    line = _turn_end_line(events)
+_TURN_KINDS = (Kind.USER.value, Kind.ASSISTANT.value)
+
+
+def _fragment_turn_end_line(fragments: list[Any]) -> int | None:
+    """`_turn_end_line` over fragments, read as untrusted data."""
+    for item in reversed(fragments):
+        kind = item.get("kind") if isinstance(item, dict) else None
+        if not isinstance(kind, str) or kind not in _TURN_KINDS:
+            continue
+        if kind != Kind.ASSISTANT.value:
+            return None
+        stop = item.get("stop") if isinstance(item.get("stop"), dict) else {}
+        extras = item.get("extras") if isinstance(item.get("extras"), dict) else {}
+        pi = extras.get("pi_extras") if isinstance(extras.get("pi_extras"), dict) else {}
+        codex = extras.get("codex_extras") if isinstance(extras.get("codex_extras"), dict) else {}
+        ended = (
+            _ends_turn(item.get("stop_reason"))
+            or _ends_turn(stop.get("reason"))
+            or _ends_turn(pi.get("stop_reason"))
+            or codex.get("phase") == "final_answer"
+        )
+        return fragment_ordinal(item) if ended else None
+    return None
+
+
+def _turn_bypass_due(key: tuple[str, str, str], line: int | None) -> bool:
+    """A turn-ending reply (`line`, from `_turn_end_line`) the live copy does
+    not have yet. Once per reply: a turn ends only when the model waits for the
+    researcher, so this is paced by their prompts, never by the throttle."""
     return line is not None and _LIVE_TURNS.get(key) != line
 
 
-def _turn_written(key: tuple[str, str, str], events: list[dict[str, Any]]) -> None:
-    line = _turn_end_line(events)
+def _turn_written(key: tuple[str, str, str], line: int | None) -> None:
     if line is not None:
         _remember(_LIVE_TURNS, key, line)
+
+
+def _live_build_due(key: tuple[str, str, str], turn_line: int | None) -> bool:
+    """Whether a LIVE pass refreshes the stored live trajectory, recording the
+    write if so: at most once per interval per process, and once for each
+    reply that ends a turn (`turn_line`), so a pause never hides the latest
+    answer. Either protocol's pass asks this."""
+    settings = get_settings()
+    if not (
+        settings.session_trajectory_store
+        and settings.session_trajectory_live_interval_s > 0
+        and key not in _LIVE_TOO_LARGE
+        and (
+            _live_write_due(key, settings.session_trajectory_live_interval_s)
+            or _turn_bypass_due(key, turn_line)
+        )
+    ):
+        return False
+    _live_written(key)
+    _turn_written(key, turn_line)
+    return True
+
+
+def _reset_live(key: tuple[str, str, str]) -> None:
+    """A completing pass: the final copy replaces any live one; a resume starts afresh."""
+    _LIVE_WRITES.pop(key, None)
+    _LIVE_TOO_LARGE.pop(key, None)
+    _LIVE_TURNS.pop(key, None)
 
 
 _FETCH_SUPP_R2_CONCURRENCY = 16
@@ -175,6 +252,24 @@ _FETCH_SUPP_R2_CONCURRENCY = 16
 
 def _nonempty_str(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+#: A client-chosen name (an event type, an error class) a log line may carry.
+_LOG_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,63}")
+
+
+def _log_name(value: object) -> object:
+    """`value` when it is None or identifier-shaped, else `*`: never a client's
+    free text in the worker's log."""
+    if value is None or (isinstance(value, str) and _LOG_NAME.fullmatch(value)):
+        return value
+    return "*"
+
+
+def _list(value: object) -> list[Any]:
+    """A stored list field, [] for anything else (the door checked it; a read
+    never trusts that)."""
+    return value if isinstance(value, list) else []
 
 
 #: `extraction_outcome.reason` values. A non-authoritative pass records the
@@ -329,15 +424,19 @@ class ClaudeCodeConnector(Connector):
         headers: Mapping[str, str],
         raw_payload: Mapping[str, Any],
     ) -> WebhookParseResult | None:
-        if raw_payload.get("protocol_version") == 2:
+        protocol = SessionProtocol.of(raw_payload)
+        if protocol.streamed:
             # Cursor-only batches still identify the session. The normalizer
-            # parses the oldest accepted key before hydrating its later events.
+            # parses the oldest accepted key before hydrating its later events
+            # (protocol 2) or fragments (protocol 3). It was accepted by the
+            # receipt door, so a fragment version that today's settings no
+            # longer list is fold's to report, not a reason to fail the row.
             from fastapi import HTTPException
 
             from kb.session_receipts import validate_payload
 
             try:
-                validate_payload(dict(raw_payload))
+                validate_payload(dict(raw_payload), accepted=True)
             except HTTPException as exc:
                 raise InvalidWebhookPayload(f"invalid transcript protocol: {exc.detail}") from exc
         # source_event_id is the bare session_id for both live batches AND
@@ -366,7 +465,7 @@ class ClaudeCodeConnector(Connector):
             raise InvalidWebhookPayload("claude_code: batch_seq must be int")
 
         events = raw_payload.get("events") or []
-        if not events and raw_payload.get("protocol_version") != 2:
+        if not events and not protocol.streamed:
             return None  # empty post, nothing to enqueue
 
         return WebhookParseResult(
@@ -415,6 +514,11 @@ class ClaudeCodeConnector(Connector):
         (a protocol-2 finalize, a protocol-1 client finalize, or the sweep's
         `finalize.marker`). Nothing is consumed, so a resumed session is live
         again simply because its end signal is no longer on top.
+
+        A protocol-3 session (any batch on it) is returned as `fragments` --
+        ordinal order, what normalize reads its Lines and trajectory from --
+        with `events` empty and the canary's `canary_events` beside them. It
+        ends exactly as protocol 2 does: its own finalize is its newest batch.
         """
         session_id = event.raw_payload.get("session_id") or event.source_event_id.split(":", 1)[0]
         if not session_id:
@@ -424,13 +528,22 @@ class ClaudeCodeConnector(Connector):
 
         merged_events: list[dict[str, Any]] = []
         seen_line_nos: set[int] = set()
+        # Protocol 3: the client's fragments, keyed by the same event ordinals
+        # (a fragment's ordinal IS its Line's line_no), and the sanitized events
+        # a canary client sends beside them, which are evidence for the
+        # fragment shadow only -- never what the session is read from.
+        merged_fragments: list[Any] = []
+        canary_events: list[dict[str, Any]] = []
+        seen_canary: set[int] = set()
+        protocols: set[SessionProtocol] = set()
         session_identity: dict[str, Any] = {}
         latest_uploader_seq = -1
 
-        def _remember_payload_identity(payload: Mapping[str, Any]) -> None:
+        def _remember_payload_identity(
+            payload: Mapping[str, Any], protocol: SessionProtocol
+        ) -> None:
             nonlocal latest_uploader_seq
-            if payload.get("protocol_version") == 2:
-                session_identity["protocol_version"] = 2
+            if protocol.streamed:
                 if isinstance(payload.get("provenance"), dict):
                     session_identity["provenance"] = dict(payload["provenance"])
                 if payload.get("batch_seq", -1) > latest_uploader_seq:
@@ -474,6 +587,24 @@ class ClaudeCodeConnector(Connector):
                 seen_line_nos.add(line_no)
             merged_events.append(obj)
 
+        def _ingest_fragment(item: Any) -> None:
+            """Append a fragment, deduplicating by ordinal: the event ordinals of
+            a session are one space whichever protocol a batch came in on."""
+            ordinal = fragment_ordinal(item)
+            if ordinal is not None:
+                if ordinal in seen_line_nos:
+                    return
+                seen_line_nos.add(ordinal)
+            merged_fragments.append(item)
+
+        def _ingest_canary(obj: dict[str, Any]) -> None:
+            line_no = obj.get("line_no")
+            if isinstance(line_no, int):
+                if line_no in seen_canary:
+                    return
+                seen_canary.add(line_no)
+            canary_events.append(obj)
+
         keys: list[str] = list(event.payload_s3_keys or [])
         if not keys and event.payload_s3_key:
             # Defensive: if the queue row was inserted before migration 0026
@@ -499,9 +630,10 @@ class ClaudeCodeConnector(Connector):
         # for the merge — we re-sort by line_no after.
         fetched: list[tuple[str, bytes]] = await asyncio.gather(*(_fetch(k) for k in keys))
 
-        last_v2_batch = -1
-        last_v2_finalized = False
-        v2_finalized_seqs: list[int] = []
+        # The receipted streams (protocol 2 and 3) order by accepted batch_seq.
+        last_stream_batch = -1
+        last_stream_finalized = False
+        stream_finalized_seqs: list[int] = []
         # What the NEWEST key on the row says, in arrival order. Set on every
         # key, so after the loop it describes the last one only.
         last_signal: _signals.CompletedBy | None = None
@@ -525,25 +657,54 @@ class ClaudeCodeConnector(Connector):
             payload = envelope.get("payload", envelope) if isinstance(envelope, dict) else {}
             if not isinstance(payload, dict):
                 continue
+            protocol = SessionProtocol.of(payload)
+            protocols.add(protocol)
+            fragments_batch = protocol is SessionProtocol.FRAGMENTS
             trail[-1] = (
                 last_signal,
                 envelope.get("received_at") if isinstance(envelope, dict) else None,
-                [e for e in payload.get("events") or [] if isinstance(e, dict)],
+                # Only protocol 1 reads these (late delivery after its finalize).
+                []
+                if fragments_batch
+                else [e for e in payload.get("events") or [] if isinstance(e, dict)],
             )
-            if payload.get("protocol_version") == 2 and payload.get("finalize") is True:
-                v2_finalized_seqs.append(payload.get("batch_seq", -1))
-            if (
-                payload.get("protocol_version") == 2
-                and payload.get("batch_seq", -1) > last_v2_batch
-            ):
-                last_v2_batch = payload["batch_seq"]
-                last_v2_finalized = payload.get("finalize") is True
-            _remember_payload_identity(payload)
+            if protocol.streamed and payload.get("finalize") is True:
+                stream_finalized_seqs.append(payload.get("batch_seq", -1))
+            if protocol.streamed and payload.get("batch_seq", -1) > last_stream_batch:
+                last_stream_batch = payload["batch_seq"]
+                last_stream_finalized = payload.get("finalize") is True
+            _remember_payload_identity(payload, protocol)
+            if fragments_batch:
+                # Each batch is read by its own protocol: a protocol-3 batch's
+                # `events` (the canary's) are never the session's events.
+                for item in _list(payload.get("fragments")):
+                    _ingest_fragment(item)
+                for obj in _list(payload.get("events")):
+                    if isinstance(obj, dict):
+                        _ingest_canary(obj)
+                continue
             for obj in payload.get("events") or []:
                 if isinstance(obj, dict):
                     _ingest(obj)
 
         merged_events.sort(key=lambda e: (e.get("line_no") is None, e.get("line_no") or 0))
+        streamed = [p for p in protocols if p.streamed]
+        if streamed:
+            # The newest protocol any batch used: a session the door pinned to
+            # protocol 3 never has another, and if one somehow does, its
+            # fragments decide how it is read.
+            session_identity["protocol_version"] = int(max(streamed))
+        if SessionProtocol.FRAGMENTS in protocols and len(protocols) > 1:
+            # The door pins a stream to one protocol; this should not happen.
+            # Each batch was read by its own protocol, in ordinal order. (A
+            # protocol 1 + 2 mix predates protocol 3 and is not this.)
+            log.warning(
+                "claude_code.mixed_protocols",
+                customer=event.customer_id,
+                source=self.source_system.value,
+                session_id=session_id,
+                protocols=sorted(int(p) for p in protocols),
+            )
 
         # One rule (engine.shared.session_signals): the session has ended when
         # the NEWEST key is an end signal. Nothing is consumed; a batch that
@@ -557,8 +718,8 @@ class ClaudeCodeConnector(Connector):
         completed_by: _signals.CompletedBy | None
         if last_signal == _signals.CompletedBy.CRON_MARKER:
             completed_by = last_signal
-        elif last_v2_batch >= 0:
-            completed_by = _signals.CompletedBy.V2_FINALIZE if last_v2_finalized else None
+        elif last_stream_batch >= 0:
+            completed_by = _signals.CompletedBy.V2_FINALIZE if last_stream_finalized else None
         elif last_signal == _signals.CompletedBy.V1_CLIENT_FINALIZE:
             completed_by = last_signal
         elif _late_deliveries_after_client_finalize(trail):
@@ -574,10 +735,10 @@ class ClaudeCodeConnector(Connector):
         # An end signal that is not the newest one: the session ended once and
         # resumed. Its trajectory.json describes the earlier ending only.
         ended_before = any(signal is not None for signal, _, _ in trail[:-1]) or any(
-            seq < last_v2_batch for seq in v2_finalized_seqs
+            seq < last_stream_batch for seq in stream_finalized_seqs
         )
 
-        return {
+        hydrated: dict[str, Any] = {
             "session_id": session_id,
             "events": merged_events,
             "ended_before": ended_before,
@@ -586,6 +747,21 @@ class ClaudeCodeConnector(Connector):
             "cwd": event.raw_payload.get("cwd"),
             **session_identity,
         }
+        if SessionProtocol.FRAGMENTS in protocols:
+            # A protocol-3 session is read from its fragments; any event that
+            # came on another protocol's batch is mapped into one here.
+            merged_fragments.sort(
+                key=lambda f: (fragment_ordinal(f) is None, fragment_ordinal(f) or 0)
+            )
+            canary_events.sort(
+                key=lambda e: (
+                    (False, e["line_no"]) if isinstance(e.get("line_no"), int) else (True, 0)
+                )
+            )
+            hydrated["fragments"] = session_fragments(merged_fragments, merged_events)
+            hydrated["canary_events"] = canary_events
+            hydrated["events"] = []
+        return hydrated
 
     async def normalize(
         self,
@@ -596,6 +772,12 @@ class ClaudeCodeConnector(Connector):
         events = hydrated.get("events") or []
         cwd = hydrated.get("cwd")
         complete = bool(hydrated.get("session_complete"))
+        protocol = SessionProtocol.of(hydrated)
+        # Protocol 3: the client's fragments, in ordinal order, are what the
+        # session is read from -- Lines and trajectory alike. `events` is empty.
+        uploaded: list[Any] | None = (
+            _list(hydrated.get("fragments")) if protocol is SessionProtocol.FRAGMENTS else None
+        )
         # A row holding only end signals has nothing to write and no one to
         # attribute it to. That shape used to exist -- the sweep INSERTed a
         # marker-only row for a session with no live row -- and every one of
@@ -604,7 +786,7 @@ class ClaudeCodeConnector(Connector):
         # that shape: a live batch without an employee_id still raises.
         if (
             complete
-            and not events
+            and not (uploaded if uploaded is not None else events)
             and not _nonempty_str(hydrated.get("employee_id"))
             and not _nonempty_str(event.raw_payload.get("employee_id"))
         ):
@@ -617,8 +799,9 @@ class ClaudeCodeConnector(Connector):
             # and the row dead-letters anyway; with one it is marked skipped.
             return NormalizationResult(skipped_reason="agent session has no events to write")
         # Authentication proves who uploaded supplied bytes, not who authored
-        # the historical conversation. There is no verified-author v2 claim.
-        unverified_author = hydrated.get("protocol_version") == 2
+        # the historical conversation. There is no verified-author claim on a
+        # receipted stream (protocol 2 or 3).
+        unverified_author = protocol.streamed
         employee_id = _nonempty_str(hydrated.get("employee_id")) or self._employee_id_from_event(
             event, events
         )
@@ -638,7 +821,19 @@ class ClaudeCodeConnector(Connector):
             employee_name = employee_email = employee_hostname = None
 
         now = datetime.now(UTC)
-        lines, built, served_atif = await self._session_lines(event, session_id, events, complete)
+        read: FragmentLines | None = None
+        if uploaded is not None:
+            # Lines straight from the fragments, never waiting on fold (R2);
+            # whatever the render mode, they are what is indexed and mined.
+            read = fragment_lines(uploaded)
+            self._log_fragment_reading(event, session_id, read, complete)
+            lines = read.lines
+            built = await self._fragment_trajectory(event, session_id, uploaded, lines, complete)
+            served_lines = True
+        else:
+            lines, built, served_lines = await self._session_lines(
+                event, session_id, events, complete
+            )
         session_doc = self._build_session_doc(
             event=event,
             session_id=session_id,
@@ -652,6 +847,15 @@ class ClaudeCodeConnector(Connector):
             complete=complete,
             completed_by=hydrated.get("completed_by"),
             now=now,
+            **(
+                {}
+                if uploaded is None
+                else {
+                    "event_count": len(uploaded),
+                    "compaction_count": sum(1 for line in lines if line.compact_boundary),
+                    "preview": first_content(uploaded),
+                }
+            ),
         )
         settings = get_settings()
         if built is not None and settings.session_trajectory_store:
@@ -663,13 +867,17 @@ class ClaudeCodeConnector(Connector):
                     settings.session_trajectory_store
                     and settings.session_trajectory_live_interval_s > 0
                 )
-                or (event.customer_id, self.source_system.value, session_id) in _LIVE_TOO_LARGE
+                or self._live_key(event, session_id) in _LIVE_TOO_LARGE
             )
         ):
             # A completing pass that built nothing, or (with no live copies) a
             # session that ended and then resumed: whatever trajectory.json holds
             # no longer describes this session; a reader gets "not built".
             await self._discard_trajectory(event, session_id, why="stale")
+        if complete and settings.session_fragment_shadow:
+            await self._fragment_shadow(
+                event, session_id, protocol, hydrated, uploaded, built, lines
+            )
 
         documents: list[Document] = [session_doc]
         if unverified_author:
@@ -806,9 +1014,10 @@ class ClaudeCodeConnector(Connector):
             cwd=cwd,
             agent=self._agent_label,
             cache=cache,
-            # Only when the trajectory's text is served: otherwise extraction
-            # renders the events itself, exactly as it did before.
-            **({"lines": lines} if served_atif else {}),
+            # Only when the trajectory's (or, protocol 3, the fragments') text
+            # is served: otherwise extraction renders the events itself,
+            # exactly as it did before. Same Lines, same segments either way.
+            **({"lines": lines} if served_lines else {}),
         )
         # One line per mining pass: the only record of what a pass cost and
         # why it ran. `segment_hashes` repeat across passes of one session
@@ -819,9 +1028,11 @@ class ClaudeCodeConnector(Connector):
             customer=event.customer_id,
             source=self.source_system.value,
             session_id=session_id,
-            protocol_version=2 if hydrated.get("protocol_version") == 2 else 1,
+            protocol_version=int(protocol),
             completed_by=hydrated.get("completed_by"),
-            events=len(events),
+            events=len(uploaded) if uploaded is not None else len(events),
+            # Protocol 3: what reading the fragments cost (counts only).
+            **(read.counts() if read is not None else {}),
             segments=bundle.segments,
             calls=bundle.calls,
             cache_hits=bundle.cache_hits,
@@ -1022,7 +1233,8 @@ class ClaudeCodeConnector(Connector):
     @staticmethod
     def _capture_provenance(doc: Document, hydrated: Mapping[str, Any], uploader: dict) -> None:
         doc.author_id = None
-        doc.metadata["protocol_version"] = 2
+        # Only receipted streams (protocol 2 or 3) are captured this way.
+        doc.metadata["protocol_version"] = int(SessionProtocol.of(hydrated))
         doc.metadata["author_verification"] = "unverified"
         provenance = dict(hydrated.get("provenance") or {})
         doc.metadata["provenance"] = provenance
@@ -1157,95 +1369,42 @@ class ClaudeCodeConnector(Connector):
         """
         legacy = lines_from_events(events)
         settings = get_settings()
-        live_key = (event.customer_id, self.source_system.value, session_id)
+        live_key = self._live_key(event, session_id)
         if not complete:
             # A live pass serves the events' Lines whatever the mode. It builds
             # only to refresh the stored live trajectory: at most once per
             # interval per process, and once for each reply that ends a turn,
             # so a pause never hides the latest answer.
-            if not (
-                settings.session_trajectory_store
-                and settings.session_trajectory_live_interval_s > 0
-                and live_key not in _LIVE_TOO_LARGE
-                and (
-                    _live_write_due(live_key, settings.session_trajectory_live_interval_s)
-                    or _turn_bypass_due(live_key, events)
-                )
-            ):
+            if not _live_build_due(live_key, _turn_end_line(events)):
                 return legacy, None, False
-            _live_written(live_key)
-            _turn_written(live_key, events)
             mode, compare = None, False
         else:
-            # The final copy replaces any live one; a resume starts afresh.
-            _LIVE_WRITES.pop(live_key, None)
-            _LIVE_TOO_LARGE.pop(live_key, None)
-            _LIVE_TURNS.pop(live_key, None)
+            _reset_live(live_key)
             mode = render_mode(event.customer_id)
             compare = mode is not RenderMode.LEGACY
             if not compare and not settings.session_trajectory_store:
                 return legacy, None, False
-        try:
-            # Pure-Python over the whole session: off the event loop, in the
-            # process pool when large, like every other large CPU pass. The
-            # builder is chosen here: a pool process has its own settings.
-            built, atif, render_error = await cpu_pool.run_cpu(
-                build_and_render,
-                events,
-                session_id,
-                self._agent_label,
-                compare,
-                settings.session_atif_builder,
-                size=sum(len(line.text) for line in legacy),
-            )
-        except CpuPoolUnavailable:
-            if not complete:
-                # Optional work: keep the previous live copy, retry next pass.
-                _LIVE_WRITES.pop(live_key, None)
-                log.info(
-                    "trajectory.live_skipped_pool",
-                    customer=event.customer_id,
-                    source=self.source_system.value,
-                    session_id=session_id,
-                )
-                return legacy, None, False
-            # The pool's transient failure: the row retries, as the body scrub's
-            # does, rather than leave an ended session without its trajectory.
-            raise
-        except Exception as exc:
-            # A live build repeats every interval: one quiet line; the
-            # completing pass logs the traceback.
-            (log.warning if complete else log.info)(
-                "atif.build_failed",
-                customer=event.customer_id,
-                source=self.source_system.value,
-                session_id=session_id,
-                live=not complete,
-                error=type(exc).__name__,
-                exc_info=complete,
-            )
+        # Pure-Python over the whole session: off the event loop, in the
+        # process pool when large, like every other large CPU pass. The
+        # builder is chosen here: a pool process has its own settings.
+        result = await self._build(
+            event,
+            session_id,
+            complete,
+            build_and_render,
+            events,
+            session_id,
+            self._agent_label,
+            compare,
+            settings.session_atif_builder,
+            size=sum(len(line.text) for line in legacy),
+        )
+        if result is None:
             return legacy, None, False
+        built, atif, render_error = result
+        self._log_unparsed(event, session_id, built, complete)
         if not complete:
-            # One line per live build, not one per event: live builds repeat.
-            if built.unparsed:
-                log.info(
-                    "atif.live_unparsed",
-                    customer=event.customer_id,
-                    source=self.source_system.value,
-                    session_id=session_id,
-                    unparsed=built.unparsed,
-                )
             return legacy, built, False
-        for line_no, ev_type, error in built.unparsed_events:
-            log.warning(
-                "atif.event_unparsed",
-                customer=event.customer_id,
-                source=self.source_system.value,
-                session_id=session_id,
-                line_no=line_no,
-                event_type=ev_type,
-                error=error,
-            )
         if not compare or mode is None:
             return legacy, built, False
         if render_error is not None:
@@ -1277,6 +1436,205 @@ class ClaudeCodeConnector(Connector):
         if mode is RenderMode.ATIF and same and atif is not None and built.unparsed == 0:
             return atif, built, True
         return legacy, built, False
+
+    def _live_key(self, event: WebhookEvent, session_id: str) -> tuple[str, str, str]:
+        """A session's key in the live-trajectory tables (_LIVE_WRITES and co.)."""
+        return (event.customer_id, self.source_system.value, session_id)
+
+    async def _fragment_trajectory(
+        self,
+        event: WebhookEvent,
+        session_id: str,
+        fragments: list[Any],
+        lines: list[Line],
+        complete: bool,
+    ) -> BuildResult | None:
+        """A protocol-3 session's trajectory: `fold` over its fragments, on the
+        same live throttle and completing pass as an event build (`_session_lines`).
+
+        Its Lines are read from the fragments themselves, so there is nothing
+        independent to compare them with here and no render-mode comparison
+        runs: the fragment shadow (`_fragment_shadow`) checks the fragments
+        against the canary's events instead.
+        """
+        live_key = self._live_key(event, session_id)
+        if not complete:
+            if not _live_build_due(live_key, _turn_end_line(fragments, fragments=True)):
+                return None
+        else:
+            _reset_live(live_key)
+            if not get_settings().session_trajectory_store:
+                return None
+        built = await self._build(
+            event,
+            session_id,
+            complete,
+            fold_fragments,
+            fragments,
+            session_id,
+            self._agent_label,
+            size=sum(len(line.text) for line in lines),
+        )
+        if built is not None:
+            self._log_unparsed(event, session_id, built, complete, untrusted=True)
+        return built
+
+    async def _build(
+        self,
+        event: WebhookEvent,
+        session_id: str,
+        complete: bool,
+        fn: Any,
+        *args: Any,
+        size: int,
+    ) -> Any:
+        """`fn(*args)` in `cpu_pool`; None when the build failed or (live) the
+        pool is down. Never fails the pass, except that a completing pass
+        re-raises a pool outage so the row retries."""
+        try:
+            return await cpu_pool.run_cpu(fn, *args, size=size)
+        except CpuPoolUnavailable:
+            if not complete:
+                # Optional work: keep the previous live copy, retry next pass.
+                _LIVE_WRITES.pop(self._live_key(event, session_id), None)
+                log.info(
+                    "trajectory.live_skipped_pool",
+                    customer=event.customer_id,
+                    source=self.source_system.value,
+                    session_id=session_id,
+                )
+                return None
+            # The pool's transient failure: the row retries, as the body scrub's
+            # does, rather than leave an ended session without its trajectory.
+            raise
+        except Exception as exc:
+            # A live build repeats every interval: one quiet line; the
+            # completing pass logs the traceback.
+            (log.warning if complete else log.info)(
+                "atif.build_failed",
+                customer=event.customer_id,
+                source=self.source_system.value,
+                session_id=session_id,
+                live=not complete,
+                error=type(exc).__name__,
+                exc_info=complete,
+            )
+            return None
+
+    def _log_unparsed(
+        self,
+        event: WebhookEvent,
+        session_id: str,
+        built: BuildResult,
+        complete: bool,
+        *,
+        untrusted: bool = False,
+    ) -> None:
+        """`untrusted`: the build folded a client's fragments, whose event type
+        and error name are the client's strings: only identifier-shaped ones
+        reach the log, anything else prints as `*`."""
+        name = _log_name if untrusted else (lambda value: value)
+        if not complete:
+            # One line per live build, not one per event: live builds repeat.
+            if built.unparsed:
+                log.info(
+                    "atif.live_unparsed",
+                    customer=event.customer_id,
+                    source=self.source_system.value,
+                    session_id=session_id,
+                    unparsed=built.unparsed,
+                )
+            return
+        for line_no, ev_type, error in built.unparsed_events:
+            log.warning(
+                "atif.event_unparsed",
+                customer=event.customer_id,
+                source=self.source_system.value,
+                session_id=session_id,
+                line_no=line_no,
+                event_type=name(ev_type),
+                error=name(error),
+            )
+
+    def _log_fragment_reading(
+        self, event: WebhookEvent, session_id: str, read: FragmentLines, complete: bool
+    ) -> None:
+        """One line per pass when a fragment's Line was unreadable, cut, or
+        carried the client's own failure: counts only. The Line still holds its
+        ordinal (empty when unreadable), so every later Line keeps its place.
+        Extraction stays authoritative: the same fragments read the same way on
+        every pass, so a retry could not recover the text."""
+        if not read.degraded:
+            return
+        (log.warning if complete else log.info)(
+            "session_fragments.degraded",
+            customer=event.customer_id,
+            source=self.source_system.value,
+            session_id=session_id,
+            live=not complete,
+            **read.counts(),
+        )
+
+    async def _fragment_shadow(
+        self,
+        event: WebhookEvent,
+        session_id: str,
+        protocol: SessionProtocol,
+        hydrated: Mapping[str, Any],
+        uploaded: list[Any] | None,
+        built: BuildResult | None,
+        lines: list[Line],
+    ) -> None:
+        """SESSION_FRAGMENT_SHADOW, on a completing pass: one
+        `session_fragments.compared` line (engine/ingest/atif/compare.py
+        `shadow`). Protocol 2: fold(map(fragment, events)) against the frozen
+        builder. Protocol 3 with the canary's events: the client's fragments
+        against fragment(events), and fold of the client's against the frozen
+        builder. Nothing else has anything to compare.
+
+        Whatever it finds, the client's fragments stay what this session is
+        read from: they are the client's word, and the events are only the
+        canary's evidence of whether that word can be trusted at the flip.
+        Runs off the event loop; never fails the pass.
+        """
+        if protocol is SessionProtocol.EVENTS:
+            events, fragments = list(hydrated.get("events") or []), None
+        elif uploaded is not None:
+            events, fragments = _list(hydrated.get("canary_events")), uploaded
+        else:
+            return
+        if not events:
+            return
+        try:
+            record = await cpu_pool.run_cpu(
+                _compare.shadow,
+                events,
+                fragments,
+                built,
+                get_settings().session_atif_builder,
+                session_id,
+                self._agent_label,
+                size=sum(len(line.text) for line in lines),
+            )
+        except Exception as exc:  # optional work, a pool outage included
+            log.warning(
+                "session_fragments.compare_failed",
+                customer=event.customer_id,
+                source=self.source_system.value,
+                session_id=session_id,
+                protocol=int(protocol),
+                error=type(exc).__name__,
+            )
+            return
+        same = record["same_trajectory"] and record["same_fragments"] is not False
+        (log.info if same else log.warning)(
+            "session_fragments.compared",
+            customer=event.customer_id,
+            source=self.source_system.value,
+            session_id=session_id,
+            protocol=int(protocol),
+            **record,
+        )
 
     async def _discard_trajectory(self, event: WebhookEvent, session_id: str, *, why: str) -> None:
         """Delete `trajectory.json` so readers get "not built". Never raises."""
@@ -1352,15 +1710,13 @@ class ClaudeCodeConnector(Connector):
             )
             if not ended:
                 # No more live builds for it until it ends (each would scrub megabytes).
-                _remember(
-                    _LIVE_TOO_LARGE, (event.customer_id, self.source_system.value, session_id)
-                )
+                _remember(_LIVE_TOO_LARGE, self._live_key(event, session_id))
             await self._discard_trajectory(event, session_id, why="too_large")
             return
         except CpuPoolUnavailable:
             if ended:
                 raise
-            _LIVE_WRITES.pop((event.customer_id, self.source_system.value, session_id), None)
+            _LIVE_WRITES.pop(self._live_key(event, session_id), None)
             log.info(
                 "trajectory.live_skipped_pool",
                 customer=event.customer_id,
@@ -1416,7 +1772,12 @@ class ClaudeCodeConnector(Connector):
         now: datetime,
         completed_by: str | None = None,
         lines: list[Line] | None = None,
+        event_count: int | None = None,
+        compaction_count: int | None = None,
+        preview: str | None = None,
     ) -> Document:
+        """`event_count`, `compaction_count`, `preview`: what a session read
+        from fragments (protocol 3) says itself; otherwise read from `events`."""
         rendered_body = render_lines(lines if lines is not None else lines_from_events(events))
         body_bytes = rendered_body.encode("utf-8")
         # Body only. A completing pass that adds no text is therefore skipped
@@ -1428,8 +1789,8 @@ class ClaudeCodeConnector(Connector):
         # queue row's `extraction_outcome` is the record of a pass instead.
         content_hash = hashlib.sha256(body_bytes).hexdigest()
         doc_id = f"{self._doc_id_prefix}:{event.customer_id}:{session_id}"
-        first_content = ""
-        if events:
+        first_content = preview or ""
+        if preview is None and events:
             raw = events[0].get("raw") or {}
             first_content = raw.get("content", "") or ""
             if not isinstance(first_content, str):
@@ -1453,12 +1814,14 @@ class ClaudeCodeConnector(Connector):
             "device_id": event.raw_payload.get("device_id"),
             "session_complete": complete,
             **({"completed_by": completed_by} if complete and completed_by else {}),
-            "event_count": len(events),
+            "event_count": len(events) if event_count is None else event_count,
             # How many times the agent ran out of context and summarised itself.
             # A reader wants this BEFORE opening any unit: it says whether the
             # session is one sitting or a long campaign, and it is the count of
             # chapter breaks the units are indexed against.
-            "compaction_count": _count_compactions(events),
+            "compaction_count": (
+                _count_compactions(events) if compaction_count is None else compaction_count
+            ),
         }
         if employee_name:
             md["employee_name"] = employee_name

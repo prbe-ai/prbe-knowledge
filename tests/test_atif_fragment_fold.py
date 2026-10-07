@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import hashlib
 import json
 import random
 import sys
@@ -559,6 +560,9 @@ def test_every_key_a_fragment_carries_is_documented() -> None:
     doc = fragment_mod.__doc__ or ""
     undocumented = sorted(k for k in emitted if k not in doc)
     assert not undocumented, f"document these in fragment.py's schema: {undocumented}"
+    # Keys the cases must exercise, not merely allow (the harness goldens end
+    # turns with `end_turn` and `tool_use`, which no Line prints).
+    assert {"stop", "stop_reason", "extras", "lineage"} <= emitted
     assert {p.value for p in PieceType} <= {
         p["type"]
         for events, _a in ALL_CASES.values()
@@ -568,6 +572,39 @@ def test_every_key_a_fragment_carries_is_documented() -> None:
 
 
 VENDORED = (ROOT / "engine/ingest/atif/fragment.py", ROOT / "engine/shared/transcript_render.py")
+
+#: FRAGMENT_VERSION -> the sha256 of each vendored file that makes its fragments.
+VENDORED_PINS: dict[int, dict[str, str]] = {
+    1: {
+        "engine/ingest/atif/fragment.py": (
+            "83cbfbe7341db227592c5a82c37e8a47201890def95e1f852b0478534fff89cb"
+        ),
+        "engine/shared/transcript_render.py": (
+            "c0bb4168f7aa86f89a9c6360d1f120b588458d94ad5e0b84cd9c077942008c9e"
+        ),
+    },
+}
+
+
+def test_the_vendored_files_are_pinned_for_their_fragment_version() -> None:
+    """These two files are vendored into the research-os tap
+    (agent/src/probe/tap_core/): the tap runs them to build the fragments it
+    uploads (protocol 3), so changing either one changes what clients send.
+    Either bump FRAGMENT_VERSION (and teach fold the new version), or
+    consciously update the pin here AND re-vendor the files in research-os.
+    A wording change in the renderer moves every Line a client sends."""
+    assert FRAGMENT_VERSION in VENDORED_PINS, (
+        f"FRAGMENT_VERSION {FRAGMENT_VERSION} has no pin: add one, and teach fold the version"
+    )
+    actual = {
+        str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in VENDORED
+    }
+    assert actual == VENDORED_PINS[FRAGMENT_VERSION], (
+        "a vendored file changed: bump FRAGMENT_VERSION, or update this pin AND re-vendor "
+        "into research-os agent/src/probe/tap_core/"
+    )
+
 
 #: Standard library names newer than Python 3.10, the tap's floor, by module.
 _NEWER_THAN_3_10 = {
@@ -963,6 +1000,49 @@ def test_token_counts_are_capped_so_the_document_serialises() -> None:
     assert second["metrics"]["completion_tokens"] == 2**63 - 1
     totals = built.trajectory["final_metrics"]
     assert totals["total_prompt_tokens"] == totals["total_completion_tokens"] == 2**63 - 1
+
+
+@pytest.mark.parametrize(
+    ("msg", "expected"),
+    [
+        ({"stop_reason": "end_turn", "content": [{"type": "text", "text": "x"}]}, "end_turn"),
+        (
+            {"stop_reason": "tool_use", "content": [{"type": "tool_use", "name": "Bash"}]},
+            "tool_use",
+        ),
+        ({"stop_reason": "max_tokens", "content": [{"type": "text", "text": "x"}]}, "max_tokens"),
+        ({"stop_reason": "end_turn", "content": "a string reply"}, "end_turn"),
+        ({"stop_reason": "stop"}, "stop"),
+        ({"stop_reason": "x" * 1000, "content": []}, "x" * 256),
+        ({"stop_reason": "", "content": []}, None),
+        ({"stop_reason": None, "content": []}, None),
+        ({"stop_reason": {"why": "x"}, "content": []}, None),
+        ({"stop_reason": 5, "content": []}, None),
+    ],
+)
+def test_every_string_stop_reason_is_carried_capped_and_never_rendered(
+    msg: dict[str, Any], expected: str | None
+) -> None:
+    """`stop_reason` is what ended the reply, on any content: a reader (the
+    engine's live trajectory) needs Claude Code's `end_turn`, which no Line
+    prints. `stop` stays the printed one, the only one fold renders."""
+    ev = _ev(_assistant(None, msg=msg), 0)
+    frag = fragment(ev)
+    assert frag.get("stop_reason") == expected
+    assert fragment_line(frag) == line_from_event(ev), "the Line does not move"
+    reference = build_reference.build_trajectory([ev], session_id="s", agent_name="a")
+    assert _data(fold([frag], session_id="s", agent_name="a")) == _data(reference)
+
+
+def test_fold_never_reads_stop_reason() -> None:
+    """A `stop_reason` the index would print still renders only through `stop`."""
+    frag = fragment(
+        _ev(_assistant([{"type": "text", "text": "x"}], msg={"stop_reason": "end_turn"}), 0)
+    )
+    frag["stop_reason"] = "max_tokens"
+    [step] = _fold([frag]).trajectory["steps"]
+    assert "stop_reason" not in step["extra"]
+    assert lines_from_trajectory(_fold([frag]).trajectory)[0].text == "ASSISTANT: x"
 
 
 def test_a_stop_reason_the_renderer_would_not_print_is_dropped() -> None:

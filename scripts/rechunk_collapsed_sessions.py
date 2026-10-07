@@ -20,7 +20,8 @@ PER DOCUMENT:
 
   1. Re-render the body from R2 exactly as the worker does (first readable
      payload -> `parse_webhook_event` -> `fetch_supplementary` over every key
-     on the session's queue row -> `normalize`). The session is declared LIVE
+     on the session's queue row -> `normalize`; a protocol-3 session's body is
+     its fragments' Lines, as the worker's). The session is declared LIVE
      for this pass: the body renders identically either way, and only an
      ended pass runs extraction (mining, a paid LLM call). No other LLM call
      exists on this path.

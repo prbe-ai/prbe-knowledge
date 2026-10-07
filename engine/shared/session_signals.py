@@ -29,13 +29,49 @@ server admits v2 batches strictly in sequence (kb/session_receipts.accept), so
 "newest" is the highest accepted `batch_seq`, and `session_streams.finalized`
 records whether that batch was the finalize. A sweep marker on top of a v2 row
 also ends it; nothing puts one there until the sweep covers protocol 2.
+Protocol 3 is the same receipted stream with fragments instead of events: its
+batches live under the same `sessions-v2/` keys and end the same way.
 """
 
 from __future__ import annotations
 
-from enum import StrEnum
+from collections.abc import Mapping
+from enum import IntEnum, StrEnum
 
 import orjson
+
+
+class SessionProtocol(IntEnum):
+    """The upload protocol a stored session batch was sent on.
+
+    `protocol_version` on the payload; kb/session_receipts.py is the door for
+    the two receipted ones and defines the wire.
+    """
+
+    #: No `protocol_version`: the webhook's own per-batch upload.
+    LEGACY = 1
+    #: Receipted stream; each batch carries the sanitized `events`.
+    EVENTS = 2
+    #: Receipted stream; each batch carries one ATIF `fragments` entry per event
+    #: (and `events` too, only while a canary asks for them).
+    FRAGMENTS = 3
+
+    @classmethod
+    def of(cls, payload: object) -> SessionProtocol:
+        """The protocol of one stored payload (anything unknown is LEGACY)."""
+        value = payload.get("protocol_version") if isinstance(payload, Mapping) else None
+        if value == cls.FRAGMENTS:
+            return cls.FRAGMENTS
+        if value == cls.EVENTS:
+            return cls.EVENTS
+        return cls.LEGACY
+
+    @property
+    def streamed(self) -> bool:
+        """A receipted stream (kb/session_receipts.py): ordered by `batch_seq`,
+        ended by its own finalize."""
+        return self is not SessionProtocol.LEGACY
+
 
 #: Suffix of the sweep's placeholder object, written under
 #: `raw/<source>/<customer>/<session_id>/finalize.marker`.
@@ -53,6 +89,8 @@ V1_KEY_EXT = ".json"
 class CompletedBy(StrEnum):
     """Which signal ended a session. Recorded on every extraction pass."""
 
+    #: A receipted stream's own finalize: protocol 2 or 3 (both are stored
+    #: under `sessions-v2/`; the name predates protocol 3).
     V2_FINALIZE = "v2_finalize"
     V1_CLIENT_FINALIZE = "v1_client_finalize"
     CRON_MARKER = "cron_marker"

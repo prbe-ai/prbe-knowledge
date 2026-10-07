@@ -32,6 +32,14 @@ readable payload -> parse_webhook_event -> fetch_supplementary. Output is ids,
 counts and timings, one JSON line per session and a summary line: never any
 transcript text.
 
+A protocol-3 session (its client uploaded ATIF fragments, kb/session_receipts.py)
+is read as the worker reads it: Lines from its fragments, trajectory
+fold(fragments). replay checks that fold's provenance renders those Lines back;
+--compare-builders, when its batches carried the canary's events, also compares
+the client's fragments with fragment(events) and fold(client fragments) with the
+frozen builder over the events, and with neither, fold against the stored copy
+(`builders_skipped`). backfill writes fold(fragments).
+
 Run as a throwaway Job from the live worker's pod spec, pinned to the image
 digest the worker runs (same code, same credentials; never `kubectl exec` Python
 into a serving pod -- an exec'd process shares the container's memory limit and
@@ -60,6 +68,15 @@ from typing import Any
 import orjson
 
 from engine.ingest.atif.build import Builder, BuildResult, build_trajectory, builder_for
+from engine.ingest.atif.compare import (
+    PATH_KEYS,
+    WRITE_STAMPS,
+    covered_fragments,
+    first_difference,
+    fragments_difference,
+    result_data,
+)
+from engine.ingest.atif.fragment import fragment
 from engine.ingest.atif.lines import lines_from_trajectory
 from engine.ingest.atif.models import Trajectory
 from engine.ingest.atif.store import (
@@ -70,6 +87,7 @@ from engine.ingest.atif.store import (
     trajectory_key,
     write_trajectory,
 )
+from engine.ingest.atif.uploaded import fold_fragments, fragment_lines, fragment_ordinal
 from engine.ingest.handlers.base import make_default_context
 from engine.ingest.normalizer import Normalizer
 from engine.shared import claude_code_extraction as _ext
@@ -99,85 +117,17 @@ _ROW_SQL = """
 """
 _BUSY = ("pending", "processing")
 
-#: Root `extra` keys of a stored trajectory.json that stamp the WRITE rather
-#: than come out of the build, so a rebuild is compared without them:
-#:   session_ended     final or live copy; the writer adds it (claude_code.py)
-#:   validation_error  the writer's validator message, only on an invalid
-#:                     document, worded by whichever pydantic that image had
-#: The render provenance (`extra.probe`: format, lines, unparsed; each step's
-#: `extra.probe_parts`) is never stored (store.strip_provenance), so the
+#: The write stamps a rebuild is compared without, and the content-free
+#: difference report: engine/ingest/atif/compare.py (the ingest pass's fragment
+#: shadow reports the same way). The render provenance (`extra.probe`, each
+#: step's `extra.probe_parts`) is never stored (store.strip_provenance), so a
 #: rebuild goes through the same strip and the same credential scrub as the
 #: write before it is compared. Between the two builders nothing is ignored:
 #: the whole BuildResult, provenance included, must be equal.
-_WRITE_STAMPS = ("session_ended", "validation_error")
-
-#: Keys a difference path may name: the document's own vocabulary (ATIF, the
-#: render provenance, BuildResult). Any other key -- a harness extra's name,
-#: anything a client chose -- prints as `*`, so a report carries ids, counts
-#: and schema names, never transcript content.
-_PATH_KEYS = frozenset(
-    {
-        "trajectory",
-        "unparsed",
-        "unparsed_events",
-        "schema_version",
-        "session_id",
-        "agent",
-        "name",
-        "version",
-        "model_name",
-        "steps",
-        "step_id",
-        "source",
-        "message",
-        "type",
-        "text",
-        "timestamp",
-        "reasoning_content",
-        "tool_calls",
-        "tool_call_id",
-        "function_name",
-        "arguments",
-        "observation",
-        "results",
-        "source_call_id",
-        "metrics",
-        "prompt_tokens",
-        "completion_tokens",
-        "cached_tokens",
-        "cache_creation_input_tokens",
-        "final_metrics",
-        "total_prompt_tokens",
-        "total_completion_tokens",
-        "total_cached_tokens",
-        "total_steps",
-        "extra",
-        "probe",
-        "format",
-        "lines",
-        "probe_parts",
-        "subtype",
-        "event_type",
-        "attachment_type",
-        "inference_id",
-        "continues_inference",
-        "origin",
-        "stop_reason",
-        "dropped_blocks",
-        "summary",
-        "stats",
-        "added_lines",
-        "removed_lines",
-        "replace_all",
-        "is_error",
-        "tool_use_id",
-        "result_bytes",
-        "codex_extras",
-        "pi_extras",
-        "kimi_extras",
-        *_WRITE_STAMPS,
-    }
-)
+_WRITE_STAMPS = WRITE_STAMPS
+_PATH_KEYS = PATH_KEYS
+_first_difference = first_difference
+_result_data = result_data
 
 
 class StoredCopy(StrEnum):
@@ -300,7 +250,34 @@ def _compare(
         built = build_trajectory(events, session_id=session_id, agent_name=agent, builder=builder)
     except Exception as exc:  # a builder crash on a real shape fails the gate
         return {"events": len(events), "same": False, "build_error": type(exc).__name__}
-    t2 = time.perf_counter()
+    return _render_record(legacy, built, len(events), t0, t1, time.perf_counter())
+
+
+def _compare_uploaded(fragments: list[Any], session_id: str, agent: str) -> dict[str, Any]:
+    """`_compare` for a protocol-3 session: the Lines it serves are its
+    fragments' own (engine/ingest/atif/uploaded.py), its trajectory is
+    fold(fragments); the record says whether fold's provenance renders them
+    back. `ms_legacy` is the time to read the fragments' Lines."""
+    t0 = time.perf_counter()
+    read = fragment_lines(fragments)
+    t1 = time.perf_counter()
+    try:
+        built = fold_fragments(fragments, session_id, agent)
+    except Exception as exc:  # fold never raises on content; a crash fails the gate
+        return {
+            "events": len(fragments),
+            "same": False,
+            "build_error": type(exc).__name__,
+            "protocol": 3,
+        }
+    record = _render_record(read.lines, built, len(fragments), t0, t1, time.perf_counter())
+    return {**record, "protocol": 3, "fragments_degraded": read.degraded}
+
+
+def _render_record(
+    legacy: list[Any], built: BuildResult, count: int, t0: float, t1: float, t2: float
+) -> dict[str, Any]:
+    """Whether a build's trajectory renders back to the Lines the index holds."""
     try:
         atif = lines_from_trajectory(built.trajectory)
         render_error = None
@@ -333,7 +310,7 @@ def _compare(
     except Exception as exc:
         invalid = str(exc).splitlines()[0][:200]
     return {
-        "events": len(events),
+        "events": count,
         "steps": len(built.trajectory.get("steps") or []),
         "same": same,
         "text_same": text_same,
@@ -349,49 +326,6 @@ def _compare(
         "ms_legacy": round((t1 - t0) * 1000, 2),
         "ms_build": round((t2 - t1) * 1000, 2),
         "ms_atif": round((t3 - t2) * 1000, 2),
-    }
-
-
-def _first_difference(left: Any, right: Any, path: str = "") -> dict[str, Any] | None:
-    """Where two JSON values first differ: a path of schema keys and indexes
-    and what differs (`type`, `missing_left` / `missing_right`, `length` with
-    both lengths, `value`). Never a value."""
-    here = path or "$"
-    if type(left) is not type(right):
-        return {
-            "path": here,
-            "kind": "type",
-            "left": type(left).__name__,
-            "right": type(right).__name__,
-        }
-    if isinstance(left, dict):
-        for key in left:
-            name = key if key in _PATH_KEYS else "*"
-            sub = f"{path}.{name}" if path else name
-            if key not in right:
-                return {"path": sub, "kind": "missing_right"}
-            if (diff := _first_difference(left[key], right[key], sub)) is not None:
-                return diff
-        for key in right:
-            if key not in left:
-                name = key if key in _PATH_KEYS else "*"
-                return {"path": f"{path}.{name}" if path else name, "kind": "missing_left"}
-        return None
-    if isinstance(left, list):
-        for i, (a, b) in enumerate(zip(left, right, strict=False)):
-            if (diff := _first_difference(a, b, f"{path}[{i}]")) is not None:
-                return diff
-        if len(left) != len(right):
-            return {"path": here, "kind": "length", "left": len(left), "right": len(right)}
-        return None
-    return None if left == right else {"path": here, "kind": "value"}
-
-
-def _result_data(built: BuildResult) -> dict[str, Any]:
-    return {
-        "trajectory": built.trajectory,
-        "unparsed": built.unparsed,
-        "unparsed_events": [list(e) for e in built.unparsed_events],
     }
 
 
@@ -419,6 +353,48 @@ def _builders(
     diff = _first_difference(_result_data(reference), _result_data(folded))
     return (
         {"builders_same": diff is None, "builders_diff": diff, "builders_error": None},
+        reference,
+        folded,
+    )
+
+
+def _uploaded_builders(
+    fragments: list[Any], events: list[dict[str, Any]], session_id: str, agent: str
+) -> tuple[dict[str, Any], BuildResult | None, BuildResult | None]:
+    """A protocol-3 session whose batches carried the canary's events: the
+    frozen builder over the events against fold over the CLIENT's fragments,
+    and the client's fragments against this engine's fragment(events), both
+    over the ordinals the events cover (a batch may come without them:
+    `events_missing`, as the ingest pass's shadow counts them). The fold
+    returned is of those fragments only."""
+    try:
+        reference = build_trajectory(
+            events, session_id=session_id, agent_name=agent, builder=Builder.REFERENCE
+        )
+        kept, missing = covered_fragments(fragments, events)
+        folded = fold_fragments(kept, session_id, agent)
+        server = [fragment(e) for e in events if isinstance(e, dict)]
+    except Exception as exc:  # a crash on a real shape fails the gate
+        return (
+            {
+                "builders_same": False,
+                "builders_diff": None,
+                "builders_error": f"uploaded:{type(exc).__name__}",
+            },
+            None,
+            None,
+        )
+    diff = _first_difference(_result_data(reference), _result_data(folded))
+    fragments_diff, _differing = fragments_difference(kept, server)
+    return (
+        {
+            "builders_same": diff is None,
+            "builders_diff": diff,
+            "builders_error": None,
+            "fragments_same": fragments_diff is None,
+            "fragments_diff": fragments_diff,
+            "events_missing": missing,
+        },
         reference,
         folded,
     )
@@ -481,8 +457,68 @@ async def _compare_builders(
     }
 
 
-def _merge_prefix(bodies: dict[str, bytes], keys: list[str]) -> list[dict[str, Any]]:
-    """fetch_supplementary's merge over the first `keys` (dedupe by line_no, sort)."""
+async def _compare_builders_uploaded(
+    store: Any,
+    row: dict[str, Any],
+    fragments: list[Any],
+    events: list[dict[str, Any]],
+    session_id: str,
+    complete: bool,
+) -> dict[str, Any]:
+    """--compare-builders for a protocol-3 session. With the canary's events:
+    `_uploaded_builders`, then both builds against the stored final copy.
+    Without them nothing independent exists to compare with: only fold of the
+    stored fragments against the stored final copy (`builders_skipped`)."""
+    source = row["source_system"]
+    if events:
+        record, reference, folded = _uploaded_builders(fragments, events, session_id, source)
+        if reference is None or folded is None:
+            return record
+        if record["events_missing"]:
+            # The stored copy is the fold of every fragment; the events describe
+            # only part of the session, so the reference cannot reproduce it.
+            reference, folded = None, fold_fragments(fragments, session_id, source)
+    else:
+        record = {"builders_skipped": "no_events"}
+        reference, folded = None, fold_fragments(fragments, session_id, source)
+    if not complete:
+        return {**record, "stored": StoredCopy.NOT_ENDED.value}
+    try:
+        bucket = await store.bucket_for(row["customer_id"])
+        stored = await read_trajectory(
+            store, bucket, trajectory_key(source, row["customer_id"], session_id)
+        )
+        if stored is None:
+            return {**record, "stored": StoredCopy.ABSENT.value}
+        if (stored.get("extra") or {}).get("session_ended") is False:
+            return {**record, "stored": StoredCopy.LIVE.value}
+        actual = _without_stamps(stored)
+        fold_diff = _first_difference(actual, await _as_stored(folded.trajectory))
+        if reference is None:
+            reference_diff = None
+        elif record["builders_same"]:
+            reference_diff = fold_diff
+        else:
+            reference_diff = _first_difference(actual, await _as_stored(reference.trajectory))
+    except Exception as exc:
+        return {**record, "stored": StoredCopy.ERROR.value, "stored_error": type(exc).__name__}
+    return {
+        **record,
+        "stored": StoredCopy.FINAL.value,
+        "stored_fold_same": fold_diff is None,
+        "stored_fold_diff": fold_diff,
+        "stored_reference_same": None if reference is None else reference_diff is None,
+        "stored_reference_diff": reference_diff,
+    }
+
+
+def _merge_prefix(
+    bodies: dict[str, bytes], keys: list[str], field: str = "events"
+) -> list[dict[str, Any]]:
+    """fetch_supplementary's merge over the first `keys` (dedupe by ordinal,
+    sort). `field` "fragments" merges a protocol-3 session's fragments; on such
+    a session "events" are the canary's."""
+    ordinal = fragment_ordinal if field == "fragments" else (lambda obj: obj.get("line_no"))
     seen: set[int] = set()
     merged: list[dict[str, Any]] = []
     for key in keys:
@@ -494,16 +530,16 @@ def _merge_prefix(bodies: dict[str, bytes], keys: list[str]) -> list[dict[str, A
         except orjson.JSONDecodeError:
             continue
         payload = envelope.get("payload", envelope) if isinstance(envelope, dict) else {}
-        for obj in (payload or {}).get("events") or []:
+        for obj in (payload or {}).get(field) or []:
             if not isinstance(obj, dict):
                 continue
-            n = obj.get("line_no")
+            n = ordinal(obj)
             if n is not None:
                 if n in seen:
                     continue
                 seen.add(n)
             merged.append(obj)
-    merged.sort(key=lambda e: (e.get("line_no") is None, e.get("line_no") or 0))
+    merged.sort(key=lambda e: (ordinal(e) is None, ordinal(e) or 0))
     return merged
 
 
@@ -515,8 +551,11 @@ def _batchwise(
     points: int,
     builder: Builder = Builder.REFERENCE,
     compare_builders: bool = False,
+    uploaded: bool = False,
 ) -> dict[str, Any]:
     """Replay the session as live ingestion did: one pass per batch prefix.
+    `uploaded`: a protocol-3 session, read from its fragments (with the
+    canary's events, when its batches carry them, for `compare_builders`).
 
     Sampled at `points` evenly spaced prefixes (a 2,485-key session would be
     millions of re-reads otherwise). Reports cumulative milliseconds for the
@@ -534,9 +573,19 @@ def _batchwise(
     builder_disagreements = 0
     for cut in cuts:
         events = _merge_prefix(bodies, readable[:cut])
-        if compare_builders and not _builders(events, session_id, agent)[0]["builders_same"]:
-            builder_disagreements += 1
-        r = _compare(events, session_id, agent, builder)
+        if uploaded:
+            fragments = _merge_prefix(bodies, readable[:cut], "fragments")
+            if (
+                compare_builders
+                and events
+                and not _uploaded_builders(fragments, events, session_id, agent)[0]["builders_same"]
+            ):
+                builder_disagreements += 1
+            r = _compare_uploaded(fragments, session_id, agent)
+        else:
+            if compare_builders and not _builders(events, session_id, agent)[0]["builders_same"]:
+                builder_disagreements += 1
+            r = _compare(events, session_id, agent, builder)
         if r.get("build_error"):
             disagreements += 1
             continue
@@ -602,16 +651,32 @@ async def replay(args: argparse.Namespace) -> None:
         ident = {"customer": row["customer_id"], "source": row["source_system"],
                  "session_id": row["source_event_id"],
                  "keys": len(row["payload_s3_keys"] or [])}
+        uploaded = False
         try:
             hydrated = await _read_session(normalizer, store, row)
             session_id = hydrated.get("session_id") or row["source_event_id"]
             complete = bool(hydrated.get("session_complete"))
             events = list(hydrated.get("events") or [])
+            fragments = hydrated.get("fragments")
+            uploaded = fragments is not None
+            if uploaded:
+                # Protocol 3: read from its fragments; any `events` are the canary's.
+                fragments = list(fragments)
+                events = list(hydrated.get("canary_events") or [])
             del hydrated
-            record = {**ident, **_compare(events, session_id, row["source_system"], builder)}
-            if args.compare_builders:
-                record.update(await _compare_builders(store, row, events, session_id, complete))
-            del events
+            if uploaded:
+                record = {**ident, **_compare_uploaded(fragments, session_id, row["source_system"])}
+                if args.compare_builders:
+                    record.update(
+                        await _compare_builders_uploaded(
+                            store, row, fragments, events, session_id, complete
+                        )
+                    )
+            else:
+                record = {**ident, **_compare(events, session_id, row["source_system"], builder)}
+                if args.compare_builders:
+                    record.update(await _compare_builders(store, row, events, session_id, complete))
+            del events, fragments
         except Skip as skip:
             record = {**ident, "skipped": str(skip)}
         except Exception as exc:
@@ -622,7 +687,7 @@ async def replay(args: argparse.Namespace) -> None:
                 bodies = await _events_by_key(store, row["customer_id"], keys)
                 record["batchwise"] = _batchwise(
                     bodies, keys, row["source_event_id"], row["source_system"], args.points,
-                    builder, args.compare_builders,
+                    builder, args.compare_builders, uploaded,
                 )
                 del bodies
             except Exception as exc:
@@ -657,6 +722,7 @@ async def replay(args: argparse.Namespace) -> None:
         "spans_identical": sum(1 for r in compared if r["spans_same"]),
         "segments_identical": sum(1 for r in compared if r["segments_same"]),
         "with_unparsed": sum(1 for r in compared if r["unparsed"]),
+        "uploaded": sum(1 for r in compared if r.get("protocol") == 3),
         "invalid": sum(1 for r in compared if r["invalid"]),
         "diff_kinds": dict(sorted(
             ((k, sum(1 for r in compared if r["diff_kind"] == k))
@@ -715,8 +781,12 @@ def _builders_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
         for r in compared
         if r.get("builders_diff")
     )
-    stored = Counter(r.get("stored") for r in compared if r.get("stored"))
-    final = [r for r in compared if r.get("stored") == StoredCopy.FINAL]
+    # Every session with a stored-copy check, including a protocol-3 one with
+    # no canary events (`builders_skipped`), which has no builders to compare.
+    with_stored = [r for r in results if r.get("stored")]
+    stored = Counter(r["stored"] for r in with_stored)
+    final = [r for r in with_stored if r["stored"] == StoredCopy.FINAL]
+    uploaded = [r for r in compared if "fragments_same" in r]
     stored_paths = Counter(
         re.sub(r"\[\d+\]", "[]", r["stored_fold_diff"]["path"])
         for r in final
@@ -740,6 +810,10 @@ def _builders_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
         "stored_reference_identical": sum(1 for r in final if r["stored_reference_same"]),
         "stored_fold_diff_paths": dict(stored_paths.most_common(20)),
         "stored_fold_lost": fold_lost_stored,
+        "builders_skipped": sum(1 for r in results if r.get("builders_skipped")),
+        "events_missing": sum(r.get("events_missing") or 0 for r in compared),
+        "fragments_compared": len(uploaded),
+        "fragments_identical": sum(1 for r in uploaded if r["fragments_same"]),
         # Strict, as gate_passed: every compared session and sampled prefix
         # agrees, nothing crashed or went unread, and fold reproduces every
         # stored copy the reference does. Stored copies the reference no longer
@@ -751,7 +825,9 @@ def _builders_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
         and not unread
         and not batch_errors
         and not prefix_disagreements
-        and not fold_lost_stored,
+        and not fold_lost_stored
+        # A protocol-3 client's fragments are what this engine makes of its events.
+        and all(r["fragments_same"] for r in uploaded),
     }
 
 
@@ -813,16 +889,25 @@ async def backfill(args: argparse.Namespace) -> None:
                     counts["not_ended"] += 1
                     return
                 events = list(hydrated.get("events") or [])
+                fragments = hydrated.get("fragments")
                 del hydrated
-                if not events:
-                    counts["no_events"] += 1  # normalize() writes nothing for these either
-                    return
-                built = build_trajectory(
-                    events,
-                    session_id=session_id,
-                    agent_name=source,
-                    builder=_settings().session_atif_builder,
-                )
+                if fragments is not None:
+                    # Protocol 3: the worker folds the client's fragments, whatever
+                    # SESSION_ATIF_BUILDER says (that picks protocol 2's builder).
+                    if not fragments:
+                        counts["no_fragments"] += 1
+                        return
+                    built = fold_fragments(list(fragments), session_id, source)
+                else:
+                    if not events:
+                        counts["no_events"] += 1  # normalize() writes nothing for these either
+                        return
+                    built = build_trajectory(
+                        events,
+                        session_id=session_id,
+                        agent_name=source,
+                        builder=_settings().session_atif_builder,
+                    )
                 if not args.write:
                     counts["would_write"] += 1
                     _emit({"kind": "session", **ident, "would_write": True,

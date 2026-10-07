@@ -17,6 +17,13 @@ Safe by construction, checked per batch:
   * The receipt is not touched: it pins the hash of the client's original
     request (kb/session_receipts.py), never the stored representation, which
     the server already rewrites when it redacts.
+  * A protocol-3 batch (ATIF `fragments`, kb/session_receipts.py) keeps its
+    fragments exactly: they are allow-listed by construction (fragment.py) and
+    the session is read from them. Its `events`, present only while a canary
+    asks for them, are projected like any others -- and only if each still
+    fragments to what it did, since they are the evidence the fragment shadow
+    compares the client's fragments with (`fragments_changed` otherwise). One
+    with no `events` reads `no_events`: nothing to strip.
   * Nothing is rewritten for a tenant under legal hold or not active, nor for a
     deleted session (engine/shared/legal_hold.purge_blocked_reason, checked per
     tenant and again per batch). A session deleted or purged while its batch
@@ -42,6 +49,7 @@ from typing import Any
 
 import orjson
 
+from engine.ingest.atif.fragment import fragment
 from engine.ingest.probe_events.project import dropped_paths, project_event
 from engine.shared import storage
 from engine.shared.constants import AGENT_SESSION_SOURCES
@@ -84,10 +92,18 @@ def strip_batch(body: bytes) -> tuple[bytes | None, str, int, list[str]]:
         return None, "clean", 0, []
     if lines_from_events(stripped) != lines_from_events(events):
         return None, "lines_changed", 0, dropped
+    if "fragments" in payload and _fragments_of(stripped) != _fragments_of(events):
+        return None, "fragments_changed", 0, dropped
+    # Everything else in the payload -- a protocol-3 batch's fragments included
+    # -- is kept as it is.
     new_payload = {**payload, "events": stripped}
     new_envelope = {**envelope, "payload": new_payload} if "payload" in envelope else new_payload
     new_body = json.dumps(new_envelope, sort_keys=True, separators=(",", ":")).encode()
     return new_body, "stripped", len(body) - len(new_body), dropped
+
+
+def _fragments_of(events: list[Any]) -> list[dict[str, Any]]:
+    return [fragment(e) for e in events if isinstance(e, dict)]
 
 
 async def _blocked(customer_id: str, source: str, session_id: str) -> str | None:

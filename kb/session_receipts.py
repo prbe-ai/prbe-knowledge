@@ -22,6 +22,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 
 from engine.ingest.atif.fold import SUPPORTED_FRAGMENT_VERSIONS
+from engine.ingest.atif.uploaded import fragment_ordinal as uploaded_fragment_ordinal
 from engine.ingest.connectedness import is_source_connected
 from engine.ingest.payload_redaction import redact_payload_async
 from engine.shared.config import Settings, get_settings
@@ -51,13 +52,11 @@ PROTOCOL3_NOT_ENABLED = "protocol 3 not enabled"
 PROTOCOL_MISMATCH = "protocol mismatch"
 
 
-def fragment_ordinal(fragment: object) -> int | None:
-    """The event ordinal a fragment covers: its Line's `line_no`
-    (engine/ingest/atif/fragment.py). This door checks only that the ordinals
-    are contiguous; `fold` validates everything else."""
-    line = fragment.get("line") if isinstance(fragment, dict) else None
-    ordinal = line.get("line_no") if isinstance(line, dict) else None
-    return ordinal if type(ordinal) is int else None
+# The event ordinal a fragment covers: its Line's `line_no`. One definition,
+# shared with the worker that orders a session's fragments by it
+# (engine/ingest/atif/uploaded.py). This door checks only that the ordinals are
+# contiguous; `fold` validates everything else.
+fragment_ordinal = uploaded_fragment_ordinal
 
 _FIELDS = (
     "session_id",
@@ -140,11 +139,12 @@ def _check_ordinals(items: list, key: str, start: int, end: int, what: str) -> N
         raise ValueError(f"{what} ordinals are not contiguous")
 
 
-def _validate_fragments(payload: dict) -> None:
+def _validate_fragments(payload: dict, *, accepted: bool = False) -> None:
     """Protocol 3's batch body: one fragment per covered event ordinal.
 
     Only the envelope is checked here. The fragment's own fields are the
-    client's word and `fold` treats them as untrusted.
+    client's word and `fold` treats them as untrusted. `accepted`: see
+    `validate_payload`.
     """
     start, end = payload["event_start"], payload["event_end"]
     fragments = payload.get("fragments", [])
@@ -159,7 +159,7 @@ def _validate_fragments(payload: dict) -> None:
         raise ValueError("fragment ordinals are not contiguous")
     if fragments and "fragment_version" not in payload:
         raise ValueError("fragments carry no fragment_version")
-    if "fragment_version" in payload:
+    if "fragment_version" in payload and not accepted:
         version = payload["fragment_version"]
         if type(version) is not int or version not in fragment_versions():
             raise ValueError("unsupported fragment version")
@@ -174,7 +174,15 @@ def _validate_fragments(payload: dict) -> None:
         _check_ordinals(events, "line_no", start, end, "retained-event")
 
 
-def validate_payload(payload: dict) -> None:
+def validate_payload(payload: dict, *, accepted: bool = False) -> None:
+    """422 unless `payload` is a well-formed protocol-2 or -3 batch.
+
+    `accepted`: a batch this door already accepted and stored, re-read by the
+    worker (kb/handlers/claude_code.py). Its fragment version is then not
+    checked against today's settings: a version withdrawn since, or one an
+    older worker image's fold does not list, is fold's to report as unparsed
+    steps, never a reason to fail the session -- its Lines need no fold.
+    """
     try:
         UUID(payload["session_id"])
         UUID(payload["stream_id"])
@@ -208,7 +216,7 @@ def validate_payload(payload: dict) -> None:
             if not re.fullmatch(r"[a-f0-9]{64}", payload.get("snapshot_sha256", "")):
                 raise ValueError("invalid historical snapshot digest")
         if sends_fragments:
-            _validate_fragments(payload)
+            _validate_fragments(payload, accepted=accepted)
         else:
             events = payload.get("events", [])
             if not isinstance(events, list) or payload["event_end"] - payload["event_start"] != len(
