@@ -43,6 +43,11 @@ _SOURCES = {"claude_code", "codex", "pi", "kimi_code"}
 PROTOCOL_EVENTS = 2
 PROTOCOL_FRAGMENTS = 3
 SESSION_PROTOCOLS = (PROTOCOL_EVENTS, PROTOCOL_FRAGMENTS)
+#: 409 details a capture client acts on (it restarts a refused new protocol-3
+#: stream on protocol 2). Matched by text through the research-os gateway, so
+#: they never change wording.
+PROTOCOL3_NOT_ENABLED = "protocol 3 not enabled"
+PROTOCOL_MISMATCH = "protocol mismatch"
 
 
 def fragment_ordinal(fragment: object) -> int | None:
@@ -357,7 +362,7 @@ async def accept(payload: dict, customer: str, source: SourceSystem, store) -> d
             # Only a NEW stream asks: one already pinned to 3 keeps being
             # accepted after the customer stops being advertised it.
             if protocol == PROTOCOL_FRAGMENTS and not protocol3_enabled(customer):
-                raise HTTPException(409, "protocol 3 not enabled")
+                raise HTTPException(409, PROTOCOL3_NOT_ENABLED)
             await conn.execute(
                 "INSERT INTO session_streams(customer_id,source_system,session_id,stream_id,"
                 "protocol_version,prefix_sha256,uploader_device_id) VALUES($1,$2,$3,$4,$5,$6,$7)",
@@ -380,7 +385,7 @@ async def accept(payload: dict, customer: str, source: SourceSystem, store) -> d
         if stream["stream_id"] != payload["stream_id"]:
             raise HTTPException(409, "session owned by another stream; reconcile receipts first")
         if stream["protocol_version"] != protocol:
-            raise HTTPException(409, "protocol mismatch")
+            raise HTTPException(409, PROTOCOL_MISMATCH)
         previous = await conn.fetchrow(
             "SELECT * FROM session_batch_receipts WHERE customer_id=$1 "
             "AND source_system=$2 AND session_id=$3 AND batch_seq=$4",

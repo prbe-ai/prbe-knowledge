@@ -1002,7 +1002,7 @@ async def test_a_new_protocol_3_stream_needs_the_customer_enabled(database, prot
     store = Store()
     with pytest.raises(HTTPException) as error:
         await sr.accept(fragments_batch(), "tenant-b", SourceSystem.CLAUDE_CODE, store)
-    assert error.value.status_code == 409 and error.value.detail == "protocol 3 not enabled"
+    assert error.value.status_code == 409 and error.value.detail == sr.PROTOCOL3_NOT_ENABLED == "protocol 3 not enabled"
     assert store.writes == 0
     assert await admin.fetchval("SELECT count(*) FROM session_streams") == 0
     protocol3(session_protocol3_all=True)
@@ -1045,7 +1045,7 @@ async def test_a_batch_on_the_other_protocol_than_its_stream_is_refused(database
     for wrong in (onto_v2, onto_v3):
         with pytest.raises(HTTPException) as error:
             await sr.accept(wrong, "tenant-a", SourceSystem.CLAUDE_CODE, store)
-        assert error.value.status_code == 409 and error.value.detail == "protocol mismatch"
+        assert error.value.status_code == 409 and error.value.detail == sr.PROTOCOL_MISMATCH == "protocol mismatch"
     assert store.writes == 2
     assert await admin.fetchval("SELECT count(*) FROM session_batch_receipts") == 2
 
@@ -1066,7 +1066,7 @@ async def test_an_open_protocol_3_stream_outlives_the_kill_switch(database, prot
     assert read["protocol_version"] == 3 and read["accepts"]["protocols"] == [2]
     with pytest.raises(HTTPException) as error:
         await sr.accept(fragments_batch(), "tenant-a", SourceSystem.CLAUDE_CODE, store)
-    assert error.value.detail == "protocol 3 not enabled"
+    assert error.value.detail == sr.PROTOCOL3_NOT_ENABLED == "protocol 3 not enabled"
     assert await admin.fetchval("SELECT event_end FROM session_streams") == 3
 
 
