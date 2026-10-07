@@ -1046,6 +1046,18 @@ async def _enqueue(
                         version = ingestion_queue.version + 1,
                         completed_at = NULL,
                         error = NULL,
+                        -- first_enqueued_at means "when the CURRENT wait
+                        -- started". A row still pending/processing keeps its
+                        -- original arrival time (that's the backlog-age
+                        -- signal queue_age.py reads); a row that had already
+                        -- finished (done, or any other terminal status) is
+                        -- starting a fresh wait, so this enqueue IS its new
+                        -- arrival.
+                        first_enqueued_at = CASE
+                            WHEN ingestion_queue.status IN ('pending', 'processing')
+                            THEN ingestion_queue.first_enqueued_at
+                            ELSE NOW()
+                        END,
                         -- Bump enqueued_at to reflect most-recent activity so
                         -- session_completer's idle check (the row's
                         -- enqueued_at) tracks idle correctly. Side effect: chatty sessions get pushed
