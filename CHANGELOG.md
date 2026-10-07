@@ -6,6 +6,16 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Changed
+
+- **Paging a session's trajectory reads it from R2 once per version, not once per page.** `GET /trajectory` used to fetch the whole `trajectory.json`, parse it, strip it and re-encode the page on every request, so walking a session cost O(pages x size). Measured locally on a 7.6 MB, 3,473-step session (the largest stored is ~7.5 MB): the 8-page walk the dashboard makes read 61 MB and took 325 ms (~40 ms a page); now it reads 7.6 MB once and takes 104 ms cold (54 ms first page, then 6-9 ms a page) and 50-73 ms warm, with 0 body bytes per later page.
+  - **What is cached:** per retrieval process, the stripped document serialized once (every step's JSON in one buffer plus offsets), so a page is one slice and FastAPI no longer re-encodes it. An entry costs what it holds (7.66 MB for a 7.63 MB object, by tracemalloc).
+  - **Never stale:** every page revalidates with a conditional GET carrying the cached ETag (`ObjectStore.get_if_changed`): 304 serves the cache, a rewritten object (a live session's refresh) is served and re-cached, a removed one is `not_built`. The round trip stays; the body does not.
+  - **Tenants:** the key is (customer, source, session), from the authenticated tenant and the RLS-read document row.
+  - **Bound:** `TRAJECTORY_CACHE_MAX_BYTES` (16 MiB) and `TRAJECTORY_CACHE_MAX_ENTRIES` (256) per process, LRU by bytes. The retrieval pod runs 4 uvicorn processes (`RETRIEVAL_WORKERS:-4` in the image), each with its own cache, so this is 64 MiB per pod against a 2 GiB limit. A trajectory larger than the budget is served uncached; `0` turns the cache off. The byte-bounded LRU is now shared with the source-view reassembly cache (`engine/retrieval/byte_lru.py`).
+  - **Per process:** with 4 processes and a fresh connection per page (research-os today), each process misses once per version (measured, 8-page walks: 2 misses, then 1, 1, then none once all 4 held it); a miss costs about what every page cost before.
+  - `step_from` above 1,000,000,000 is now refused with 422 (it used to return an empty page; orjson cannot echo integers past 64 bits).
+
 ### Fixed
 
 - **`scripts/atif_sessions_job.sh` Jobs schedule on a packed research pool.** They reserved the worker's 2Gi, which no research worker node had free on 2026-10-07 (80-97% of memory reserved), so a strip run sat Pending with "Insufficient memory". They now reserve 512Mi (a strip run peaked at 275Mi; the 1,953-session replay fit in 320Mi) under the same 2Gi limit; `REQUEST_MEMORY` raises it for a heavier run.

@@ -257,6 +257,8 @@ jobs:
           tests/test_atif_fragment_fold.py
           tests/test_atif_ingest.py
           tests/test_atif_endpoint.py
+          tests/retrieval/test_trajectory_cache.py
+          tests/retrieval/test_reassembly_cache.py
           tests/test_atif_sessions_script.py
           tests/test_probe_events_project.py
           tests/test_strip_session_payloads_script.py
@@ -366,6 +368,7 @@ jobs:
           tests/test_codegraph_github_branch_filter.py
           tests/test_object_store_s3.py
           tests/test_storage_list_keys.py
+          tests/test_storage_get_if_changed.py
           tests/test_persist_trace_blob_r2.py
           tests/test_query_traces_trace_blob_migration.py
           tests/handlers/test_manual_upload.py
