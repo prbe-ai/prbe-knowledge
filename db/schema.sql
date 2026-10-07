@@ -1087,10 +1087,12 @@ CREATE TABLE ingestion_queue (
     -- mid-Phase-A triggers a clean re-claim with the extended array.
     version              INT NOT NULL DEFAULT 0,
     enqueued_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    -- When the work ARRIVED. `enqueued_at` is bumped by every transcript
+    -- When the CURRENT wait began. `enqueued_at` is bumped by every transcript
     -- batch (session_completer reads it as an idle signal), so
     -- an active session looks permanently young and a queue that is not
-    -- draining reads as a queue with nothing old in it. Set once, on insert.
+    -- draining reads as a queue with nothing old in it. Set on insert, and
+    -- again when a FINISHED row is re-enqueued (kb/ingestion_app._enqueue); a
+    -- batch landing on a pending/processing row keeps it.
     first_enqueued_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     started_at           TIMESTAMPTZ,
     heartbeat_at         TIMESTAMPTZ,

@@ -8,6 +8,8 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Fixed
 
+- **`ingestion_queue_age` measures the current wait, not a session's whole life.** A finished session row that receives new batches starts a new `first_enqueued_at`; a row still waiting keeps its own, so a backlog that is not draining still reads old (a live session read 46 h old with a 90 s wait, 2026-10-07).
+
 - **Codex, pi and Kimi compactions are recognised.**
   - **What changed.** A size cut through a long session now lands where the agent ran out of context, at the first of a run of markers, so the next piece opens with that agent's summary and is labelled `compaction`.
   - **Counting.** `compaction_count` counts these markers too: a run of markers is one compaction, and a marker before the session's first turn (a Codex subagent fork's inherited `compacted` record) is not counted.

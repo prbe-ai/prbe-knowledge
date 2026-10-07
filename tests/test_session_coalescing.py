@@ -288,6 +288,114 @@ async def test_done_session_resurrects_on_new_batch(live_db) -> None:
     assert row["completed_at"] is None, "completed_at must be cleared on resurrection"
 
 
+# ---- 3b. first_enqueued_at reset (queue_age backlog-age signal) ------------
+#
+# `first_enqueued_at` is the backlog-age signal queue_age.py reads
+# (NOW() - MIN(first_enqueued_at)). It must restart when a finished session
+# gets a new batch (that is a NEW wait), and must NOT move while the row is
+# still pending/processing (that is the backlog that queue_age.py exists to
+# catch).
+
+
+@pytest.mark.asyncio
+async def test_done_session_new_batch_resets_first_enqueued_at(live_db) -> None:
+    from kb.ingestion_app import _enqueue
+
+    customer = "reset-cust-1"
+    session = "sess-reset-done"
+    await _seed_customer(customer)
+
+    await _enqueue(
+        customer_id=customer,
+        source=SourceSystem.CLAUDE_CODE,
+        source_event_id=session,
+        payload_s3_key=f"raw/claude_code/{customer}/2026/04/29/{session}:0.json",
+    )
+
+    # Mark it 'done' and backdate first_enqueued_at, as a long-finished
+    # session would have.
+    old_arrival = datetime(2026, 10, 5, 21, 21, tzinfo=UTC)
+    async with db_module.raw_conn() as conn:
+        await conn.execute(
+            "UPDATE ingestion_queue SET status='done', completed_at=NOW(), "
+            "first_enqueued_at=$3 WHERE customer_id=$1 AND source_event_id=$2",
+            customer, session, old_arrival,
+        )
+
+    # New batch arrives on the finished session — this is a fresh wait, so
+    # first_enqueued_at must move to now, not stay pinned to the old arrival.
+    await _enqueue(
+        customer_id=customer,
+        source=SourceSystem.CLAUDE_CODE,
+        source_event_id=session,
+        payload_s3_key=f"raw/claude_code/{customer}/2026/04/29/{session}:1.json",
+    )
+
+    async with db_module.raw_conn() as conn:
+        row = await conn.fetchrow(
+            "SELECT status, first_enqueued_at FROM ingestion_queue "
+            "WHERE customer_id=$1 AND source_event_id=$2",
+            customer, session,
+        )
+
+    assert row is not None
+    assert row["status"] == "pending"
+    assert row["first_enqueued_at"] > old_arrival, (
+        "a finished session's new batch must start a new arrival, not keep "
+        "the old one — otherwise a 90s-old enqueue reads as days old"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pending_session_new_batch_keeps_first_enqueued_at(live_db) -> None:
+    from kb.ingestion_app import _enqueue
+
+    customer = "reset-cust-2"
+    session = "sess-reset-pending"
+    await _seed_customer(customer)
+
+    await _enqueue(
+        customer_id=customer,
+        source=SourceSystem.CLAUDE_CODE,
+        source_event_id=session,
+        payload_s3_key=f"raw/claude_code/{customer}/2026/04/29/{session}:0.json",
+    )
+
+    async with db_module.raw_conn() as conn:
+        first_row = await conn.fetchrow(
+            "SELECT first_enqueued_at FROM ingestion_queue "
+            "WHERE customer_id=$1 AND source_event_id=$2",
+            customer, session,
+        )
+    assert first_row is not None
+    original_arrival = first_row["first_enqueued_at"]
+
+    # Row is still 'pending' (never claimed). A second batch arrives — this
+    # is still the SAME wait, so first_enqueued_at must not move, even
+    # though enqueued_at does.
+    await _enqueue(
+        customer_id=customer,
+        source=SourceSystem.CLAUDE_CODE,
+        source_event_id=session,
+        payload_s3_key=f"raw/claude_code/{customer}/2026/04/29/{session}:1.json",
+    )
+
+    async with db_module.raw_conn() as conn:
+        row = await conn.fetchrow(
+            "SELECT status, version, first_enqueued_at FROM ingestion_queue "
+            "WHERE customer_id=$1 AND source_event_id=$2",
+            customer, session,
+        )
+
+    assert row is not None
+    assert row["status"] == "pending"
+    assert row["version"] == 2
+    assert row["first_enqueued_at"] == original_arrival, (
+        "a still-waiting row must keep its original arrival time — that is "
+        "the whole point of the column"
+    )
+
+
 # ---- 4. data-loss regression ------------------------------------------------
 
 
