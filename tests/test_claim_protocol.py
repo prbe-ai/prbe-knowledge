@@ -84,3 +84,16 @@ def test_the_reclaim_loop_is_still_the_backstop() -> None:
     for reclaim: a worker that dies mid-row writes no release at all."""
     assert "QUEUE_RECLAIM_THRESHOLD_SECONDS" in _WORKER
     assert "class ReclaimLoop" in _WORKER
+
+
+def test_a_finished_pass_that_lost_its_commit_starts_a_new_wait() -> None:
+    """`first_enqueued_at` is the queue-age alert's clock. A live session whose
+    batches land mid-pass loops pending -> processing -> pending and never
+    reaches `done`; without this its age grew for days while a worker mined it
+    every few minutes (10-07: three such rows held the alert at 47h). The done
+    and skipped paths finished their work, so the next pass is a new wait; the
+    error path did not, so it keeps the clock until the row dead-letters."""
+    done, skipped, errored = _cas_miss_blocks()
+    assert "first_enqueued_at = NOW()" in done
+    assert "first_enqueued_at = NOW()" in skipped
+    assert "first_enqueued_at" not in errored

@@ -15,8 +15,10 @@ Every transcript batch bumps `enqueued_at` (session_completer reads it as an
 idle signal), so an actively-batching session looks
 permanently young. Age measured that way reports zero on precisely the workload
 that is filling the queue. `first_enqueued_at` is when the CURRENT wait began:
-stamped on insert and again when a finished row is re-enqueued, so a session
-that has been batching for days but drains each batch reads as young.
+stamped on insert, when a finished row is re-enqueued, and when a pass that
+succeeded loses its commit to a newer batch -- so a session that has been
+batching for days but is mined every few minutes reads as young. A pass that
+FAILED keeps the clock: an erroring row is a backlog until it dead-letters.
 
 WHY A SAMPLER AND NOT A QUERY ON /health
 ----------------------------------------
