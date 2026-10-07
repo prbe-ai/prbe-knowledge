@@ -71,6 +71,7 @@ from engine.ingest.atif.build import Builder, BuildResult, build_trajectory, bui
 from engine.ingest.atif.compare import (
     PATH_KEYS,
     WRITE_STAMPS,
+    covered_fragments,
     first_difference,
     fragments_difference,
     result_data,
@@ -362,12 +363,16 @@ def _uploaded_builders(
 ) -> tuple[dict[str, Any], BuildResult | None, BuildResult | None]:
     """A protocol-3 session whose batches carried the canary's events: the
     frozen builder over the events against fold over the CLIENT's fragments,
-    and the client's fragments against this engine's fragment(events)."""
+    and the client's fragments against this engine's fragment(events), both
+    over the ordinals the events cover (a batch may come without them:
+    `events_missing`, as the ingest pass's shadow counts them). The fold
+    returned is of those fragments only."""
     try:
         reference = build_trajectory(
             events, session_id=session_id, agent_name=agent, builder=Builder.REFERENCE
         )
-        folded = fold_fragments(fragments, session_id, agent)
+        kept, missing = covered_fragments(fragments, events)
+        folded = fold_fragments(kept, session_id, agent)
         server = [fragment(e) for e in events if isinstance(e, dict)]
     except Exception as exc:  # a crash on a real shape fails the gate
         return (
@@ -380,7 +385,7 @@ def _uploaded_builders(
             None,
         )
     diff = _first_difference(_result_data(reference), _result_data(folded))
-    fragments_diff, _differing = fragments_difference(fragments, server)
+    fragments_diff, _differing = fragments_difference(kept, server)
     return (
         {
             "builders_same": diff is None,
@@ -388,6 +393,7 @@ def _uploaded_builders(
             "builders_error": None,
             "fragments_same": fragments_diff is None,
             "fragments_diff": fragments_diff,
+            "events_missing": missing,
         },
         reference,
         folded,
@@ -468,6 +474,10 @@ async def _compare_builders_uploaded(
         record, reference, folded = _uploaded_builders(fragments, events, session_id, source)
         if reference is None or folded is None:
             return record
+        if record["events_missing"]:
+            # The stored copy is the fold of every fragment; the events describe
+            # only part of the session, so the reference cannot reproduce it.
+            reference, folded = None, fold_fragments(fragments, session_id, source)
     else:
         record = {"builders_skipped": "no_events"}
         reference, folded = None, fold_fragments(fragments, session_id, source)
@@ -801,6 +811,7 @@ def _builders_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
         "stored_fold_diff_paths": dict(stored_paths.most_common(20)),
         "stored_fold_lost": fold_lost_stored,
         "builders_skipped": sum(1 for r in results if r.get("builders_skipped")),
+        "events_missing": sum(r.get("events_missing") or 0 for r in compared),
         "fragments_compared": len(uploaded),
         "fragments_identical": sum(1 for r in uploaded if r["fragments_same"]),
         # Strict, as gate_passed: every compared session and sampled prefix

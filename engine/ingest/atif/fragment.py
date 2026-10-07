@@ -70,7 +70,14 @@ A key that does not apply is absent. Unknown keys are ignored by fold.
                              tool_call id str?, name str, summary str?,
                                        stats {added_lines int?, removed_lines int?,
                                               replace_all true?}?
-    stop            object   {seq: int, reason: str}: a stop reason the renderer prints
+    stop_reason     str      the message's `stop_reason` when it is a non-empty string,
+                             whatever it is (<= 256 chars): `end_turn` and `tool_use`
+                             too, and on any content. What ended the reply -- the
+                             engine's live trajectory writes a turn end at once -- and
+                             nothing renders it; fold does not read it
+    stop            object   {seq: int, reason: str}: a stop reason the renderer prints,
+                             as it prints it (whole), on block-list content only: the
+                             one fold renders
   system
     message str (the content), subtype str, agent_version str (Codex `cli_version`, <= 64)
   other
@@ -382,6 +389,12 @@ def _assistant(out: dict[str, Any], raw: dict[str, Any]) -> None:
     )
     if usage:
         out["usage"] = usage
+    # Every stop reason, printed or not (`stop` below is only the printed one):
+    # Claude Code's `end_turn` is how a reader knows the model is waiting for
+    # the researcher. Before the content, so no content shape can lose it.
+    stop_reason = short(msg.get("stop_reason"), EXTRA_VALUE_CHARS)
+    if stop_reason:
+        out["stop_reason"] = stop_reason
     _stamp_and_extras(out, raw)
     content = msg.get("content")
     if isinstance(content, str) and content:

@@ -17,7 +17,12 @@ frozen builder (build_reference.py) builds:
   protocol 3   when the batches carried `events` (the canary, R5): the CLIENT's
   + events     fragments against this engine's fragment(events), ordinal by
                ordinal, and fold(client fragments) -- the pass's own build --
-               against build_reference(events).
+               against build_reference(events). Only over the ordinals the
+               events cover: a client may send a batch without them (the door
+               takes `events` per batch, and the tap drops them from a batch
+               too large to carry both), and those fragments are counted as
+               `events_missing`, never as a difference. Fold over the covered
+               fragments alone is compared then, not the pass's build.
 
 The client's fragments are what the pass serves either way: they are the
 client's word, and the events are canary evidence only. A difference is what
@@ -228,6 +233,16 @@ def fragments_difference(client: list[Any], server: list[Any]) -> tuple[dict[str
     return first, differing
 
 
+def covered_fragments(client: list[Any], events: list[Any]) -> tuple[list[Any], int]:
+    """(the client's fragments at the ordinals `events` cover, in their order;
+    how many of its fragments have no event)."""
+    have = {
+        e["line_no"] for e in events if isinstance(e, dict) and type(e.get("line_no")) is int
+    }
+    kept = [f for f in client if fragment_ordinal(f) in have]
+    return kept, len(client) - len(kept)
+
+
 def shadow(
     events: list[Any],
     client_fragments: list[Any] | None,
@@ -258,16 +273,23 @@ def shadow(
             reference = built
         else:
             reference = _reference(events, session_id, agent_name)
-        record.update(same_fragments=None, fragments_diff=None, fragments_differing=None)
+        record.update(
+            same_fragments=None,
+            fragments_diff=None,
+            fragments_differing=None,
+            events_missing=None,
+        )
     else:
-        diff, differing = fragments_difference(client_fragments, server)
-        if built is not None:
+        kept, missing = covered_fragments(client_fragments, events)
+        diff, differing = fragments_difference(kept, server)
+        if built is not None and not missing:
             folded = built
         else:
-            folded = fold(client_fragments, session_id=session_id, agent_name=agent_name)
+            folded = fold(kept, session_id=session_id, agent_name=agent_name)
         reference = _reference(events, session_id, agent_name)
         record.update(
             fragments=len(client_fragments),
+            events_missing=missing,
             same_fragments=diff is None,
             fragments_diff=diff,
             fragments_differing=differing,

@@ -59,12 +59,16 @@ async def p3_session(
     finalize: bool = True,
     tamper: bool = False,
     leak: bool = False,
+    drop_events_of: int | None = None,
 ) -> list[dict[str, Any]]:
     from engine.shared.storage import get_store
 
     batches = session_batches(
         EVENTS, protocol=3, sid=sid, with_events=with_events, finalize=finalize
     )
+    if drop_events_of is not None:
+        # A batch the tap sent without its events (too large to carry both).
+        del batches[drop_events_of]["events"]
     if tamper:
         batches[0]["fragments"][0]["line"]["text"] = "USER: TAMPERED"
         batches[0]["fragments"][0]["message"] = "TAMPERED"
@@ -154,6 +158,39 @@ async def test_replay_names_a_client_fragment_that_disagrees_without_content(
     assert record["same"] is True and summary["gate_passed"] is True
     assert summary["builders_gate_passed"] is False
     assert "TAMPERED" not in json.dumps(records)
+
+
+@pytest.mark.asyncio
+async def test_replay_compares_only_the_ordinals_the_canary_events_cover(
+    env,  # noqa: F811
+    capsys,
+) -> None:
+    (a, _b), _store = env
+    sid = str(uuid4())
+    batches = await p3_session(a, sid, with_events=True, drop_events_of=1)
+    records = await _replay(
+        capsys,
+        [
+            "replay",
+            "--customer",
+            a,
+            "--sample",
+            "5",
+            "--batchwise",
+            "1",
+            "--points",
+            "3",
+            "--compare-builders",
+        ],
+    )
+    [record] = [r for r in records if r["kind"] == "session"]
+    missing = batches[1]["event_end"] - batches[1]["event_start"]
+    assert record["events_missing"] == missing > 0
+    assert (record["builders_same"], record["fragments_same"]) == (True, True), record
+    # The stored copy is the fold of every fragment; partial events cannot reproduce it.
+    assert (record["stored_fold_same"], record["stored_reference_same"]) == (True, None)
+    assert record["batchwise"]["prefix_builder_disagreements"] == 0
+    assert records[-1]["builders_gate_passed"] is True and records[-1]["events_missing"] == missing
 
 
 @pytest.mark.asyncio

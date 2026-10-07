@@ -156,11 +156,9 @@ def _turn_end_line(items: list[Any], *, fragments: bool = False) -> int | None:
     user/assistant event.
 
     `fragments`: `items` are a protocol-3 session's fragments (fragment.py),
-    which carry what this reads as `stop` and `extras`. A fragment keeps a stop
-    reason only when the index prints it, so Claude Code's `end_turn` -- the
-    common turn end -- is NOT in a version-1 fragment: such a turn reaches the
-    live copy on the interval, not at once. pi's `stop_reason` and Codex's
-    `phase` ride in `extras` and are read.
+    which carry the same facts: the message's `stop_reason` (every one,
+    Claude Code's `end_turn` included, not only those the index prints), and
+    pi's `stop_reason` and Codex's `phase` in `extras`.
     """
     if fragments:
         return _fragment_turn_end_line(items)
@@ -199,7 +197,8 @@ def _fragment_turn_end_line(fragments: list[Any]) -> int | None:
         pi = extras.get("pi_extras") if isinstance(extras.get("pi_extras"), dict) else {}
         codex = extras.get("codex_extras") if isinstance(extras.get("codex_extras"), dict) else {}
         ended = (
-            _ends_turn(stop.get("reason"))
+            _ends_turn(item.get("stop_reason"))
+            or _ends_turn(stop.get("reason"))
             or _ends_turn(pi.get("stop_reason"))
             or codex.get("phase") == "final_answer"
         )

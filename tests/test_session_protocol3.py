@@ -456,6 +456,8 @@ def _spy(monkeypatch: pytest.MonkeyPatch, name: str) -> list[Any]:
         ("golden:pi.expected.jsonl", [8, 11, 12], [1, 2, 2, 2]),
         # Codex: 3 is a `final_answer`, 4 the next prompt, 13 the last answer.
         ("golden:codex.expected.jsonl", [2, 4, 5], [1, 2, 2, 3]),
+        # Claude Code: 11 and 19 are `end_turn` replies, 14 the next prompt.
+        ("golden:claude_code.expected.jsonl", [8, 12, 15], [1, 2, 2, 3]),
     ],
 )
 async def test_live_copies_are_throttled_and_a_turn_end_is_written_at_once(
@@ -489,26 +491,34 @@ async def test_live_copies_are_throttled_and_a_turn_end_is_written_at_once(
 
 
 @pytest.mark.asyncio
-async def test_claude_codes_end_turn_is_not_in_a_version_1_fragment(
+async def test_a_claude_code_turn_end_is_written_live_inside_the_interval(
     worker: Worker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """KNOWN GAP (engine/ingest/atif/fragment.py keeps a stop reason only when
-    the index prints it, and `end_turn` never prints): protocol 2 writes a
-    Claude Code turn end live at once, protocol 3 waits for the interval. When
-    a fragment version carries every stop reason, this flips."""
+    """Claude Code ends a turn with `end_turn`, a stop reason the index never
+    prints; the fragment carries it anyway (`stop_reason`), so the reply the
+    researcher is waiting on reaches the live trajectory at once, as on
+    protocol 2, not one interval later."""
     worker.configure(session_trajectory_live_interval_s=3600)
     folds = _spy(monkeypatch, "fold_fragments")
-    builds = _spy(monkeypatch, "build_and_render")
     events, source = SESSIONS["golden:claude_code.expected.jsonl"]
-    for protocol, customer in ((2, P2), (3, P3)):
-        sid = str(uuid4())
-        # 11 is the assistant's `end_turn`; 12 a system note after it.
-        for body in session_batches(
-            events, protocol=protocol, sid=sid, cuts=[8, 13], finalize=False
-        )[:2]:
-            await worker.upload(customer, source, [body])
-            await worker.run(customer, source, sid)
-    assert (len(builds), len(folds)) == (2, 1)
+    sid = str(uuid4())
+    # The first batch is the session's first live write; the second ends with
+    # 11, the assistant's `end_turn`, and 12, a system note after it; the
+    # third is one more system note.
+    batches = session_batches(events, protocol=3, sid=sid, cuts=[8, 13, 14], finalize=False)
+    assert batches[1]["fragments"][3]["stop_reason"] == "end_turn"
+    for body in batches[:2]:
+        await worker.upload(P3, source, [body])
+        await worker.run(P3, source, sid)
+    assert len(folds) == 2, "the turn end is not held back by the throttle"
+    assert [f["line"]["line_no"] for f in folds[-1][0]] == list(range(13))
+    stored = orjson.loads(worker.trajectory(P3, source, sid))
+    assert stored["extra"] == {"session_ended": False}
+    assert stored["steps"][-1]["source"] == "system", "the live copy reaches past the reply"
+    # The same reply again, behind more bookkeeping, is not rewritten.
+    await worker.upload(P3, source, batches[2:3])
+    await worker.run(P3, source, sid)
+    assert len(folds) == 2
 
 
 # -- the fragment shadow -------------------------------------------------------------
@@ -536,8 +546,42 @@ async def test_the_shadow_agrees_when_the_canary_events_match(worker: Worker, na
         None,
         0,
     )
-    assert (line["fragments"], line["events"]) == (n, n)
+    assert (line["fragments"], line["events"], line["events_missing"]) == (n, n, 0)
     assert line["steps"] == line["reference_steps"] > 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tamper", [False, True])
+async def test_a_batch_without_canary_events_is_counted_not_a_difference(
+    worker: Worker, tamper: bool
+) -> None:
+    """The door takes `events` per batch, and a tap drops them from a batch
+    too large to carry both. Only the ordinals the events cover are compared;
+    the rest are `events_missing`. A covered fragment that differs still shows."""
+    events, source = SESSIONS["golden:claude_code.expected.jsonl"]
+    sid = str(uuid4())
+    batches = session_batches(events, protocol=3, sid=sid, with_events=True)
+    dropped = batches[1].pop("events")
+    if tamper:
+        batches[2]["fragments"][0]["line"]["text"] = "USER: TAMPERED"
+    await worker.upload(P3, source, batches)
+    with capture_logs() as logs:
+        await worker.run(P3, source, sid)
+    [line] = _compared(logs)
+    n = len(_numbered(events))
+    assert (line["fragments"], line["events"]) == (n, n - len(dropped))
+    assert line["events_missing"] == len(dropped) > 0
+    assert line["same_trajectory"] is True
+    if tamper:
+        assert line["same_fragments"] is False and line["fragments_differing"] == 1
+        assert line["fragments_diff"] == {
+            "ordinal": batches[2]["event_start"],
+            "path": "line.text",
+            "kind": "value",
+        }
+    else:
+        assert (line["same_fragments"], line["fragments_diff"]) == (True, None)
+        assert line["log_level"] == "info"
 
 
 @pytest.mark.asyncio
@@ -584,6 +628,7 @@ async def test_a_protocol_2_session_compares_the_fold_with_the_frozen_builder(
             True,
         )
         assert line["events"] == len(events) and "fragments" not in line
+        assert line["events_missing"] is None
 
 
 @pytest.mark.asyncio
@@ -765,6 +810,7 @@ def test_any_fragment_reads_as_one_line(junk: Any) -> None:
         {"kind": "assistant", "extras": {"codex_extras": {"phase": ["final_answer"]}}},
         {"kind": ["assistant"]},
         {"kind": "assistant", "extras": "junk"},
+        {"kind": "assistant", "stop_reason": ["end_turn"]},
     ],
 )
 def test_a_hostile_reply_is_never_a_turn_end_and_never_raises(item: dict[str, Any]) -> None:
@@ -780,6 +826,8 @@ def test_an_unhashable_stop_reason_on_an_event_no_longer_raises() -> None:
     ("item", "line"),
     [
         ({"kind": "assistant", "stop": {"seq": 1, "reason": "stop_sequence"}}, 4),
+        ({"kind": "assistant", "stop_reason": "end_turn"}, 4),
+        ({"kind": "assistant", "stop_reason": "tool_use"}, None),
         ({"kind": "assistant", "extras": {"pi_extras": {"stop_reason": "stop"}}}, 4),
         ({"kind": "assistant", "extras": {"codex_extras": {"phase": "final_answer"}}}, 4),
         ({"kind": "assistant", "extras": {"codex_extras": {"phase": "commentary"}}}, None),
