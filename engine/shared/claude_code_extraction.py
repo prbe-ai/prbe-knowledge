@@ -24,6 +24,8 @@ from engine.shared.llm_tools import ToolCallParseError, forced_tool_call
 from engine.shared.logging import get_logger
 from engine.shared.transcript_render import (
     Line,
+    format_assistant_text,
+    format_system,
     line_for_offset,
     line_from_event,
     render_lines,
@@ -730,18 +732,53 @@ def _is_compact_boundary(event: Item) -> bool:
 
 
 #: How a Codex, pi or Kimi compaction renders: the tap's sanitizers emit
-#: `system` subtype `compaction`, and `format_system` writes this prefix on both
-#: line paths (events and ATIF), which `engine.ingest.atif.compare` holds equal.
-#: Read from the TEXT so no new `Line` flag has to ride the trajectory.
-_COMPACTION_TEXT = "SYSTEM (compaction)"
+#: `system` subtype `compaction`, and this is `format_system`'s own output for
+#: it on both line paths (events and ATIF), so a compaction is told from the
+#: TEXT the two paths already hold equal -- no `Line` flag rides a trajectory,
+#: and the renderer the tap vendors is untouched.
+_COMPACTION_TEXT = format_system("compaction", None)
+_ASSISTANT_TEXT = format_assistant_text("x")[:-1]
+
+
+def is_compaction_line(line: Line) -> bool:
+    """Any agent's compaction: Claude Code's boundary, or another agent's
+    `compaction` event (with or without its summary)."""
+    return line.compact_boundary or line.text.startswith(_COMPACTION_TEXT)
+
+
+def is_conversation_line(line: Line) -> bool:
+    """A user turn or the assistant's own words: what a session HAS, as opposed
+    to the system notes around it."""
+    return line.user_turn or line.text.startswith(_ASSISTANT_TEXT)
+
+
+def count_compactions(items: list[Item]) -> int:
+    """Compactions in a session: points where the agent hit its context limit
+    and wrote its own summary. A run of markers with no conversation between
+    them is ONE (Codex writes two per compaction), and a marker before the
+    session's first turn is inherited, not had (a Codex subagent fork opens
+    with its parent's `compacted` record). ONE counter for every upload
+    protocol (`kb/handlers/claude_code.py`)."""
+    total = 0
+    talked = False
+    in_run = False
+    for item in items:
+        line = _line(item)
+        if is_compaction_line(line):
+            if talked and not in_run:
+                total += 1
+            in_run = True
+        elif is_conversation_line(line):
+            talked = True
+            in_run = False
+    return total
 
 
 def _is_compaction_marker(event: Item) -> bool:
-    """Any agent's compaction: Claude Code's boundary or another agent's
-    `compaction` event. Only Claude's FORCES a cut (`_split_on_compaction`);
-    the rest are where a size cut prefers to land (`_split_to_budget`)."""
-    line = _line(event)
-    return line.compact_boundary or line.text.startswith(_COMPACTION_TEXT)
+    """Any agent's compaction. Only Claude Code's FORCES a cut
+    (`_split_on_compaction`); the rest are where a size cut prefers to land
+    (`_split_to_budget`)."""
+    return is_compaction_line(_line(event))
 
 
 def _is_compact_summary(event: Item) -> bool:
@@ -784,7 +821,7 @@ def _split_to_budget(segment: list[Item]) -> list[list[Item]]:
     # cut: Codex stretches render to 2k-84k chars, and cutting at every one put
     # long sessions past `_MAX_SEGMENTS` (one replayed session mined 33%).
     marker_at: int | None = None
-    previous_marker = False
+    in_run = False
     for event in segment:
         one = _rendered_size([event])
         starts_turn = _renders_as_user_turn(event)
@@ -802,11 +839,14 @@ def _split_to_budget(segment: list[Item]) -> list[list[Item]]:
             out.append(current)
             current, size = [], 0
             marker_at = None
-        marker = _is_compaction_marker(event)
-        # The FIRST of a run: Codex writes two markers per compaction.
-        if marker and not previous_marker and current and size >= _SEGMENT_CHAR_BUDGET / 2:
-            marker_at = len(current)
-        previous_marker = marker
+        # The FIRST of a run (markers with no conversation between them): Codex
+        # writes two per compaction, and a cut between them strands one.
+        if _is_compaction_marker(event):
+            if not in_run and current and size >= _SEGMENT_CHAR_BUDGET / 2:
+                marker_at = len(current)
+            in_run = True
+        elif is_conversation_line(_line(event)):
+            in_run = False
         current.append(event)
         size += one
     if current:
