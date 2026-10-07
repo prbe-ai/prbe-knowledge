@@ -852,7 +852,7 @@ class ClaudeCodeConnector(Connector):
                 if uploaded is None
                 else {
                     "event_count": len(uploaded),
-                    "compaction_count": sum(1 for line in lines if line.compact_boundary),
+                    "compaction_count": _ext.count_compactions(lines),
                     "preview": first_content(uploaded),
                 }
             ),
@@ -2103,23 +2103,9 @@ def _change_body(change: Any) -> str:
 
 
 def _count_compactions(events: list[dict[str, Any]]) -> int:
-    """Compaction boundaries in the merged stream.
-
-    Each one is a point where the agent hit its context limit and wrote its own
-    summary of everything so far — a chapter break it chose, and the same
-    boundary the unit extractor segments on.
-    """
-    total = 0
-    for event in events:
-        raw = event.get("raw") if isinstance(event, dict) else None
-        raw = raw if isinstance(raw, dict) else event
-        if (
-            isinstance(raw, dict)
-            and raw.get("type") == "system"
-            and raw.get("subtype") == "compact_boundary"
-        ):
-            total += 1
-    return total
+    """Compactions in the merged stream, by the one counter every upload
+    protocol uses (`claude_code_extraction.count_compactions`)."""
+    return _ext.count_compactions(events)
 
 
 def _format_session_title(

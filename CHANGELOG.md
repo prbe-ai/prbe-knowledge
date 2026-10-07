@@ -6,6 +6,15 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Fixed
+
+- **Codex, pi and Kimi compactions are recognised.**
+  - **What changed.** A size cut through a long session now lands where the agent ran out of context, at the first of a run of markers, so the next piece opens with that agent's summary and is labelled `compaction`.
+  - **Counting.** `compaction_count` counts these markers too: a run of markers is one compaction, and a marker before the session's first turn (a Codex subagent fork's inherited `compacted` record) is not counted.
+  - **What does not change.** Only Claude Code's `compact_boundary` forces a cut, as before. Cutting at every other agent's compaction pushed long Codex sessions past the 16-piece cap: in a replay, one session was only 33% mined, and model calls rose from 61 to 147 across 57 sessions.
+  - **Replay of the same 57 real Codex sessions, main vs this change:** 61 model calls either way, 0 sessions capped, 100% of the text mined, no session's piece count changed, and 4 cuts in 2 sessions now land on a compaction.
+  - **How markers are read.** From the rendered text (`SYSTEM (compaction)`), which both line paths render identically, so no `Line` flag is added to trajectories. Claude Code sessions segment byte-identically.
+
 ### Security
 
 - **`scripts/strip_session_payloads.py` strips stored session batches down to probe-events/1.** Taps before 0.9.10 uploaded a second copy of every tool's output, file and CLAUDE.md attachments, unknown blocks and pasted images; each stored batch is rewritten with every event projected onto the probe-events/1 schema (a vendored copy of research-os's, `engine/ingest/probe_events/`), only when its rendered Lines are identical before and after. Receipts are untouched (they pin the client's request, not the stored copy); a session deleted mid-run is never resurrected. Dry run unless `--write`; run as a Job with `MODULE=scripts.strip_session_payloads scripts/atif_sessions_job.sh strip ...`.
