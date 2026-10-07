@@ -821,10 +821,12 @@ class Worker:
                 # ALREADY moved (that is why the CAS missed), and the guard
                 # that matters is not resurrecting a row another path has
                 # since finished or dead-lettered.
+                # The pass finished: the next is a new wait (queue_age.py).
                 await conn.execute(
                     """
                     UPDATE ingestion_queue
-                    SET status = $1, started_at = NULL, heartbeat_at = NULL
+                    SET status = $1, started_at = NULL, heartbeat_at = NULL,
+                        first_enqueued_at = NOW()
                     WHERE queue_id = $2 AND status = $3
                     """,
                     QueueStatus.PENDING.value,
@@ -892,10 +894,12 @@ class Worker:
                 # ALREADY moved (that is why the CAS missed), and the guard
                 # that matters is not resurrecting a row another path has
                 # since finished or dead-lettered.
+                # The pass finished: the next is a new wait (queue_age.py).
                 await conn.execute(
                     """
                     UPDATE ingestion_queue
-                    SET status = $1, started_at = NULL, heartbeat_at = NULL
+                    SET status = $1, started_at = NULL, heartbeat_at = NULL,
+                        first_enqueued_at = NOW()
                     WHERE queue_id = $2 AND status = $3
                     """,
                     QueueStatus.PENDING.value,
