@@ -91,6 +91,9 @@ target-version = "py312"
 # Vendored verbatim from Harbor (engine/ingest/atif/models/VENDORED.md); kept
 # byte-close to upstream so a refresh is a diff of their changes, not ours.
 extend-exclude = ["engine/ingest/atif/models"]
+# Vendored into the tap, which supports Python 3.10 (engine/ingest/atif/fragment.py,
+# PORTABLE): linted as 3.10 so a newer construct or an UP rewrite to one fails here.
+per-file-target-version = { "engine/ingest/atif/fragment.py" = "py310", "engine/shared/transcript_render.py" = "py310" }
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
