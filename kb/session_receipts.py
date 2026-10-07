@@ -4,6 +4,12 @@ The session advisory lock covers validation, the content-addressed R2 write,
 receipt and queue transaction. A crash before commit leaves only an unreferenced
 object; a crash after commit replays its receipt without rewriting any object.
 Protocol 1 cannot write into a protocol-2 stream, even with a different device.
+
+Protocol 3 is protocol 2 with each event sent as an ATIF fragment
+(`fragments`, keyed by the same event ordinals) and the sanitized `events`
+optional. A stream is pinned to the protocol of its first batch, and a new
+stream may start on protocol 3 only while this customer is advertised it
+(`accepts`); an open protocol-3 stream stays accepted after that is withdrawn.
 """
 
 from __future__ import annotations
@@ -15,8 +21,10 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 
+from engine.ingest.atif.fold import SUPPORTED_FRAGMENT_VERSIONS
 from engine.ingest.connectedness import is_source_connected
 from engine.ingest.payload_redaction import redact_payload_async
+from engine.shared.config import Settings, get_settings
 from engine.shared.constants import SourceSystem
 from engine.shared.db import with_tenant
 from engine.shared.session_suppression import (
@@ -31,11 +39,33 @@ from kb.admin_routes import verify_internal_knowledge_key
 router = APIRouter(prefix="/api/sessions", dependencies=[Depends(verify_internal_knowledge_key)])
 EMPTY_HASH = hashlib.sha256(b"").hexdigest()
 _SOURCES = {"claude_code", "codex", "pi", "kimi_code"}
+#: Session upload protocols: 2 sends sanitized probe-events/1 `events`; 3 sends
+#: one ATIF `fragments` entry per event (and `events` only when asked to).
+PROTOCOL_EVENTS = 2
+PROTOCOL_FRAGMENTS = 3
+SESSION_PROTOCOLS = (PROTOCOL_EVENTS, PROTOCOL_FRAGMENTS)
+#: 409 details a capture client acts on (it restarts a refused new protocol-3
+#: stream on protocol 2). Matched by text through the research-os gateway, so
+#: they never change wording.
+PROTOCOL3_NOT_ENABLED = "protocol 3 not enabled"
+PROTOCOL_MISMATCH = "protocol mismatch"
+
+
+def fragment_ordinal(fragment: object) -> int | None:
+    """The event ordinal a fragment covers: its Line's `line_no`
+    (engine/ingest/atif/fragment.py). This door checks only that the ordinals
+    are contiguous; `fold` validates everything else."""
+    line = fragment.get("line") if isinstance(fragment, dict) else None
+    ordinal = line.get("line_no") if isinstance(line, dict) else None
+    return ordinal if type(ordinal) is int else None
+
 _FIELDS = (
     "session_id",
     "batch_seq",
     "cwd",
     "events",
+    "fragments",
+    "fragment_version",
     "finalize",
     "protocol_version",
     "stream_id",
@@ -52,6 +82,47 @@ _FIELDS = (
 )
 
 
+def _csv(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def fragment_versions(settings: Settings | None = None) -> list[int]:
+    """Fragment versions this door accepts: those the deploy lists AND this
+    engine's `fold` reads (a version only the setting names would be accepted
+    and then fold to unparsed steps). A typo in the deploy drops that entry
+    rather than taking ingestion down."""
+    s = settings or get_settings()
+    listed = {int(v) for v in _csv(s.session_fragment_versions) if v.isascii() and v.isdigit()}
+    return sorted(listed & SUPPORTED_FRAGMENT_VERSIONS)
+
+
+def protocol3_enabled(customer_id: str, settings: Settings | None = None) -> bool:
+    """May this customer START a protocol-3 stream now?"""
+    s = settings or get_settings()
+    return s.session_protocol3_all or customer_id in _csv(s.session_protocol3_customers)
+
+
+def accepts(customer_id: str, settings: Settings | None = None) -> dict:
+    """What a client may start a NEW stream with. An existing stream keeps the
+    protocol it was pinned to, whatever this says."""
+    s = settings or get_settings()
+    protocols = [PROTOCOL_EVENTS]
+    if protocol3_enabled(customer_id, s):
+        protocols.append(PROTOCOL_FRAGMENTS)
+    return {
+        "protocols": protocols,
+        "fragment_versions": fragment_versions(s),
+        "events": s.session_protocol3_events,
+    }
+
+
+def payload_protocol(payload: dict) -> int:
+    """The protocol of a payload `validate_payload` accepted."""
+    return (
+        PROTOCOL_FRAGMENTS if payload["protocol_version"] == PROTOCOL_FRAGMENTS else PROTOCOL_EVENTS
+    )
+
+
 def canonical_payload(payload: dict) -> bytes:
     """Identity enrichment and request timestamps are not source event identity."""
     return json.dumps(
@@ -62,11 +133,57 @@ def canonical_payload(payload: dict) -> bytes:
     ).encode()
 
 
+def _check_ordinals(items: list, key: str, start: int, end: int, what: str) -> None:
+    if [item.get(key) if isinstance(item, dict) else None for item in items] != list(
+        range(start, end)
+    ):
+        raise ValueError(f"{what} ordinals are not contiguous")
+
+
+def _validate_fragments(payload: dict) -> None:
+    """Protocol 3's batch body: one fragment per covered event ordinal.
+
+    Only the envelope is checked here. The fragment's own fields are the
+    client's word and `fold` treats them as untrusted.
+    """
+    start, end = payload["event_start"], payload["event_end"]
+    fragments = payload.get("fragments", [])
+    if not isinstance(fragments, list) or end - start != len(fragments):
+        raise ValueError("fragment coverage does not match payload")
+    if payload.get("finalize") and fragments:
+        raise ValueError("finalize cannot carry fragments")
+    ordinals = [fragment_ordinal(f) for f in fragments]
+    if None in ordinals:
+        raise ValueError("fragment is not an object with an integer ordinal")
+    if ordinals != list(range(start, end)):
+        raise ValueError("fragment ordinals are not contiguous")
+    if fragments and "fragment_version" not in payload:
+        raise ValueError("fragments carry no fragment_version")
+    if "fragment_version" in payload:
+        version = payload["fragment_version"]
+        if type(version) is not int or version not in fragment_versions():
+            raise ValueError("unsupported fragment version")
+    # Optional in protocol 3 (the canary also sends them), and when present they
+    # cover exactly the fragments' ordinals.
+    if "events" in payload:
+        events = payload["events"]
+        if not isinstance(events, list) or len(events) != len(fragments):
+            raise ValueError("event coverage does not match payload")
+        if payload.get("finalize") and events:
+            raise ValueError("finalize cannot carry events")
+        _check_ordinals(events, "line_no", start, end, "retained-event")
+
+
 def validate_payload(payload: dict) -> None:
     try:
         UUID(payload["session_id"])
         UUID(payload["stream_id"])
-        if payload["protocol_version"] != 2:
+        protocol = payload["protocol_version"]
+        if protocol == PROTOCOL_FRAGMENTS and type(protocol) is int:
+            sends_fragments = True
+        elif protocol == PROTOCOL_EVENTS:
+            sends_fragments = False
+        else:
             raise ValueError("unsupported codec")
         for name in (
             "batch_seq",
@@ -90,22 +207,25 @@ def validate_payload(payload: dict) -> None:
                 raise ValueError("invalid historical snapshot boundary")
             if not re.fullmatch(r"[a-f0-9]{64}", payload.get("snapshot_sha256", "")):
                 raise ValueError("invalid historical snapshot digest")
-        events = payload.get("events", [])
-        if not isinstance(events, list) or payload["event_end"] - payload["event_start"] != len(
-            events
-        ):
-            raise ValueError("event coverage does not match payload")
-        if payload.get("finalize") and events:
-            raise ValueError("finalize cannot carry events")
+        if sends_fragments:
+            _validate_fragments(payload)
+        else:
+            events = payload.get("events", [])
+            if not isinstance(events, list) or payload["event_end"] - payload["event_start"] != len(
+                events
+            ):
+                raise ValueError("event coverage does not match payload")
+            if payload.get("finalize") and events:
+                raise ValueError("finalize cannot carry events")
         if payload.get("finalize") and any(
             payload[f"{unit}_start"] != payload[f"{unit}_end"]
             for unit in ("source_byte", "source_line", "event")
         ):
             raise ValueError("finalize must certify the already accepted cursor")
-        if [e.get("line_no") if isinstance(e, dict) else None for e in events] != list(
-            range(payload["event_start"], payload["event_end"])
-        ):
-            raise ValueError("retained-event ordinals are not contiguous")
+        if not sends_fragments:
+            _check_ordinals(
+                events, "line_no", payload["event_start"], payload["event_end"], "retained-event"
+            )
     except (KeyError, TypeError, ValueError, AttributeError) as exc:
         raise HTTPException(422, f"invalid transcript protocol: {exc}") from exc
 
@@ -214,6 +334,7 @@ def _receipt(row) -> dict:
 
 async def accept(payload: dict, customer: str, source: SourceSystem, store) -> dict:
     validate_payload(payload)
+    protocol = payload_protocol(payload)
     if not await is_source_connected(customer, source):
         raise HTTPException(409, "session capture source is disconnected")
     sid = payload["session_id"]
@@ -240,18 +361,24 @@ async def accept(payload: dict, customer: str, source: SourceSystem, store) -> d
                 )
             if payload["batch_seq"] != 0:
                 raise HTTPException(409, "unknown stream; first sequence must be zero")
+            # Only a NEW stream asks: one already pinned to 3 keeps being
+            # accepted after the customer stops being advertised it.
+            if protocol == PROTOCOL_FRAGMENTS and not protocol3_enabled(customer):
+                raise HTTPException(409, PROTOCOL3_NOT_ENABLED)
             await conn.execute(
                 "INSERT INTO session_streams(customer_id,source_system,session_id,stream_id,"
-                "protocol_version,prefix_sha256,uploader_device_id) VALUES($1,$2,$3,$4,2,$5,$6)",
+                "protocol_version,prefix_sha256,uploader_device_id) VALUES($1,$2,$3,$4,$5,$6,$7)",
                 customer,
                 source.value,
                 sid,
                 payload["stream_id"],
+                protocol,
                 EMPTY_HASH,
                 stored_payload.get("device_id"),
             )
             stream = {
                 "stream_id": payload["stream_id"],
+                "protocol_version": protocol,
                 "last_seq": -1,
                 "source_byte_end": 0,
                 "source_line_end": 0,
@@ -259,6 +386,8 @@ async def accept(payload: dict, customer: str, source: SourceSystem, store) -> d
             }
         if stream["stream_id"] != payload["stream_id"]:
             raise HTTPException(409, "session owned by another stream; reconcile receipts first")
+        if stream["protocol_version"] != protocol:
+            raise HTTPException(409, PROTOCOL_MISMATCH)
         previous = await conn.fetchrow(
             "SELECT * FROM session_batch_receipts WHERE customer_id=$1 "
             "AND source_system=$2 AND session_id=$3 AND batch_seq=$4",
@@ -270,7 +399,11 @@ async def accept(payload: dict, customer: str, source: SourceSystem, store) -> d
         if previous:
             if previous["body_sha256"] != digest:
                 raise HTTPException(409, "batch identity already accepted with different content")
-            return {"status": "duplicate", "protocol_version": 2, "receipt": _receipt(previous)}
+            return {
+                "status": "duplicate",
+                "protocol_version": protocol,
+                "receipt": _receipt(previous),
+            }
         if payload["batch_seq"] != stream["last_seq"] + 1 or any(
             payload[f"{unit}_start"] != stream[f"{unit}_end"]
             for unit in ("source_byte", "source_line", "event")
@@ -340,7 +473,7 @@ async def accept(payload: dict, customer: str, source: SourceSystem, store) -> d
             snapshot_end,
             snapshot_hash,
         )
-        return {"status": "accepted", "protocol_version": 2, "receipt": _receipt(row)}
+        return {"status": "accepted", "protocol_version": protocol, "receipt": _receipt(row)}
 
 
 @router.get("/{source}/{session_id}/receipts")
@@ -379,7 +512,10 @@ async def receipts(
             else:
                 state = "absent"
             return {
-                "protocol_version": 2,
+                # Old clients refuse anything but 2 here; `accepts` is what a
+                # new stream may start on.
+                "protocol_version": PROTOCOL_EVENTS,
+                "accepts": accepts(x_prbe_customer),
                 "customer_id": x_prbe_customer,
                 "source": source,
                 "session_id": session_id,
@@ -396,7 +532,9 @@ async def receipts(
             limit,
         )
         return {
-            "protocol_version": 2,
+            # The protocol this stream is pinned to, for its whole life.
+            "protocol_version": stream["protocol_version"],
+            "accepts": accepts(x_prbe_customer),
             "customer_id": x_prbe_customer,
             "source": source,
             "session_id": session_id,
