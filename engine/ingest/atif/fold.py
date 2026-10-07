@@ -19,10 +19,11 @@ id and name caps), copies only the fields it knows into the document (a tool
 call's `arguments` is always `{}`, a result never carries content), ignores
 unknown keys (and `lineage`, carried for later), and never raises on a
 fragment's content. A fragment it cannot read is one line and one `unparsed`
-step, counted like an event the builder could not map. Fragments are folded
-in the order given: putting them in ordinal order and dropping duplicates is
-the caller's (a duplicate is folded twice, as the builder maps a duplicated
-event twice).
+step, counted like an event the builder could not map. Its ordinal must be a
+non-negative int (or null, for events stored without one) that no earlier
+fragment of the session holds: a repeated one is unreadable and its line has
+no number, so the first fragment keeps the slot. Fragments are folded in the
+order given; putting them in ordinal order is the caller's.
 
 OUTPUT is a plain dict that validates against the vendored models in
 `engine.ingest.atif.models`. Readers (the session API, the dashboard, `probe
@@ -70,6 +71,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
@@ -78,12 +80,12 @@ from engine.ingest.atif.fragment import (
     EXTRA_VALUE_CHARS,
     FRAGMENT_VERSION,
     HARNESS_EXTRAS,
+    JSON_INT_MAX,
     TYPE_NAME_CHARS,
     USER_SHELL,
     Kind,
     PieceType,
     call_stats,
-    iso_timestamp,
     safe_extras,
     short,
     usage_counts,
@@ -108,8 +110,10 @@ FLAG_USER_TURN = 1
 FLAG_COMPACT_BOUNDARY = 2
 FLAG_COMPACT_SUMMARY = 4
 
-#: Fragment versions fold reads; one session may mix them.
-SUPPORTED_FRAGMENT_VERSIONS = frozenset({FRAGMENT_VERSION})
+#: The fragment versions this fold reads; one session may mix them. Public: the
+#: door accepts a protocol-3 batch only in versions it lists here (intersected
+#: with whatever the door's own setting allows).
+SUPPORTED_FRAGMENT_VERSIONS: frozenset[int] = frozenset({FRAGMENT_VERSION})
 
 #: Unparsed events reported per build; the count covers the rest.
 _UNPARSED_LOGGED = 20
@@ -120,6 +124,7 @@ _ERROR_CHARS = 64
 _SEQ_MAX = 2**31 - 1
 
 _KINDS = frozenset(k.value for k in Kind)
+_FLAG_NAMES = ("user_turn", "compact_boundary", "compact_summary")
 
 
 class Unreadable(StrEnum):
@@ -154,17 +159,21 @@ def fold(fragments: Iterable[Any], *, session_id: str, agent_name: str) -> Build
 def line_of(fragment: Any) -> Line | None:
     """A fragment's index Line, checked field by field; None when it carries
     none fold can read (fold then records the event with no line number and no
-    text)."""
+    text). Whether its ordinal repeats an earlier one is fold's to say."""
     if not isinstance(fragment, dict):
         return None
     line = fragment.get("line")
     if not isinstance(line, dict):
         return None
     line_no, text = line.get("line_no"), line.get("text")
-    if (line_no is not None and not isinstance(line_no, int)) or not isinstance(text, str):
+    if line_no is not None and not (
+        isinstance(line_no, int) and not isinstance(line_no, bool) and 0 <= line_no <= JSON_INT_MAX
+    ):
+        return None
+    if not isinstance(text, str):
         return None
     flags: dict[str, bool] = {}
-    for name in ("user_turn", "compact_boundary", "compact_summary"):
+    for name in _FLAG_NAMES:
         value = line.get(name, False)
         if not isinstance(value, bool):
             return None
@@ -180,13 +189,27 @@ def _flags(line: Line) -> int:
     )
 
 
+def iso_timestamp(value: Any) -> str | None:
+    """A timestamp the ATIF model accepts, or None. Engine-side only: what
+    `datetime.fromisoformat` accepts differs between Python versions."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return value
+
+
 def _metrics(usage: dict[str, int]) -> dict[str, Any]:
     """ATIF counts every input token in prompt_tokens; cached_tokens is a subset."""
     prompt = sum(
         usage.get(k, 0)
         for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
     )
-    metrics: dict[str, Any] = {"prompt_tokens": prompt}
+    # Each count is capped (fragment.non_negative_int); their sum is too, or a
+    # JSON writer refuses the document.
+    metrics: dict[str, Any] = {"prompt_tokens": min(prompt, JSON_INT_MAX)}
     if "output_tokens" in usage:
         metrics["completion_tokens"] = usage["output_tokens"]
     if "cache_read_input_tokens" in usage:
@@ -271,9 +294,12 @@ class _Event:
         return self.event_type if self.kind is Kind.OTHER else self.kind.value
 
 
+#: Piece types (their wire strings) each kind may carry.
 _PIECES_BY_KIND = {
-    Kind.USER: frozenset({PieceType.TEXT, PieceType.TOOL_RESULT}),
-    Kind.ASSISTANT: frozenset({PieceType.TEXT, PieceType.THINKING, PieceType.TOOL_CALL}),
+    Kind.USER: frozenset({PieceType.TEXT.value, PieceType.TOOL_RESULT.value}),
+    Kind.ASSISTANT: frozenset(
+        {PieceType.TEXT.value, PieceType.THINKING.value, PieceType.TOOL_CALL.value}
+    ),
 }
 
 
@@ -334,14 +360,14 @@ def _read(fragment: dict[str, Any], line: Line) -> _Event:
     return event
 
 
-def _read_parts(value: Any, allowed: frozenset[PieceType]) -> list[_Piece]:
+def _read_parts(value: Any, allowed: frozenset[str]) -> list[_Piece]:
     if value is None:
         return []
     _need(isinstance(value, list))
     return [_read_piece(p, allowed) for p in value]
 
 
-def _read_piece(value: Any, allowed: frozenset[PieceType]) -> _Piece:
+def _read_piece(value: Any, allowed: frozenset[str]) -> _Piece:
     _need(isinstance(value, dict))
     kind = value.get("type")
     _need(isinstance(kind, str) and kind in allowed)
@@ -393,11 +419,18 @@ class _Folder:
         #: once joined with blank lines.
         self.reasoning: dict[int, list[str]] = {}
         self.reasoning_len: dict[int, int] = {}
+        #: Ordinals already given a line: each belongs to one fragment.
+        self.ordinals: set[int] = set()
 
     # -- per fragment ----------------------------------------------------------
 
     def add(self, fragment: Any) -> None:
         line = line_of(fragment)
+        if line is not None and line.line_no is not None and line.line_no in self.ordinals:
+            # A repeated ordinal: the first fragment keeps the slot; this one is
+            # recorded without a number, so no two lines claim one event.
+            self._unreadable(None, Unreadable.INVALID, line_no=line.line_no)
+            return
         try:
             if line is None:
                 raise _Invalid
@@ -408,8 +441,7 @@ class _Folder:
         except Exception:  # a value no check above foresaw: still never the session
             self._unreadable(line, Unreadable.INVALID)
             return
-        index = len(self.lines)
-        self.lines.append([event.line_no, _flags(line)])
+        index = self._line(event.line_no, _flags(line))
         if event.kind is Kind.NONE:
             return
         try:
@@ -421,9 +453,23 @@ class _Folder:
             # The event failed where the fragment stops; what precedes is mapped.
             self._unparsed(event.line_no, event.type_name(), event.error)
 
-    def _unreadable(self, line: Line | None, reason: Unreadable) -> None:
-        line_no = line.line_no if line is not None else None
-        self.lines.append([line_no, _flags(line) if line is not None else 0])
+    def _line(self, line_no: int | None, flags: int) -> int:
+        """Record one fragment's line; returns its index (a part's `line`)."""
+        if line_no is not None:
+            self.ordinals.add(line_no)
+        self.lines.append([line_no, flags])
+        return len(self.lines) - 1
+
+    def _unreadable(
+        self, line: Line | None, reason: Unreadable, *, line_no: int | None = None
+    ) -> None:
+        """One line and one unparsed step for a fragment fold cannot read.
+        `line_no`: the ordinal to report when the line itself goes unnumbered."""
+        if line is not None:
+            self._line(line.line_no, _flags(line))
+            line_no = line.line_no
+        else:
+            self._line(None, 0)
         self._unparsed(line_no, None, reason.value)
 
     def _unparsed(self, line_no: int | None, event_type: str | None, error: str) -> None:
@@ -703,6 +749,7 @@ class _Folder:
                 totals["completion"] += metrics.get("completion_tokens") or 0
                 totals["cached"] += metrics.get("cached_tokens") or 0
             steps.append(out)
+        totals = {k: min(v, JSON_INT_MAX) for k, v in totals.items()}
         agent: dict[str, Any] = {"name": agent_name, "version": self.agent_version or "unknown"}
         if self.model_name:
             agent["model_name"] = self.model_name

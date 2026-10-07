@@ -15,6 +15,13 @@ resume, which is what per-batch receipts need. This module is VENDORED into
 the tap together with engine/shared/transcript_render.py, so it imports the
 standard library and that module, nothing else.
 
+PORTABLE. The tap runs on Python 3.10 and up, the engine on 3.12 and up, and
+both must build the same bytes from the same event: no syntax or standard
+library newer than 3.10, and no call whose result moved between versions
+(`datetime.fromisoformat` accepts more from 3.11 on, so a timestamp is carried
+as written and fold, which runs only in the engine, decides whether it parses).
+tests/test_atif_fragment_fold.py checks both files.
+
 UNTRUSTED ONCE BUILT. Whoever made a fragment, fold re-reads every field,
 re-applies every bound and copies only what it knows (fold.py).
 
@@ -33,7 +40,8 @@ A key that does not apply is absent. Unknown keys are ignored by fold.
     error           str      mapping raised (exception class): what precedes it in the
                              fragment was mapped, and the event counts as unparsed
   kinds user, assistant, system, other
-    timestamp       str      the event's ISO-8601 timestamp, when it parses
+    timestamp       str      the event's timestamp as written (a non-empty string);
+                             fold keeps it only when it parses as ISO-8601
     extras          object   {codex_extras|pi_extras|kimi_extras: {key: scalar}}, each
                              flat, <= 64 keys, keys <= 64 and strings <= 256 chars
     lineage         object   Claude Code's event ids, carried for mapping sidechains
@@ -55,7 +63,8 @@ A key that does not apply is absent. Unknown keys are ignored by fold.
     origin          str      "user_shell": a command the researcher typed (pi's `!`)
     model           str      <= 256 chars
     usage           object   input_tokens, output_tokens, cache_read_input_tokens,
-                             cache_creation_input_tokens: ints >= 0, each optional
+                             cache_creation_input_tokens: ints >= 0, each optional,
+                             capped at 2**63 - 1
     parts           list     text      text str (a string content is one, at seq 0)
                              thinking  text str (not blank)
                              tool_call id str?, name str, summary str?,
@@ -78,8 +87,7 @@ image, any other block's content.
 from __future__ import annotations
 
 from dataclasses import fields
-from datetime import datetime
-from enum import StrEnum
+from enum import Enum
 from typing import Any
 
 from engine.shared.transcript_render import Line, line_from_event, renders_stop, strip_harness
@@ -89,7 +97,7 @@ from engine.shared.transcript_render import Line, line_from_event, renders_stop,
 FRAGMENT_VERSION = 1
 
 
-class Kind(StrEnum):
+class Kind(str, Enum):
     """What an event contributes, by its probe-events/1 type."""
 
     USER = "user"
@@ -101,7 +109,7 @@ class Kind(StrEnum):
     NONE = "none"
 
 
-class PieceType(StrEnum):
+class PieceType(str, Enum):
     """One block of an event's message, in a fragment's `parts`."""
 
     TEXT = "text"
@@ -133,6 +141,10 @@ EXTRA_KEY_CHARS = 64
 EXTRA_VALUE_CHARS = 256
 TYPE_NAME_CHARS = 64
 DROPPED_BLOCKS_MAX = 32
+
+#: The largest count a fragment or a trajectory carries: a JSON writer such as
+#: orjson refuses integers past 64 bits, and fold sums these.
+JSON_INT_MAX = 2**63 - 1
 
 USAGE_KEYS = (
     "input_tokens",
@@ -187,17 +199,10 @@ def fragment_line(fragment: dict[str, Any]) -> Line:
 
 
 def non_negative_int(value: Any) -> int | None:
-    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
-
-
-def iso_timestamp(value: Any) -> str | None:
-    if not isinstance(value, str) or not value:
+    """An int >= 0, capped at JSON_INT_MAX; None for anything else (bools included)."""
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         return None
-    try:
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return value
+    return min(value, JSON_INT_MAX)
 
 
 def short(value: Any, limit: int) -> str | None:
@@ -279,8 +284,9 @@ def _kind(raw: Any) -> Kind:
 
 
 def _stamp_and_extras(out: dict[str, Any], raw: dict[str, Any]) -> None:
-    stamp = iso_timestamp(raw.get("timestamp"))
-    if stamp:
+    stamp = raw.get("timestamp")
+    if isinstance(stamp, str) and stamp:
+        # As written: whether it parses is fold's call (see PORTABLE above).
         out["timestamp"] = stamp
     extras: dict[str, Any] = {}
     for key, name in HARNESS_EXTRAS:

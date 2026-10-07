@@ -309,22 +309,52 @@ EXTRA_CASES: dict[str, list[dict[str, Any]]] = {
         _ev({"type": "system", "subtype": "shell_output", "_kimi_extras": {"result_bytes": 39}}, 7),
     ],
     "a long unknown event type": [_ev({"type": "Z" * 100, "content": "hello"}, 0)],
-    "duplicate and missing ordinals": [
+    "events stored without an ordinal": [
         _ev(_user("one"), 3),
-        _ev(_user("one again"), 3),
-        _ev(_assistant([{"type": "text", "text": "x"}]), True),
         _ev(_user("unnumbered"), None),
         {"raw": {"type": "system", "content": "no line_no key"}},
+        _ev(_user("unnumbered again"), None),
     ],
     "timestamps that do and do not parse": [
         _ev(_user("a", timestamp="2026-10-01T00:00:00Z"), 0),
         _ev(_assistant([{"type": "text", "text": "b"}], timestamp="yesterday"), 1),
         _ev(_assistant([{"type": "text", "text": "c"}], timestamp="2026-10-01T00:00:01+00:00"), 2),
         _ev({"type": "system", "timestamp": 5}, 3),
+        # Parses on 3.11+ only: a fragment carries it as written, fold decides.
+        _ev({"type": "system", "timestamp": "2026-10-01T00:00:01.12Z"}, 4),
+        _ev({"type": "system", "timestamp": "20261001T000001"}, 5),
+        _ev({"type": "system", "timestamp": ""}, 6),
     ],
     "nothing readable at all": [_ev("x", 0), {"line_no": 1}],
     "empty": [],
 }
+
+
+#: Not an equality case: the frozen builder does not cap counts, so a sum past
+#: 64 bits makes a document no JSON writer accepts. fold caps; no real count
+#: comes near it.
+HUGE_USAGE = [
+    _ev(
+        _assistant(
+            [{"type": "text", "text": "a"}],
+            inference_id="m",
+            usage={
+                "input_tokens": 2**63 - 1,
+                "cache_read_input_tokens": 2**63 - 1,
+                "output_tokens": 2**70,
+            },
+        ),
+        0,
+    ),
+    _ev(
+        _assistant(
+            [{"type": "text", "text": "b"}],
+            inference_id="n",
+            usage={"input_tokens": 2**63 - 1, "output_tokens": 2**63 - 1},
+        ),
+        1,
+    ),
+]
 
 
 def _generated(seed: int) -> list[dict[str, Any]]:
@@ -537,29 +567,141 @@ def test_every_key_a_fragment_carries_is_documented() -> None:
     }
 
 
-def _imports(path: Path) -> set[str]:
-    names: set[str] = set()
-    for node in ast.walk(ast.parse(path.read_text())):
-        if isinstance(node, ast.Import):
-            names |= {alias.name for alias in node.names}
+VENDORED = (ROOT / "engine/ingest/atif/fragment.py", ROOT / "engine/shared/transcript_render.py")
+
+#: Standard library names newer than Python 3.10, the tap's floor, by module.
+_NEWER_THAN_3_10 = {
+    "enum": {
+        "StrEnum",
+        "ReprEnum",
+        "EnumCheck",
+        "FlagBoundary",
+        "verify",
+        "member",
+        "nonmember",
+        "global_enum",
+        "show_flag_values",
+        "EnumType",
+        "property",
+    },
+    "typing": {
+        "Self",
+        "LiteralString",
+        "Never",
+        "assert_never",
+        "assert_type",
+        "reveal_type",
+        "Required",
+        "NotRequired",
+        "TypeVarTuple",
+        "Unpack",
+        "dataclass_transform",
+        "override",
+        "TypeAliasType",
+        "get_overloads",
+        "clear_overloads",
+        "ReadOnly",
+        "TypeIs",
+        "NoDefault",
+        "get_protocol_members",
+        "is_protocol",
+    },
+    "datetime": {"UTC"},
+    "itertools": {"batched"},
+    "contextlib": {"chdir"},
+    "operator": {"call"},
+    "hashlib": {"file_digest"},
+    "asyncio": {"TaskGroup", "timeout", "timeout_at", "Timeout", "Runner", "Barrier"},
+    "warnings": {"deprecated"},
+    "copy": {"replace"},
+    "re": {"NOFLAG", "PatternError"},
+    "math": {"cbrt", "exp2", "sumprod", "fma"},
+}
+_MODULES_NEWER_THAN_3_10 = {"tomllib", "wsgiref.types"}
+_BUILTINS_NEWER_THAN_3_10 = {"ExceptionGroup", "BaseExceptionGroup", "PythonFinalizationError"}
+#: Calls whose result changed after 3.10: a fragment built on the tap would differ
+#: from one built in the engine. `fromisoformat` accepts far more from 3.11 on.
+_VERSION_DEPENDENT_CALLS = {"fromisoformat"}
+
+
+def _not_3_10(source: str) -> list[str]:
+    """What in `source` a Python 3.10 tap cannot run, or would run differently."""
+    try:
+        tree = ast.parse(source, feature_version=(3, 10))
+    except SyntaxError as exc:
+        return [f"syntax: {exc.msg} (line {exc.lineno})"]
+    found: list[str] = []
+    modules: dict[str, str] = {}  # local name -> stdlib module
+    for node in ast.walk(tree):
+        if isinstance(node, ast.TryStar):  # belt and braces: feature_version is best-effort
+            found.append("except*")
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in _MODULES_NEWER_THAN_3_10:
+                    found.append(f"import {alias.name}")
+                modules[alias.asname or alias.name] = alias.name
         elif isinstance(node, ast.ImportFrom) and node.module:
-            names.add(node.module)
-    return names
+            if node.module in _MODULES_NEWER_THAN_3_10:
+                found.append(f"from {node.module}")
+            for alias in node.names:
+                if alias.name in _NEWER_THAN_3_10.get(node.module, ()):
+                    found.append(f"{node.module}.{alias.name}")
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.attr in _NEWER_THAN_3_10.get(modules.get(node.value.id, ""), ())
+        ):
+            found.append(f"{modules[node.value.id]}.{node.attr}")
+        elif isinstance(node, ast.Attribute) and node.attr in _VERSION_DEPENDENT_CALLS:
+            found.append(f".{node.attr} (version-dependent)")
+        elif isinstance(node, ast.Name) and node.id in _BUILTINS_NEWER_THAN_3_10:
+            found.append(node.id)
+    return found
 
 
-def test_fragment_imports_only_what_a_client_can_vendor() -> None:
-    """fragment.py goes into the tap with transcript_render.py: stdlib and that."""
-    allowed = {"engine.shared.transcript_render"}
-    for path in (
-        ROOT / "engine/ingest/atif/fragment.py",
-        ROOT / "engine/shared/transcript_render.py",
-    ):
-        foreign = {
-            name
-            for name in _imports(path)
-            if name not in allowed and name.split(".")[0] not in sys.stdlib_module_names
+@pytest.mark.parametrize("path", VENDORED, ids=lambda p: p.name)
+def test_what_the_tap_vendors_runs_the_same_on_python_3_10(path: Path) -> None:
+    """fragment.py goes into the tap (Python >= 3.10) with transcript_render.py:
+    standard library and each other only, nothing newer than 3.10, and nothing
+    whose result moved between versions."""
+    source = path.read_text()
+    assert _not_3_10(source) == []
+    foreign = set()
+    for node in ast.walk(ast.parse(source)):
+        names = (
+            [a.name for a in node.names]
+            if isinstance(node, ast.Import)
+            else [node.module]
+            if isinstance(node, ast.ImportFrom) and node.module
+            else []
+        )
+        foreign |= {
+            n
+            for n in names
+            if n != "engine.shared.transcript_render"
+            and n.split(".")[0] not in sys.stdlib_module_names
         }
-        assert not foreign, f"{path.name} imports {sorted(foreign)}"
+    assert not foreign, f"{path.name} imports {sorted(foreign)}"
+
+
+@pytest.mark.parametrize(
+    "snippet",
+    [
+        "from enum import StrEnum",
+        "import enum\nclass K(enum.StrEnum): pass",
+        "from typing import Self",
+        "import typing as t\nx: t.Self",
+        "import tomllib",
+        "try:\n    pass\nexcept* ValueError:\n    pass",
+        "def f[T](x: T) -> T: return x",
+        "from datetime import UTC",
+        "import datetime\ndatetime.datetime.fromisoformat('2026-10-01')",
+        "raise ExceptionGroup('x', [ValueError()])",
+    ],
+)
+def test_the_portability_check_bites(snippet: str) -> None:
+    assert _not_3_10(snippet)
 
 
 # -- fold reads fragments as untrusted ------------------------------------------------
@@ -646,6 +788,11 @@ def test_a_field_of_the_wrong_type_makes_the_fragment_unreadable(path: tuple, va
         s["source"] == "agent" and s["extra"].get("inference_id") == "m1"
         for s in built.trajectory["steps"]
     ), "nothing of it is mapped"
+
+
+def test_fold_publishes_the_fragment_versions_it_reads() -> None:
+    """The door intersects its own setting with this."""
+    assert frozenset({FRAGMENT_VERSION}) == fold_mod.SUPPORTED_FRAGMENT_VERSIONS
 
 
 def test_an_unknown_version_is_unreadable_and_named() -> None:
@@ -780,12 +927,42 @@ def test_missing_fields_are_absent_values_not_errors() -> None:
     assert [s["source"] for s in built.trajectory["steps"]] == ["agent", "system", "system"]
 
 
-def test_duplicate_ordinals_fold_as_the_builder_maps_duplicate_events() -> None:
+def test_a_repeated_ordinal_is_unreadable_and_the_first_keeps_the_slot() -> None:
     events = [_ev(_user("a"), 0), _ev(_assistant([{"type": "text", "text": "b"}]), 1)]
-    doubled = [events[0], events[1], events[1], events[0]]
-    _assert_same(doubled, "claude_code")
-    lines = fold(_fragments(doubled), session_id="s", agent_name="a").trajectory["extra"]["probe"]
-    assert [n for n, _flags in lines["lines"]] == [0, 1, 1, 0]
+    fragments = _fragments([events[0], events[1], events[1], events[0]])
+    built = _fold(fragments)
+    assert [n for n, _flags in built.trajectory["extra"]["probe"]["lines"]] == [0, 1, None, None]
+    assert built.unparsed_events == [(1, None, Unreadable.INVALID), (0, None, Unreadable.INVALID)]
+    assert [line.text for line in lines_from_trajectory(built.trajectory)] == [
+        "USER: a",
+        "ASSISTANT: b",
+        "",
+        "",
+    ]
+    # Null ordinals (events stored without one) are not ordinals: never repeats.
+    unnumbered = _fragments([_ev(_user("x"), None), _ev(_user("y"), None)])
+    assert _fold(unnumbered).unparsed == 0
+
+
+@pytest.mark.parametrize("line_no", [True, False, -1, 2**63, 1.0, "3"])
+def test_an_ordinal_that_is_not_a_non_negative_int_is_unreadable(line_no: Any) -> None:
+    frag = fragment(_ev(_user("x"), 0))
+    frag["line"]["line_no"] = line_no
+    built = _fold([frag])
+    assert built.unparsed_events == [(None, None, Unreadable.INVALID)]
+    assert built.trajectory["extra"]["probe"]["lines"] == [[None, 0]]
+
+
+def test_token_counts_are_capped_so_the_document_serialises() -> None:
+    events = HUGE_USAGE
+    frags = _fragments(events)
+    assert frags[0]["usage"]["output_tokens"] == 2**63 - 1
+    built = _fold(frags)  # orjson.dumps inside
+    first, second = built.trajectory["steps"]
+    assert first["metrics"]["prompt_tokens"] == 2**63 - 1
+    assert second["metrics"]["completion_tokens"] == 2**63 - 1
+    totals = built.trajectory["final_metrics"]
+    assert totals["total_prompt_tokens"] == totals["total_completion_tokens"] == 2**63 - 1
 
 
 def test_a_stop_reason_the_renderer_would_not_print_is_dropped() -> None:

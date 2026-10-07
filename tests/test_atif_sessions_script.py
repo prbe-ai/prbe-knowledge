@@ -332,3 +332,35 @@ def test_a_difference_is_reported_by_schema_path_and_counts_only() -> None:
         "kind": "missing_left",
     }
     assert diff({"x-secret": 1}, {}) == {"path": "*", "kind": "missing_right"}
+
+
+@pytest.mark.asyncio
+async def test_replay_compare_builders_counts_a_fold_crash_when_fold_is_configured(
+    env,  # noqa: F811
+    capsys,
+    monkeypatch,
+) -> None:
+    """With SESSION_ATIF_BUILDER=fold the render gate's own build crashes too,
+    and that row leaves `compared`; the builders gate must still see it."""
+    (a, _b), _store = env
+    await v2_session(a, _sid())
+    import engine.ingest.atif.build as build_mod
+    from engine.shared.config import get_settings
+
+    def crash(*_a, **_k):
+        raise TypeError("a fragment shape fold never saw")
+
+    monkeypatch.setattr(build_mod, "fold", crash)
+    monkeypatch.setenv("SESSION_ATIF_BUILDER", "fold")
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+    records = await _run(
+        capsys,
+        ["replay", "--customer", a, "--sample", "5", "--batchwise", "0", "--compare-builders"],
+    )
+    [session] = [r for r in records if r["kind"] == "session"]
+    summary = records[-1]
+    assert session["build_error"] == "TypeError" and session["builders_error"] == "fold:TypeError"
+    assert summary["build_errors"] == 1 and summary["gate_passed"] is False
+    assert (summary["builders_compared"], summary["builders_errors"]) == (1, 1)
+    assert summary["builders_error_kinds"] == ["fold:TypeError"]
+    assert summary["builders_gate_passed"] is False

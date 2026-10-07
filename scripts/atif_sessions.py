@@ -694,15 +694,21 @@ async def replay(args: argparse.Namespace) -> None:
     if ratio:
         summary["render_ratio_mean"] = round(statistics.fmean(ratio), 2)
     if args.compare_builders:
-        summary.update(_builders_summary(compared, batch))
+        summary.update(_builders_summary(results))
     _emit(summary)
 
 
-def _builders_summary(
-    compared: list[dict[str, Any]], batch: list[dict[str, Any]]
-) -> dict[str, Any]:
+def _builders_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
     """--compare-builders over the run: counts, and where differences start
-    (paths with their indexes folded, e.g. `trajectory.steps[].metrics`)."""
+    (paths with their indexes folded, e.g. `trajectory.steps[].metrics`).
+
+    Over every session that reached the comparison, including one whose
+    configured builder crashed in the render gate (with SESSION_ATIF_BUILDER
+    `fold`, that is a fold crash, which `compared` above leaves out)."""
+    compared = [r for r in results if "builders_same" in r]
+    unread = sum(1 for r in results if "error" in r)
+    batch = [r["batchwise"] for r in compared if r.get("batchwise", {}).get("prefixes")]
+    batch_errors = sum(1 for r in compared if r.get("batchwise", {}).get("error"))
     errors = [r for r in compared if r.get("builders_error")]
     paths = Counter(
         re.sub(r"\[\d+\]", "[]", r["builders_diff"]["path"])
@@ -728,19 +734,22 @@ def _builders_summary(
         "builders_error_kinds": sorted({r["builders_error"] for r in errors}),
         "builders_diff_paths": dict(paths.most_common(20)),
         "builders_prefix_disagreements": prefix_disagreements,
+        "builders_unread": unread,
         "stored": dict(sorted(stored.items())),
         "stored_fold_identical": sum(1 for r in final if r["stored_fold_same"]),
         "stored_reference_identical": sum(1 for r in final if r["stored_reference_same"]),
         "stored_fold_diff_paths": dict(stored_paths.most_common(20)),
         "stored_fold_lost": fold_lost_stored,
         # Strict, as gate_passed: every compared session and sampled prefix
-        # agrees, nothing crashed, and fold reproduces every stored copy the
-        # reference does. Stored copies the reference no longer reproduces
-        # (written before a builder fix, or by an older scanner) are counted,
-        # not failed.
+        # agrees, nothing crashed or went unread, and fold reproduces every
+        # stored copy the reference does. Stored copies the reference no longer
+        # reproduces (written before a builder fix, or by an older scanner) are
+        # counted, not failed.
         "builders_gate_passed": bool(compared)
         and all(r.get("builders_same") for r in compared)
         and not errors
+        and not unread
+        and not batch_errors
         and not prefix_disagreements
         and not fold_lost_stored,
     }
