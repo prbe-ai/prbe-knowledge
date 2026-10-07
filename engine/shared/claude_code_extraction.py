@@ -737,7 +737,9 @@ def _is_compact_boundary(event: Item) -> bool:
 #: TEXT the two paths already hold equal -- no `Line` flag rides a trajectory,
 #: and the renderer the tap vendors is untouched.
 _COMPACTION_TEXT = format_system("compaction", None)
-_ASSISTANT_TEXT = format_assistant_text("x")[:-1]
+#: Every assistant line opens with this, whichever block comes first
+#: (`ASSISTANT: ...`, `ASSISTANT (thinking): ...`).
+_ASSISTANT_TEXT = format_assistant_text("x").split(":", 1)[0]
 
 
 def is_compaction_line(line: Line) -> bool:

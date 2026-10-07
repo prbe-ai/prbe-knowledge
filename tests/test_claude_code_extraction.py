@@ -380,6 +380,11 @@ def test_claude_sessions_segment_exactly_as_before() -> None:
         ([_user("a", 0), _codex_compaction(1), _codex_compaction(2, "s"), _user("b", 3)], 1),
         # A subagent fork opens with its parent's `compacted` record: inherited, not had.
         ([_codex_compaction(0), _user("a", 1), _user("b", 2)], 0),
+        # An assistant event that opens with thinking is still conversation.
+        ([_user("a", 0), _codex_compaction(1),
+          {"line_no": 2, "raw": {"type": "assistant", "message": {"role": "assistant", "content": [
+              {"type": "thinking", "thinking": "hmm"}, {"type": "text", "text": "done"}]}}},
+          _codex_compaction(3)], 2),
         # Claude Code, as before.
         ([_user("a", 0), _boundary(1), _summary(2), _user("b", 3), _boundary(4)], 2),
     ],
