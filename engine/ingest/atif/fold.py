@@ -313,7 +313,8 @@ def _read(fragment: dict[str, Any], line: Line) -> _Event:
     _need(isinstance(kind, str) and kind in _KINDS)
     event = _Event(line_no=line.line_no, kind=Kind(kind))
     error = _opt_str(fragment, "error")
-    if error is not None:
+    if error:
+        # Only a non-empty name is a failure; `""` reports nothing.
         event.error = error[:_ERROR_CHARS]
     if event.kind is Kind.NONE:
         return event

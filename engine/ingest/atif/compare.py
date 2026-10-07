@@ -236,9 +236,7 @@ def fragments_difference(client: list[Any], server: list[Any]) -> tuple[dict[str
 def covered_fragments(client: list[Any], events: list[Any]) -> tuple[list[Any], int]:
     """(the client's fragments at the ordinals `events` cover, in their order;
     how many of its fragments have no event)."""
-    have = {
-        e["line_no"] for e in events if isinstance(e, dict) and type(e.get("line_no")) is int
-    }
+    have = {e["line_no"] for e in events if isinstance(e, dict) and type(e.get("line_no")) is int}
     kept = [f for f in client if fragment_ordinal(f) in have]
     return kept, len(client) - len(kept)
 
@@ -261,13 +259,13 @@ def shadow(
     so only the other side is computed here.
     """
     events = [e for e in events if isinstance(e, dict)]
-    server = [fragment(e) for e in events]
     record: dict[str, Any] = {"events": len(events)}
     if client_fragments is None:
         configured = builder_for(builder)
         if built is not None and configured is Builder.FOLD:
             folded = built
         else:
+            server = [fragment(e) for e in events]
             folded = fold(server, session_id=session_id, agent_name=agent_name)
         if built is not None and configured is Builder.REFERENCE:
             reference = built
@@ -281,7 +279,7 @@ def shadow(
         )
     else:
         kept, missing = covered_fragments(client_fragments, events)
-        diff, differing = fragments_difference(kept, server)
+        diff, differing = fragments_difference(kept, [fragment(e) for e in events])
         if built is not None and not missing:
             folded = built
         else:

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Mapping
@@ -251,6 +252,18 @@ _FETCH_SUPP_R2_CONCURRENCY = 16
 
 def _nonempty_str(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+#: A client-chosen name (an event type, an error class) a log line may carry.
+_LOG_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,63}")
+
+
+def _log_name(value: object) -> object:
+    """`value` when it is None or identifier-shaped, else `*`: never a client's
+    free text in the worker's log."""
+    if value is None or (isinstance(value, str) and _LOG_NAME.fullmatch(value)):
+        return value
+    return "*"
 
 
 def _list(value: object) -> list[Any]:
@@ -681,9 +694,10 @@ class ClaudeCodeConnector(Connector):
             # protocol 3 never has another, and if one somehow does, its
             # fragments decide how it is read.
             session_identity["protocol_version"] = int(max(streamed))
-        if len(protocols) > 1:
+        if SessionProtocol.FRAGMENTS in protocols and len(protocols) > 1:
             # The door pins a stream to one protocol; this should not happen.
-            # Each batch was read by its own protocol, in ordinal order.
+            # Each batch was read by its own protocol, in ordinal order. (A
+            # protocol 1 + 2 mix predates protocol 3 and is not this.)
             log.warning(
                 "claude_code.mixed_protocols",
                 customer=event.customer_id,
@@ -853,7 +867,7 @@ class ClaudeCodeConnector(Connector):
                     settings.session_trajectory_store
                     and settings.session_trajectory_live_interval_s > 0
                 )
-                or (event.customer_id, self.source_system.value, session_id) in _LIVE_TOO_LARGE
+                or self._live_key(event, session_id) in _LIVE_TOO_LARGE
             )
         ):
             # A completing pass that built nothing, or (with no live copies) a
@@ -1355,7 +1369,7 @@ class ClaudeCodeConnector(Connector):
         """
         legacy = lines_from_events(events)
         settings = get_settings()
-        live_key = (event.customer_id, self.source_system.value, session_id)
+        live_key = self._live_key(event, session_id)
         if not complete:
             # A live pass serves the events' Lines whatever the mode. It builds
             # only to refresh the stored live trajectory: at most once per
@@ -1423,6 +1437,10 @@ class ClaudeCodeConnector(Connector):
             return atif, built, True
         return legacy, built, False
 
+    def _live_key(self, event: WebhookEvent, session_id: str) -> tuple[str, str, str]:
+        """A session's key in the live-trajectory tables (_LIVE_WRITES and co.)."""
+        return (event.customer_id, self.source_system.value, session_id)
+
     async def _fragment_trajectory(
         self,
         event: WebhookEvent,
@@ -1439,7 +1457,7 @@ class ClaudeCodeConnector(Connector):
         runs: the fragment shadow (`_fragment_shadow`) checks the fragments
         against the canary's events instead.
         """
-        live_key = (event.customer_id, self.source_system.value, session_id)
+        live_key = self._live_key(event, session_id)
         if not complete:
             if not _live_build_due(live_key, _turn_end_line(fragments, fragments=True)):
                 return None
@@ -1458,7 +1476,7 @@ class ClaudeCodeConnector(Connector):
             size=sum(len(line.text) for line in lines),
         )
         if built is not None:
-            self._log_unparsed(event, session_id, built, complete)
+            self._log_unparsed(event, session_id, built, complete, untrusted=True)
         return built
 
     async def _build(
@@ -1478,7 +1496,7 @@ class ClaudeCodeConnector(Connector):
         except CpuPoolUnavailable:
             if not complete:
                 # Optional work: keep the previous live copy, retry next pass.
-                _LIVE_WRITES.pop((event.customer_id, self.source_system.value, session_id), None)
+                _LIVE_WRITES.pop(self._live_key(event, session_id), None)
                 log.info(
                     "trajectory.live_skipped_pool",
                     customer=event.customer_id,
@@ -1504,8 +1522,18 @@ class ClaudeCodeConnector(Connector):
             return None
 
     def _log_unparsed(
-        self, event: WebhookEvent, session_id: str, built: BuildResult, complete: bool
+        self,
+        event: WebhookEvent,
+        session_id: str,
+        built: BuildResult,
+        complete: bool,
+        *,
+        untrusted: bool = False,
     ) -> None:
+        """`untrusted`: the build folded a client's fragments, whose event type
+        and error name are the client's strings: only identifier-shaped ones
+        reach the log, anything else prints as `*`."""
+        name = _log_name if untrusted else (lambda value: value)
         if not complete:
             # One line per live build, not one per event: live builds repeat.
             if built.unparsed:
@@ -1524,8 +1552,8 @@ class ClaudeCodeConnector(Connector):
                 source=self.source_system.value,
                 session_id=session_id,
                 line_no=line_no,
-                event_type=ev_type,
-                error=error,
+                event_type=name(ev_type),
+                error=name(error),
             )
 
     def _log_fragment_reading(
@@ -1682,15 +1710,13 @@ class ClaudeCodeConnector(Connector):
             )
             if not ended:
                 # No more live builds for it until it ends (each would scrub megabytes).
-                _remember(
-                    _LIVE_TOO_LARGE, (event.customer_id, self.source_system.value, session_id)
-                )
+                _remember(_LIVE_TOO_LARGE, self._live_key(event, session_id))
             await self._discard_trajectory(event, session_id, why="too_large")
             return
         except CpuPoolUnavailable:
             if ended:
                 raise
-            _LIVE_WRITES.pop((event.customer_id, self.source_system.value, session_id), None)
+            _LIVE_WRITES.pop(self._live_key(event, session_id), None)
             log.info(
                 "trajectory.live_skipped_pool",
                 customer=event.customer_id,

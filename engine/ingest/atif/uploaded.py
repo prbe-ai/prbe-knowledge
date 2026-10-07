@@ -35,12 +35,13 @@ from engine.shared.transcript_render import Line
 
 #: The longest Line text the pass reads from one fragment. The event path has
 #: no per-Line cap of its own: one event's text is bounded by the batch it came
-#: in, which the research-os gateway caps at 2,000,000 bytes
-#: (app/ingestion/sessions_router.py MAX_BODY_BYTES), and a rendered Line is
-#: shorter than the JSON event it came from. The same bound here never cuts a
-#: Line the gateway let through, and still holds if that gateway changes,
-#: because this engine's own webhook has no body cap.
-FRAGMENT_LINE_MAX_CHARS = 2_000_000
+#: in. The research-os gateway caps a protocol-3 batch at 6,000,000 bytes
+#: (app/ingestion/sessions_router.py MAX_FRAGMENT_BODY_BYTES, research-os #2397;
+#: a protocol-2 batch at 2,000,000), and a Line is no longer than the JSON
+#: string it travels in. The same bound here never cuts a Line the gateway let
+#: through, and still holds if that gateway changes, because this engine's own
+#: webhook has no body cap.
+FRAGMENT_LINE_MAX_CHARS = 6_000_000
 
 #: Fragment kinds whose `message` is the event's top-level `content` (what a
 #: session document previews): fragment.py `_system` / `_other`.
@@ -64,11 +65,12 @@ class FragmentLines:
     #: A Line that could not be read (not an object, a field of the wrong
     #: type): served empty at the fragment's ordinal.
     invalid: int = 0
-    #: The client's renderer raised on the event (`line_error`): its text is
-    #: empty by construction.
+    #: The client's renderer raised on the event (`line_error`, a non-empty
+    #: string): its text is empty by construction.
     line_errors: int = 0
-    #: The client could not map the event (`error`), including a client's
-    #: fallback fragment for an event it could not fragment at all.
+    #: The client could not map the event (`error`, a non-empty string, which
+    #: is what fold counts unparsed), including a client's fallback fragment
+    #: for an event it could not fragment at all.
     errors: int = 0
     #: Text cut to FRAGMENT_LINE_MAX_CHARS.
     truncated: int = 0
@@ -100,12 +102,17 @@ def fragment_lines(fragments: Iterable[Any]) -> FragmentLines:
             out.truncated += 1
             line = replace(line, text=line.text[:FRAGMENT_LINE_MAX_CHARS])
         if isinstance(item, dict):
-            if item.get("line_error") is not None:
+            if _named(item.get("line_error")):
                 out.line_errors += 1
-            if item.get("error") is not None:
+            if _named(item.get("error")):
                 out.errors += 1
         out.lines.append(line)
     return out
+
+
+def _named(value: object) -> bool:
+    """An error a fragment reports: a non-empty string (as fold reads `error`)."""
+    return isinstance(value, str) and bool(value)
 
 
 def session_fragments(fragments: list[Any], events: list[Any]) -> list[Any]:

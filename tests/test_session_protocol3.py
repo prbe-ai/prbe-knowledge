@@ -37,6 +37,7 @@ from structlog.testing import capture_logs
 
 from engine.ingest.atif import compare as compare_mod
 from engine.ingest.atif import uploaded
+from engine.ingest.atif.fold import fold
 from engine.ingest.atif.fragment import FRAGMENT_VERSION, fragment
 from engine.ingest.atif.mode import render_mode
 from engine.ingest.atif.store import trajectory_key
@@ -672,6 +673,43 @@ async def test_no_shadow_without_events_on_a_live_pass_or_when_switched_off(
 
 
 @pytest.mark.asyncio
+async def test_the_shadow_runs_in_the_real_process_pool(
+    worker: Worker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Past `ingest_cpu_pool_min_chars` the fold and the comparison run in a
+    spawned process: the client's fragments, the canary's events and the
+    pass's BuildResult are pickled there and the record pickled back."""
+    from engine.ingest import cpu_pool
+    from engine.shared.config import get_settings
+
+    pool = cpu_pool._executor()
+    assert pool is not None, "needs the CPU pool: INGEST_CPU_POOL_WORKERS > 0 and 2 GiB"
+    submitted: list[Any] = []
+    real_submit = pool.submit
+
+    def submit(fn: Any, *args: Any, **kwargs: Any) -> Any:
+        submitted.append(fn)
+        return real_submit(fn, *args, **kwargs)
+
+    monkeypatch.setattr(pool, "submit", submit)
+    events, source = SESSIONS["golden:claude_code.expected.jsonl"]
+    words = "plain words " * (get_settings().ingest_cpu_pool_min_chars // 12 + 1)
+    long_prompt = {"raw": {"type": "user", "message": {"role": "user", "content": words}}}
+    sid = str(uuid4())
+    batches = session_batches([*events, long_prompt], protocol=3, sid=sid, with_events=True)
+    await worker.upload(P3, source, batches)
+    try:
+        with capture_logs() as logs:
+            await worker.run(P3, source, sid)
+    finally:
+        cpu_pool.shutdown()
+    assert compare_mod.shadow in submitted and uploaded.fold_fragments in submitted
+    [line] = _compared(logs)
+    assert (line["same_fragments"], line["same_trajectory"]) == (True, True)
+    assert line["fragments"] == len(events) + 1
+
+
+@pytest.mark.asyncio
 async def test_a_failing_comparison_is_logged_and_never_fails_the_pass(
     worker: Worker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -776,8 +814,40 @@ async def test_a_giant_line_is_cut_and_counted(
 
 
 def test_the_line_cap_never_cuts_what_the_gateway_lets_through() -> None:
-    # research-os app/ingestion/sessions_router.py MAX_BODY_BYTES: one batch.
-    assert uploaded.FRAGMENT_LINE_MAX_CHARS >= 2_000_000
+    # research-os app/ingestion/sessions_router.py MAX_FRAGMENT_BODY_BYTES: one
+    # protocol-3 batch (#2397; protocol 2's MAX_BODY_BYTES is 2,000,000).
+    assert uploaded.FRAGMENT_LINE_MAX_CHARS >= 6_000_000
+
+
+@pytest.mark.parametrize(("error", "counted"), [(None, 0), ("", 0), ("KeyError", 1)])
+def test_only_a_named_error_counts_and_fold_agrees(error: str | None, counted: int) -> None:
+    frag = fragment({"line_no": 0, "raw": {"type": "system", "content": "x"}})
+    if error is not None:
+        frag["error"] = frag["line_error"] = error
+    read = uploaded.fragment_lines([frag])
+    assert (read.errors, read.line_errors) == (counted, counted)
+    assert fold([frag], session_id="s", agent_name="a").unparsed == counted
+
+
+@pytest.mark.asyncio
+async def test_a_clients_names_reach_the_log_only_when_identifier_shaped(
+    worker: Worker,
+) -> None:
+    """fold reports an unmapped fragment's event type and error name, both the
+    client's strings: free text prints as `*`."""
+    events, source = SESSIONS["golden:codex.expected.jsonl"]
+    sid = str(uuid4())
+    batches = session_batches(events, protocol=3, sid=sid)
+    hostile, plain = batches[0]["fragments"][0], batches[0]["fragments"][1]
+    hostile.update(kind="other", event_type="paste sk-live 123!", error="it said: hello")
+    plain.update(kind="other", event_type="queue_operation", error="KeyError")
+    await worker.upload(P3, source, batches)
+    with capture_logs() as logs:
+        await worker.run(P3, source, sid)
+    unparsed = {e["line_no"]: e for e in logs if e["event"] == "atif.event_unparsed"}
+    assert (unparsed[0]["event_type"], unparsed[0]["error"]) == ("*", "*")
+    assert (unparsed[1]["event_type"], unparsed[1]["error"]) == ("queue_operation", "KeyError")
+    assert "hello" not in json.dumps(logs, default=str)
 
 
 @pytest.mark.parametrize(
@@ -868,6 +938,26 @@ async def test_mixed_protocols_are_each_read_by_their_own_and_logged(
     assert mixed["protocols"] == [2, 3]
     assert hydrated["protocol_version"] == 3 and hydrated["events"] == []
     assert result.documents[0].body == render_lines_indexed(lines_from_events(_numbered(events)))[0]
+
+
+@pytest.mark.asyncio
+async def test_a_protocol_1_and_2_mix_is_not_reported_as_one(worker: Worker) -> None:
+    """Older than protocol 3, and not what the warning is for."""
+    events, source = SESSIONS["golden:claude_code.expected.jsonl"]
+    sid = str(uuid4())
+    v2 = session_batches(events, protocol=2, sid=sid, cuts=[10], finalize=False)
+    legacy = {"session_id": sid, "batch_seq": 0, "events": v2[0]["events"], **IDENTITY}
+    keys = [
+        f"raw/{source}/{P3}/2026/10/07/{sid}:0.json",
+        f"raw/{source}/{P3}/sessions-v2/{sid}/1-x.json",
+    ]
+    worker.store.blobs[P3, keys[0]] = orjson.dumps({"payload": legacy})
+    worker.store.blobs[P3, keys[1]] = orjson.dumps({"payload": v2[1]})
+    connector = ClaudeCodeConnector(make_default_context())
+    with capture_logs() as logs:
+        hydrated = await connector.fetch_supplementary(sr_event(source, sid, legacy, keys), None)
+    assert not [e for e in logs if e["event"] == "claude_code.mixed_protocols"]
+    assert hydrated["protocol_version"] == 2 and "fragments" not in hydrated
 
 
 def sr_event(source: str, sid: str, payload: dict[str, Any], keys: list[str]) -> Any:
