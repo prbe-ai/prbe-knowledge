@@ -208,6 +208,20 @@ class Settings(BaseSettings):
     #: Comma-separated fragment versions this engine's fold reads. A protocol-3
     #: batch of any other version is refused with a 422.
     session_fragment_versions: str = Field(default="1")
+    #: May a NEW session stream start on protocol 2 (sanitized events, no
+    #: fragments)? False retires protocol 2 for new sessions of every customer
+    #: protocol 3 is advertised to (kb/session_receipts.py `protocol2_retired`):
+    #: the receipts read stops offering it and the door refuses its batch 0 with
+    #: 409 `protocol 2 retired`, which a tap >= 0.9.15 answers by sending the
+    #: session again on protocol 3. A stream already on protocol 2 keeps being
+    #: accepted to its end. A customer NOT offered protocol 3 (the protocol-3
+    #: kill switch) may still start on 2, so withdrawing protocol 3 never leaves
+    #: a new session with no protocol at all. That holds per CUSTOMER, not per
+    #: machine: while this is false, never drop from SESSION_FRAGMENT_VERSIONS
+    #: a fragment version any live tap still builds -- a tap offered protocol 3
+    #: only at versions it cannot build falls back to protocol 2, is refused,
+    #: and stops capturing new sessions (only its local log says so).
+    session_protocol2_new_streams: bool = Field(default=True)
     #: Reuse a segment's extraction when the same session re-ends with that
     #: segment unchanged (engine/shared/extraction_cache.py). Off = no cache
     #: read or write; every segment is mined, as before.

@@ -1106,6 +1106,102 @@ async def test_an_open_protocol_3_stream_outlives_the_kill_switch(database, prot
     assert await admin.fetchval("SELECT event_end FROM session_streams") == 3
 
 
+# -- retiring protocol 2 for NEW streams (SESSION_PROTOCOL2_NEW_STREAMS) -------------
+# research-os tap >= 0.9.15 answers 409 `protocol 2 retired` on a new stream's
+# batch 0 by sending the session again on protocol 3; older taps keep the batch.
+
+
+@pytest.mark.parametrize(
+    ("values", "retired", "protocols"),
+    [
+        # Default: today's behaviour, protocol 2 open to everyone.
+        ({"session_protocol3_all": True}, False, [2, 3]),
+        ({"session_protocol3_all": True, "session_protocol2_new_streams": False}, True, [3]),
+        (
+            {"session_protocol3_customers": "tenant-z,tenant-a",
+             "session_protocol2_new_streams": False},
+            True,
+            [3],
+        ),
+        # Not offered protocol 3 (or the kill switch): protocol 2 stays open, so a
+        # new session always has a protocol it may start on.
+        ({"session_protocol3_customers": "tenant-z", "session_protocol2_new_streams": False},
+         False, [2]),
+        ({"session_protocol2_new_streams": False}, False, [2]),
+        # No fragment version this door reads: no protocol-3 batch could be taken.
+        (
+            {"session_protocol3_all": True, "session_protocol2_new_streams": False,
+             "session_fragment_versions": "99"},
+            False,
+            [2, 3],
+        ),
+    ],
+)
+def test_protocol_2_is_retired_only_where_protocol_3_can_replace_it(values, retired, protocols):
+    from engine.shared.config import Settings
+
+    settings = Settings(**values)
+    assert sr.protocol2_retired("tenant-a", settings) is retired
+    assert sr.accepts("tenant-a", settings)["protocols"] == protocols
+
+
+def test_the_retired_detail_is_stable():
+    """research-os's tap matches this text (`PROTOCOL2_RETIRED` in its journal)."""
+    assert sr.PROTOCOL2_RETIRED == "protocol 2 retired"
+
+
+@pytest.mark.asyncio
+async def test_a_retired_protocol_2_refuses_new_streams_and_finishes_open_ones(
+    database, protocol3
+):
+    _tenant, admin = database
+    store = Store()
+    protocol3(session_protocol3_all=True)
+    open_v2 = batch()
+    await sr.accept(open_v2, "tenant-a", SourceSystem.CLAUDE_CODE, store)
+
+    protocol3(session_protocol3_all=True, session_protocol2_new_streams=False)
+    # A new protocol-2 stream: refused before any byte is written.
+    new_v2 = batch()
+    with pytest.raises(HTTPException) as error:
+        await sr.accept(new_v2, "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    assert error.value.status_code == 409 and error.value.detail == sr.PROTOCOL2_RETIRED
+    assert store.writes == 1
+    assert await admin.fetchval(
+        "SELECT count(*) FROM session_streams WHERE session_id=$1", new_v2["session_id"]
+    ) == 0
+    read = await sr.receipts("claude_code", new_v2["session_id"], "tenant-a", -1, 200)
+    # Old taps refuse any protocol_version but 2 for an absent session.
+    assert read["state"] == "absent" and read["protocol_version"] == 2
+    assert read["accepts"]["protocols"] == [3]
+
+    # The same session sent again from batch 0 on protocol 3, same stream id: taken.
+    restarted = fragments_batch(session_id=new_v2["session_id"], stream_id=new_v2["stream_id"])
+    accepted = await sr.accept(restarted, "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    assert accepted["status"] == "accepted" and accepted["protocol_version"] == 3
+
+    # The open protocol-2 stream: a lost-response replay of batch 0 and its next
+    # batch are both accepted, and its receipts still name protocol 2.
+    replay = await sr.accept(open_v2, "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    assert replay["status"] == "duplicate" and replay["protocol_version"] == 2
+    later = _next(open_v2, events=[{"line_no": 2, "raw": {"type": "user"}}])
+    assert (await sr.accept(later, "tenant-a", SourceSystem.CLAUDE_CODE, store))["status"] == "accepted"
+    read = await sr.receipts("claude_code", open_v2["session_id"], "tenant-a", -1, 200)
+    assert read["state"] == "ready" and read["protocol_version"] == 2
+    assert read["stream"]["last_seq"] == 1 and read["accepts"]["protocols"] == [3]
+
+
+@pytest.mark.asyncio
+async def test_withdrawing_protocol_3_reopens_protocol_2_for_new_streams(database, protocol3):
+    """The protocol-3 kill switch must never leave a new session with neither."""
+    store = Store()
+    protocol3(session_protocol3_customers="", session_protocol2_new_streams=False)
+    body = batch()
+    assert (await sr.accept(body, "tenant-a", SourceSystem.CLAUDE_CODE, store))["protocol_version"] == 2
+    read = await sr.receipts("claude_code", str(uuid4()), "tenant-a", -1, 200)
+    assert read["accepts"]["protocols"] == [2]
+
+
 @pytest.mark.asyncio
 async def test_credentials_inside_fragments_are_redacted_before_storage(
     database, protocol3, tmp_path

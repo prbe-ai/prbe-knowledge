@@ -162,6 +162,21 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   sessions that ended before the engine wrote it (dry run unless `--write`; skips deleted
   sessions and removes an object a deletion overtook). Both print ids, counts and timings only.
 
+- **Protocol 2 can be retired for NEW sessions: `SESSION_PROTOCOL2_NEW_STREAMS` (default `true`,
+  today's behaviour).** Gate 2 of the old-format sunset (research-os #2454). With it `false`, a
+  customer offered protocol 3 (`SESSION_PROTOCOL3_ALL` / `_CUSTOMERS`, and at least one fragment
+  version this door reads) gets 409 `protocol 2 retired` (`PROTOCOL2_RETIRED`, a stable detail the
+  tap matches as text) for the protocol-2 batch 0 of a stream that does not exist yet, before any
+  byte is written, and the receipts read stops listing 2 in `accepts.protocols` (`[3]`; its
+  `protocol_version` stays 2 for an absent session, which older taps require). A stream already on
+  protocol 2 keeps being accepted to its end, a lost-response replay of its batch 0 included.
+  Withdrawing protocol 3 from a customer (the kill switch) re-opens protocol 2 for its new sessions,
+  so no new session is left without a protocol (`protocol2_retired`). research-os tap 0.9.15
+  answers the 409 by dropping the pending protocol-2 batch 0 and sending the whole session again
+  from batch 0 on protocol 3 under the same stream id; older taps keep the batch and re-send it
+  every tick until they update, so flip it only once their machines run tap 0.9.15+. Reaches
+  ingestion through research-os chart value `engine.sessionProtocol3.protocol2NewStreams`.
+
 ### Fixed
 - **A Kimi Code shell command is marked as typed by the researcher.** Kimi's shell mode sends the command as the researcher's own turn (`origin: user_shell`); its trajectory step now carries `extra.origin: user_shell`, as pi's `!` commands already do. Indexed text is unchanged.
 - **A command the researcher typed is its own trajectory step.** A probe-events/1 event with `origin: user_shell` (pi's `!` command, Kimi Code's shell mode; tap 0.9.11) became part of the model's step around it. It is now a separate agent step marked `extra.origin: user_shell`. Indexed text is unchanged.

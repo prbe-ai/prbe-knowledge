@@ -10,6 +10,9 @@ Protocol 3 is protocol 2 with each event sent as an ATIF fragment
 optional. A stream is pinned to the protocol of its first batch, and a new
 stream may start on protocol 3 only while this customer is advertised it
 (`accepts`); an open protocol-3 stream stays accepted after that is withdrawn.
+Protocol 2 can be retired the same way for NEW streams
+(`SESSION_PROTOCOL2_NEW_STREAMS=false`, see `protocol2_retired`); an open
+protocol-2 stream stays accepted to its end.
 """
 
 from __future__ import annotations
@@ -46,10 +49,16 @@ PROTOCOL_EVENTS = 2
 PROTOCOL_FRAGMENTS = 3
 SESSION_PROTOCOLS = (PROTOCOL_EVENTS, PROTOCOL_FRAGMENTS)
 #: 409 details a capture client acts on (it restarts a refused new protocol-3
-#: stream on protocol 2). Matched by text through the research-os gateway, so
-#: they never change wording.
+#: stream on protocol 2, and a refused new protocol-2 stream on protocol 3).
+#: Matched by text through the research-os gateway, so they never change
+#: wording.
 PROTOCOL3_NOT_ENABLED = "protocol 3 not enabled"
 PROTOCOL_MISMATCH = "protocol mismatch"
+#: A NEW stream's protocol-2 batch 0 while protocol 2 is retired for this
+#: customer (`protocol2_retired`). research-os tap >= 0.9.15 drops that pending
+#: batch and sends the session again from its batch 0 on protocol 3; older taps
+#: keep it and re-send it until they update.
+PROTOCOL2_RETIRED = "protocol 2 retired"
 
 
 # The event ordinal a fragment covers: its Line's `line_no`. One definition,
@@ -101,11 +110,28 @@ def protocol3_enabled(customer_id: str, settings: Settings | None = None) -> boo
     return s.session_protocol3_all or customer_id in _csv(s.session_protocol3_customers)
 
 
+def protocol2_retired(customer_id: str, settings: Settings | None = None) -> bool:
+    """Is a NEW protocol-2 stream refused for this customer now?
+
+    Only while protocol 3 can take its place: `SESSION_PROTOCOL2_NEW_STREAMS`
+    is off AND this customer may start a protocol-3 stream AND this door reads
+    at least one fragment version. Withdrawing protocol 3 (the kill switch)
+    therefore re-opens protocol 2 for that customer's new sessions instead of
+    refusing both. An existing protocol-2 stream is never asked.
+    """
+    s = settings or get_settings()
+    return (
+        not s.session_protocol2_new_streams
+        and protocol3_enabled(customer_id, s)
+        and bool(fragment_versions(s))
+    )
+
+
 def accepts(customer_id: str, settings: Settings | None = None) -> dict:
     """What a client may start a NEW stream with. An existing stream keeps the
     protocol it was pinned to, whatever this says."""
     s = settings or get_settings()
-    protocols = [PROTOCOL_EVENTS]
+    protocols = [] if protocol2_retired(customer_id, s) else [PROTOCOL_EVENTS]
     if protocol3_enabled(customer_id, s):
         protocols.append(PROTOCOL_FRAGMENTS)
     return {
@@ -378,6 +404,10 @@ async def accept(payload: dict, customer: str, source: SourceSystem, store) -> d
             # accepted after the customer stops being advertised it.
             if protocol == PROTOCOL_FRAGMENTS and not protocol3_enabled(customer):
                 raise HTTPException(409, PROTOCOL3_NOT_ENABLED)
+            # Same for protocol 2 once it is retired: an open protocol-2 stream
+            # (found above) keeps being accepted; only a new one is refused.
+            if protocol == PROTOCOL_EVENTS and protocol2_retired(customer):
+                raise HTTPException(409, PROTOCOL2_RETIRED)
             await conn.execute(
                 "INSERT INTO session_streams(customer_id,source_system,session_id,stream_id,"
                 "protocol_version,prefix_sha256,uploader_device_id) VALUES($1,$2,$3,$4,$5,$6,$7)",
@@ -525,8 +555,9 @@ async def receipts(
             else:
                 state = "absent"
             return {
-                # Old clients refuse anything but 2 here; `accepts` is what a
-                # new stream may start on.
+                # Old clients refuse anything but 2 here, so it stays 2 even
+                # once protocol 2 is retired; `accepts` is what a new stream
+                # may start on.
                 "protocol_version": PROTOCOL_EVENTS,
                 "accepts": accepts(x_prbe_customer),
                 "customer_id": x_prbe_customer,
