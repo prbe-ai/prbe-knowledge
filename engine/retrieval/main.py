@@ -37,11 +37,12 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any, Literal
 
+import orjson
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 
-from engine.ingest.atif.store import read_trajectory, strip_provenance, trajectory_key
+from engine.ingest.atif.store import trajectory_key
 from engine.retrieval.auth import authenticate_query
 from engine.retrieval.direct import DirectRetrieveRequest, DirectRetrieveResponse, retrieve_direct
 from engine.retrieval.graph_explore import (
@@ -72,6 +73,7 @@ from engine.retrieval.synthesis import (
     synthesize,
     synthesize_stream,
 )
+from engine.retrieval.trajectory_cache import load_trajectory_pages
 from engine.retrieval.usage import usage_router
 from engine.shared.chunk_reconstruction import (
     DEFAULT_CHUNK_OVERLAP,
@@ -1193,6 +1195,9 @@ def _source_grep_view(
 _TRAJECTORY_DEFAULT_STEPS = 200
 _TRAJECTORY_MAX_STEPS = 2000
 _TRAJECTORY_PAGE_MAX_BYTES = 1_000_000
+#: No session has a billion steps; the bound keeps `step_from` inside what the
+#: response encoder (orjson, 64-bit integers) can echo back.
+_TRAJECTORY_MAX_STEP_FROM = 1_000_000_000
 
 
 @app.get("/trajectory/{doc_id:path}")
@@ -1200,7 +1205,7 @@ async def get_trajectory(
     doc_id: str,
     request: Request,
     customer_id: str = Depends(authenticate_query),
-    step_from: int = Query(default=1, ge=1),
+    step_from: int = Query(default=1, ge=1, le=_TRAJECTORY_MAX_STEP_FROM),
     step_limit: int = Query(default=_TRAJECTORY_DEFAULT_STEPS, ge=1),
 ) -> Any:
     """An agent session as an ATIF trajectory (engine/ingest/atif), paged by step.
@@ -1211,7 +1216,13 @@ async def get_trajectory(
     ends and refreshed while it runs (`extra.session_ended` says which); a
     session with none yet answers 404 with `reason: not_built` and the reader
     falls back to /source-view text.
+
+    Paging a session reads R2 once per version, not once per page: the
+    stored document is cached per process, serialized per step, and every
+    request revalidates it with a conditional GET (trajectory_cache.py), so a
+    page is never older than the stored object.
     """
+    started = time.perf_counter()
     step_limit = min(step_limit, _TRAJECTORY_MAX_STEPS)
     request.state.customer_id = customer_id
     request.state.usage_summary = doc_id
@@ -1237,36 +1248,41 @@ async def get_trajectory(
         raise HTTPException(status_code=404, detail=f"document not found: {doc_id}")
     store = get_store()
     bucket = await store.bucket_for(customer_id)
-    trajectory = await read_trajectory(
-        store, bucket, trajectory_key(doc["source_system"], customer_id, doc["source_id"])
+    pages, cache_hit = await load_trajectory_pages(
+        store,
+        bucket,
+        trajectory_key(doc["source_system"], customer_id, doc["source_id"]),
+        (customer_id, doc["source_system"], doc["source_id"]),
     )
-    if trajectory is None:
+    if pages is None:
         return JSONResponse(
             status_code=404,
             content={"detail": "trajectory not built", "reason": "not_built"},
         )
-    # Documents stored before provenance was stripped at write time still carry it.
-    public = strip_provenance(trajectory)
-    steps = public["steps"]
-    page: list[Any] = []
-    budget = _TRAJECTORY_PAGE_MAX_BYTES
-    for step in steps[step_from - 1 : step_from - 1 + step_limit]:
-        size = len(json.dumps(step, separators=(",", ":"), ensure_ascii=False).encode())
-        if page and size > budget:
-            break
-        page.append(step)
-        budget -= size
-    following = step_from + len(page)
-    public["steps"] = page
-    return {
+    trajectory, shown = pages.page(step_from, step_limit, _TRAJECTORY_PAGE_MAX_BYTES)
+    total = pages.total_steps
+    following = step_from + shown
+    envelope = orjson.dumps({
         "doc_id": doc_id,
         "session_id": doc["source_id"],
         "source": doc["source_system"],
-        "total_steps": len(steps),
+        "total_steps": total,
         "step_from": step_from,
-        "next_step_from": following if following <= len(steps) else None,
-        "trajectory": public,
-    }
+        "next_step_from": following if following <= total else None,
+    })
+    body = envelope[:-1] + b',"trajectory":' + trajectory + b"}"
+    log.info(
+        "trajectory.page",
+        customer=customer_id,
+        cache="hit" if cache_hit else "miss",
+        step_from=step_from,
+        steps=shown,
+        total_steps=total,
+        bytes=len(body),
+        ms=round((time.perf_counter() - started) * 1000, 1),
+    )
+    # Already JSON: FastAPI's encoder would walk every value of the page again.
+    return Response(content=body, media_type="application/json")
 
 
 @app.get("/source-view/{doc_id:path}", response_model=SourceViewResponse)

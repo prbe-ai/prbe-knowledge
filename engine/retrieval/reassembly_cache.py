@@ -25,10 +25,10 @@ and a cross-tenant text hit would be an RLS bypass through a cache. Belt over
 cleverness.
 
 BOUNDS: LRU by total cached BYTES (the values are whole reassembled documents,
-so entry counts mean nothing) with an entry cap as a backstop. The budget is
-deliberately modest -- this cache rides inside the retrieval pod next to the
-gatherer's working memory; evicting a transcript costs one 400ms restitch,
-OOMing the pod costs every in-flight search.
+so entry counts mean nothing) with an entry cap as a backstop (byte_lru.py).
+The budget is deliberately modest -- this cache rides inside the retrieval pod
+next to the gatherer's working memory; evicting a transcript costs one 400ms
+restitch, OOMing the pod costs every in-flight search.
 
 CONCURRENCY: get/put run on the event loop thread only (the stitch itself runs
 in a worker thread, but callers await it before putting), so plain dict
@@ -41,9 +41,9 @@ from __future__ import annotations
 
 import hashlib
 import os
-from collections import OrderedDict
 from typing import Any
 
+from engine.retrieval.byte_lru import ByteBudgetLRU
 from engine.shared.logging import get_logger
 
 log = get_logger(__name__)
@@ -96,30 +96,17 @@ class ReassemblyCache:
         max_bytes: int = REASSEMBLY_CACHE_MAX_BYTES,
         max_entries: int = REASSEMBLY_CACHE_MAX_ENTRIES,
     ) -> None:
-        self._max_bytes = max_bytes
-        self._max_entries = max_entries
         # spans are ChunkLineSpan objects, read-only downstream
         # (_chunk_line_offsets only zips over them), so sharing one list
         # across requests is safe.
-        self._entries: OrderedDict[
-            tuple[str, str, str], tuple[str, list[Any], int]
-        ] = OrderedDict()
-        self._total_bytes = 0
-        self.hits = 0
-        self.misses = 0
+        self._lru: ByteBudgetLRU[tuple[str, str, str], tuple[str, list[Any]]] = (
+            ByteBudgetLRU(max_bytes, max_entries)
+        )
 
     def get(
         self, customer_id: str, doc_id: str, fingerprint: str
     ) -> tuple[str, list[Any]] | None:
-        key = (customer_id, doc_id, fingerprint)
-        entry = self._entries.get(key)
-        if entry is None:
-            self.misses += 1
-            return None
-        self._entries.move_to_end(key)
-        self.hits += 1
-        content, spans, _ = entry
-        return content, spans
+        return self._lru.get((customer_id, doc_id, fingerprint))
 
     def put(
         self,
@@ -129,30 +116,24 @@ class ReassemblyCache:
         content: str,
         spans: list[Any],
     ) -> None:
-        nbytes = len(content)
-        if nbytes > self._max_bytes:
-            # A single document larger than the whole budget: caching it
-            # would evict everything to hold one entry. Serve it uncached.
-            return
-        key = (customer_id, doc_id, fingerprint)
-        old = self._entries.pop(key, None)
-        if old is not None:
-            self._total_bytes -= old[2]
-        self._entries[key] = (content, spans, nbytes)
-        self._total_bytes += nbytes
-        while self._entries and (
-            self._total_bytes > self._max_bytes
-            or len(self._entries) > self._max_entries
-        ):
-            _, (_, _, evicted_bytes) = self._entries.popitem(last=False)
-            self._total_bytes -= evicted_bytes
+        # A single document larger than the whole budget is served uncached
+        # (byte_lru.ByteBudgetLRU.put).
+        self._lru.put((customer_id, doc_id, fingerprint), (content, spans), len(content))
+
+    @property
+    def hits(self) -> int:
+        return self._lru.hits
+
+    @property
+    def misses(self) -> int:
+        return self._lru.misses
 
     @property
     def total_bytes(self) -> int:
-        return self._total_bytes
+        return self._lru.total_bytes
 
     def __len__(self) -> int:
-        return len(self._entries)
+        return len(self._lru)
 
 
 #: Process-wide instance, mirroring the module-level posture of the ANN

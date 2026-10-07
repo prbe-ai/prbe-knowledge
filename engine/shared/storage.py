@@ -76,6 +76,15 @@ class ObjectLocation:
     key: str
 
 
+@dataclass(frozen=True, slots=True)
+class ObjectRead:
+    """What `ObjectStore.get_if_changed` read: `body` is None when the object
+    still has the ETag the caller sent (it was not transferred)."""
+
+    body: bytes | None
+    etag: str | None
+
+
 def _make_client(
     settings: Settings,
     *,
@@ -214,6 +223,32 @@ class ObjectStore:
                 return resp["Body"].read()
             except ClientError as exc:
                 code = exc.response.get("Error", {}).get("Code", "")
+                if code in {"NoSuchKey", "404"}:
+                    raise StorageNotFound(f"{bucket}/{key}") from exc
+                raise StorageUnavailable(f"get_object failed: {exc}") from exc
+
+        return await asyncio.to_thread(_get)
+
+    async def get_if_changed(self, bucket: str, key: str, etag: str | None) -> ObjectRead:
+        """A conditional GET: the object's body and ETag, or `body=None` when
+        its ETag still equals `etag` (HTTP 304; nothing is transferred).
+
+        One request either way, so a caller holding a copy pays a round trip,
+        not the object, to learn its copy is current. Raises StorageNotFound
+        when the object is gone, whatever `etag` says.
+        """
+        def _get() -> ObjectRead:
+            kwargs: dict[str, Any] = {"Bucket": bucket, "Key": key}
+            if etag:
+                kwargs["IfNoneMatch"] = etag
+            try:
+                resp = self._client.get_object(**kwargs)
+                return ObjectRead(body=resp["Body"].read(), etag=resp.get("ETag"))
+            except ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code", "")
+                status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+                if etag and (code in {"304", "NotModified"} or status == 304):
+                    return ObjectRead(body=None, etag=etag)
                 if code in {"NoSuchKey", "404"}:
                     raise StorageNotFound(f"{bucket}/{key}") from exc
                 raise StorageUnavailable(f"get_object failed: {exc}") from exc
