@@ -314,3 +314,40 @@ async def test_index_side_doc_filters_off_calls_bm25_exactly_as_before(monkeypat
         direct.DirectRetrieveRequest(query="concept", sources=["custom_ingest"]), "tenant"
     )
     assert "index_side_doc_filters" not in bm25.await_args.kwargs
+
+
+@pytest.mark.parametrize("key", ["a" * 129, "Experiments", "-leading", "has space", ""])
+def test_source_keys_outside_the_ingest_charset_are_refused(key):
+    """One oversized or malformed key is a 422, not a lost BM25 channel: the
+    index-side scope compiles every key into a regex, and no stored document
+    carries a key outside this charset anyway."""
+    with pytest.raises(ValidationError):
+        direct.DirectRetrieveRequest(query="x", source_keys=["experiments", key])
+
+
+def test_source_keys_inside_the_ingest_charset_are_accepted():
+    keys = ["experiments", "team_notes", "workspace:1d155c9c-4f05-4707-98a7-f69763c171e0",
+            "a" * 128]
+    assert direct.DirectRetrieveRequest(query="x", source_keys=keys).source_keys == keys
+
+
+async def test_bm25_only_caps_each_document_at_the_chunks_a_result_shows(monkeypatch):
+    """One document matching everywhere must not take every chunk slot."""
+    bm25 = AsyncMock(return_value=[])
+    monkeypatch.setattr(direct, "vector_search", AsyncMock(side_effect=AssertionError("no")))
+    monkeypatch.setattr(direct, "bm25_search", bm25)
+    await direct.retrieve_direct(
+        direct.DirectRetrieveRequest(query="concept", channels=["bm25"]), "tenant"
+    )
+    assert bm25.await_args.kwargs["max_chunks_per_doc"] == direct.CHUNKS_PER_DOCUMENT == 2
+
+
+@pytest.mark.parametrize("channels", [None, ["bm25", "vector"], ["vector", "bm25"]])
+async def test_two_channel_requests_send_bm25_no_document_cap(monkeypatch, channels):
+    """The typeahead's request (both channels) reaches bm25_search unchanged."""
+    bm25 = AsyncMock(return_value=[])
+    monkeypatch.setattr(direct, "vector_search", AsyncMock(return_value=[]))
+    monkeypatch.setattr(direct, "bm25_search", bm25)
+    extra = {} if channels is None else {"channels": channels}
+    await direct.retrieve_direct(direct.DirectRetrieveRequest(query="concept", **extra), "t")
+    assert "max_chunks_per_doc" not in bm25.await_args.kwargs

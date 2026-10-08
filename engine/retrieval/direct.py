@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from engine.retrieval.retrievers.bm25 import BM25Hit, bm25_search
 from engine.retrieval.retrievers.vector import VectorHit, vector_search
 from engine.shared.constants import MAX_REQUEST_SOURCE_KEYS, SourceSystem
+from engine.shared.custom_ingest import is_valid_source_key
 from engine.shared.db import with_tenant
 from engine.shared.logging import get_logger
 from engine.shared.models import (
@@ -30,6 +31,8 @@ from engine.shared.models import (
 log = get_logger(__name__)
 CHANNEL_TIMEOUT_SECONDS = 5.0
 RRF_CONSTANT = 60
+#: Body chunks a result carries.
+CHUNKS_PER_DOCUMENT = 2
 Hit = VectorHit | BM25Hit
 
 
@@ -66,6 +69,16 @@ class DirectRetrieveRequest(BaseModel):
     @classmethod
     def dedupe_channels(cls, value: list[DirectChannel]) -> list[DirectChannel]:
         return list(dict.fromkeys(value))
+
+    @field_validator("source_keys")
+    @classmethod
+    def valid_source_keys(cls, value: list[str] | None) -> list[str] | None:
+        # The ingest charset, 128 characters at most. No stored document has a
+        # key outside it, and an oversized one would otherwise reach BM25's
+        # index-side regex and cost the whole channel instead of a 422.
+        if value and not all(is_valid_source_key(key) for key in value):
+            raise ValueError("each source_key must match ^[a-z0-9][a-z0-9:_-]{0,127}$")
+        return value
 
     @field_validator("query")
     @classmethod
@@ -133,7 +146,13 @@ async def retrieve_direct(req: DirectRetrieveRequest, customer_id: str) -> Direc
         # Only when asked, so a default request calls bm25_search exactly as
         # before this flag existed.
         if name is DirectChannel.BM25 and req.index_side_doc_filters:
-            kwargs = {**filters, "index_side_doc_filters": True}
+            kwargs = {**kwargs, "index_side_doc_filters": True}
+        # A result keeps CHUNKS_PER_DOCUMENT chunks, so without a cap one long
+        # document matching everywhere (a live session) can fill every chunk
+        # slot and leave a one-document answer. BM25-only for now: the
+        # default two-channel request (the typeahead) stays exactly as it was.
+        if name is DirectChannel.BM25 and req.channels == [DirectChannel.BM25]:
+            kwargs = {**kwargs, "max_chunks_per_doc": CHUNKS_PER_DOCUMENT}
         before = time.perf_counter()
         try:
             async with asyncio.timeout(CHANNEL_TIMEOUT_SECONDS):
@@ -205,7 +224,7 @@ async def retrieve_direct(req: DirectRetrieveRequest, customer_id: str) -> Direc
                 matched_via=chunk_evidence[chunk.chunk_id],
                 retriever_scores={m.channel: m.score for m in chunk_evidence[chunk.chunk_id]},
             )
-            for chunk_rank, chunk in enumerate(body_chunks[:2], 1)
+            for chunk_rank, chunk in enumerate(body_chunks[:CHUNKS_PER_DOCUMENT], 1)
         ]
         results.append(
             QueryDocumentResult(

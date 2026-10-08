@@ -456,14 +456,23 @@ async def run_once(*, dry_run: bool = False) -> int:
                 # without its own partition both runs scan the parent, and
                 # logging "partition" there claims coverage that did not happen.
                 resolved_partition = await _resolve_scan_target(conn, tenant)
-                for path, override in (
-                    (resolved_partition, None),
-                    (CHUNKS_PARENT, CHUNKS_PARENT),
+                # The third run is /retrieve/direct's index-side source scope,
+                # which adds regex legs to the boolean -- on the parent, where
+                # pg_search has rejected shapes it accepted on a partition.
+                # The sampled term need not occur in custom_ingest, so zero
+                # hits is not a finding there; a rejection is. Worst case
+                # 30 + 3 x 30 s of canary, 45 s of backstop: under the
+                # CronJob's 240 s activeDeadlineSeconds.
+                for path, override, scope in (
+                    (resolved_partition, None, {}),
+                    (CHUNKS_PARENT, CHUNKS_PARENT, {}),
+                    (f"{CHUNKS_PARENT}:index_side_doc_filters", CHUNKS_PARENT,
+                     {"sources": ["custom_ingest"], "index_side_doc_filters": True}),
                 ):
                     try:
                         hits = await asyncio.wait_for(
                             bm25_search(tenant, term, top_k=1,
-                                        _scan_target_override=override),
+                                        _scan_target_override=override, **scope),
                             CANARY_SEARCH_TIMEOUT_S,
                         )
                     except Exception as exc:
@@ -472,7 +481,7 @@ async def run_once(*, dry_run: bool = False) -> int:
                                     tenant=tenant, term=term,
                                     error=rejected[path])
                         continue
-                    if not hits:
+                    if not hits and not scope:
                         log.warning("guardian.bm25_canary_zero_hits", path=path,
                                     tenant=tenant, term=term)
                     else:

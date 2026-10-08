@@ -167,15 +167,55 @@ def _regex_literal(text: str) -> str:
     )
 
 
-def _chunk_id_prefix_regex(prefixes: Iterable[str]) -> str:
-    """One anchored regex matching any chunk_id that starts with one of `prefixes`.
+#: Bytes of prefix one `paradedb.regex` may carry. pg_search 0.23.4 compiles a
+#: regex with tantivy-fst, which refuses one past 1,000 DFA states ("could not
+#: build regex"), and an alternation of literal prefixes costs about one state
+#: per byte the prefixes do not share. Measured on 0.23.4 with distinct random
+#: prefixes: 7 x 128 bytes compiled and 8 x 128 failed, 25 x 40 compiled and 26
+#: x 40 failed. research-os's real key list fails at 31 keys (5 fixed + 26
+#: `workspace:<uuid>`) and it sends up to 50. 600 leaves 40% headroom even
+#: with nothing shared, and still fits the longest valid key: 128 characters
+#: of ':' encode to a 403-byte prefix.
+_REGEX_PREFIX_BUDGET_BYTES = 600
 
-    One alternation, not one clause per prefix: a regex query walks the term
-    dictionary once per clause, so fifty source keys as fifty clauses would be
-    fifty walks. Tantivy anchors a regex to the whole term, so no `^`/`$`.
+
+def _chunk_id_prefix_regexes(prefixes: Iterable[str]) -> list[str]:
+    """Anchored regexes that together match any chunk_id starting with one of `prefixes`.
+
+    As few as fit `_REGEX_PREFIX_BUDGET_BYTES` each, not one per prefix: a
+    regex query walks the term dictionary once, so fifty keys as fifty regexes
+    would be fifty walks. Tantivy anchors a regex to the whole term, so no
+    `^`/`$`. `(?s:.)*`, not `.*`: the regex syntax's `.` stops at '\\n', and a
+    custom-ingest document id may contain one -- `.*` dropped that row in the
+    index while the SQL filter kept it (verified on 0.23.4).
     """
-    alternatives = "|".join(_regex_literal(p) for p in dict.fromkeys(prefixes))
-    return f"({alternatives}).*"
+    groups: list[list[str]] = []
+    used = 0
+    for prefix in dict.fromkeys(prefixes):
+        size = len(prefix.encode())
+        if groups and used + size <= _REGEX_PREFIX_BUDGET_BYTES:
+            groups[-1].append(prefix)
+            used += size
+        else:
+            groups.append([prefix])
+            used = size
+    return [f"({'|'.join(_regex_literal(p) for p in group)})(?s:.)*" for group in groups]
+
+
+def _chunk_id_prefix_leg(params: list, prefixes: Iterable[str]) -> str:
+    """One `must` leg matching chunk_ids that start with any of `prefixes`.
+
+    The regexes are binds, appended to `params`, and sit in a nested `should`
+    -- inside `must`, never beside it, where Tantivy would treat them as
+    optional. `const_score(0.0, ...)` because a bare regex leg adds 1.0 to
+    every hit (measured): the order holds, but scores would differ with the
+    flag on and off.
+    """
+    regexes = []
+    for regex in _chunk_id_prefix_regexes(prefixes):
+        params.append(regex)
+        regexes.append(f"paradedb.regex('chunk_id', ${len(params)})")
+    return f"paradedb.const_score(0.0, paradedb.boolean(should => ARRAY[{', '.join(regexes)}])),"
 
 
 def _source_chunk_prefix(source: str) -> str:
@@ -491,6 +531,7 @@ async def bm25_search(
     per_source_top_k: int | None = None,
     *,
     index_side_doc_filters: bool = False,
+    max_chunks_per_doc: int | None = None,
     _scan_target_override: str | None = None,
 ) -> list[BM25Hit]:
     """`include_drafts` defaults to False — retrieval hides ``visibility='draft'``
@@ -513,6 +554,10 @@ async def bm25_search(
     pg_search boolean as chunk_id prefixes, so they narrow TopK instead of
     post-filtering its pool (see the comment at `doc_scope_legs`). Off by
     default: every caller but `/retrieve/direct` gets today's SQL, byte for byte.
+
+    `max_chunks_per_doc`, when set, keeps at most that many of each document's
+    chunks, best-scored first, inside the bounded pool (see step 2b). Unset,
+    the SQL is unchanged.
     """
     spec = temporal or TemporalSpec()
     or_query = _build_or_tsquery_string(query_text)
@@ -590,10 +635,11 @@ async def bm25_search(
         # On prod `probe` custom_ingest is 25,980 of 485,872 live chunks (5.3%),
         # so a `sources=["custom_ingest"]` query can fill even the 4x scoped
         # pool with transcript chunks and return nothing for experiments,
-        # files or notes. Measured there 2026-10-08, pool statement, top_k 80:
-        # `error fix` kept 29 custom_ingest rows of its 3,200; with this leg the
-        # pool is all 457 that match, 726 -> 406 ms. It is not free: `loss
-        # curve` went 98 -> 230 rows but 208 -> 308 ms.
+        # files or notes. Measured there 2026-10-08, pool statement, top_k 80,
+        # back to back on a warm cache: `error fix` kept 29 custom_ingest rows
+        # of its 3,200; with this leg the pool is all 457 that match, 518 ->
+        # 237 ms. It is not free: `loss curve` went 98 -> 230 rows but 169 ->
+        # 242 ms.
         #
         # A chunk_id PREFIX, NOT `match('doc_id', ...)`. The index's default
         # tokenizer on pg_search 0.23.4 is `unicode_words` (UAX#29), where ':'
@@ -616,28 +662,23 @@ async def bm25_search(
         # 0 of 92,717 sampled chunks break the doc_id prefix. The SQL
         # predicates below still run and stay the correctness filter.
         #
-        # `const_score(0.0, ...)` because a bare regex leg adds 1.0 to every
-        # hit (measured): the order holds, but scores would differ with the
-        # flag on and off. Keyless docs carry no key prefix, so
-        # `source_keys_include_keyless` keeps the key scope on the join alone.
+        # Keyless docs carry no key prefix, so `source_keys_include_keyless`
+        # keeps the key scope on the join alone.
         sources_index_side = bool(index_side_doc_filters and sources)
         keys_index_side = bool(
             index_side_doc_filters and source_keys and not source_keys_include_keyless
         )
         doc_scope_legs: list[str] = []
         if sources_index_side:
-            params.append(_chunk_id_prefix_regex(_source_chunk_prefix(s) for s in sources or ()))
             doc_scope_legs.append(
-                f"paradedb.const_score(0.0, paradedb.regex('chunk_id', ${len(params)})),"
+                _chunk_id_prefix_leg(params, (_source_chunk_prefix(s) for s in sources or ()))
             )
         if keys_index_side:
-            params.append(
-                _chunk_id_prefix_regex(
-                    _source_key_chunk_prefix(customer_id, key) for key in source_keys or ()
-                )
-            )
             doc_scope_legs.append(
-                f"paradedb.const_score(0.0, paradedb.regex('chunk_id', ${len(params)})),"
+                _chunk_id_prefix_leg(
+                    params,
+                    (_source_key_chunk_prefix(customer_id, key) for key in source_keys or ()),
+                )
             )
         # Rendered on the `project_must` line, so the flag-off SQL is unchanged
         # to the byte.
@@ -858,6 +899,32 @@ async def bm25_search(
                 FROM ({pool_sql}) p
             ) q
             WHERE q.content_hit OR q._title_rn <= ${cap_idx}
+        """
+
+        # ---- 2b. optional per-document cap, also INSIDE the pool ----
+        # Results are chunks, but a caller that shows documents keeps only a
+        # few chunks of each, so one long document whose every chunk matches
+        # can take all `top_k` rows and leave the answer one document wide --
+        # and that document can be the caller's own live session, which it
+        # then drops. Capping each doc_id here hands the freed slots to other
+        # documents. After the title cap, so a chunk that cap removed never
+        # takes a slot here; over the pool, never the table, so TopK stays a
+        # TopK (see `_BM25_POOL_MULTIPLIER`). It cannot reach a document the
+        # pool never held. Wrapped only when asked: every other caller's SQL
+        # is unchanged to the byte.
+        if max_chunks_per_doc is not None:
+            params.append(max_chunks_per_doc)
+            doc_cap_idx = len(params)
+            capped_sql = f"""
+            SELECT * FROM (
+                SELECT t.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY t.doc_id
+                           ORDER BY t.score DESC, t.chunk_id
+                       ) AS _doc_rn
+                FROM ({capped_sql}) t
+            ) u
+            WHERE u._doc_rn <= ${doc_cap_idx}
         """
 
         # ---- 3. join documents for the doc-level filters and projection ----

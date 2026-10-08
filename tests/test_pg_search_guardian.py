@@ -688,3 +688,46 @@ async def test_provisioning_backstop_runs_after_the_timeline_is_recorded(monkeyp
 
     assert await cron.run_once() == 0
     assert order == ["timeline", "backstop"]
+
+
+async def test_canary_also_runs_the_index_side_doc_scope_on_the_parent(monkeypatch) -> None:
+    """/retrieve/direct's `index_side_doc_filters` adds regex legs to the pool
+    query. pg_search has rejected shapes on the partitioned parent that it
+    accepted on a partition, so the canary runs that shape on the parent too,
+    and a rejection there is announced like the others. Zero hits there is
+    not: the sampled term need not occur in custom_ingest."""
+    from engine.shared.partitions import CHUNKS_PARENT
+    from scripts import cron_pg_search_guardian as cron
+
+    calls: list[dict[str, Any]] = []
+    captured: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_search(tenant: str, term: str, **kwargs: Any) -> list[Any]:
+        calls.append(kwargs)
+        if kwargs.get("index_side_doc_filters"):
+            raise RuntimeError("Unsupported query shape")
+        return ["hit"]
+
+    def fake_capture(event: str, props: dict[str, Any]) -> bool:
+        captured.append((event, props))
+        return True
+
+    monkeypatch.setattr(cron, "capture", fake_capture)
+    monkeypatch.setattr(cron, "find_broken_pg_search_indexes", _async_return([]))
+    monkeypatch.setattr(cron, "find_invalid_index_debris", _async_return([]))
+    monkeypatch.setattr(cron, "current_timeline_id", _async_return(1))
+    monkeypatch.setattr(cron, "read_last_timeline", _async_return(1))
+    monkeypatch.setattr(cron, "record_timeline", _async_return(None))
+    monkeypatch.setattr(cron, "_provision_missing", _async_return(None))
+    monkeypatch.setattr(cron, "bm25_canary_probe", _async_return(("tenant-a", "zephyr")))
+    monkeypatch.setattr(cron, "_resolve_scan_target", _async_return("chunks_p_tenant_a_0"))
+    monkeypatch.setattr(cron, "bm25_search", fake_search)
+    monkeypatch.setattr(cron, "get_pool", lambda: _FakePool())
+
+    assert await cron.run_once() == 0
+    assert [c.get("_scan_target_override") for c in calls] == [None, CHUNKS_PARENT, CHUNKS_PARENT]
+    assert calls[2]["sources"] == ["custom_ingest"]
+    assert not calls[0].get("index_side_doc_filters") and not calls[1].get("index_side_doc_filters")
+    rejected = [p for e, p in captured if e == "kb_pg_search_query_rejected"]
+    assert len(rejected) == 1
+    assert rejected[0]["paths"] == [f"{CHUNKS_PARENT}:index_side_doc_filters"]
