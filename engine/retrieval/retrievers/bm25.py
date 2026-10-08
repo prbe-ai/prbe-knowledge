@@ -74,6 +74,7 @@ and how densely.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
@@ -83,6 +84,7 @@ import asyncpg
 from engine.retrieval.helpers import origin_of, project_scope_predicate, source_key_predicate
 from engine.retrieval.temporal import build_predicate, live_version_join
 from engine.shared.constants import LIVE_CHUNK_LAST_SEEN, TOP_K_BM25
+from engine.shared.custom_ingest import custom_ingest_doc_id
 from engine.shared.db import with_tenant
 from engine.shared.logging import get_logger
 from engine.shared.models import TemporalMode, TemporalSpec, normalize_author_id
@@ -149,6 +151,43 @@ def _build_pg_search_query(tokens: list[str]) -> str:
     let a query escape into pg_search's query-string syntax.
     """
     return " ".join(tokens)
+
+
+def _regex_literal(text: str) -> str:
+    """`text` as a pattern that matches exactly itself in pg_search's regex.
+
+    Everything outside [A-Za-z0-9_] becomes a code-point escape (`\\x{3a}`
+    for ':') rather than a backslash before the character, so no question of
+    which punctuation the parser accepts escaped arises. Verified on paradedb
+    0.23.4 with `%`, `:` and `-`, the characters a doc_id actually carries.
+    """
+    return "".join(
+        ch if ch.isascii() and (ch.isalnum() or ch == "_") else f"\\x{{{ord(ch):x}}}"
+        for ch in text
+    )
+
+
+def _chunk_id_prefix_regex(prefixes: Iterable[str]) -> str:
+    """One anchored regex matching any chunk_id that starts with one of `prefixes`.
+
+    One alternation, not one clause per prefix: a regex query walks the term
+    dictionary once per clause, so fifty source keys as fifty clauses would be
+    fifty walks. Tantivy anchors a regex to the whole term, so no `^`/`$`.
+    """
+    alternatives = "|".join(_regex_literal(p) for p in dict.fromkeys(prefixes))
+    return f"({alternatives}).*"
+
+
+def _source_chunk_prefix(source: str) -> str:
+    """Every chunk of a `source` document starts with this: a doc_id starts
+    `{source_system}:` and a chunk_id is `{doc_id}:...` (normalizer)."""
+    return f"{source}:"
+
+
+def _source_key_chunk_prefix(customer_id: str, source_key: str) -> str:
+    """Every chunk of a document under `source_key` starts with this: its
+    doc_id's `custom_ingest:{tenant}:{encoded key}:`."""
+    return custom_ingest_doc_id(customer_id, source_key, "")
 
 
 # How many chunks ONE document may contribute on the strength of its TITLE
@@ -451,6 +490,7 @@ async def bm25_search(
     project_id: str | None = None,
     per_source_top_k: int | None = None,
     *,
+    index_side_doc_filters: bool = False,
     _scan_target_override: str | None = None,
 ) -> list[BM25Hit]:
     """`include_drafts` defaults to False — retrieval hides ``visibility='draft'``
@@ -468,6 +508,11 @@ async def bm25_search(
     `source_keys`, when set, hard-filters by
     `documents.metadata->>'source_key' = ANY(...)` (custom-ingest scope
     key). Applied BEFORE the LIMIT -- mirrors vector_search.
+
+    `index_side_doc_filters` also restates `sources` / `source_keys` inside the
+    pg_search boolean as chunk_id prefixes, so they narrow TopK instead of
+    post-filtering its pool (see the comment at `doc_scope_legs`). Off by
+    default: every caller but `/retrieve/direct` gets today's SQL, byte for byte.
     """
     spec = temporal or TemporalSpec()
     or_query = _build_or_tsquery_string(query_text)
@@ -539,6 +584,65 @@ async def bm25_search(
             )
         project_filter = project_scope_predicate(params, project_id, alias="d")
 
+        # Source and source-key scope as an index-side PRE-FILTER, opt-in
+        # (`index_side_doc_filters`, sent by /retrieve/direct only). Without it
+        # both predicates land on the documents join AFTER the pool's LIMIT.
+        # On prod `probe` custom_ingest is 25,980 of 485,872 live chunks (5.3%),
+        # so a `sources=["custom_ingest"]` query can fill even the 4x scoped
+        # pool with transcript chunks and return nothing for experiments,
+        # files or notes. Measured there 2026-10-08, pool statement, top_k 80:
+        # `error fix` kept 29 custom_ingest rows of its 3,200; with this leg the
+        # pool is all 457 that match, 726 -> 406 ms. It is not free: `loss
+        # curve` went 98 -> 230 rows but 208 -> 308 ms.
+        #
+        # A chunk_id PREFIX, NOT `match('doc_id', ...)`. The index's default
+        # tokenizer on pg_search 0.23.4 is `unicode_words` (UAX#29), where ':'
+        # between letters and '_' do not split a word: verified on that
+        # engine, `custom_ingest:probe:experiments:page:738f` indexes as
+        # {custom_ingest:probe:experiments:page, 738f}, and
+        # `match('doc_id', 'custom_ingest')` matches ZERO rows. Where a doc_id
+        # splits depends on its tenant, key and the caller's document id, so no
+        # token query over it is a sound pre-filter -- the trap the
+        # customer_id and project_id clauses document, one field over.
+        # `chunk_id` is the key field, indexed `raw`: one case-sensitive term
+        # per row with no length cap (a 300-byte id still matched), so an
+        # anchored regex on it means exactly "starts with".
+        #
+        # The prefixes are EXACT. Every chunk_id is `{doc_id}:...`
+        # (normalizer), every doc_id starts `{source_system}:`, and every keyed
+        # doc_id is `custom_ingest_doc_id(tenant, key, ...)`. Checked on the
+        # research plane 2026-10-08: 0 of 1,231,524 document versions break
+        # the source prefix, 0 of 459,970 keyed versions break the key prefix,
+        # 0 of 92,717 sampled chunks break the doc_id prefix. The SQL
+        # predicates below still run and stay the correctness filter.
+        #
+        # `const_score(0.0, ...)` because a bare regex leg adds 1.0 to every
+        # hit (measured): the order holds, but scores would differ with the
+        # flag on and off. Keyless docs carry no key prefix, so
+        # `source_keys_include_keyless` keeps the key scope on the join alone.
+        sources_index_side = bool(index_side_doc_filters and sources)
+        keys_index_side = bool(
+            index_side_doc_filters and source_keys and not source_keys_include_keyless
+        )
+        doc_scope_legs: list[str] = []
+        if sources_index_side:
+            params.append(_chunk_id_prefix_regex(_source_chunk_prefix(s) for s in sources or ()))
+            doc_scope_legs.append(
+                f"paradedb.const_score(0.0, paradedb.regex('chunk_id', ${len(params)})),"
+            )
+        if keys_index_side:
+            params.append(
+                _chunk_id_prefix_regex(
+                    _source_key_chunk_prefix(customer_id, key) for key in source_keys or ()
+                )
+            )
+            doc_scope_legs.append(
+                f"paradedb.const_score(0.0, paradedb.regex('chunk_id', ${len(params)})),"
+            )
+        # Rendered on the `project_must` line, so the flag-off SQL is unchanged
+        # to the byte.
+        doc_scope_must = "".join(f"\n                    {leg}" for leg in doc_scope_legs)
+
         pred = build_predicate(
             spec, doc_alias="d", chunk_alias="c", next_param_index=len(params) + 1
         )
@@ -573,11 +677,18 @@ async def bm25_search(
         # small residual, so widening 4x for it would be four times the work
         # for nothing. The other scopes still land only on the join and still
         # need it.
+        #
+        # Sources and source keys follow the same rule once they ride the
+        # index, and more strongly: their prefix is exact, so the join removes
+        # NOTHING for them, and every row past the 10x pool ranks below every
+        # row that can be returned. The factor would only buy what an unscoped
+        # query already forgoes. doc_types, author and keyless source keys
+        # still post-filter, and any one of them keeps the 4x.
         scoped = bool(
-            sources
+            (sources and not sources_index_side)
             or doc_types
             or author_ids
-            or source_keys
+            or (source_keys and not keys_index_side)
             or (project_id and not project_index_side)
         )
         pool_size = top_k * _BM25_POOL_MULTIPLIER * (_BM25_SCOPED_POOL_FACTOR if scoped else 1)
@@ -718,7 +829,7 @@ async def bm25_search(
               AND c.chunk_id @@@ paradedb.boolean(must => ARRAY[
                     {tenant_must},
                     {visibility_must}
-                    {project_must}
+                    {project_must}{doc_scope_must}
                     paradedb.boolean(should => ARRAY[
                       paradedb.boost({_BM25_TITLE_BOOST}, paradedb.match('title', $2)),
                       paradedb.match('content', $2)
