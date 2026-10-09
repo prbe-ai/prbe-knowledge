@@ -688,3 +688,69 @@ async def test_provisioning_backstop_runs_after_the_timeline_is_recorded(monkeyp
 
     assert await cron.run_once() == 0
     assert order == ["timeline", "backstop"]
+
+
+def _canary_harness(monkeypatch, reject: Any) -> tuple[list[dict[str, Any]], list[Any]]:
+    """`run_once` down to the canary, with `bm25_search` raising when
+    `reject(kwargs)` says so. Returns the search calls and captured events."""
+    from scripts import cron_pg_search_guardian as cron
+
+    calls: list[dict[str, Any]] = []
+    captured: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_search(tenant: str, term: str, **kwargs: Any) -> list[Any]:
+        calls.append(kwargs)
+        if reject(kwargs):
+            raise RuntimeError("Unsupported query shape")
+        return ["hit"]
+
+    def fake_capture(event: str, props: dict[str, Any]) -> bool:
+        captured.append((event, props))
+        return True
+
+    monkeypatch.setattr(cron, "capture", fake_capture)
+    monkeypatch.setattr(cron, "find_broken_pg_search_indexes", _async_return([]))
+    monkeypatch.setattr(cron, "find_invalid_index_debris", _async_return([]))
+    monkeypatch.setattr(cron, "current_timeline_id", _async_return(1))
+    monkeypatch.setattr(cron, "read_last_timeline", _async_return(1))
+    monkeypatch.setattr(cron, "record_timeline", _async_return(None))
+    monkeypatch.setattr(cron, "_provision_missing", _async_return(None))
+    monkeypatch.setattr(cron, "bm25_canary_probe", _async_return(("tenant-a", "zephyr")))
+    monkeypatch.setattr(cron, "_resolve_scan_target", _async_return("chunks_p_tenant_a_0"))
+    monkeypatch.setattr(cron, "bm25_search", fake_search)
+    monkeypatch.setattr(cron, "get_pool", lambda: _FakePool())
+    return calls, captured
+
+
+async def test_canary_also_runs_the_index_side_doc_scope_on_the_parent(monkeypatch) -> None:
+    """/retrieve/direct's `index_side_doc_filters` adds regex legs to the pool
+    query. pg_search has rejected shapes on the partitioned parent that it
+    accepted on a partition, so the canary runs that shape on the parent too.
+    A rejection there is announced as what it is -- the opt-in keyword path,
+    not production BM25. Zero hits there is not reported: the sampled term
+    need not occur in custom_ingest."""
+    from engine.shared.partitions import CHUNKS_PARENT
+    from scripts import cron_pg_search_guardian as cron
+
+    calls, captured = _canary_harness(
+        monkeypatch, lambda kwargs: kwargs.get("index_side_doc_filters")
+    )
+    assert await cron.run_once() == 0
+    assert [c.get("_scan_target_override") for c in calls] == [None, CHUNKS_PARENT, CHUNKS_PARENT]
+    assert calls[2]["sources"] == ["custom_ingest"]
+    assert not calls[0].get("index_side_doc_filters") and not calls[1].get("index_side_doc_filters")
+    rejected = [p for e, p in captured if e == "kb_pg_search_query_rejected"]
+    assert len(rejected) == 1
+    assert rejected[0]["paths"] == [cron.OPT_IN_CANARY_PATH] == ["chunks:index_side_doc_filters"]
+    assert cron.OPT_IN_CANARY_PATH in rejected[0]["state"]
+    assert "production BM25 is unaffected" in rejected[0]["state"]
+
+
+async def test_a_production_rejection_keeps_the_production_alert_text(monkeypatch) -> None:
+    from scripts import cron_pg_search_guardian as cron
+
+    _calls, captured = _canary_harness(monkeypatch, lambda _kwargs: True)
+    assert await cron.run_once() == 0
+    (rejected,) = [p for e, p in captured if e == "kb_pg_search_query_rejected"]
+    assert len(rejected["paths"]) == 3
+    assert rejected["state"].startswith("pg_search rejects the production BM25 query")

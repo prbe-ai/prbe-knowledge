@@ -101,6 +101,7 @@ jobs:
           .venv/bin/pytest -q -rs
           tests/retrieval/test_bm25_live_sentinel.py
           tests/retrieval/test_chunks_partition_pruning.py
+          tests/retrieval/test_bm25_index_side_doc_filters.py
           tests/test_retrieval_visibility.py::test_bm25_search_excludes_drafts_by_default
           tests/test_retrieval_visibility.py::test_bm25_search_include_drafts_returns_both
           tests/test_pg_search_guardian_integration.py
@@ -389,6 +390,7 @@ jobs:
           tests/retrieval/test_dedupe_gathered.py
           tests/retrieval/test_graph_discovery_ordering.py
           tests/retrieval/test_bm25_project_scope_shape.py
+          tests/retrieval/test_direct.py
           tests/retrieval/test_helpers_resolve_aliases.py
           tests/retrieval/test_helpers_expand_to_cluster_members.py
           tests/retrieval/test_search_quick_wins.py

@@ -195,3 +195,160 @@ async def test_cancellation_propagates_and_cancels_both_index_reads(monkeypatch)
 def test_direct_request_is_bounded_and_cannot_assert_identity_or_draft_access(payload):
     with pytest.raises(ValidationError):
         direct.DirectRetrieveRequest(**payload)
+
+
+async def test_bm25_only_never_calls_the_vector_channel(monkeypatch):
+    """`["bm25"]` is the zero-model-call lookup: vector_search embeds the query,
+    so it must not even be invoked, let alone have its result ignored."""
+    vector = AsyncMock(side_effect=AssertionError("vector_search embeds the query"))
+    bm25 = AsyncMock(return_value=[hit("keyword", channel="bm25")])
+    monkeypatch.setattr(direct, "vector_search", vector)
+    monkeypatch.setattr(direct, "bm25_search", bm25)
+    response = await direct.retrieve_direct(
+        direct.DirectRetrieveRequest(query="concept", channels=["bm25"]), "tenant"
+    )
+    vector.assert_not_called()
+    bm25.assert_awaited_once()
+    assert [doc.doc_id for doc in response.results] == ["keyword"]
+    assert [m.channel for m in response.results[0].matched_via] == ["bm25"]
+    assert set(response.timing_ms) == {"bm25", "total"}
+    assert not response.lost_channels and not response.degraded
+
+
+async def test_default_channels_run_both_retrievers(monkeypatch):
+    vector = AsyncMock(return_value=[])
+    bm25 = AsyncMock(return_value=[])
+    monkeypatch.setattr(direct, "vector_search", vector)
+    monkeypatch.setattr(direct, "bm25_search", bm25)
+    req = direct.DirectRetrieveRequest(query="concept")
+    assert req.channels == [direct.DirectChannel.VECTOR, direct.DirectChannel.BM25]
+    assert req.index_side_doc_filters is False
+    await direct.retrieve_direct(req, "tenant")
+    vector.assert_awaited_once()
+    bm25.assert_awaited_once()
+
+
+def test_channels_must_name_at_least_one_known_channel():
+    for channels in ([], ["graph"]):
+        with pytest.raises(ValidationError):
+            direct.DirectRetrieveRequest(query="x", channels=channels)
+
+
+def test_duplicate_channels_collapse_in_order():
+    req = direct.DirectRetrieveRequest(query="x", channels=["bm25", "vector", "bm25"])
+    assert req.channels == [direct.DirectChannel.BM25, direct.DirectChannel.VECTOR]
+    assert direct.DirectRetrieveRequest(query="x", channels=["bm25", "bm25"]).channels == [
+        direct.DirectChannel.BM25
+    ]
+
+
+async def test_listing_order_does_not_change_the_representative_hit(monkeypatch):
+    """Hits fold in a fixed order, so `["bm25", "vector"]` answers exactly as
+    the default does."""
+    monkeypatch.setattr(
+        direct, "vector_search", AsyncMock(return_value=[hit("both", score=0.01)])
+    )
+    monkeypatch.setattr(
+        direct, "bm25_search", AsyncMock(return_value=[hit("both", channel="bm25", score=9)])
+    )
+    default = await direct.retrieve_direct(direct.DirectRetrieveRequest(query="x"), "t")
+    reordered = await direct.retrieve_direct(
+        direct.DirectRetrieveRequest(query="x", channels=["bm25", "vector"]), "t"
+    )
+    for response in (default, reordered):
+        assert [m.channel for m in response.results[0].matched_via] == ["vector", "bm25"]
+
+
+async def test_bm25_only_failure_is_reported_as_the_lost_channel(monkeypatch):
+    monkeypatch.setattr(
+        direct, "vector_search", AsyncMock(side_effect=AssertionError("not requested"))
+    )
+    monkeypatch.setattr(direct, "bm25_search", AsyncMock(side_effect=TimeoutError("busy")))
+    response = await direct.retrieve_direct(
+        direct.DirectRetrieveRequest(query="concept", channels=["bm25"]), "tenant"
+    )
+    assert response.results == []
+    assert response.lost_channels == ["bm25"]
+    assert response.degraded
+    assert response.degraded_reason == "retrieval_channel_unavailable"
+
+
+async def test_candidate_cap_counts_only_requested_channels(monkeypatch):
+    monkeypatch.setattr(
+        direct, "bm25_search", AsyncMock(return_value=[
+            hit("long", channel="bm25", chunk=str(i)) for i in range(8)
+        ]),
+    )
+    monkeypatch.setattr(
+        direct, "vector_search", AsyncMock(side_effect=AssertionError("not requested"))
+    )
+    response = await direct.retrieve_direct(
+        direct.DirectRetrieveRequest(query="concept", top_k=2, channels=["bm25"]), "tenant"
+    )
+    assert len(response.results) == 1
+    assert response.truncated
+
+
+async def test_index_side_doc_filters_reaches_bm25_and_never_vector(monkeypatch):
+    vector = AsyncMock(return_value=[])
+    bm25 = AsyncMock(return_value=[])
+    monkeypatch.setattr(direct, "vector_search", vector)
+    monkeypatch.setattr(direct, "bm25_search", bm25)
+    req = direct.DirectRetrieveRequest(
+        query="concept", sources=["custom_ingest"], source_keys=["experiments"],
+        index_side_doc_filters=True,
+    )
+    await direct.retrieve_direct(req, "tenant")
+    assert bm25.await_args.kwargs["index_side_doc_filters"] is True
+    assert bm25.await_args.kwargs["sources"] == ["custom_ingest"]
+    assert "index_side_doc_filters" not in vector.await_args.kwargs
+
+
+async def test_index_side_doc_filters_off_calls_bm25_exactly_as_before(monkeypatch):
+    """The flag is passed only when set, so every existing request reaches
+    bm25_search with the arguments it always had."""
+    bm25 = AsyncMock(return_value=[])
+    monkeypatch.setattr(direct, "vector_search", AsyncMock(return_value=[]))
+    monkeypatch.setattr(direct, "bm25_search", bm25)
+    await direct.retrieve_direct(
+        direct.DirectRetrieveRequest(query="concept", sources=["custom_ingest"]), "tenant"
+    )
+    assert "index_side_doc_filters" not in bm25.await_args.kwargs
+
+
+@pytest.mark.parametrize("key", ["a" * 129, "", "experiments\n", "tab\there", "del\x7f"])
+def test_source_keys_that_cannot_ride_the_index_are_refused(key):
+    """One oversized or control-character key is a 422, not a lost BM25
+    channel: the index-side scope compiles every key into a regex."""
+    with pytest.raises(ValidationError):
+        direct.DirectRetrieveRequest(query="x", source_keys=["experiments", key])
+
+
+def test_source_keys_are_not_held_to_the_ingest_charset():
+    """research-os sends `shared:{customer_id}`, and a tenant id may hold
+    capitals and '.', so the request must not refuse what a tenant id allows."""
+    keys = ["experiments", "workspace:1d155c9c-4f05-4707-98a7-f69763c171e0",
+            "shared:Acme.io", "a" * 128]
+    assert direct.DirectRetrieveRequest(query="x", source_keys=keys).source_keys == keys
+
+
+async def test_bm25_only_caps_each_document_at_the_chunks_a_result_shows(monkeypatch):
+    """One document matching everywhere must not take every chunk slot."""
+    bm25 = AsyncMock(return_value=[])
+    monkeypatch.setattr(direct, "vector_search", AsyncMock(side_effect=AssertionError("no")))
+    monkeypatch.setattr(direct, "bm25_search", bm25)
+    await direct.retrieve_direct(
+        direct.DirectRetrieveRequest(query="concept", channels=["bm25"]), "tenant"
+    )
+    assert bm25.await_args.kwargs["max_chunks_per_doc"] == direct.CHUNKS_PER_DOCUMENT == 2
+
+
+@pytest.mark.parametrize("channels", [None, ["bm25", "vector"], ["vector", "bm25"]])
+async def test_two_channel_requests_send_bm25_no_document_cap(monkeypatch, channels):
+    """The typeahead's request (both channels) reaches bm25_search unchanged."""
+    bm25 = AsyncMock(return_value=[])
+    monkeypatch.setattr(direct, "vector_search", AsyncMock(return_value=[]))
+    monkeypatch.setattr(direct, "bm25_search", bm25)
+    extra = {} if channels is None else {"channels": channels}
+    await direct.retrieve_direct(direct.DirectRetrieveRequest(query="concept", **extra), "t")
+    assert "max_chunks_per_doc" not in bm25.await_args.kwargs

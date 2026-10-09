@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from enum import StrEnum
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -29,7 +30,18 @@ from engine.shared.models import (
 log = get_logger(__name__)
 CHANNEL_TIMEOUT_SECONDS = 5.0
 RRF_CONSTANT = 60
+#: Body chunks a result carries.
+CHUNKS_PER_DOCUMENT = 2
 Hit = VectorHit | BM25Hit
+
+
+class DirectChannel(StrEnum):
+    """The index reads this adapter can run. VECTOR embeds the query (a model
+    call); BM25 is keyword-only, so `["bm25"]` alone is a lookup with no model
+    call at all."""
+
+    VECTOR = "vector"
+    BM25 = "bm25"
 
 
 class DirectRetrieveRequest(BaseModel):
@@ -43,6 +55,32 @@ class DirectRetrieveRequest(BaseModel):
     source_keys: list[str] | None = Field(default=None, max_length=MAX_REQUEST_SOURCE_KEYS)
     doc_types: list[str] | None = None
     scope: ScopeSpec | None = None
+    # An unrequested channel is never called: `["bm25"]` must not embed.
+    channels: list[DirectChannel] = Field(
+        default_factory=lambda: [DirectChannel.VECTOR, DirectChannel.BM25], min_length=1
+    )
+    # BM25 only: restate sources / source_keys inside the pg_search query so
+    # they narrow its candidate pool instead of post-filtering it (see
+    # `bm25_search`). Vector already applies them before its LIMIT.
+    index_side_doc_filters: bool = False
+
+    @field_validator("channels")
+    @classmethod
+    def dedupe_channels(cls, value: list[DirectChannel]) -> list[DirectChannel]:
+        return list(dict.fromkeys(value))
+
+    @field_validator("source_keys")
+    @classmethod
+    def bounded_source_keys(cls, value: list[str] | None) -> list[str] | None:
+        # What BM25's index-side regex needs, and no more: an oversized key
+        # would cost the whole channel instead of a 422. 128 characters keeps
+        # one key's prefix under `_REGEX_PREFIX_BUDGET_BYTES` (at most 4 bytes
+        # a character, plus the tenant), and printable keeps control bytes out.
+        # NOT the ingest charset: research-os sends `shared:{customer_id}`,
+        # and a tenant id may hold capitals and '.' (`_SAFE_CUSTOMER_ID`).
+        if value and not all(0 < len(key) <= 128 and key.isprintable() for key in value):
+            raise ValueError("each source_key must be 1-128 printable characters")
+        return value
 
     @field_validator("query")
     @classmethod
@@ -101,36 +139,56 @@ async def retrieve_direct(req: DirectRetrieveRequest, customer_id: str) -> Direc
     }
     lost: list[str] = []
     timings: dict[str, float] = {}
+    # Looked up per call, not bound at import, so the module attributes stay
+    # the seam tests patch.
+    searches = {DirectChannel.VECTOR: vector_search, DirectChannel.BM25: bm25_search}
 
-    async def channel(name: str, search) -> list[Hit]:
+    async def channel(name: DirectChannel) -> list[Hit]:
+        kwargs = filters
+        # Only when asked, so a default request calls bm25_search exactly as
+        # before this flag existed.
+        if name is DirectChannel.BM25 and req.index_side_doc_filters:
+            kwargs = {**kwargs, "index_side_doc_filters": True}
+        # A result keeps CHUNKS_PER_DOCUMENT chunks, so without a cap one long
+        # document matching everywhere (a live session) can fill every chunk
+        # slot and leave a one-document answer. BM25-only for now: the
+        # default two-channel request (the typeahead) stays exactly as it was.
+        if name is DirectChannel.BM25 and req.channels == [DirectChannel.BM25]:
+            kwargs = {**kwargs, "max_chunks_per_doc": CHUNKS_PER_DOCUMENT}
         before = time.perf_counter()
         try:
             async with asyncio.timeout(CHANNEL_TIMEOUT_SECONDS):
-                return await search(customer_id, req.query, **filters)
+                return await searches[name](customer_id, req.query, **kwargs)
         except Exception as exc:
-            lost.append(name)
-            log.warning("direct_search.channel_failed", channel=name, error=type(exc).__name__)
+            lost.append(name.value)
+            log.warning(
+                "direct_search.channel_failed", channel=name.value, error=type(exc).__name__
+            )
             return []
         finally:
-            timings[name] = round((time.perf_counter() - before) * 1000, 1)
+            timings[name.value] = round((time.perf_counter() - before) * 1000, 1)
 
-    vector, bm25 = await asyncio.gather(
-        channel("vector", vector_search), channel("bm25", bm25_search)
-    )
-    candidate_cap_reached = len(vector) >= filters["top_k"] or len(bm25) >= filters["top_k"]
+    # Folded in enum order whatever order the caller listed, so a document
+    # both channels found keeps its vector hit as the representative, as it
+    # did before channels were selectable.
+    requested = [name for name in DirectChannel if name in req.channels]
+    gathered = await asyncio.gather(*(channel(name) for name in requested))
+    candidate_cap_reached = any(len(hits) >= filters["top_k"] for hits in gathered)
     try:
-        live = await _live_docs(req, customer_id, list({h.doc_id for h in [*vector, *bm25]}))
+        live = await _live_docs(
+            req, customer_id, list({h.doc_id for hits in gathered for h in hits})
+        )
     except Exception as exc:
         log.warning("direct_search.live_lookup_failed", error=type(exc).__name__)
         live = set()
         lost.append("live_documents")
-    vector = [h for h in vector if (h.doc_id, h.doc_version) in live]
-    bm25 = [h for h in bm25 if (h.doc_id, h.doc_version) in live]
     docs: dict[str, Hit] = {}
     evidence: dict[str, list[MatchProvenance]] = {}
     chunks: dict[str, dict[str, Hit]] = {}
     chunk_evidence: dict[str, list[MatchProvenance]] = {}
-    for name, hits in (("vector", vector), ("bm25", bm25)):
+    for channel_name, channel_hits in zip(requested, gathered, strict=True):
+        name = channel_name.value
+        hits = [h for h in channel_hits if (h.doc_id, h.doc_version) in live]
         seen: set[str] = set()
         for hit in hits:
             docs.setdefault(hit.doc_id, hit)
@@ -168,7 +226,7 @@ async def retrieve_direct(req: DirectRetrieveRequest, customer_id: str) -> Direc
                 matched_via=chunk_evidence[chunk.chunk_id],
                 retriever_scores={m.channel: m.score for m in chunk_evidence[chunk.chunk_id]},
             )
-            for chunk_rank, chunk in enumerate(body_chunks[:2], 1)
+            for chunk_rank, chunk in enumerate(body_chunks[:CHUNKS_PER_DOCUMENT], 1)
         ]
         results.append(
             QueryDocumentResult(
