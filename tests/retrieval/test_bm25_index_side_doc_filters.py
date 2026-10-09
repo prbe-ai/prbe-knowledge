@@ -54,8 +54,17 @@ WORKSPACE_KEY = "workspace:1d155c9c-4f05-4707-98a7-f69763c171e0"
 LOOKALIKE_KEY = "experiments-archive"
 #: The longest key the ingest charset allows (128 characters).
 LONG_KEY = ("long-key-" + "0123456789abcdef" * 8)[:128]
-TRANSCRIPT_CHUNKS = 120
 TOP_K = 2
+#: top_k of the source-key tests: the largest result the expected sets need.
+KEYED_TOP_K = 3
+#: Enough transcript chunks to fill the largest pool any test here can build
+#: WITHOUT its index leg (a scoped pool, the 4x factor included), plus a
+#: margin. Derived, not typed: if a pool knob grows, a fixed count would let
+#: the transcripts stop filling the pool, and a test whose leg had been
+#: removed would pass on the SQL post-filter alone.
+TRANSCRIPT_CHUNKS = (
+    max(TOP_K, KEYED_TOP_K) * bm25._BM25_POOL_MULTIPLIER * bm25._BM25_SCOPED_POOL_FACTOR + 20
+)
 APP_ROLE = "bm25_doc_scope_app"
 
 EXPERIMENT_DOC = custom_ingest_doc_id(TENANT, "experiments", "page:738f0c2e")
@@ -91,13 +100,15 @@ async def _doc(
     )
 
 
-async def _chunk(conn, doc_id: str, n: int, content: str, tenant: str = TENANT) -> None:
+async def _chunk(
+    conn, doc_id: str, n: int, content: str, tenant: str = TENANT, kind: str = "content"
+) -> None:
     await conn.execute(
         """
         INSERT INTO chunks (chunk_id, doc_id, customer_id, chunk_index, content,
                             content_hash, token_count, chunker_version,
                             first_seen_version, last_seen_version, kind, visibility)
-        VALUES ($1, $2, $3, $4, $5, $6, 3, 'v1', 1, 2147483647, 'content', 'approved')
+        VALUES ($1, $2, $3, $4, $5, $6, 3, 'v1', 1, 2147483647, $7, 'approved')
         """,
         f"{doc_id}:c_{n:016x}",
         doc_id,
@@ -105,6 +116,7 @@ async def _chunk(conn, doc_id: str, n: int, content: str, tenant: str = TENANT) 
         n,
         content,
         f"h{n}",
+        kind,
     )
 
 
@@ -267,7 +279,8 @@ async def test_source_keys_keep_only_the_keyed_docs(seeded, as_app_role, overrid
     ':' (encoded `%3A`) still matches and a key sharing a prefix up to the
     separator does not.
 
-    top_k=3 makes the pool 30 rows, against 120 transcript chunks that all
+    The pool is KEYED_TOP_K x 10 rows (x 4 if the key scope fell back to the
+    join), and TRANSCRIPT_CHUNKS more than fill either with chunks that all
     outrank every custom chunk: with the key leg gone the pool is all
     transcript and the SQL filter leaves nothing, so this fails rather than
     passing on the post-filter alone.
@@ -278,13 +291,13 @@ async def test_source_keys_keep_only_the_keyed_docs(seeded, as_app_role, overrid
         (["experiments", WORKSPACE_KEY], {EXPERIMENT_DOC, NEWLINE_DOC, WORKSPACE_DOC}),
     ):
         hits = await bm25_search(
-            TENANT, TERM, top_k=3, source_keys=keys, index_side_doc_filters=True,
+            TENANT, TERM, top_k=KEYED_TOP_K, source_keys=keys, index_side_doc_filters=True,
             _scan_target_override=override,
         )
         assert {h.doc_id for h in hits} == expected, keys
         # The same scope, also narrowed by source: both legs ride the index.
         both = await bm25_search(
-            TENANT, TERM, top_k=3, sources=["custom_ingest"], source_keys=keys,
+            TENANT, TERM, top_k=KEYED_TOP_K, sources=["custom_ingest"], source_keys=keys,
             index_side_doc_filters=True, _scan_target_override=override,
         )
         assert {h.doc_id for h in both} == expected, keys
@@ -332,7 +345,7 @@ async def test_fifty_keys_stay_under_the_regex_state_limit(
         await _index_count("paradedb.regex('chunk_id', $1)", unsplit)
     assert len(bm25._chunk_id_prefix_regexes(prefixes)) > 1
     hits = await bm25_search(
-        TENANT, TERM, top_k=3, source_keys=keys, index_side_doc_filters=True,
+        TENANT, TERM, top_k=KEYED_TOP_K, source_keys=keys, index_side_doc_filters=True,
         _scan_target_override=override,
     )
     assert {h.doc_id for h in hits} == expected
@@ -361,9 +374,13 @@ OTHER_DOCS = [custom_ingest_doc_id(CAP_TENANT, "experiments", f"run:{i}") for i 
 
 @pytest_asyncio.fixture
 async def seeded_long_doc(pg_search_db):
-    """One session whose 300 chunks all match densely, and 10 documents that
-    match once each, below every one of them. A 40-chunk answer is all
-    session unless each document is capped."""
+    """One session whose 300 body chunks all match densely, and 10 documents
+    with 2 body chunks that match once each, below every one of them. A
+    40-chunk answer is all session unless each document is capped.
+
+    Every document also has its `kind='metadata'` chunk, as ingest writes
+    one. The session's is short and dense, so it scores highest of all --
+    the shape that, counted in the cap, cost a result one of its snippets."""
     async with db_module.raw_conn() as conn:
         if not await is_partitioned(conn):
             pytest.skip("chunks is not partitioned on this database")
@@ -374,13 +391,25 @@ async def seeded_long_doc(pg_search_db):
         )
         await ensure_tenant_partition(conn, CAP_TENANT)
         await _doc(conn, LONG_SESSION, "claude_code", None, tenant=CAP_TENANT)
+        await _chunk(
+            conn, LONG_SESSION, 9999, " ".join([CAP_TERM] * 4), tenant=CAP_TENANT,
+            kind="metadata",
+        )
         for n in range(300):
             await _chunk(
                 conn, LONG_SESSION, n, f"{CAP_TERM} {CAP_TERM} {CAP_TERM} s{n}", tenant=CAP_TENANT
             )
         for i, doc_id in enumerate(OTHER_DOCS):
             await _doc(conn, doc_id, "custom_ingest", "experiments", tenant=CAP_TENANT)
-            await _chunk(conn, doc_id, 1000 + i, f"{CAP_TERM} {_FILLER}", tenant=CAP_TENANT)
+            await _chunk(
+                conn, doc_id, 2000 + i, f"{CAP_TERM} metadata {_FILLER}", tenant=CAP_TENANT,
+                kind="metadata",
+            )
+            for part in range(2):
+                await _chunk(
+                    conn, doc_id, 1000 + 10 * i + part, f"{CAP_TERM} {part} {_FILLER}",
+                    tenant=CAP_TENANT,
+                )
         await _ensure_app_role(conn)
     yield
 
@@ -389,9 +418,10 @@ async def seeded_long_doc(pg_search_db):
 async def test_max_chunks_per_doc_hands_the_slots_to_other_documents(
     seeded_long_doc, as_app_role, override
 ) -> None:
-    """top_k=40 -> a 400-row pool holding all 310 matches. Uncapped, the 40
-    best chunks are all the session's; capped at 2, the session keeps 2 and
-    the 10 other documents fill in behind it."""
+    """top_k=40 -> a 400-row pool holding all 331 matches. Uncapped, the 40
+    best chunks are all the session's; capped at 2, every document keeps 2
+    body chunks and its metadata chunk, which does not count against them,
+    and the 10 other documents fill in behind the session."""
     uncapped = await bm25_search(
         CAP_TENANT, CAP_TERM, top_k=40, _scan_target_override=override
     )
@@ -399,10 +429,12 @@ async def test_max_chunks_per_doc_hands_the_slots_to_other_documents(
     capped = await bm25_search(
         CAP_TENANT, CAP_TERM, top_k=40, max_chunks_per_doc=2, _scan_target_override=override
     )
-    assert [h.doc_id for h in capped].count(LONG_SESSION) == 2
     assert {h.doc_id for h in capped} == {LONG_SESSION, *OTHER_DOCS}
-    # Best-scored first, both before the documents that fill in behind.
-    assert [h.doc_id for h in capped[:2]] == [LONG_SESSION, LONG_SESSION]
+    for doc_id in (LONG_SESSION, *OTHER_DOCS):
+        kinds = sorted(h.kind for h in capped if h.doc_id == doc_id)
+        assert kinds == ["content", "content", "metadata"], doc_id
+    # Best-scored first: all three of the session's before anything else.
+    assert {h.doc_id for h in capped[:3]} == {LONG_SESSION}
 
 
 async def test_a_bm25_only_direct_answer_is_not_one_document_wide(
@@ -420,6 +452,9 @@ async def test_a_bm25_only_direct_answer_is_not_one_document_wide(
     doc_ids = [r.doc_id for r in response.results]
     assert len(set(doc_ids)) >= 8
     assert doc_ids[0] == LONG_SESSION
+    # Two snippets each: the metadata chunk, which a result never shows, did
+    # not take one of the two slots.
+    assert [r.chunk_count for r in response.results] == [2] * len(doc_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -561,7 +596,7 @@ async def test_the_document_cap_wraps_the_pool_and_leaves_its_limit_alone() -> N
     plain = await _render(bm25, False, {"top_k": 40})
     capped = await _render(bm25, False, {"top_k": 40, "max_chunks_per_doc": 2})
     assert "_doc_rn" not in plain["sql"]
-    assert capped["sql"].count("PARTITION BY t.doc_id") == 1
+    assert capped["sql"].count("PARTITION BY t.doc_id, (t.kind = 'metadata')") == 1
     assert capped["params"] == [*plain["params"], 2]
     # The pool subquery -- the part pg_search executes as TopK -- is untouched.
     pool = plain["sql"][plain["sql"].index("SELECT c.chunk_id") : plain["sql"].index(") p")]

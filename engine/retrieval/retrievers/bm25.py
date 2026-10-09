@@ -556,8 +556,8 @@ async def bm25_search(
     default: every caller but `/retrieve/direct` gets today's SQL, byte for byte.
 
     `max_chunks_per_doc`, when set, keeps at most that many of each document's
-    chunks, best-scored first, inside the bounded pool (see step 2b). Unset,
-    the SQL is unchanged.
+    body chunks, best-scored first, inside the bounded pool, and counts its
+    metadata chunk apart (see step 2b). Unset, the SQL is unchanged.
     """
     spec = temporal or TemporalSpec()
     or_query = _build_or_tsquery_string(query_text)
@@ -912,6 +912,12 @@ async def bm25_search(
         # TopK (see `_BM25_POOL_MULTIPLIER`). It cannot reach a document the
         # pool never held. Wrapped only when asked: every other caller's SQL
         # is unchanged to the byte.
+        #
+        # The metadata chunk is counted APART from the body. It is short and
+        # often matches the title, so it tends to score highest, and a caller
+        # that shows body chunks drops it: counted together, it took one of
+        # the two slots and every such document came back with one snippet
+        # instead of two (reproduced on 0.23.4).
         if max_chunks_per_doc is not None:
             params.append(max_chunks_per_doc)
             doc_cap_idx = len(params)
@@ -919,7 +925,7 @@ async def bm25_search(
             SELECT * FROM (
                 SELECT t.*,
                        ROW_NUMBER() OVER (
-                           PARTITION BY t.doc_id
+                           PARTITION BY t.doc_id, (t.kind = 'metadata')
                            ORDER BY t.score DESC, t.chunk_id
                        ) AS _doc_rn
                 FROM ({capped_sql}) t

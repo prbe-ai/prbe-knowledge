@@ -17,7 +17,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from engine.retrieval.retrievers.bm25 import BM25Hit, bm25_search
 from engine.retrieval.retrievers.vector import VectorHit, vector_search
 from engine.shared.constants import MAX_REQUEST_SOURCE_KEYS, SourceSystem
-from engine.shared.custom_ingest import is_valid_source_key
 from engine.shared.db import with_tenant
 from engine.shared.logging import get_logger
 from engine.shared.models import (
@@ -72,12 +71,15 @@ class DirectRetrieveRequest(BaseModel):
 
     @field_validator("source_keys")
     @classmethod
-    def valid_source_keys(cls, value: list[str] | None) -> list[str] | None:
-        # The ingest charset, 128 characters at most. No stored document has a
-        # key outside it, and an oversized one would otherwise reach BM25's
-        # index-side regex and cost the whole channel instead of a 422.
-        if value and not all(is_valid_source_key(key) for key in value):
-            raise ValueError("each source_key must match ^[a-z0-9][a-z0-9:_-]{0,127}$")
+    def bounded_source_keys(cls, value: list[str] | None) -> list[str] | None:
+        # What BM25's index-side regex needs, and no more: an oversized key
+        # would cost the whole channel instead of a 422. 128 characters keeps
+        # one key's prefix under `_REGEX_PREFIX_BUDGET_BYTES` (at most 4 bytes
+        # a character, plus the tenant), and printable keeps control bytes out.
+        # NOT the ingest charset: research-os sends `shared:{customer_id}`,
+        # and a tenant id may hold capitals and '.' (`_SAFE_CUSTOMER_ID`).
+        if value and not all(0 < len(key) <= 128 and key.isprintable() for key in value):
+            raise ValueError("each source_key must be 1-128 printable characters")
         return value
 
     @field_validator("query")

@@ -316,18 +316,19 @@ async def test_index_side_doc_filters_off_calls_bm25_exactly_as_before(monkeypat
     assert "index_side_doc_filters" not in bm25.await_args.kwargs
 
 
-@pytest.mark.parametrize("key", ["a" * 129, "Experiments", "-leading", "has space", ""])
-def test_source_keys_outside_the_ingest_charset_are_refused(key):
-    """One oversized or malformed key is a 422, not a lost BM25 channel: the
-    index-side scope compiles every key into a regex, and no stored document
-    carries a key outside this charset anyway."""
+@pytest.mark.parametrize("key", ["a" * 129, "", "experiments\n", "tab\there", "del\x7f"])
+def test_source_keys_that_cannot_ride_the_index_are_refused(key):
+    """One oversized or control-character key is a 422, not a lost BM25
+    channel: the index-side scope compiles every key into a regex."""
     with pytest.raises(ValidationError):
         direct.DirectRetrieveRequest(query="x", source_keys=["experiments", key])
 
 
-def test_source_keys_inside_the_ingest_charset_are_accepted():
-    keys = ["experiments", "team_notes", "workspace:1d155c9c-4f05-4707-98a7-f69763c171e0",
-            "a" * 128]
+def test_source_keys_are_not_held_to_the_ingest_charset():
+    """research-os sends `shared:{customer_id}`, and a tenant id may hold
+    capitals and '.', so the request must not refuse what a tenant id allows."""
+    keys = ["experiments", "workspace:1d155c9c-4f05-4707-98a7-f69763c171e0",
+            "shared:Acme.io", "a" * 128]
     assert direct.DirectRetrieveRequest(query="x", source_keys=keys).source_keys == keys
 
 

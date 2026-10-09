@@ -119,6 +119,10 @@ def _canary_tick() -> int:
 
 CANARY_PROBE_TIMEOUT_S = 30.0
 CANARY_SEARCH_TIMEOUT_S = 30.0
+#: The canary run of /retrieve/direct's opt-in `index_side_doc_filters` shape.
+#: Its rejection costs that opt-in keyword path, not production BM25, and the
+#: alert has to say which.
+OPT_IN_CANARY_PATH = f"{CHUNKS_PARENT}:index_side_doc_filters"
 
 # Indexes worth pg_prewarm'ing after a promotion -- what the DEFAULT search
 # path actually walks, in the order a cold search hits them. The LIVE partial
@@ -466,7 +470,7 @@ async def run_once(*, dry_run: bool = False) -> int:
                 for path, override, scope in (
                     (resolved_partition, None, {}),
                     (CHUNKS_PARENT, CHUNKS_PARENT, {}),
-                    (f"{CHUNKS_PARENT}:index_side_doc_filters", CHUNKS_PARENT,
+                    (OPT_IN_CANARY_PATH, CHUNKS_PARENT,
                      {"sources": ["custom_ingest"], "index_side_doc_filters": True}),
                 ):
                     try:
@@ -489,6 +493,17 @@ async def run_once(*, dry_run: bool = False) -> int:
                                  tenant=tenant, hits=len(hits))
                 if rejected:
                     nonlocal_rejected = True
+                    production = sorted(p for p in rejected if p != OPT_IN_CANARY_PATH)
+                    state = (
+                        "pg_search rejects the production BM25 query; the "
+                        "exact channel is returning nothing while searches "
+                        "report ok"
+                        if production
+                        else f"pg_search rejects only the opt-in keyword path "
+                        f"({OPT_IN_CANARY_PATH}): /retrieve/direct requests "
+                        "that send index_side_doc_filters lose their BM25 "
+                        "channel; production BM25 is unaffected"
+                    )
                     # ONE event per tick naming every failed path, not one per
                     # path: on an unpartitioned database both paths resolve to
                     # the same relation and would otherwise double-count the
@@ -510,11 +525,9 @@ async def run_once(*, dry_run: bool = False) -> int:
                             # above, which is what an operator needs to
                             # reproduce the rejection.
                             "term_length": len(term),
-                            "error": next(iter(rejected.values()))[:300],
+                            "error": rejected[(production or [OPT_IN_CANARY_PATH])[0]][:300],
                             "timeline_id": timeline,
-                            "state": "pg_search rejects the production BM25 "
-                            "query; the exact channel is returning nothing "
-                            "while searches report ok",
+                            "state": state,
                         },
                     )
         except TimeoutError:
