@@ -137,3 +137,34 @@ def test_pagerduty_incident_ids() -> None:
     assert _kinds("q00cushzae4oxf") == []
     # Digit-free ALL-CAPS words are English, not PD ids (review).
     assert _kinds("QUALIFICATIONS matrix") == []
+
+
+def _url_pairs(q: str) -> list[tuple[str, str]]:
+    return [(d.kind, d.canonical_id) for d in detect_identifiers(q, urls=True)]
+
+
+def test_github_pr_and_issue_links_read_as_issue_refs_when_asked() -> None:
+    """A GitHub PR/issue is stored with source_id `owner/repo#N`, and a pasted
+    link carries no '#'. Verified on prod 2026-10-09: all 4,285 live PR and
+    issue docs have exactly the `owner/repo#N` their URL path spells."""
+    for link in (
+        "https://github.com/prbe-ai/research-os/pull/2499",
+        "github.com/prbe-ai/research-os/pull/2499/files",
+        "https://github.com/prbe-ai/research-os/pull/2499#pullrequestreview-5463735468",
+        "https://www.github.com/prbe-ai/research-os/pull/2499?diff=split",
+    ):
+        assert _url_pairs(link) == [("issue_ref", "prbe-ai/research-os#2499")], link
+    assert _url_pairs("https://github.com/a/b.c/issues/7") == [("issue_ref", "a/b.c#7")]
+
+
+def test_github_links_are_opt_in_and_never_partial() -> None:
+    """Off by default, so the agentic id-pins lane keeps its behaviour; and a
+    number glued to more characters is not shed as a shorter one."""
+    link = "https://github.com/prbe-ai/research-os/pull/2499"
+    assert _pairs(link) == []
+    assert _url_pairs("https://github.com/a/b/pull/24990x") == []
+    assert _url_pairs("https://github.com/a/b/tree/main") == []
+    assert _url_pairs(f"run 61c0db57-56d1-49a4-a0a3-3f29cd7e98eb in {link}") == [
+        ("uuid", "61c0db57-56d1-49a4-a0a3-3f29cd7e98eb"),
+        ("issue_ref", "prbe-ai/research-os#2499"),
+    ]

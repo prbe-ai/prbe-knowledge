@@ -570,6 +570,10 @@ class MatchProvenance(BaseModel):
         "graph",
         "inferred_edge",
         "id_lookup",
+        # /retrieve/direct's name for the same exact lookup, matching its
+        # request channel (`channels: ["id"]`), `lost_channels` and
+        # `timing_ms`, as "vector" and "bm25" already do there.
+        "id",
         # No selector picked anything (the `floor` selector, Jev unavailable, a
         # gatherer that failed), so the response is the pre-fan-out pool's own
         # fused order -- never a top-up of a selector's answer. It is named

@@ -52,6 +52,16 @@ _UUID_RE = re.compile(
 _TICKET_RE = re.compile(r"(?<![\w-])([A-Za-z][A-Za-z0-9]{1,9}-\d{1,6})(?![\w-])")
 # repo#123 / owner/repo#123.
 _ISSUE_REF_RE = re.compile(r"\b([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?#\d{1,6})\b")
+# A pasted GitHub pull-request or issue link. GitHub documents store
+# source_id `owner/repo#N` -- the issue_ref canonical form -- and a URL
+# carries no '#', so without this a pasted link detects nothing at all
+# (prod probe, 2026-10-09: `.../research-os/pull/2499` is stored as
+# `prbe-ai/research-os#2499`). `\b` after the number keeps `/pull/24990`
+# from shedding `#2499`; `/files`, `#discussion_r1` and `?diff=` tails are
+# fine. Opt-in (`detect_identifiers(urls=True)`): see there.
+_GITHUB_URL_RE = re.compile(
+    r"\bgithub\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(?:pull|issues)/(\d{1,6})\b"
+)
 # Bare commit shas: 12-40 hex. Runs AFTER UUID masking. The 12 floor keeps
 # ordinary words and short hex fragments out.
 _SHA_RE = re.compile(r"\b[0-9a-fA-F]{12,40}\b")
@@ -130,12 +140,18 @@ class DetectedIdentifier:
     number: str = ""
 
 
-def detect_identifiers(query: str) -> list[DetectedIdentifier]:
+def detect_identifiers(query: str, *, urls: bool = False) -> list[DetectedIdentifier]:
     """Every typed identifier in `query`, canonicalized, in query order.
 
     Deduplicated on canonical_id (the same ticket typed twice is one
     identifier). Returns [] for identifier-free queries, which is the
     common case and must stay O(regex).
+
+    `urls=True` also reads a pasted GitHub PR/issue link as the issue_ref it
+    names (`owner/repo#N`). Off by default so the agentic id-pins lane, whose
+    pins can short-circuit the ranked loop, keeps exactly its measured
+    behaviour; /retrieve/direct's keyword path turns it on. The link is
+    still something the user typed, so the provenance rule above holds.
     """
     out: list[DetectedIdentifier] = []
     seen: set[str] = set()
@@ -161,6 +177,10 @@ def detect_identifiers(query: str) -> list[DetectedIdentifier]:
         if prefix in _TICKET_STOPWORDS:
             continue
         _add("ticket", m.group(1).upper())
+
+    if urls:
+        for m in _GITHUB_URL_RE.finditer(masked):
+            _add("issue_ref", f"{m.group(1)}#{m.group(2)}")
 
     for m in _ISSUE_REF_RE.finditer(masked):
         _add("issue_ref", m.group(1))

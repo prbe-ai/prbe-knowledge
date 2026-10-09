@@ -1,6 +1,6 @@
 """Bounded index lookup for interactive search, without the gatherer.
 
-Both retrievers own their SQL, tenant RLS, live-version, visibility and scope
+The retrievers own their SQL, tenant RLS, live-version, visibility and scope
 predicates. This adapter only combines their document ranks; it does not run
 grounding, query expansion, graph traversal or a generative model.
 """
@@ -15,9 +15,11 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from engine.retrieval.retrievers.bm25 import BM25Hit, bm25_search
+from engine.retrieval.retrievers.id_lookup import IdLookupHit, lookup_identifiers, resolve_pins
 from engine.retrieval.retrievers.vector import VectorHit, vector_search
 from engine.shared.constants import MAX_REQUEST_SOURCE_KEYS, SourceSystem
 from engine.shared.db import with_tenant
+from engine.shared.identifiers import detect_identifiers
 from engine.shared.logging import get_logger
 from engine.shared.models import (
     MatchProvenance,
@@ -32,20 +34,62 @@ CHANNEL_TIMEOUT_SECONDS = 5.0
 RRF_CONSTANT = 60
 #: Body chunks a result carries.
 CHUNKS_PER_DOCUMENT = 2
-Hit = VectorHit | BM25Hit
+Hit = VectorHit | BM25Hit | IdLookupHit
 
 
 class DirectChannel(StrEnum):
     """The index reads this adapter can run. VECTOR embeds the query (a model
     call); BM25 is keyword-only, so `["bm25"]` alone is a lookup with no model
-    call at all."""
+    call at all. ID resolves identifiers the user typed (a UUID, a ticket, a
+    sha, a GitHub PR link) by exact lookup, also with no model call.
+
+    Declaration order is fold order (see `retrieve_direct`), so ID goes last:
+    adding it changes nothing for a request that does not ask for it."""
 
     VECTOR = "vector"
     BM25 = "bm25"
+    ID = "id"
+
+
+async def id_search(
+    customer_id: str,
+    query: str,
+    *,
+    top_k: int,
+    sources: list[SourceSystem] | None,
+    source_keys: list[str] | None,
+    doc_types: list[str] | None,
+    project_id: str | None,
+) -> list[IdLookupHit]:
+    """The agentic id-pins lane, as a channel: identifiers in the RAW query,
+    resolved exactly, one best document per identifier.
+
+    Detection is a regex pass, so a query with no identifier costs nothing and
+    returns [] -- an empty channel, never a lost one. The lookup enforces the
+    request's scope in its own SQL (sources, source_keys, doc_types, project;
+    latest versions; drafts hidden), exactly as the agentic lane calls it.
+    `resolve_pins` then keeps the best document per identifier, capped at
+    max(1, top_k // 2) so a query quoting many ids leaves ranking room. An
+    inferred reference that does not expand uniquely (a short hex prefix, a
+    bare '#N' matching several repos) has no hits, so it pins nothing.
+    """
+    detected = detect_identifiers(query, urls=True)
+    if not detected:
+        return []
+    hits, _ambiguous = await lookup_identifiers(
+        customer_id,
+        detected,
+        sources=sources,
+        doc_types=doc_types,
+        source_keys=source_keys,
+        project_id=project_id,
+    )
+    pins, _unresolved, _overflow = resolve_pins(detected, hits, top_k)
+    return pins
 
 
 class DirectRetrieveRequest(BaseModel):
-    """Only filters that both direct retrievers enforce before ranking."""
+    """Only filters that every direct retriever enforces before ranking."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -141,7 +185,11 @@ async def retrieve_direct(req: DirectRetrieveRequest, customer_id: str) -> Direc
     timings: dict[str, float] = {}
     # Looked up per call, not bound at import, so the module attributes stay
     # the seam tests patch.
-    searches = {DirectChannel.VECTOR: vector_search, DirectChannel.BM25: bm25_search}
+    searches = {
+        DirectChannel.VECTOR: vector_search,
+        DirectChannel.BM25: bm25_search,
+        DirectChannel.ID: id_search,
+    }
 
     async def channel(name: DirectChannel) -> list[Hit]:
         kwargs = filters
@@ -155,6 +203,10 @@ async def retrieve_direct(req: DirectRetrieveRequest, customer_id: str) -> Direc
         # default two-channel request (the typeahead) stays exactly as it was.
         if name is DirectChannel.BM25 and req.channels == [DirectChannel.BM25]:
             kwargs = {**kwargs, "max_chunks_per_doc": CHUNKS_PER_DOCUMENT}
+        # Pins are capped against the RESULT size, as the agentic lane caps
+        # them against its request's top_k -- not the over-fetched chunk pool.
+        if name is DirectChannel.ID:
+            kwargs = {**kwargs, "top_k": req.top_k}
         before = time.perf_counter()
         try:
             async with asyncio.timeout(CHANNEL_TIMEOUT_SECONDS):
@@ -170,7 +222,8 @@ async def retrieve_direct(req: DirectRetrieveRequest, customer_id: str) -> Direc
 
     # Folded in enum order whatever order the caller listed, so a document
     # both channels found keeps its vector hit as the representative, as it
-    # did before channels were selectable.
+    # did before channels were selectable. An id hit takes part in the RRF
+    # sum like any other, and is ALSO pinned first below.
     requested = [name for name in DirectChannel if name in req.channels]
     gathered = await asyncio.gather(*(channel(name) for name in requested))
     candidate_cap_reached = any(len(hits) >= filters["top_k"] for hits in gathered)
@@ -206,7 +259,24 @@ async def retrieve_direct(req: DirectRetrieveRequest, customer_id: str) -> Direc
         doc_id: sum(1 / (RRF_CONSTANT + match.rank) for match in matches)
         for doc_id, matches in evidence.items()
     }
-    ordered = sorted(docs, key=lambda doc_id: (-scores[doc_id], doc_id))
+    # A document resolved from an identifier the user typed leads the answer,
+    # in the order the identifiers were typed, as the agentic lane's pins do.
+    # RRF alone cannot promise that: an id hit at rank 1 scores 1/61, the
+    # same as a document BM25 alone ranked first, and the tie would fall to
+    # doc_id order. Without the id channel this map is empty and the order
+    # is exactly the RRF order it always was.
+    pinned = {
+        doc_id: match.rank
+        for doc_id, matches in evidence.items()
+        for match in matches
+        if match.channel == DirectChannel.ID.value
+    }
+    ordered = sorted(
+        docs,
+        key=lambda doc_id: (
+            doc_id not in pinned, pinned.get(doc_id, 0), -scores[doc_id], doc_id
+        ),
+    )
     results = []
     for rank, doc_id in enumerate(ordered[: req.top_k], 1):
         hit = docs[doc_id]
