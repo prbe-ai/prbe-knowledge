@@ -351,6 +351,9 @@ jobs:
       # test_alias_chains_and_enqueue covers alias routing through merge chains
       # (write and read path) and the insert-or-change gate on the post-write
       # queue, with the two retrieval alias-helper suites beside it.
+      # test_direct_id_channel resolves typed ids through /retrieve/direct's
+      # id channel as a FORCE-RLS-bound role (plain SQL, no pg_search), and
+      # test_identifiers pins the shapes detect_identifiers reads.
       # Keep every tests/retrieval/ path in ONE run: a file from elsewhere
       # between two of them makes pytest drop tests/retrieval/conftest.py's
       # fixtures for the second half ("fixture 'recorded' not found").
@@ -391,11 +394,13 @@ jobs:
           tests/retrieval/test_graph_discovery_ordering.py
           tests/retrieval/test_bm25_project_scope_shape.py
           tests/retrieval/test_direct.py
+          tests/retrieval/test_direct_id_channel.py
           tests/retrieval/test_helpers_resolve_aliases.py
           tests/retrieval/test_helpers_expand_to_cluster_members.py
           tests/retrieval/test_search_quick_wins.py
           tests/retrieval/test_title_match_function.py
           tests/retrieval/test_entity_match_function.py
+          tests/test_identifiers.py
           tests/test_bm25_index_generations.py
           tests/test_custom_ingest.py
           tests/test_tombstone_purge.py

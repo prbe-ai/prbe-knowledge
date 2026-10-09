@@ -2,7 +2,7 @@
 
 Endpoints exposed:
     POST /retrieve         raw chunks pipeline (vector + BM25 + graph fusion)
-    POST /retrieve/direct  bounded vector + BM25 lookup, no gatherer
+    POST /retrieve/direct  bounded vector / BM25 / typed-id lookup, no gatherer
     POST /query            /retrieve + LLM synthesis (cited answer)
     POST /query/stream     /query as SSE stream
     POST /graph/explore    knowledge-graph viz: default mode (top-N by degree)
@@ -261,7 +261,8 @@ async def direct_retrieve(
     req: DirectRetrieveRequest,
     customer_id: str = Depends(authenticate_query),
 ) -> DirectRetrieveResponse:
-    """Direct vector + BM25 index lookup for interactive entity navigation."""
+    """Direct index lookup -- vector, BM25 and typed identifiers, as requested -- for
+    interactive entity navigation and keyword search."""
     return await retrieve_direct(req, customer_id)
 
 

@@ -137,3 +137,54 @@ def test_pagerduty_incident_ids() -> None:
     assert _kinds("q00cushzae4oxf") == []
     # Digit-free ALL-CAPS words are English, not PD ids (review).
     assert _kinds("QUALIFICATIONS matrix") == []
+
+
+def _url_pairs(q: str) -> list[tuple[str, str]]:
+    return [(d.kind, d.canonical_id) for d in detect_identifiers(q, urls=True)]
+
+
+def test_github_pr_and_issue_links_read_as_issue_refs_when_asked() -> None:
+    """A GitHub PR/issue is stored with source_id `owner/repo#N`, and a pasted
+    link carries no '#'. Verified on prod 2026-10-09: all 4,285 live PR and
+    issue docs have exactly the `owner/repo#N` their URL path spells."""
+    for link in (
+        "https://github.com/prbe-ai/research-os/pull/2499",
+        "github.com/prbe-ai/research-os/pull/2499/files",
+        "https://github.com/prbe-ai/research-os/pull/2499#pullrequestreview-5463735468",
+        "https://www.github.com/prbe-ai/research-os/pull/2499?diff=split",
+    ):
+        assert _url_pairs(link) == [("issue_ref", "prbe-ai/research-os#2499")], link
+    assert _url_pairs("https://github.com/a/b.c/issues/7") == [("issue_ref", "a/b.c#7")]
+    # The host is case-insensitive; owner/repo keep the case typed.
+    assert _url_pairs("GitHub.com/prbe-ai/research-os/pull/2499") == [
+        ("issue_ref", "prbe-ai/research-os#2499")
+    ]
+    assert _url_pairs("HTTPS://GITHUB.COM/a/b/pull/1") == [("issue_ref", "a/b#1")]
+
+
+def test_start_is_where_the_identifier_was_typed() -> None:
+    """The list is grouped by kind; `start` carries the query order, at the
+    earliest occurrence of an identifier typed twice or in two forms."""
+    q = "PRB-17 broke 61c0db57-56d1-49a4-a0a3-3f29cd7e98eb, see prbe-ai/research-os#2499 (PRB-17)"
+    found = detect_identifiers(q)
+    assert [(d.kind, d.start) for d in found] == [
+        ("uuid", q.index("61c0")), ("ticket", 0), ("issue_ref", q.index("prbe-ai")),
+    ]
+    link = "https://github.com/prbe-ai/research-os/pull/2499"
+    both = detect_identifiers(f"prbe-ai/research-os#2499 or {link}", urls=True)
+    assert [(d.canonical_id, d.start) for d in both] == [("prbe-ai/research-os#2499", 0)]
+    # Position is not identity.
+    assert detect_identifiers("x PRB-17")[0] == detect_identifiers("PRB-17")[0]
+
+
+def test_github_links_are_opt_in_and_never_partial() -> None:
+    """Off by default, so the agentic id-pins lane keeps its behaviour; and a
+    number glued to more characters is not shed as a shorter one."""
+    link = "https://github.com/prbe-ai/research-os/pull/2499"
+    assert _pairs(link) == []
+    assert _url_pairs("https://github.com/a/b/pull/24990x") == []
+    assert _url_pairs("https://github.com/a/b/tree/main") == []
+    assert _url_pairs(f"run 61c0db57-56d1-49a4-a0a3-3f29cd7e98eb in {link}") == [
+        ("uuid", "61c0db57-56d1-49a4-a0a3-3f29cd7e98eb"),
+        ("issue_ref", "prbe-ai/research-os#2499"),
+    ]

@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from engine.retrieval import direct
 from engine.retrieval.retrievers.bm25 import BM25Hit
 from engine.retrieval.retrievers.vector import VectorHit
+from engine.shared.identifiers import detect_identifiers
 
 
 @pytest.fixture(autouse=True)
@@ -332,19 +333,26 @@ def test_source_keys_are_not_held_to_the_ingest_charset():
     assert direct.DirectRetrieveRequest(query="x", source_keys=keys).source_keys == keys
 
 
-async def test_bm25_only_caps_each_document_at_the_chunks_a_result_shows(monkeypatch):
-    """One document matching everywhere must not take every chunk slot."""
+@pytest.mark.parametrize("channels", [["bm25"], ["bm25", "id"], ["id", "bm25"]])
+async def test_keyword_requests_cap_each_document_at_the_chunks_a_result_shows(
+    monkeypatch, channels
+):
+    """One document matching everywhere must not take every chunk slot -- on
+    every keyword request, `["bm25", "id"]` (what keyword search sends)
+    included."""
     bm25 = AsyncMock(return_value=[])
     monkeypatch.setattr(direct, "vector_search", AsyncMock(side_effect=AssertionError("no")))
     monkeypatch.setattr(direct, "bm25_search", bm25)
     await direct.retrieve_direct(
-        direct.DirectRetrieveRequest(query="concept", channels=["bm25"]), "tenant"
+        direct.DirectRetrieveRequest(query="concept", channels=channels), "tenant"
     )
     assert bm25.await_args.kwargs["max_chunks_per_doc"] == direct.CHUNKS_PER_DOCUMENT == 2
 
 
-@pytest.mark.parametrize("channels", [None, ["bm25", "vector"], ["vector", "bm25"]])
-async def test_two_channel_requests_send_bm25_no_document_cap(monkeypatch, channels):
+@pytest.mark.parametrize(
+    "channels", [None, ["bm25", "vector"], ["vector", "bm25"], ["vector", "bm25", "id"]]
+)
+async def test_requests_with_vector_send_bm25_no_document_cap(monkeypatch, channels):
     """The typeahead's request (both channels) reaches bm25_search unchanged."""
     bm25 = AsyncMock(return_value=[])
     monkeypatch.setattr(direct, "vector_search", AsyncMock(return_value=[]))
@@ -352,3 +360,218 @@ async def test_two_channel_requests_send_bm25_no_document_cap(monkeypatch, chann
     extra = {} if channels is None else {"channels": channels}
     await direct.retrieve_direct(direct.DirectRetrieveRequest(query="concept", **extra), "t")
     assert "max_chunks_per_doc" not in bm25.await_args.kwargs
+
+
+# ---------------------------------------------------------------------------
+# The id channel: identifiers the user typed, resolved by exact lookup.
+# ---------------------------------------------------------------------------
+
+RUN_UUID = "61c0db57-56d1-49a4-a0a3-3f29cd7e98eb"
+RUN_DOC = f"custom_ingest:probe:experiments:run:{RUN_UUID}"
+
+
+def id_hit(doc_id, canonical, *, chunk="0", updated=None):
+    from engine.retrieval.retrievers.id_lookup import IdLookupHit
+
+    when = updated or datetime(2026, 1, 1, tzinfo=UTC)
+    return IdLookupHit(
+        chunk_id=f"{doc_id}#{chunk}",
+        doc_id=doc_id,
+        doc_version=1,
+        source_system="custom_ingest",
+        source_url=f"https://example.test/{doc_id}",
+        title=doc_id,
+        content=f"evidence for {doc_id}",
+        created_at=when,
+        updated_at=when,
+        score=1.0,
+        matched_canonical_id=canonical,
+    )
+
+
+def no_ranked_channels(monkeypatch):
+    for name in ("vector", "bm25"):
+        monkeypatch.setattr(direct, f"{name}_search", AsyncMock(return_value=[]))
+
+
+async def test_id_channel_resolves_a_typed_uuid_in_scope_and_pins_it_first(monkeypatch):
+    lookup = AsyncMock(return_value=([id_hit(RUN_DOC, RUN_UUID)], set()))
+    monkeypatch.setattr(direct, "lookup_identifiers", lookup)
+    # BM25 ranks another document first; the typed id must still lead.
+    monkeypatch.setattr(direct, "bm25_search", AsyncMock(return_value=[
+        hit("keyword", channel="bm25"), hit(RUN_DOC, channel="bm25"),
+    ]))
+    monkeypatch.setattr(direct, "vector_search", AsyncMock(side_effect=AssertionError("no")))
+    project = str(uuid4())
+    response = await direct.retrieve_direct(
+        direct.DirectRetrieveRequest(
+            query=f"run {RUN_UUID}", channels=["bm25", "id"], sources=["custom_ingest"],
+            source_keys=["experiments"], doc_types=["custom.experiment.run"],
+            scope={"project_id": project},
+        ),
+        "tenant-a",
+    )
+    (customer, detected), kwargs = lookup.await_args
+    assert customer == "tenant-a"
+    assert [(d.kind, d.canonical_id) for d in detected] == [("uuid", RUN_UUID)]
+    assert kwargs == {
+        "sources": ["custom_ingest"], "doc_types": ["custom.experiment.run"],
+        "source_keys": ["experiments"], "project_id": project,
+    }
+    assert [doc.doc_id for doc in response.results] == [RUN_DOC, "keyword"]
+    assert [m.channel for m in response.results[0].matched_via] == ["bm25", "id"]
+    assert response.results[0].retriever_scores["id"] == 1.0
+    assert response.results[0].chunks[0].chunk_id == f"{RUN_DOC}#0"
+    assert not response.lost_channels and not response.degraded
+
+
+async def test_id_channel_reads_a_pasted_github_pr_link(monkeypatch):
+    """The PR is stored as source_id `owner/repo#N`; the link carries no '#'."""
+    pr = "github:prbe-ai/research-os:pr:2499"
+    lookup = AsyncMock(return_value=([id_hit(pr, "prbe-ai/research-os#2499")], set()))
+    monkeypatch.setattr(direct, "lookup_identifiers", lookup)
+    no_ranked_channels(monkeypatch)
+    response = await direct.retrieve_direct(
+        direct.DirectRetrieveRequest(
+            query="https://github.com/prbe-ai/research-os/pull/2499", channels=["bm25", "id"]
+        ),
+        "tenant",
+    )
+    detected = lookup.await_args.args[1]
+    assert [(d.kind, d.canonical_id) for d in detected] == [
+        ("issue_ref", "prbe-ai/research-os#2499")
+    ]
+    assert [doc.doc_id for doc in response.results] == [pr]
+
+
+async def test_id_channel_without_an_identifier_does_nothing_and_is_not_lost(monkeypatch):
+    lookup = AsyncMock(side_effect=AssertionError("no identifier, no lookup"))
+    monkeypatch.setattr(direct, "lookup_identifiers", lookup)
+    monkeypatch.setattr(direct, "bm25_search", AsyncMock(return_value=[hit("kw", channel="bm25")]))
+    response = await direct.retrieve_direct(
+        direct.DirectRetrieveRequest(query="loss curve diverged", channels=["bm25", "id"]), "t"
+    )
+    lookup.assert_not_called()
+    assert [doc.doc_id for doc in response.results] == ["kw"]
+    assert not response.lost_channels and not response.degraded
+
+
+async def test_id_lookup_failure_is_a_lost_channel(monkeypatch):
+    monkeypatch.setattr(
+        direct, "lookup_identifiers", AsyncMock(side_effect=TimeoutError("pool busy"))
+    )
+    monkeypatch.setattr(direct, "bm25_search", AsyncMock(return_value=[hit("kw", channel="bm25")]))
+    response = await direct.retrieve_direct(
+        direct.DirectRetrieveRequest(query=RUN_UUID, channels=["bm25", "id"]), "t"
+    )
+    assert response.lost_channels == ["id"]
+    assert response.degraded
+    assert [doc.doc_id for doc in response.results] == ["kw"]
+
+
+@pytest.mark.parametrize("channels", [None, ["bm25"], ["vector", "bm25"]])
+async def test_id_channel_is_never_called_unless_requested(monkeypatch, channels):
+    """The typeahead's default request and the bm25-only one stay as they were."""
+    lookup = AsyncMock(side_effect=AssertionError("not requested"))
+    monkeypatch.setattr(direct, "lookup_identifiers", lookup)
+    no_ranked_channels(monkeypatch)
+    extra = {} if channels is None else {"channels": channels}
+    response = await direct.retrieve_direct(
+        direct.DirectRetrieveRequest(query=f"run {RUN_UUID}", **extra), "t"
+    )
+    lookup.assert_not_called()
+    assert "id" not in response.timing_ms
+    assert not response.lost_channels
+
+
+async def test_ambiguous_inferred_ids_contribute_nothing(monkeypatch):
+    """A short hex prefix that expands to two shas has no hits: nothing pins,
+    and nothing is reported lost."""
+    monkeypatch.setattr(
+        direct, "lookup_identifiers", AsyncMock(return_value=([], {"ce09c43"}))
+    )
+    no_ranked_channels(monkeypatch)
+    response = await direct.retrieve_direct(
+        direct.DirectRetrieveRequest(query="commit ce09c43", channels=["id"]), "t"
+    )
+    assert response.results == []
+    assert not response.lost_channels
+
+
+async def test_one_pin_per_identifier_the_best_doc(monkeypatch):
+    """Two documents carry the same uuid: the lookup's order (newest first)
+    picks one, as the agentic lane's resolve_pins does."""
+    newer = id_hit(RUN_DOC, RUN_UUID, updated=datetime(2026, 2, 1, tzinfo=UTC))
+    older = id_hit("custom_ingest:probe:artifacts:run:x", RUN_UUID)
+    monkeypatch.setattr(direct, "lookup_identifiers", AsyncMock(return_value=([newer, older], set())))
+    no_ranked_channels(monkeypatch)
+    response = await direct.retrieve_direct(
+        direct.DirectRetrieveRequest(query=RUN_UUID, channels=["id"]), "t"
+    )
+    assert [doc.doc_id for doc in response.results] == [RUN_DOC]
+
+
+async def test_an_id_hit_still_passes_the_live_gate(monkeypatch):
+    monkeypatch.setattr(
+        direct, "lookup_identifiers", AsyncMock(return_value=([id_hit(RUN_DOC, RUN_UUID)], set()))
+    )
+    no_ranked_channels(monkeypatch)
+    monkeypatch.setattr(direct, "_live_docs", AsyncMock(return_value=set()))
+    response = await direct.retrieve_direct(
+        direct.DirectRetrieveRequest(query=RUN_UUID, channels=["id"]), "t"
+    )
+    assert response.results == []
+
+
+async def test_an_id_hit_leads_even_where_rrf_would_tie_it_away(monkeypatch):
+    """Rank 1 in the id channel scores 1/61, exactly what BM25's own rank 1
+    scores, and a tie falls to doc_id order -- 'aaa' would win. The typed
+    identifier leads regardless, as the agentic lane's pins do."""
+    monkeypatch.setattr(
+        direct, "lookup_identifiers", AsyncMock(return_value=([id_hit(RUN_DOC, RUN_UUID)], set()))
+    )
+    monkeypatch.setattr(direct, "bm25_search", AsyncMock(return_value=[hit("aaa", channel="bm25")]))
+    response = await direct.retrieve_direct(
+        direct.DirectRetrieveRequest(query=RUN_UUID, channels=["bm25", "id"]), "t"
+    )
+    assert response.results[0].retriever_scores["rrf_fused"] == (
+        response.results[1].retriever_scores["rrf_fused"]
+    )
+    assert [doc.doc_id for doc in response.results] == [RUN_DOC, "aaa"]
+
+
+async def test_pins_follow_the_order_the_identifiers_were_typed(monkeypatch):
+    """Detection groups by kind (UUIDs first); the answer follows the query.
+    Here the ticket is typed first, so it leads although detection found the
+    UUID first."""
+    ticket_doc = "linear:org:issue:prb-17"
+    monkeypatch.setattr(direct, "lookup_identifiers", AsyncMock(return_value=(
+        [id_hit(RUN_DOC, RUN_UUID), id_hit(ticket_doc, "PRB-17")], set()
+    )))
+    no_ranked_channels(monkeypatch)
+    query = f"did PRB-17 break run {RUN_UUID}"
+    assert [d.kind for d in detect_identifiers(query, urls=True)] == ["uuid", "ticket"]
+    response = await direct.retrieve_direct(
+        direct.DirectRetrieveRequest(query=query, channels=["id"]), "t"
+    )
+    assert [doc.doc_id for doc in response.results] == [ticket_doc, RUN_DOC]
+    assert [doc.matched_via[0].rank for doc in response.results] == [1, 2]
+
+
+async def test_pins_never_exceed_half_the_result_size(monkeypatch):
+    """top_k=4 caps pins at max(1, 4 // 2) = 2, so five typed ids that all
+    resolve pin only the first two typed, and ranked results keep room."""
+    uuids = [f"{i:08x}-56d1-49a4-a0a3-3f29cd7e98eb" for i in range(5)]
+    monkeypatch.setattr(direct, "lookup_identifiers", AsyncMock(return_value=(
+        [id_hit(f"doc-{u}", u) for u in uuids], set()
+    )))
+    monkeypatch.setattr(direct, "bm25_search", AsyncMock(return_value=[
+        hit(f"ranked-{i}", channel="bm25") for i in range(4)
+    ]))
+    response = await direct.retrieve_direct(
+        direct.DirectRetrieveRequest(query=" ".join(uuids), top_k=4, channels=["bm25", "id"]),
+        "t",
+    )
+    pinned = [d.doc_id for d in response.results if any(m.channel == "id" for m in d.matched_via)]
+    assert pinned == [f"doc-{uuids[0]}", f"doc-{uuids[1]}"]
+    assert [d.doc_id for d in response.results] == [*pinned, "ranked-0", "ranked-1"]
