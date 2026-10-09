@@ -33,7 +33,7 @@ lane exists to fix.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import Literal
 
 # Order-sensitive: UUID first (masked before sha runs), then ticket,
@@ -60,7 +60,7 @@ _ISSUE_REF_RE = re.compile(r"\b([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?#\d{1,6})\b"
 # from shedding `#2499`; `/files`, `#discussion_r1` and `?diff=` tails are
 # fine. Opt-in (`detect_identifiers(urls=True)`): see there.
 _GITHUB_URL_RE = re.compile(
-    r"\bgithub\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(?:pull|issues)/(\d{1,6})\b"
+    r"\b(?i:github\.com)/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(?:pull|issues)/(\d{1,6})\b"
 )
 # Bare commit shas: 12-40 hex. Runs AFTER UUID masking. The 12 floor keeps
 # ordinary words and short hex fragments out.
@@ -138,14 +138,21 @@ class DetectedIdentifier:
     # lookup treats it as a SOFT filter.
     qualifier: str = ""
     number: str = ""
+    # Offset of the identifier's earliest occurrence in the query. The list
+    # comes back grouped by kind (UUIDs must be found and masked first), so
+    # a caller that orders by what the user typed first sorts on this.
+    # compare=False: an identifier is its kind and canonical form, wherever
+    # it was typed.
+    start: int = field(default=-1, compare=False)
 
 
 def detect_identifiers(query: str, *, urls: bool = False) -> list[DetectedIdentifier]:
-    """Every typed identifier in `query`, canonicalized, in query order.
+    """Every typed identifier in `query`, canonicalized.
 
-    Deduplicated on canonical_id (the same ticket typed twice is one
-    identifier). Returns [] for identifier-free queries, which is the
-    common case and must stay O(regex).
+    Grouped by kind, each kind in query order; `start` gives each one's
+    position in the query. Deduplicated on canonical_id (the same ticket
+    typed twice is one identifier, at its earliest position). Returns [] for
+    identifier-free queries, which is the common case and must stay O(regex).
 
     `urls=True` also reads a pasted GitHub PR/issue link as the issue_ref it
     names (`owner/repo#N`). Off by default so the agentic id-pins lane, whose
@@ -154,12 +161,17 @@ def detect_identifiers(query: str, *, urls: bool = False) -> list[DetectedIdenti
     still something the user typed, so the provenance rule above holds.
     """
     out: list[DetectedIdentifier] = []
-    seen: set[str] = set()
+    index: dict[str, int] = {}
 
-    def _add(kind: IdentifierKind, canonical: str) -> None:
-        if canonical not in seen:
-            seen.add(canonical)
-            out.append(DetectedIdentifier(kind=kind, canonical_id=canonical))
+    def _add(found: DetectedIdentifier) -> None:
+        at = index.get(found.canonical_id)
+        if at is None:
+            index[found.canonical_id] = len(out)
+            out.append(found)
+        elif found.start < out[at].start:
+            # Same identifier, typed earlier in another form (a link after
+            # an `owner/repo#N`): first kind wins, earliest position wins.
+            out[at] = replace(out[at], start=found.start)
 
     # ONLY uuids are masked: their hex segments would re-report under the
     # sha and prefix kinds. Nothing else needs it — issue_ref and number_ref
@@ -169,21 +181,21 @@ def detect_identifiers(query: str, *, urls: bool = False) -> list[DetectedIdenti
     # identifier it resolves best (review: removed-behavior).
     masked = query
     for m in _UUID_RE.finditer(query):
-        _add("uuid", m.group(0).lower())
+        _add(DetectedIdentifier("uuid", m.group(0).lower(), start=m.start()))
         masked = masked.replace(m.group(0), "\x00" * len(m.group(0)))
 
     for m in _TICKET_RE.finditer(masked):
         prefix = m.group(1).rsplit("-", 1)[0].upper()
         if prefix in _TICKET_STOPWORDS:
             continue
-        _add("ticket", m.group(1).upper())
+        _add(DetectedIdentifier("ticket", m.group(1).upper(), start=m.start(1)))
 
     if urls:
         for m in _GITHUB_URL_RE.finditer(masked):
-            _add("issue_ref", f"{m.group(1)}#{m.group(2)}")
+            _add(DetectedIdentifier("issue_ref", f"{m.group(1)}#{m.group(2)}", start=m.start()))
 
     for m in _ISSUE_REF_RE.finditer(masked):
-        _add("issue_ref", m.group(1))
+        _add(DetectedIdentifier("issue_ref", m.group(1), start=m.start(1)))
 
     for m in _NUMBER_REF_RE.finditer(masked):
         repo = m.group("repo") or ""
@@ -198,27 +210,26 @@ def detect_identifiers(query: str, *, urls: bool = False) -> list[DetectedIdenti
             repo = ""
         num = m.group("num")
         canonical = f"{repo}#{num}" if repo else f"#{num}"
-        if canonical not in seen:
-            seen.add(canonical)
-            out.append(
-                DetectedIdentifier(
-                    kind="number_ref",
-                    canonical_id=canonical,
-                    qualifier=repo,
-                    number=num,
-                )
+        _add(
+            DetectedIdentifier(
+                kind="number_ref",
+                canonical_id=canonical,
+                qualifier=repo,
+                number=num,
+                start=m.start(),
             )
+        )
 
     for m in _SHA_RE.finditer(masked):
-        _add("commit_sha", m.group(0).lower())
+        _add(DetectedIdentifier("commit_sha", m.group(0).lower(), start=m.start()))
 
     for m in _PD_RE.finditer(masked):
-        _add("pd_incident", m.group(0))
+        _add(DetectedIdentifier("pd_incident", m.group(0), start=m.start()))
 
     for m in _HEX_PREFIX_RE.finditer(masked):
         token = m.group(0).lower()
         if token in _HEX_PREFIX_STOPWORDS:
             continue
-        _add("hex_prefix", token)
+        _add(DetectedIdentifier("hex_prefix", token, start=m.start()))
 
     return out

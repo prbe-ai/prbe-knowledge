@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from engine.retrieval import direct
 from engine.retrieval.retrievers.bm25 import BM25Hit
 from engine.retrieval.retrievers.vector import VectorHit
+from engine.shared.identifiers import detect_identifiers
 
 
 @pytest.fixture(autouse=True)
@@ -332,19 +333,26 @@ def test_source_keys_are_not_held_to_the_ingest_charset():
     assert direct.DirectRetrieveRequest(query="x", source_keys=keys).source_keys == keys
 
 
-async def test_bm25_only_caps_each_document_at_the_chunks_a_result_shows(monkeypatch):
-    """One document matching everywhere must not take every chunk slot."""
+@pytest.mark.parametrize("channels", [["bm25"], ["bm25", "id"], ["id", "bm25"]])
+async def test_keyword_requests_cap_each_document_at_the_chunks_a_result_shows(
+    monkeypatch, channels
+):
+    """One document matching everywhere must not take every chunk slot -- on
+    every keyword request, `["bm25", "id"]` (what keyword search sends)
+    included."""
     bm25 = AsyncMock(return_value=[])
     monkeypatch.setattr(direct, "vector_search", AsyncMock(side_effect=AssertionError("no")))
     monkeypatch.setattr(direct, "bm25_search", bm25)
     await direct.retrieve_direct(
-        direct.DirectRetrieveRequest(query="concept", channels=["bm25"]), "tenant"
+        direct.DirectRetrieveRequest(query="concept", channels=channels), "tenant"
     )
     assert bm25.await_args.kwargs["max_chunks_per_doc"] == direct.CHUNKS_PER_DOCUMENT == 2
 
 
-@pytest.mark.parametrize("channels", [None, ["bm25", "vector"], ["vector", "bm25"]])
-async def test_two_channel_requests_send_bm25_no_document_cap(monkeypatch, channels):
+@pytest.mark.parametrize(
+    "channels", [None, ["bm25", "vector"], ["vector", "bm25"], ["vector", "bm25", "id"]]
+)
+async def test_requests_with_vector_send_bm25_no_document_cap(monkeypatch, channels):
     """The typeahead's request (both channels) reaches bm25_search unchanged."""
     bm25 = AsyncMock(return_value=[])
     monkeypatch.setattr(direct, "vector_search", AsyncMock(return_value=[]))
@@ -530,3 +538,40 @@ async def test_an_id_hit_leads_even_where_rrf_would_tie_it_away(monkeypatch):
         response.results[1].retriever_scores["rrf_fused"]
     )
     assert [doc.doc_id for doc in response.results] == [RUN_DOC, "aaa"]
+
+
+async def test_pins_follow_the_order_the_identifiers_were_typed(monkeypatch):
+    """Detection groups by kind (UUIDs first); the answer follows the query.
+    Here the ticket is typed first, so it leads although detection found the
+    UUID first."""
+    ticket_doc = "linear:org:issue:prb-17"
+    monkeypatch.setattr(direct, "lookup_identifiers", AsyncMock(return_value=(
+        [id_hit(RUN_DOC, RUN_UUID), id_hit(ticket_doc, "PRB-17")], set()
+    )))
+    no_ranked_channels(monkeypatch)
+    query = f"did PRB-17 break run {RUN_UUID}"
+    assert [d.kind for d in detect_identifiers(query, urls=True)] == ["uuid", "ticket"]
+    response = await direct.retrieve_direct(
+        direct.DirectRetrieveRequest(query=query, channels=["id"]), "t"
+    )
+    assert [doc.doc_id for doc in response.results] == [ticket_doc, RUN_DOC]
+    assert [doc.matched_via[0].rank for doc in response.results] == [1, 2]
+
+
+async def test_pins_never_exceed_half_the_result_size(monkeypatch):
+    """top_k=4 caps pins at max(1, 4 // 2) = 2, so five typed ids that all
+    resolve pin only the first two typed, and ranked results keep room."""
+    uuids = [f"{i:08x}-56d1-49a4-a0a3-3f29cd7e98eb" for i in range(5)]
+    monkeypatch.setattr(direct, "lookup_identifiers", AsyncMock(return_value=(
+        [id_hit(f"doc-{u}", u) for u in uuids], set()
+    )))
+    monkeypatch.setattr(direct, "bm25_search", AsyncMock(return_value=[
+        hit(f"ranked-{i}", channel="bm25") for i in range(4)
+    ]))
+    response = await direct.retrieve_direct(
+        direct.DirectRetrieveRequest(query=" ".join(uuids), top_k=4, channels=["bm25", "id"]),
+        "t",
+    )
+    pinned = [d.doc_id for d in response.results if any(m.channel == "id" for m in d.matched_via)]
+    assert pinned == [f"doc-{uuids[0]}", f"doc-{uuids[1]}"]
+    assert [d.doc_id for d in response.results] == [*pinned, "ranked-0", "ranked-1"]

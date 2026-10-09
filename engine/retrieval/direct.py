@@ -66,14 +66,20 @@ async def id_search(
 
     Detection is a regex pass, so a query with no identifier costs nothing and
     returns [] -- an empty channel, never a lost one. The lookup enforces the
-    request's scope in its own SQL (sources, source_keys, doc_types, project;
-    latest versions; drafts hidden), exactly as the agentic lane calls it.
-    `resolve_pins` then keeps the best document per identifier, capped at
-    max(1, top_k // 2) so a query quoting many ids leaves ranking room. An
+    request's scope in its own SQL: sources, source_keys, doc_types and
+    project, as the agentic lane passes them. The agentic lane also passes
+    its request's temporal spec and `source_keys_include_keyless`; this
+    request has neither, so the lookup's defaults apply: latest versions,
+    drafts hidden, keyless documents outside a key scope.
+
+    Identifiers are taken in the order the user typed them (detection groups
+    them by kind), so `resolve_pins` -- best document per identifier, capped
+    at max(1, top_k // 2) so a query quoting many ids leaves ranking room --
+    keeps the first ones typed and returns the pins in that order. An
     inferred reference that does not expand uniquely (a short hex prefix, a
     bare '#N' matching several repos) has no hits, so it pins nothing.
     """
-    detected = detect_identifiers(query, urls=True)
+    detected = sorted(detect_identifiers(query, urls=True), key=lambda found: found.start)
     if not detected:
         return []
     hits, _ambiguous = await lookup_identifiers(
@@ -199,9 +205,11 @@ async def retrieve_direct(req: DirectRetrieveRequest, customer_id: str) -> Direc
             kwargs = {**kwargs, "index_side_doc_filters": True}
         # A result keeps CHUNKS_PER_DOCUMENT chunks, so without a cap one long
         # document matching everywhere (a live session) can fill every chunk
-        # slot and leave a one-document answer. BM25-only for now: the
-        # default two-channel request (the typeahead) stays exactly as it was.
-        if name is DirectChannel.BM25 and req.channels == [DirectChannel.BM25]:
+        # slot and leave a one-document answer. Every keyword request gets it
+        # -- BM25 without vector, the id channel or not, since `["bm25", "id"]`
+        # is what keyword search sends. A request with vector (the typeahead's
+        # default) stays exactly as it was.
+        if name is DirectChannel.BM25 and DirectChannel.VECTOR not in req.channels:
             kwargs = {**kwargs, "max_chunks_per_doc": CHUNKS_PER_DOCUMENT}
         # Pins are capped against the RESULT size, as the agentic lane caps
         # them against its request's top_k -- not the over-fetched chunk pool.
@@ -260,8 +268,8 @@ async def retrieve_direct(req: DirectRetrieveRequest, customer_id: str) -> Direc
         for doc_id, matches in evidence.items()
     }
     # A document resolved from an identifier the user typed leads the answer,
-    # in the order the identifiers were typed, as the agentic lane's pins do.
-    # RRF alone cannot promise that: an id hit at rank 1 scores 1/61, the
+    # in the order the identifiers were typed (`id_search` returns them so),
+    # as the agentic lane puts its pins first. RRF alone cannot promise that: an id hit at rank 1 scores 1/61, the
     # same as a document BM25 alone ranked first, and the tie would fall to
     # doc_id order. Without the id channel this map is empty and the order
     # is exactly the RRF order it always was.
