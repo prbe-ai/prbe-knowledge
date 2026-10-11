@@ -16,7 +16,7 @@ def test_default_scanner_is_built_and_installed_in_runtime_image(dockerfile):
     builder = next(
         # Any registry: scripts/check_no_docker_hub.py is what keeps it on the mirror.
         (stage for stage in stages
-         if re.match(r"(?:\S+/)?golang:[\d.]+-\w+ AS redactd-build\n", stage)),
+         if re.match(r"(?:--platform=\S+ )?(?:\S+/)?golang:[\d.]+-\w+(?:@sha256:[0-9a-f]+)? AS redactd-build\n", stage)),
         None,
     )
     assert builder is not None, "image lacks a pinned Go stage for the default redactd transport"

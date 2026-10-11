@@ -37,7 +37,9 @@ jobs:
       # image build for an hour on 2026-10-09; every image here comes from
       # mirror.gcr.io (same digests) and this keeps new ones off Docker Hub.
       - name: No Docker Hub images
-        run: .venv/bin/python scripts/check_no_docker_hub.py
+        run: |
+          .venv/bin/python scripts/check_no_docker_hub.py --self-test
+          .venv/bin/python scripts/check_no_docker_hub.py
 
       - name: Type-check
         run: .venv/bin/mypy engine kb services || true   # strict mypy soft-gated in Phase 0

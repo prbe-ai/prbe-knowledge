@@ -42,7 +42,7 @@ applies `db/schema.sql` and stamps the alembic head on a fresh DB, or runs
   (pgvector), `pg_trgm`, and `btree_gin`. The migrate job creates these (they
   ship in `db/schema.sql`) if the DB role is allowed to `CREATE EXTENSION`;
   otherwise create them once as a superuser first. (The bundled
-  `pgvector/pgvector:pg16` option below already has them available.)
+  `mirror.gcr.io/pgvector/pgvector:pg16` option below already has them available.)
 
 - **An S3-compatible object store** (Cloudflare R2, AWS S3, or MinIO) for raw
   payload archives, plus an access key / secret.
@@ -108,7 +108,10 @@ connector keys you use (e.g. `ANTHROPIC_API_KEY`, `GITHUB_APP_PRIVATE_KEY`).
 ## Install — bundled Postgres (kick-the-tires only)
 
 For a quick local trial you can let the chart run a single-replica
-`pgvector/pgvector:pg16` StatefulSet. **Not for production.** When enabled it
+`pgvector/pgvector:pg16` StatefulSet, pulled from `mirror.gcr.io` (Google's copy of
+Docker Hub; same image). If your nodes only reach Docker Hub, or go through a docker.io
+pull-through cache, override it with `--set postgresql.bundled.image=pgvector/pgvector:pg16`.
+**Not for production.** When enabled it
 overrides `postgresql.external.*` and the DSNs are derived automatically.
 
 ```sh
