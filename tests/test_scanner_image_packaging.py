@@ -14,7 +14,9 @@ def test_default_scanner_is_built_and_installed_in_runtime_image(dockerfile):
     text = dockerfile.read_text()
     stages = re.split(r"(?m)^FROM ", text)[1:]
     builder = next(
-        (stage for stage in stages if re.match(r"golang:[\d.]+-\w+ AS redactd-build\n", stage)),
+        # Any registry: scripts/check_no_docker_hub.py is what keeps it on the mirror.
+        (stage for stage in stages
+         if re.match(r"(?:\S+/)?golang:[\d.]+-\w+ AS redactd-build\n", stage)),
         None,
     )
     assert builder is not None, "image lacks a pinned Go stage for the default redactd transport"
@@ -32,5 +34,5 @@ def test_default_scanner_is_built_and_installed_in_runtime_image(dockerfile):
 
 
 def test_ingestion_and_worker_use_identical_scanner_builds():
-    recipes = [p.read_text().split("FROM python:", 1)[0] for p in IMAGES]
+    recipes = [re.split(r"(?m)^FROM (?:\S+/)?python:", p.read_text(), maxsplit=1)[0] for p in IMAGES]
     assert recipes[0] == recipes[1]
