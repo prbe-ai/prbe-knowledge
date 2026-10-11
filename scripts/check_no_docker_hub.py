@@ -13,22 +13,27 @@ digests, without Hub's per-IP limits. A bare `python:3.12-slim` IS a Docker Hub
 pull, so this fails on one rather than on the next outage.
 
 Scanned (tracked files only):
-  - Dockerfiles (`Dockerfile*`, `*.Dockerfile`, `Containerfile*`): the
-    `# syntax=` parser directive, FROM (ARG defaults substituted), and
-    `COPY --from=` / `RUN --mount=...,from=` images. Heredoc bodies are skipped.
-  - YAML (workflows, compose, Helm, manifests): `image:` scalars and Helm
-    `image: {repository:}` maps, `uses: docker://`, scalar `container:`,
-    Buildx `driver-opts: image=`; every setup-buildx-action step must name its
-    BuildKit image and every setup-qemu-action step its binfmt image.
-  - Shell (workflow `run:` blocks, `*.sh`, Makefiles): images of
-    `docker run|create|pull` and `docker container run|create`,
-    `docker image pull`, and `*IMAGE*` variable defaults (`${X_IMAGE:-ref}`,
-    `X_IMAGE=ref`).
-Not scanned: images named inside Python or other source (testcontainers and
-the like) -- keep those on the mirror by review.
+  - Dockerfiles (`Dockerfile*`, `*.Dockerfile`, `Containerfile*`) and compose
+    `dockerfile_inline:`: the `# syntax=` directive, FROM (ARG defaults
+    substituted), and the leading `COPY --from=` / `RUN --mount=...,from=` flags.
+    Heredoc bodies are skipped.
+  - Every tracked YAML file: `image:` values (scalars, Helm `default "x"`,
+    flow lists, `image: {repository:}` maps), any `*_IMAGE:` key, `uses:
+    docker://`, scalar `container:`, Buildx `driver-opts` images; every
+    setup-buildx-action step must name its BuildKit image and every
+    setup-qemu-action step its binfmt image. `image:` keys under a `matrix:`
+    are values, not pulls, and are skipped. Every scalar is also read as shell.
+  - Shell (YAML scalars, `*.sh`, Makefiles): images of `docker run|create|pull`,
+    `docker container run|create` and `docker image pull`, including inside
+    `$(...)`, backticks and `sh -c '...'`; `docker buildx create`; and `*IMAGE`
+    variable defaults and assignments.
+A line that names a docker pull the scanner cannot parse, and a ref whose
+registry host is a variable, fail closed: it cannot vouch for them. A ref that
+is wholly one variable (a script argument, a matrix value) is skipped.
 
-Unresolvable refs (a `$` left in the repository part) fail closed: the scanner
-cannot prove where they pull from.
+This is a lint, not a security boundary. Not scanned: images named in Python
+or other source (testcontainers and the like), and refs a workflow builds at
+runtime. Keep those on the mirror by review.
 
 This file is the same in every prbe-ai repo that carries it; only CONFIG below
 differs.
@@ -49,9 +54,8 @@ MIRROR = "mirror.gcr.io/"
 # CONFIG (per repo)
 # ---------------------------------------------------------------------------
 CONFIG: dict = {
-    # git pathspecs of YAML to scan for images (workflows are always scanned).
-    "yaml": ["*compose*.yml", "*compose*.yaml", "deploy/helm/*.yaml", "deploy/helm/*.yml",
-             "k8s/*.yaml", "k8s/*.yml"],
+    # git globs of tracked YAML NOT to scan (all other *.yml / *.yaml are).
+    "yaml_exclude": [],
     # (path glob, ref) -> reason. Refs allowed to resolve to Docker Hub.
     "allowed": {
         ("docker-compose.yml", "prbe-knowledge:local"):
@@ -78,8 +82,10 @@ CONFIG: dict = {
 # ---------------------------------------------------------------------------
 
 REPO = Path(__file__).resolve().parent.parent
-
+_HUB_HOSTS = {"docker.io", "index.docker.io", "registry-1.docker.io", "registry.hub.docker.com"}
 _DOCKERFILE_GLOBS = ("Dockerfile*", "*.Dockerfile", "*.dockerfile", "Containerfile*")
+_UNRESOLVED = "<unresolved>"
+_GHA_EXPR = re.compile(r"\$\{\{.*?\}\}")
 # From `docker run --help`: every option that takes a separate value.
 _RUN_VALUE_OPTS = frozenset(
     "--add-host --annotation --attach --blkio-weight --blkio-weight-device --cap-add "  # noqa: SIM905
@@ -97,8 +103,17 @@ _RUN_VALUE_OPTS = frozenset(
     "--tmpfs --ulimit --user --userns --uts --volume --volume-driver --volumes-from "
     "--workdir --net -a -c -e -h -l -m -p -u -v -w".split()
 )
-_GHA_EXPR = re.compile(r"\$\{\{.*?\}\}")
-_UNRESOLVED = "<unresolved>"
+_SHORT_VALUE = set("acehlmpuvw")
+# `docker` global options that take a value (`docker --context x run ...`).
+_GLOBAL_VALUE_OPTS = frozenset(
+    "--context -c --config -H --host -l --log-level --tlscacert --tlscert --tlskey".split()  # noqa: SIM905
+)
+_DOCKER_WORD = re.compile(r"[@+-]*(?:\S*/)?docker")
+_DOCKER_PULL = re.compile(
+    r"(?:^|[\s;&|(`\"'@+-])(?:[^\s;&|(`\"']*/)?docker"
+    r"(?:\s+(?!(?:run|create|pull|container|image|buildx)\b)-{1,2}[\w-]+(?:[= ][^\s-]\S*)?)*"
+    r"\s+(?:run|create|pull|container\s+(?:run|create)|image\s+pull|buildx\s+create)\b"
+)
 
 
 def is_docker_hub(ref: str) -> bool:
@@ -107,7 +122,7 @@ def is_docker_hub(ref: str) -> bool:
     first, sep, _ = ref.partition("/")
     if not sep:
         return True
-    if first in {"docker.io", "index.docker.io", "registry-1.docker.io", "registry.hub.docker.com"}:
+    if first in _HUB_HOSTS:
         return True
     return "." not in first and ":" not in first and first != "localhost"
 
@@ -120,32 +135,49 @@ def repository(ref: str) -> str:
 
 
 def classify(ref: str) -> str | None:
-    """None when `ref` is fine, else why it is not."""
-    repo = repository(ref)
-    if repo == _UNRESOLVED or re.fullmatch(r"\$\{?\w+\}?", repo):
-        return None  # wholly a variable (a CI matrix value, a script argument): not checkable here
+    """None when `ref` is fine (or wholly a variable), else why it is not."""
+    repo = repository(ref.strip())
+    if not repo or repo == _UNRESOLVED or re.fullmatch(r"\$\{?\w+\}?", repo):
+        return None
+    first, sep, _ = repo.partition("/")
+    if "$" in first or _UNRESOLVED in first:
+        return "unresolvable (the registry host is a variable)"
+    if sep and first not in _HUB_HOSTS and ("." in first or ":" in first or first == "localhost"):
+        return None  # a literal non-Hub registry; the rest may vary
     if "$" in repo or _UNRESOLVED in repo:
-        return "unresolvable (variable in the repository part)"
-    if is_docker_hub(repo):
-        return "Docker Hub"
-    return None
+        return "unresolvable (variable in the repository, no registry host)"
+    return "Docker Hub" if is_docker_hub(repo) else None
+
+
+_VAR_REF = re.compile(r"\$\{(\w+)(?::?([-+=])([^}]*))?\}|\$(\w+)")
+
+
+def substitute(value: str, args: dict[str, str]) -> str:
+    """Apply known values and `${X:-default}` defaults; leave the rest."""
+
+    def one(m: re.Match) -> str:
+        name = m.group(1) or m.group(4)
+        if name in args:
+            return args[name]
+        if m.group(2) in {"-", "="}:
+            return m.group(3)
+        return m.group(0)
+
+    return _VAR_REF.sub(one, value)
 
 
 # --- Dockerfiles ------------------------------------------------------------
 
-_ARG_REF = re.compile(r"\$\{(\w+)(?::?[-+]([^}]*))?\}|\$(\w+)")
+_HEREDOC = re.compile(r"(?:^|\s)\d*<<-?([\"']?)([A-Za-z_]\w*)\1(?=\s|$)")
 
 
-def _substitute(value: str, args: dict[str, str]) -> str:
-    def one(m: re.Match) -> str:
-        name = m.group(1) or m.group(3)
-        if name in args:
-            return args[name]
-        if m.group(2) is not None:
-            return m.group(2)
-        return "$" + name
-
-    return _ARG_REF.sub(one, value)
+def _leading_flags(rest: str) -> list[str]:
+    flags = []
+    for word in rest.split():
+        if not word.startswith("--"):
+            break
+        flags.append(word)
+    return flags
 
 
 def dockerfile_refs(text: str) -> list[tuple[str, str]]:
@@ -154,8 +186,7 @@ def dockerfile_refs(text: str) -> list[tuple[str, str]]:
     found: list[tuple[str, str]] = []
     escape = "\\"
     i = 0
-    # Parser directives: leading `# key = value` lines, any order, any case.
-    while i < len(lines):
+    while i < len(lines):  # parser directives: leading `# key = value`, any order
         m = re.match(r"#\s*([a-zA-Z]+)\s*=\s*(\S+)", lines[i])
         if not m:
             break
@@ -168,11 +199,11 @@ def dockerfile_refs(text: str) -> list[tuple[str, str]]:
 
     logical: list[str] = []
     buf = ""
-    heredoc: str | None = None
+    pending: list[str] = []
     for line in lines[i:]:
-        if heredoc is not None:
-            if line.strip() == heredoc:
-                heredoc = None
+        if pending:
+            if line.strip() == pending[0]:
+                pending.pop(0)
             continue
         if not buf and re.match(r"\s*#", line):
             continue
@@ -183,11 +214,12 @@ def dockerfile_refs(text: str) -> list[tuple[str, str]]:
         full = buf + line
         buf = ""
         logical.append(full)
-        m = re.search(r"<<-?\s*[\"']?(\w+)[\"']?", full)
-        if m and re.match(r"\s*(RUN|COPY|ADD)\b", full, re.IGNORECASE):
-            heredoc = m.group(1)
+        if re.match(r"\s*(RUN|COPY|ADD)\b", full, re.IGNORECASE):
+            pending = [m.group(2) for m in _HEREDOC.finditer(full)]
     if buf:
         logical.append(buf)
+    if pending:
+        found.append(("unparseable", f"heredoc `{pending[0]}` never closed"))
 
     global_args: dict[str, str] = {}
     stage_args: dict[str, str] = {}
@@ -199,11 +231,15 @@ def dockerfile_refs(text: str) -> list[tuple[str, str]]:
             continue
         instr, rest = m.group(1).upper(), m.group(2)
         if instr == "ARG":
-            for token in shlex.split(rest, posix=True) if rest else []:
+            try:
+                tokens = shlex.split(rest)
+            except ValueError:
+                tokens = rest.split()
+            for token in tokens:
                 name, eq, value = token.partition("=")
                 target = stage_args if seen_from else global_args
                 if eq:
-                    target[name] = _substitute(value, {**global_args, **target})
+                    target[name] = substitute(value, {**global_args, **target})
                 elif seen_from and name in global_args:
                     stage_args[name] = global_args[name]
         elif instr == "FROM":
@@ -212,22 +248,22 @@ def dockerfile_refs(text: str) -> list[tuple[str, str]]:
             words = [w for w in rest.split() if not w.startswith("--")]
             if not words:
                 continue
-            base = _substitute(words[0], global_args)
+            base = substitute(words[0], global_args)
+            is_stage = base.lower() in stages or words[0].lower() in stages
             if len(words) >= 3 and words[1].upper() == "AS":
                 stages.add(words[2].lower())
-            if base.lower() in stages or base == "scratch":
-                continue
-            found.append(("from", base))
+            if not is_stage and base != "scratch":
+                found.append(("from", base))
         elif instr in {"COPY", "ADD", "RUN"}:
             args = {**global_args, **stage_args}
             values = []
-            for flag in re.finditer(r"(?:^|\s)--(from|mount)=(\S+)", rest):
-                if flag.group(1) == "from":
-                    values.append(flag.group(2))
-                else:
-                    values += [kv[5:] for kv in flag.group(2).split(",") if kv.startswith("from=")]
+            for flag in _leading_flags(rest):
+                if flag.startswith("--from="):
+                    values.append(flag[7:])
+                elif flag.startswith("--mount="):
+                    values += [kv[5:] for kv in flag[8:].split(",") if kv.startswith("from=")]
             for raw in values:
-                value = _substitute(raw.strip("\"'"), args)
+                value = substitute(raw.strip("\"'"), args)
                 if value.lower() in stages or value.isdigit():
                     continue
                 found.append(("copy-from", value))
@@ -237,18 +273,64 @@ def dockerfile_refs(text: str) -> list[tuple[str, str]]:
 # --- Shell ------------------------------------------------------------------
 
 
+def strip_comment(line: str) -> str:
+    """`cmd  # note` -> `cmd`, ignoring `#` inside quotes or words (`$#`, `a#b`)."""
+    quote = None
+    for i, ch in enumerate(line):
+        if quote:
+            if ch == quote:
+                quote = None
+            elif ch == "\\" and quote == '"':
+                continue
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "#" and (i == 0 or line[i - 1] in " \t;&|("):
+            return line[:i].rstrip()
+    return line
+
+
 def shell_commands(text: str) -> list[str]:
-    """Logical shell lines: continuations joined, GHA `${{ }}` neutralised."""
+    """Logical shell lines: comments dropped, continuations joined, heredoc
+    bodies dropped, GHA `${{ }}` neutralised."""
     out, buf = [], ""
+    pending: list[str] = []
     for line in text.splitlines():
+        if pending:
+            if line.strip() == pending[0]:
+                pending.pop(0)
+            continue
+        line = strip_comment(line)
+        if not line.strip() and not buf:
+            continue
         if line.rstrip().endswith("\\"):
             buf += line.rstrip()[:-1] + " "
             continue
-        out.append(_GHA_EXPR.sub(_UNRESOLVED, buf + line))
+        full = _GHA_EXPR.sub(_UNRESOLVED, buf + line)
         buf = ""
+        out.append(full)
+        pending = [m.group(2) for m in _HEREDOC.finditer(full)]
     if buf:
         out.append(_GHA_EXPR.sub(_UNRESOLVED, buf))
     return out
+
+
+def _substitutions(command: str) -> list[str]:
+    """Bodies of `$(...)`, backticks and `sh -c '...'` / `bash -c "..."`."""
+    bodies = []
+    i = 0
+    while True:
+        start = command.find("$(", i)
+        if start < 0:
+            break
+        depth, j = 1, start + 2
+        while j < len(command) and depth:
+            depth += {"(": 1, ")": -1}.get(command[j], 0)
+            j += 1
+        bodies.append(command[start + 2 : j - 1])
+        i = start + 2
+    bodies += re.findall(r"`([^`]*)`", command)
+    bodies += [m[1] for m in re.findall(r"\b(?:ba|z)?sh\s+-c\s+(['\"])(.*?)\1", command)]
+    return bodies
 
 
 def _image_after(tokens: list[str], start: int) -> str | None:
@@ -257,15 +339,53 @@ def _image_after(tokens: list[str], start: int) -> str | None:
         tok = tokens[j]
         if tok in _RUN_VALUE_OPTS:
             j += 2
+        elif tok.startswith("-") and not tok.startswith("--") and len(tok) > 2 and "=" not in tok:
+            j += 2 if tok[-1] in _SHORT_VALUE else 1  # `-dp 5432:5432`
         elif tok.startswith("-"):
             j += 1
+        elif tok in {";", "&&", "||", "|", "&", "(", ")"}:
+            return None
         else:
             return tok
     return None
 
 
-def shell_refs(command: str) -> list[tuple[str, str]]:
-    """(kind, ref) for docker pulls and *IMAGE* defaults on one logical line."""
+def _docker_commands(tokens: list[str]) -> list[tuple[str, str]]:
+    found = []
+    for i, tok in enumerate(tokens):
+        if not _DOCKER_WORD.fullmatch(tok):
+            continue
+        j = i + 1
+        while j < len(tokens) and tokens[j].startswith("-"):  # global options
+            j += 2 if tokens[j] in _GLOBAL_VALUE_OPTS else 1
+        verb = tokens[j] if j < len(tokens) else ""
+        nxt = tokens[j + 1] if j + 1 < len(tokens) else ""
+        if verb in {"run", "create", "pull"}:
+            start = j + 1
+        elif (verb, nxt) in {("container", "run"), ("container", "create"), ("image", "pull")}:
+            start = j + 2
+        elif (verb, nxt) == ("buildx", "create"):
+            rest = tokens[j + 2 :]
+            joined = " ".join(rest)
+            m = re.search(r"--driver-opt(?:=|\s+)[^\s]*image=([^\s,]+)", joined)
+            if m:
+                found.append(("buildkit", m.group(1)))
+            elif not re.search(r"--driver(?:=|\s+)docker\b", joined):
+                found.append(("action", "docker buildx create without --driver-opt image="
+                              f"{MIRROR}moby/buildkit:..."))
+            else:
+                found.append(("buildkit", "docker-driver"))
+            continue
+        else:
+            continue
+        image = _image_after(tokens, start)
+        if image is not None:
+            found.append(("docker", substitute(image, {})))
+    return found
+
+
+def shell_refs(command: str, _depth: int = 0) -> list[tuple[str, str]]:
+    """(kind, ref) for docker pulls and *IMAGE defaults in one logical line."""
     found: list[tuple[str, str]] = []
     # Only variables NAMED as images (`*IMAGE`): `${IMAGE_KIND:-legacy}` is not one.
     for m in re.finditer(r"\$\{(\w*IMAGE):?[-=]([^}]+)\}", command, re.IGNORECASE):
@@ -277,82 +397,143 @@ def shell_refs(command: str) -> list[tuple[str, str]]:
         command,
         re.IGNORECASE,
     ):
-        value = m.group(3)
-        if ":" in value or "/" in value:
-            found.append(("default", value))
+        found.append(("default", m.group(3)))
     if "docker" not in command:
         return found
+    pulls = 0
+    if _depth < 3:
+        for body in _substitutions(command):
+            inner = shell_refs(body, _depth + 1)
+            found += inner
+            pulls += sum(1 for k, _ in inner if k in {"docker", "buildkit", "action", "unparseable"})
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()")
         lexer.whitespace_split = True
         lexer.commenters = "#"
         tokens = list(lexer)
     except ValueError:
-        return [*found, ("unparseable", command.strip())]
-    for i, tok in enumerate(tokens):
-        if tok != "docker" or i + 1 >= len(tokens):
-            continue
-        verb = tokens[i + 1]
-        start = None
-        if verb in {"run", "create", "pull"}:
-            start = i + 2
-        elif i + 2 < len(tokens) and (verb, tokens[i + 2]) in {
-            ("container", "run"), ("container", "create"), ("image", "pull")
-        }:
-            start = i + 3
-        if start is None:
-            continue
-        image = _image_after(tokens, start)
-        if image and not image.startswith("$") and image not in ";&|()":
-            found.append(("docker", image))
+        tokens = None
+    if tokens is not None:
+        cmds = _docker_commands(tokens)
+        found += cmds
+        pulls += len(cmds)
+    expected = len(_DOCKER_PULL.findall(command))
+    if expected > pulls:
+        found.append(("unparseable", command.strip()))
     return found
 
 
 # --- YAML -------------------------------------------------------------------
 
 
-def _strip_comment(line: str) -> str | None:
-    """None for a comment-only line, else the line without a trailing ` # x`."""
-    if re.match(r"\s*#", line):
-        return None
-    return re.sub(r"\s+#.*$", "", line)
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip())
 
 
-def yaml_refs(text: str) -> list[tuple[str, str]]:
-    found: list[tuple[str, str]] = []
+_KEY_LINE = re.compile(r"^(\s*)(-\s+)?([\w.-]+)\s*:(?:\s+(.*?))?\s*$")
+
+
+def yaml_scalars(text: str) -> list[tuple[list[str], str, str]]:
+    """(ancestor keys, key, value) for every mapping key with a scalar value.
+
+    Block scalars are joined (`|` with newlines, `>` with spaces), quoted
+    scalars unquoted, plain scalars continued across lines. Lines inside a
+    block scalar are never read as keys.
+    """
     lines = text.splitlines()
-    for idx, raw in enumerate(lines):
-        line = _strip_comment(raw)
-        if line is None:
+    out: list[tuple[list[str], str, str]] = []
+    stack: list[tuple[int, str]] = []  # (key column, key)
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        m = _KEY_LINE.match(raw)
+        if not m or re.match(r"\s*#", raw):
+            i += 1
             continue
-        line = _GHA_EXPR.sub(_UNRESOLVED, line)
-        m = re.match(r"\s*(?:-\s+)?image:\s*[\"']?([^\"'\s]*)[\"']?\s*$", line)
-        if m:
-            value = m.group(1)
-            if value and "{{" not in value:
-                found.append(("image", _substitute(_GHA_EXPR.sub(_UNRESOLVED, value), {})))
-            elif not value:
-                indent = len(raw) - len(raw.lstrip())
-                fields: dict[str, str] = {}
-                for nxt in lines[idx + 1 :]:
-                    if not nxt.strip() or re.match(r"\s*#", nxt):
-                        continue
-                    if len(nxt) - len(nxt.lstrip()) <= indent:
-                        break
-                    m2 = re.match(r"\s*(registry|repository):\s*[\"']?([^\"'\s#]+)", nxt)
-                    if m2:
-                        fields[m2.group(1)] = m2.group(2)
-                repo = fields.get("repository")
-                if repo and "{{" not in repo:
-                    reg = fields.get("registry")
-                    found.append(("image", f"{reg}/{repo}" if reg and "{{" not in reg else repo))
-        for pattern, kind in (
-            (r"\buses:\s*[\"']?docker://([^\"'\s]+)", "uses"),
-            (r"^\s*container:\s*[\"']?([^\"'\s{]+)[\"']?\s*$", "container"),
-            (r"\bimage=([^\s,\"']+)", "buildkit"),
-        ):
-            for m3 in re.finditer(pattern, line):
-                found.append((kind, _GHA_EXPR.sub(_UNRESOLVED, m3.group(1))))
+        col = len(m.group(1)) + len(m.group(2) or "")
+        key = m.group(3)
+        rest = re.sub(r"\s+#.*$", "", m.group(4) or "").strip()
+        while stack and stack[-1][0] >= col:
+            stack.pop()
+        ancestors = [k for _, k in stack]
+        if rest[:1] in {"|", ">"}:
+            folded = rest.startswith(">")
+            body, j = [], i + 1
+            while j < len(lines) and (not lines[j].strip() or _indent(lines[j]) > col):
+                body.append(lines[j])
+                j += 1
+            nonblank = [b for b in body if b.strip()]
+            dedent = min((_indent(b) for b in nonblank), default=0)
+            texts = [b[dedent:] if b.strip() else "" for b in body]
+            value = " ".join(t.strip() for t in texts if t.strip()) if folded else "\n".join(texts)
+            out.append((ancestors, key, value))
+            i = j
+            continue
+        if rest:
+            j = i + 1
+            if rest[0] not in "\"'[{&*":
+                while (j < len(lines) and lines[j].strip() and _indent(lines[j]) > col
+                       and not re.match(r"\s*(?:-\s|#|[\w.-]+\s*:(?:\s|$))", lines[j])):
+                    rest += " " + lines[j].strip()
+                    j += 1
+            if len(rest) >= 2 and rest[0] == rest[-1] and rest[0] in "\"'":
+                rest = rest[1:-1]
+            out.append((ancestors, key, rest))
+            i = j
+            continue
+        stack.append((col, key))
+        i += 1
+    return out
+
+
+def _image_values(value: str) -> list[str]:
+    value = _GHA_EXPR.sub(_UNRESOLVED, value).strip()
+    if "{{" in value:  # Helm: only a literal fallback is a ref
+        return re.findall(r"\bdefault\s+\"([^\"]+)\"", value)
+    value = re.sub(r"^&\w+\s+", "", value)  # anchor
+    if value.startswith("*"):  # alias
+        return []
+    if value.startswith("["):
+        return [v.strip().strip("\"'") for v in value.strip("[]").split(",") if v.strip()]
+    if value.startswith("{"):
+        return re.findall(r"\bimage:\s*[\"']?([^,}\s\"']+)", value)
+    return [substitute(value.split()[0].strip("\"'"), {})] if value.split() else []
+
+
+def yaml_refs(text: str, workflow: bool = False) -> list[tuple[str, str]]:
+    found: list[tuple[str, str]] = []
+    scalars = yaml_scalars(text)
+    by_parent: dict[tuple[str, ...], dict[str, str]] = {}
+    for ancestors, key, value in scalars:
+        by_parent.setdefault(tuple(ancestors), {})[key] = value
+    for ancestors, key, value in scalars:
+        lkey = key.lower()
+        if lkey == "image":
+            if workflow and "matrix" in ancestors:
+                continue  # a matrix value; the pull happens where it is used
+            found += [("image", v) for v in _image_values(value)]
+        elif lkey == "repository" and ancestors and ancestors[-1].lower() == "image":
+            if "{{" not in value:
+                registry = by_parent.get(tuple(ancestors), {}).get("registry", "")
+                repo = value.strip("\"'")
+                found.append(("image", f"{registry}/{repo}" if registry and "{{" not in registry else repo))
+        elif lkey.endswith("image") or lkey.endswith("_image"):
+            found += [("default", v) for v in _image_values(value)]
+        elif lkey == "container":
+            found += [("container", v) for v in _image_values(value)]
+        elif lkey == "uses" and value.startswith("docker://"):
+            found.append(("uses", value[len("docker://"):].strip()))
+        elif lkey == "driver-opts":
+            found += [("buildkit", v) for v in re.findall(r"\bimage=([^\s,\"']+)", value)]
+        elif lkey == "dockerfile_inline":
+            found += dockerfile_refs(value)
+        if lkey in {"image", "repository", "uses", "dockerfile_inline", "driver-opts"}:
+            continue
+        for command in shell_commands(value):
+            found += shell_refs(command)
+    for line in text.splitlines():  # flow maps: `db: {image: postgres:16, ...}`
+        if not re.match(r"\s*#", line):
+            found += [("image", v) for v in re.findall(r"[{,]\s*image:\s*[\"']?([^,}\s\"']+)", line)]
     return found
 
 
@@ -361,99 +542,60 @@ def action_steps_missing_mirror(text: str) -> list[str]:
     problems = []
     lines = text.splitlines()
     for idx, raw in enumerate(lines):
-        line = _strip_comment(raw)
-        if line is None:
+        if re.match(r"\s*#", raw):
             continue
-        m = re.search(r"uses:\s*docker/(setup-buildx-action|setup-qemu-action)@", line)
+        m = re.search(r"uses:\s*[\"']?docker/(setup-buildx-action|setup-qemu-action)@", raw)
         if not m:
             continue
-        step_indent = len(raw) - len(raw.lstrip())
-        if raw.lstrip().startswith("uses:") and idx and lines[idx - 1].lstrip().startswith("-"):
-            step_indent = len(lines[idx - 1]) - len(lines[idx - 1].lstrip())
-        want = (f"image={MIRROR}moby/buildkit:" if m.group(1) == "setup-buildx-action"
-                else f"image: {MIRROR}tonistiigi/binfmt")
+        step_indent = _indent(raw)
+        if raw.lstrip().startswith("uses:"):
+            for back in range(idx - 1, -1, -1):  # the step's `- ` line
+                if lines[back].strip() and _indent(lines[back]) < step_indent:
+                    step_indent = _indent(lines[back]) if lines[back].lstrip().startswith("-") else step_indent
+                    break
+        buildx = m.group(1) == "setup-buildx-action"
+        want = f"image={MIRROR}moby/buildkit:" if buildx else f"image: {MIRROR}tonistiigi/binfmt"
         ok = False
         for nxt in lines[idx + 1 :]:
-            if not nxt.strip():
+            if not nxt.strip() or re.match(r"\s*#", nxt):
                 continue
-            if len(nxt) - len(nxt.lstrip()) <= step_indent and nxt.lstrip().startswith("-"):
+            if _indent(nxt) <= step_indent:
                 break
-            if len(nxt) - len(nxt.lstrip()) < step_indent:
-                break
-            body = _strip_comment(nxt)
-            if body and want in body.replace('"', "").replace("'", ""):
+            body = re.sub(r"\s+#.*$", "", nxt).replace('"', "").replace("'", "")
+            if want in body or (buildx and re.search(r"\bdriver:\s*docker\s*$", body)):
                 ok = True
-            if body and m.group(1) == "setup-buildx-action" and re.search(r"\bdriver:\s*docker\s*$", body):
-                ok = True  # the docker driver uses the daemon's builder: no BuildKit image pulled
         if not ok:
             problems.append(f"docker/{m.group(1)} without `{want}...`")
     return problems
 
 
-def workflow_run_blocks(text: str) -> list[str]:
-    """Bodies of `run:` steps (inline and block scalars)."""
-    blocks, lines = [], text.splitlines()
-    i = 0
-    while i < len(lines):
-        m = re.match(r"(\s*)(?:-\s+)?run:\s*(.*)$", lines[i])
-        if not m:
-            i += 1
-            continue
-        indent, rest = len(m.group(1)), m.group(2).strip()
-        if rest and rest[0] not in "|>":
-            blocks.append(rest)
-            i += 1
-            continue
-        body, folded = [], rest.startswith(">")
-        i += 1
-        while i < len(lines) and (not lines[i].strip()
-                                  or len(lines[i]) - len(lines[i].lstrip()) > indent):
-            body.append(lines[i].strip())
-            i += 1
-        blocks.append(" ".join(body) if folded else "\n".join(body))
-    return blocks
-
-
 # --- Repo scan --------------------------------------------------------------
 
 
-def tracked(*patterns: str) -> list[str]:
-    out = subprocess.run(["git", "ls-files", "-z", "--", *patterns], cwd=REPO, check=True,
+def tracked() -> list[str]:
+    out = subprocess.run(["git", "ls-files", "-z"], cwd=REPO, check=True,
                          capture_output=True, text=True).stdout
-    return sorted({p for p in out.split("\0") if p})
+    return sorted(p for p in out.split("\0") if p)
 
 
 def scan(read=lambda p: (REPO / p).read_text(errors="replace")) -> list[tuple[str, str, str]]:
     """(path, kind, ref) for every image reference, plus action-step problems."""
     results: list[tuple[str, str, str]] = []
-    all_files = tracked()
-    dockerfiles = [p for p in all_files
-                   if any(fnmatch.fnmatch(Path(p).name, g) for g in _DOCKERFILE_GLOBS)
-                   and not p.endswith(".dockerignore")]
-    for path in dockerfiles:
-        for kind, ref in dockerfile_refs(read(path)):
-            results.append((path, kind, ref))
-    workflows = tracked(".github/workflows/*.yml", ".github/workflows/*.yaml")
-    yaml_files = sorted(set(workflows) | set(tracked(*CONFIG["yaml"])) if CONFIG["yaml"]
-                        else set(workflows))
-    for path in yaml_files:
-        text = read(path)
-        for kind, ref in yaml_refs(text):
-            results.append((path, kind, ref))
-        for problem in action_steps_missing_mirror(text):
-            results.append((path, "action", problem))
-    for path in workflows:
-        for block in workflow_run_blocks(read(path)):
-            for command in shell_commands(block):
-                for kind, ref in shell_refs(command):
-                    results.append((path, kind, ref))
-    shell_files = [p for p in all_files
-                   if p.endswith(".sh") or Path(p).name in {"Makefile", "entrypoint.sh"}
-                   or (Path(p).name.startswith("entrypoint") and "." not in Path(p).name)]
-    for path in shell_files:
-        for command in shell_commands(read(path)):
-            for kind, ref in shell_refs(command):
-                results.append((path, kind, ref))
+    for path in tracked():
+        name = Path(path).name
+        if any(fnmatch.fnmatch(name, g) for g in _DOCKERFILE_GLOBS) and not name.endswith(".dockerignore"):
+            results += [(path, k, r) for k, r in dockerfile_refs(read(path))]
+        elif path.endswith((".yml", ".yaml")):
+            if any(fnmatch.fnmatch(path, g) for g in CONFIG["yaml_exclude"]):
+                continue
+            text = read(path)
+            workflow = path.startswith(".github/workflows/")
+            results += [(path, k, r) for k, r in yaml_refs(text, workflow=workflow)]
+            if workflow:
+                results += [(path, "action", p) for p in action_steps_missing_mirror(text)]
+        elif path.endswith(".sh") or name == "Makefile" or name.startswith("entrypoint"):
+            for command in shell_commands(read(path)):
+                results += [(path, k, r) for k, r in shell_refs(command)]
     return results
 
 
@@ -472,7 +614,10 @@ def main() -> int:
             offenders.append(f"{path}: {ref}")
             continue
         if kind == "unparseable":
-            offenders.append(f"{path}: cannot parse this shell line, so cannot vouch for it: {ref}")
+            offenders.append(f"{path}: names a docker pull this scanner cannot parse, so it cannot "
+                             f"vouch for it (rewrite it, or allowlist it in CONFIG): {ref}")
+            continue
+        if ref == "docker-driver":
             continue
         why = classify(ref)
         if why is None:
@@ -508,12 +653,6 @@ def main() -> int:
 
 # --- Self-test --------------------------------------------------------------
 
-_HUB_CASES = [
-    ("python:3.12-slim", True), ("library/python", True), ("docker.io/library/python", True),
-    ("prom/node-exporter:latest", True), ("mirror.gcr.io/library/python:3.12-slim", False),
-    ("ghcr.io/a/b:1", False), ("localhost/x:1", False), ("localhost:5000/x:1", False),
-]
-
 
 def self_test() -> int:
     failures: list[str] = []
@@ -522,86 +661,136 @@ def self_test() -> int:
         if got != want:
             failures.append(f"{name}: got {got!r}, want {want!r}")
 
-    for ref, hub in _HUB_CASES:
-        expect(f"is_docker_hub({ref})", is_docker_hub(ref), hub)
+    def hub(refs) -> list[str]:
+        """The refs that would fail: Docker Hub or unresolvable."""
+        return [r for _, r in refs if classify(r) is not None]
+
+    def kinds(refs) -> list[str]:
+        return [k for k, _ in refs]
+
+    for ref, want in [
+        ("python:3.12-slim", True), ("library/python", True), ("docker.io/library/python", True),
+        ("registry.hub.docker.com/library/python", True), ("prom/node-exporter:latest", True),
+        ("mirror.gcr.io/library/python:3.12-slim", False), ("ghcr.io/a/b:1", False),
+        ("localhost/x:1", False), ("localhost:5000/x:1", False),
+    ]:
+        expect(f"is_docker_hub({ref})", is_docker_hub(ref), want)
     expect("repository with port", repository("localhost:5000/x:1"), "localhost:5000/x")
     expect("repository with digest", repository("a.io/b:1@sha256:ff"), "a.io/b")
-
-    def from_refs(text: str) -> list[str]:
-        return [r for _, r in dockerfile_refs(text)]
+    expect("wholly variable", [classify(r) for r in ("$IMAGE", "${IMAGE}", _UNRESOLVED)], [None] * 3)
+    expect("variable host fails", classify("$REG/python:3.12") is not None, True)
+    expect("literal host, variable name", classify(f"ghcr.io/prbe-ai/x-{_UNRESOLVED}:1"), None)
+    expect("variable name, no host", classify("python-${V}:1") is not None, True)
 
     df = dockerfile_refs
     expect("syntax with spaces, after escape", df("# escape=`\n# syntax = docker/dockerfile:1\nFROM a.io/b\n"),
            [("syntax", "docker/dockerfile:1"), ("from", "a.io/b")])
-    expect("lowercase from + stage", from_refs("from python:3.12 as base\nFROM base\n"), ["python:3.12"])
-    expect("ARG default substituted", from_refs("ARG B=python:3.12\nFROM ${B} AS x\n"), ["python:3.12"])
-    expect("ARG tag keeps repo", from_refs("ARG V=3.12\nFROM python:${V}-slim\n"), ["python:3.12-slim"])
-    expect("ARG without default: wholly variable, skipped", classify(from_refs("ARG B\nFROM ${B}\n")[0]), None)
-    expect("variable registry fails closed", classify("$REG/python:3.12") is not None, True)
-    expect("Hub alias", is_docker_hub("registry.hub.docker.com/library/python"), True)
-    expect("from= inside a RUN command is not an image",
-           from_refs('FROM a.io/b\nRUN python -c "f(from=1)" \\\n && echo from pathlib\n'), ["a.io/b"])
-    expect("COPY --from image", from_refs("FROM a.io/b AS s\nCOPY --from=busybox:1 /x /y\nCOPY --from=s /a /b\n"),
-           ["a.io/b", "busybox:1"])
-    expect("RUN --mount from", from_refs("FROM a.io/b\nRUN --mount=type=bind,from=alpine:3,target=/a true\n"),
-           ["a.io/b", "alpine:3"])
-    expect("heredoc body skipped", from_refs("FROM a.io/b\nRUN <<EOF\nfrom pathlib import Path\nEOF\n"), ["a.io/b"])
-    expect("continuation", from_refs("FROM \\\n  python:3.12\n"), ["python:3.12"])
-    expect("platform flag", from_refs("FROM --platform=$BUILDPLATFORM golang:1 AS g\n"), ["golang:1"])
+    expect("lowercase from + stage", hub(df("from python:3.12 as base\nFROM base\n")), ["python:3.12"])
+    expect("FROM node AS node", hub(df("FROM node AS node\nRUN node -v\n")), ["node"])
+    expect("ARG default", hub(df("ARG B=python:3.12\nFROM ${B} AS x\n")), ["python:3.12"])
+    expect("ARG tag", hub(df("ARG V=3.12\nFROM python:${V}-slim\n")), ["python:3.12-slim"])
+    expect("ARG without default skipped", hub(df("ARG B\nFROM ${B}\n")), [])
+    expect("COPY --from", hub(df("FROM a.io/b AS s\nCOPY --from=busybox:1 /x /y\nCOPY --from=s /a /b\n")),
+           ["busybox:1"])
+    expect("RUN --mount from", hub(df("FROM a.io/b\nRUN --mount=type=bind,from=alpine:3,target=/a true\n")),
+           ["alpine:3"])
+    expect("--from inside a RUN command", hub(df("FROM a.io/b\nRUN pandoc --from=markdown x\n")), [])
+    expect("python inside RUN", hub(df('FROM a.io/b\nRUN python -c "f(from=1)" \\\n && echo from x\n')), [])
+    expect("heredoc body", hub(df("FROM a.io/b\nRUN <<EOF\nfrom pathlib import Path\nEOF\n")), [])
+    expect("<< that is not a heredoc", hub(df('FROM a.io/b\nRUN python -c "print(1<<20)"\nFROM node:20\n')),
+           ["node:20"])
+    expect("unclosed heredoc fails closed", kinds(df("FROM a.io/b\nRUN <<EOF\nx\n")), ["unparseable", "from"])
+    expect("continuation", hub(df("FROM \\\n  python:3.12\n")), ["python:3.12"])
+    expect("platform flag", hub(df("FROM --platform=$BUILDPLATFORM golang:1 AS g\n")), ["golang:1"])
 
-    def docker(cmd: str) -> list[str]:
-        return [r for k, r in shell_refs(cmd) if k == "docker"]
+    def sh(cmd: str) -> list[tuple[str, str]]:
+        return [x for c in shell_commands(cmd) for x in shell_refs(c)]
 
-    expect("run with value opts", docker("docker run -d --name p -e A=1 --health-interval 5s python:3.12 x"),
+    expect("run with value opts", hub(sh("docker run -d --name p -e A=1 --health-interval 5s python:3.12 x")),
            ["python:3.12"])
-    expect("trailing comment with apostrophe", docker("docker run --rm python:3.12 true  # don't cache"),
+    expect("combined short flags", hub(sh("docker run -dp 5432:5432 python:3.12")), ["python:3.12"])
+    expect("trailing comment", hub(sh("docker run --rm python:3.12 true  # don't cache")), ["python:3.12"])
+    expect("two commands", hub(sh("docker run --rm a.io/x true && docker run --rm python:3.12 true")),
            ["python:3.12"])
-    expect("two commands", docker("docker run --rm a.io/x true && docker run --rm python:3.12 true"),
-           ["a.io/x", "python:3.12"])
     expect("pull/create/container run",
-           docker("docker pull alpine:3; docker create redis:7; docker container run busybox"),
+           hub(sh("docker pull alpine:3; docker create redis:7; docker container run busybox")),
            ["alpine:3", "redis:7", "busybox"])
-    expect("GHA expr in a volume", docker(shell_commands("docker run -v ${{ github.workspace }}:/w a.io/x true")[0]),
-           ["a.io/x"])
-    expect("variable image skipped", docker('docker run --rm "$IMAGE" true'), [])
-    expect("unbalanced quote is unparseable", [k for k, _ in shell_refs("docker run 'x")], ["unparseable"])
-    expect("image defaults",
-           [r for k, r in shell_refs('POSTGRES_IMAGE="${POSTGRES_IMAGE:-postgres:16}"; : "${PG16_IMAGE:=redis:7}"')
-            if k == "default"], ["postgres:16", "redis:7"])
-    expect("IMAGE_KIND is not an image", shell_refs('echo "${IMAGE_KIND:-legacy}"'), [])
-    expect("plain image assignment", [r for k, r in shell_refs("  local BASE_IMAGE=python:3.12") if k == "default"],
+    expect("double space", hub(sh("docker  run --rm python:3.12 true")), ["python:3.12"])
+    expect("global options", hub(sh("docker --context default run --rm python:3.12 true")), ["python:3.12"])
+    expect("make recipe prefix and path", hub(sh("\t@docker run -d pgvector/pgvector:pg16\n/usr/bin/docker pull x:1")),
+           ["pgvector/pgvector:pg16", "x:1"])
+    expect("quoted command substitution", hub(sh('PG_CID="$(docker run -d -e A=1 postgres:16)"')), ["postgres:16"])
+    expect("backticks and sh -c", hub(sh("v=`docker run --rm a:1`; bash -c 'docker pull b:2'")), ["a:1", "b:2"])
+    expect("GHA expr in a volume", hub(sh("docker run -v ${{ github.workspace }}:/w a.io/x true")), [])
+    expect("variable image skipped", hub(sh('docker run --rm "$IMAGE" true')), [])
+    expect("variable with Hub default", hub(sh('docker run --rm "${REG:-docker.io}/library/postgres:16" true')),
+           ["docker.io/library/postgres:16"])
+    expect("unparseable docker line fails closed", "unparseable" in kinds(sh("docker run 'x")), True)
+    expect("prose with an apostrophe", sh("echo the docker image didn't build"), [])
+    expect("comments", sh("# Smoke test: docker run the image\n#   docker run x  -> y\n"
+                          "true  # no `docker pull` needed\n"), [])
+    expect("# inside quotes is not a comment", hub(sh('docker run --rm -e "A=#1" python:3.12 x')),
            ["python:3.12"])
-    expect("yaml forms", sorted(r for _, r in yaml_refs(
+    expect("shell heredoc body", sh('cat <<EOF\nThe docker run didn\'t work\nEOF\n'), [])
+    expect("image defaults",
+           hub(sh('POSTGRES_IMAGE="${POSTGRES_IMAGE:-postgres:16}"; : "${PG16_IMAGE:=redis:7}"')),
+           ["postgres:16", "redis:7"])
+    expect("IMAGE_KIND is not an image", sh('echo "${IMAGE_KIND:-legacy}"'), [])
+    expect("plain image assignment", hub(sh("  local BASE_IMAGE=python:3.12")), ["python:3.12"])
+    expect("buildx create from the Hub", kinds(sh("docker buildx create --use --name ci")), ["action"])
+    expect("buildx create on the mirror",
+           hub(sh(f"docker buildx create --driver-opt image={MIRROR}moby/buildkit:v1 --use")), [])
+
+    yr = yaml_refs
+    expect("yaml forms", sorted(hub(yr(
         "x:\n  image: python:3.12 # c\n  # image: ignored:1\n  container: node:20\n"
-        "  - uses: docker://alpine:3.19\n  img:\n    image:\n      repository: pgvector/pgvector\n"
-        "      tag: pg16\n  driver-opts: image=moby/buildkit:x\n  y: {{ .Values.image }}\n")),
+        "  steps:\n    - uses: docker://alpine:3.19\n  img:\n    image:\n      repository: pgvector/pgvector\n"
+        "      tag: pg16\n  b:\n    driver-opts: image=moby/buildkit:x\n  y: '{{ .Values.image }}'\n"))),
         sorted(["python:3.12", "node:20", "alpine:3.19", "pgvector/pgvector", "moby/buildkit:x"]))
-    expect("buildx step without driver-opts",
-           len(action_steps_missing_mirror("steps:\n  - uses: docker/setup-buildx-action@v3\n  - run: x\n")), 1)
-    expect("buildx step with commented driver-opts",
-           len(action_steps_missing_mirror(
-               "steps:\n  - uses: docker/setup-buildx-action@v3\n    with:\n"
-               "      # driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1\n")), 1)
-    expect("buildx multi-line driver-opts",
-           action_steps_missing_mirror(
-               "steps:\n  - uses: docker/setup-buildx-action@v3\n    with:\n      driver-opts: |\n"
-               "        image=mirror.gcr.io/moby/buildkit:buildx-stable-1\n  - run: x\n"), [])
-    expect("buildx docker driver",
-           action_steps_missing_mirror("steps:\n  - uses: docker/setup-buildx-action@v3\n    with:\n"
-                                       "      driver: docker\n"), [])
-    expect("compose default substituted", [r for _, r in yaml_refs("  image: ${PG_IMAGE:-postgres:16}\n")],
-           ["postgres:16"])
-    expect("matrix image key skipped", [classify(r) for _, r in yaml_refs(
-        "        image: ${{ fromJSON(needs.x.outputs.images) }}\n")], [None])
-    expect("double space in docker run", docker("docker  run --rm python:3.12 true"), ["python:3.12"])
-    expect("buildx step on the mirror",
-           action_steps_missing_mirror(
-               "steps:\n  - name: b\n    uses: docker/setup-buildx-action@v3\n    with:\n"
-               "      driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1\n  - run: x\n"), [])
-    expect("qemu step needs its image",
-           len(action_steps_missing_mirror("steps:\n  - uses: docker/setup-qemu-action@v3\n")), 1)
-    expect("folded run block", [r for b in workflow_run_blocks("    run: >-\n      docker run --rm\n      python:3.12 x\n")
-                                for c in shell_commands(b) for _, r in shell_refs(c)], ["python:3.12"])
+    expect("helm default", hub(yr('  image: {{ .Values.x | default "busybox" }}\n'
+                                  '  image: {{ include "probe-knowledge.image" . | quote }}\n')), ["busybox"])
+    expect("flow list, flow map, anchor",
+           sorted(hub(yr('a:\n  image: ["python:3.11", "mirror.gcr.io/x:1"]\n'
+                         '  db: {image: postgres:16, ports: [1]}\n  c:\n    image: &pg redis:7\n'))),
+           ["postgres:16", "python:3.11", "redis:7"])
+    expect("compose default", hub(yr("  image: ${PG_IMAGE:-postgres:16}\n")), ["postgres:16"])
+    expect("matrix image key", hub(yr("jobs:\n  b:\n    strategy:\n      matrix:\n        include:\n"
+                                      "          - image: knowledge\n", workflow=True)), [])
+    expect("matrix GHA expr", hub(yr("        image: ${{ fromJSON(needs.x.outputs.images) }}\n")), [])
+    expect("*_IMAGE keys and build-args",
+           sorted(hub(yr("env:\n  PG_IMAGE: postgres:16\nsteps:\n  - with:\n      build-args: |\n"
+                         "        BASE_IMAGE=python:3.12-slim\n")), ),
+           ["postgres:16", "python:3.12-slim"])
+    expect("shell in any key", hub(yr("  - with:\n      command: docker pull pgvector/pgvector:pg16\n")),
+           ["pgvector/pgvector:pg16"])
+    expect("quoted inline run", hub(yr('  - run: "docker run --rm python:3.12-slim python -V"\n')),
+           ["python:3.12-slim"])
+    expect("plain run over two lines", hub(yr("  - run: docker run --rm\n      python:3.12-slim python -V\n")),
+           ["python:3.12-slim"])
+    expect("folded run block", hub(yr("    run: >-\n      docker run --rm\n      python:3.12 x\n")),
+           ["python:3.12"])
+    expect("GITHUB_OUTPUT image= is not BuildKit",
+           hub(yr('  - run: echo "image=${REGISTRY}/${NAME}:${TAG}" >> "$GITHUB_OUTPUT"\n')), [])
+    expect("dockerfile_inline", hub(yr("  tools:\n    build:\n      dockerfile_inline: |\n"
+                                       "        FROM python:3.12-slim\n")), ["python:3.12-slim"])
+    expect("step summary prose", yr('  - run: |\n      cat >> "$GITHUB_STEP_SUMMARY" <<EOF\n'
+                                     "      The docker image didn't build.\n      EOF\n"), [])
+    steps = action_steps_missing_mirror
+    expect("buildx without driver-opts", len(steps("steps:\n  - uses: docker/setup-buildx-action@v3\n  - run: x\n")), 1)
+    expect("quoted uses", len(steps('steps:\n  - uses: "docker/setup-buildx-action@v3"\n')), 1)
+    expect("commented driver-opts", len(steps(
+        "steps:\n  - uses: docker/setup-buildx-action@v3\n    with:\n"
+        "      # driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1\n")), 1)
+    expect("buildx on the mirror", steps(
+        "steps:\n  - name: b\n    uses: docker/setup-buildx-action@v3\n    with:\n"
+        "      driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1\n  - run: x\n"), [])
+    expect("buildx multi-line driver-opts", steps(
+        "steps:\n  - uses: docker/setup-buildx-action@v3\n    with:\n      driver-opts: |\n"
+        "        image=mirror.gcr.io/moby/buildkit:buildx-stable-1\n  - run: x\n"), [])
+    expect("buildx docker driver", steps(
+        "steps:\n  - uses: docker/setup-buildx-action@v3\n    with:\n      driver: docker\n"), [])
+    expect("qemu needs its image", len(steps("steps:\n  - uses: docker/setup-qemu-action@v3\n")), 1)
+
     if failures:
         print("FAIL: scanner self-test")
         for line in failures:
