@@ -2,14 +2,14 @@
 # redactd-build stage) and CI; it must be >= the go.mod floor, because the image
 # sets GOTOOLCHAIN=local. Compile the same scanner for every standalone
 # ingress/worker image. No Go runtime or compiler ships in the final image.
-FROM golang:1.25-bookworm AS redactd-build
+FROM mirror.gcr.io/library/golang:1.25-bookworm AS redactd-build
 WORKDIR /build/redactd
 COPY tools/redactd/go.mod tools/redactd/go.sum ./
 RUN go mod download
 COPY tools/redactd/ ./
 RUN CGO_ENABLED=0 go build -mod=readonly -trimpath -ldflags="-s -w" -o /out/redactd .
 
-FROM python:3.12-slim
+FROM mirror.gcr.io/library/python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

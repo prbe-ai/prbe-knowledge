@@ -11,7 +11,7 @@ satisfied by the one configured tenant.
 - **Docker + Docker Compose** (the simplest path), or a Kubernetes cluster with
   Helm 3 for the production path.
 - A **Postgres 16** with the `vector`, `pg_trgm`, and `btree_gin` extensions —
-  the bundled `pgvector/pgvector:pg16` image ships all three. (Compose provides
+  the bundled `mirror.gcr.io/pgvector/pgvector:pg16` image ships all three. (Compose provides
   this for you.)
 - A **`GOOGLE_API_KEY`** for embeddings (Gemini) and **one LLM key**
   (`ANTHROPIC_API_KEY` or `OPENAI_API_KEY`) for answer synthesis.
@@ -42,7 +42,7 @@ The Compose stack starts:
 
 | Service        | Role                                                              |
 |----------------|-------------------------------------------------------------------|
-| `postgres`     | `pgvector/pgvector:pg16` with the required extensions             |
+| `postgres`     | `mirror.gcr.io/pgvector/pgvector:pg16` with the required extensions |
 | `minio`        | bundled S3-compatible object store (console on `:9001`)           |
 | `createbuckets`| one-shot: creates the default tenant's bucket                     |
 | `migrate`      | one-shot: runs `scripts/migrate.py` (schema + alembic stamp)      |
@@ -71,7 +71,7 @@ secrets described below, and install with `helm install`. See the chart's
 ## Choosing Postgres
 
 **Bundled (Compose).** Nothing to do — Compose sets `DATABASE_URL` and
-`DATABASE_URL_SYNC` to the bundled `pgvector/pgvector:pg16`.
+`DATABASE_URL_SYNC` to the bundled `mirror.gcr.io/pgvector/pgvector:pg16`.
 
 **Managed / external.** Point the engine at your own Postgres 16 and make sure
 the three extensions are installed (`CREATE EXTENSION` for `vector`, `pg_trgm`,

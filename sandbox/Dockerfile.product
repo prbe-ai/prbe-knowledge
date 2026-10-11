@@ -16,7 +16,7 @@
 # requires Python >=3.12 (pyproject.toml) but the base ships 3.11, so we add a pinned
 # standalone CPython 3.12 via the `uv` binary — reproducible, no PPA/deadsnakes.
 
-FROM pgvector/pgvector:pg16
+FROM mirror.gcr.io/pgvector/pgvector:pg16
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

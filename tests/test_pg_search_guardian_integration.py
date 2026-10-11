@@ -2,7 +2,7 @@
 
     docker run -d --name kb-guardian-pg \
       -e POSTGRES_USER=prbe -e POSTGRES_PASSWORD=prbe -e POSTGRES_DB=prbe_knowledge \
-      -p 5460:5432 paradedb/paradedb:latest
+      -p 5460:5432 mirror.gcr.io/paradedb/paradedb:latest
     PRBE_PGSEARCH_TEST_DSN=postgresql://prbe:prbe@localhost:5460/prbe_knowledge \
       pytest tests/test_pg_search_guardian_integration.py
 
@@ -41,7 +41,7 @@ run against the container above:
     #    instance does nothing lasting -- shutdown flushes the still-dirty
     #    buffers straight back over the hole.
     docker stop kb-guardian-pg
-    docker run --rm --volumes-from kb-guardian-pg alpine \
+    docker run --rm --volumes-from kb-guardian-pg mirror.gcr.io/library/alpine \
       truncate -s 0 /var/lib/postgresql/18/docker/base/16384/25486
     docker start kb-guardian-pg
 

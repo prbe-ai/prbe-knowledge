@@ -33,6 +33,14 @@ jobs:
       - name: Index contracts
         run: .venv/bin/python scripts/check_index_contracts.py
 
+      # Anonymous Docker Hub pulls from GitHub runners 429'd every research-os
+      # image build for an hour on 2026-10-09; every image here comes from
+      # mirror.gcr.io (same digests) and this keeps new ones off Docker Hub.
+      - name: No Docker Hub images
+        run: |
+          .venv/bin/python scripts/check_no_docker_hub.py --self-test
+          .venv/bin/python scripts/check_no_docker_hub.py
+
       - name: Type-check
         run: .venv/bin/mypy engine kb services || true   # strict mypy soft-gated in Phase 0
 
@@ -64,7 +72,7 @@ jobs:
           docker run -d --name paradedb -p 5433:5432 \
             -e POSTGRES_USER=prbe -e POSTGRES_PASSWORD=prbe -e POSTGRES_DB=postgres \
             -e POSTGRES_INITDB_ARGS="--lc-collate=C --lc-ctype=C" \
-            paradedb/paradedb:0.23.4-pg16 \
+            mirror.gcr.io/paradedb/paradedb:0.23.4-pg16 \
             -c shared_preload_libraries=pg_search,pg_cron,pg_stat_statements
           for i in $(seq 1 60); do
             pg_isready -h localhost -p 5433 -U prbe -d postgres -q && sleep 3 && \
@@ -111,7 +119,7 @@ jobs:
 
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        image: mirror.gcr.io/pgvector/pgvector:pg16
         env:
           POSTGRES_USER: prbe
           POSTGRES_PASSWORD: prbe
