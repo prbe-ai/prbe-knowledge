@@ -2,18 +2,18 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://prbe.ai/schemas/probe-events-1.schema.json",
   "title": "probe-events/1",
-  "description": "One sanitized coding-agent session event: the `raw` of each `{line_no, raw}` in a protocol-2 session batch. All four tap sanitizers emit it (tap_core/sanitize.py for Claude Code, codex_sanitize.py, pi_sanitize.py, kimi_sanitize.py) in Claude Code's user / assistant / system shape. It describes exactly what they emit from tap 0.9.11 on, not what a harness writes: every key is allow-listed and typed, and anything else stays on the researcher's machine. Optional fields are absent, never null, unless their type says null. Out of contract: a transcript line that is not a JSON object. The Claude Code and Codex sanitizers return it unchanged (the legacy batch builder keeps an unparseable line as a raw string on purpose; the protocol-2 journal drops lines that do not parse), and real transcripts have none. Clients from before 0.9.11 send no `inference_id`, `usage` or `origin`, and clients from before 0.9.9 sent more keys than this schema allows; a reader must accept both. Held by agent/tests/test_probe_events_contract.py.",
+  "description": "One sanitized coding-agent session event: the `raw` of each `{line_no, raw}` in a protocol-2 session batch. All five tap sanitizers emit it (tap_core/sanitize.py for Claude Code, codex_sanitize.py, pi_sanitize.py, kimi_sanitize.py, capy_sanitize.py for the Capy mirror `probe capy sync` writes) in Claude Code's user / assistant / system shape. It describes exactly what they emit from tap 0.9.11 on, not what a harness writes: every key is allow-listed and typed, and anything else stays on the researcher's machine. Optional fields are absent, never null, unless their type says null. Out of contract: a transcript line that is not a JSON object. The Claude Code and Codex sanitizers return it unchanged (the legacy batch builder keeps an unparseable line as a raw string on purpose; the protocol-2 journal drops lines that do not parse), and real transcripts have none. Clients from before 0.9.11 send no `inference_id`, `usage` or `origin`, and clients from before 0.9.9 sent more keys than this schema allows; a reader must accept both. Held by agent/tests/test_probe_events_contract.py.",
   "type": "object",
   "required": ["type"],
   "additionalProperties": false,
   "properties": {
     "type": {
       "type": "string",
-      "description": "Codex, pi and Kimi emit `user`, `assistant` or `system`. Claude Code also forwards its own other event types (`attachment`, `queue-operation`, `mode`, ...) reduced to the keys below; the renderer shows only a string `content` for those."
+      "description": "Codex, pi, Kimi and Capy emit `user`, `assistant` or `system`. Claude Code also forwards its own other event types (`attachment`, `queue-operation`, `mode`, ...) reduced to the keys below; the renderer shows only a string `content` for those."
     },
     "subtype": {
       "type": "string",
-      "description": "On `system` events. Harness-defined and open: Claude Code's own (`compact_boundary`, `local_command`, `away_summary`, ...); Codex `session_start`, `turn_context`, `compaction`; pi `session_meta`, `compaction`, `branch_summary`, `label`, `model_change`, `thinking_level_change`, `session_info`, `custom:<customType>`, `unknown:<type>`, `unknown:message:<role>`, `unparsed`; Kimi `session_meta`, `compaction`, `shell_output`, `skill_activation`, `clear`, `undo`."
+      "description": "On `system` events. Harness-defined and open: Claude Code's own (`compact_boundary`, `local_command`, `away_summary`, ...); Codex `session_start`, `turn_context`, `compaction`; pi `session_meta`, `compaction`, `branch_summary`, `label`, `model_change`, `thinking_level_change`, `session_info`, `custom:<customType>`, `unknown:<type>`, `unknown:message:<role>`, `unparsed`; Kimi `session_meta`, `compaction`, `shell_output`, `skill_activation`, `clear`, `undo`; Capy `session_meta`, `session_meta:unsupported_version`, `unknown:<type>`, `unknown:message:<source>`, `unparsed`. Every harness, from tap 0.9.17: `oversize_line`, standing in for a transcript line too long to read (over 64 MiB), its size in `content`."
     },
     "timestamp": {
       "type": ["string", "null"],
@@ -21,7 +21,7 @@
     },
     "content": {
       "type": "string",
-      "description": "Top-level text of a `system` event (a compaction or branch summary, a local command line) or of a forwarded Claude Code event such as `queue-operation`. Conversation text: uncapped."
+      "description": "Top-level text of a `system` event (a compaction or branch summary, a local command line) or of a forwarded Claude Code event such as `queue-operation`. Conversation text: uncapped. From tap 0.9.13 a command's output in it is withheld as in `text_block`."
     },
     "message": { "$ref": "#/$defs/message" },
     "isCompactSummary": {
@@ -36,7 +36,7 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 200,
-      "description": "The model call this `assistant` event came from: Claude Code's Anthropic message id (every line of one call shares it), pi's entry id (one entry per response), Kimi's `<turn_id>:<step>`. Codex: never set. Absent also on events from clients before 0.9.11."
+      "description": "The model call this `assistant` event came from: Claude Code's Anthropic message id (every line of one call shares it), pi's entry id (one entry per response), Kimi's `<turn_id>:<step>`, Capy's message id. Codex: never set. Absent also on events from clients before 0.9.11."
     },
     "usage": { "$ref": "#/$defs/usage" },
     "origin": {
@@ -89,7 +89,8 @@
       "type": "object",
       "required": ["type", "text"],
       "additionalProperties": false,
-      "properties": { "type": { "const": "text" }, "text": { "type": "string" } }
+      "properties": { "type": { "const": "text" }, "text": { "type": "string" } },
+      "description": "Conversation text. From tap 0.9.13, on user and system events, what a command the researcher ran printed is withheld: inside Claude Code's `<bash-stdout>`, `<bash-stderr>`, `<local-command-stdout>` and `<local-command-stderr>`, and after `Output:` in Codex's `<user_shell_command>` result, the text is `[output not sent: <N> chars]` (N comma-grouped), or empty when nothing was printed. Claude Code's injected skill bodies (`isMeta` turns starting `Base directory for this skill:`) are not sent."
     },
     "thinking_block": {
       "type": "object",
@@ -148,7 +149,7 @@
       "type": "object",
       "required": ["type", "mimeType", "bytes"],
       "additionalProperties": false,
-      "description": "A pasted image (Kimi also audio, video): its media type and encoded size, never the bytes.",
+      "description": "A pasted image (Kimi also audio, video): its media type and encoded size, never the bytes. From tap 0.9.17 an image the researcher pasted into their own prompt also carries `sha256` when its bytes were uploaded beside the batch (never in it).",
       "properties": {
         "type": { "enum": ["image", "audio", "video"] },
         "mimeType": { "type": "string", "maxLength": 200 },

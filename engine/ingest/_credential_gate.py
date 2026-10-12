@@ -741,7 +741,7 @@ def _check_source(info: os.stat_result, scan_policy: ScanPolicy | None = None) -
 def _read_source(path, *, scan_policy: ScanPolicy | None = None, inspect: bool) -> bytes:
     _check_path(path)
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
         with os.fdopen(fd, "rb") as stream:
             _check_source(os.fstat(stream.fileno()), scan_policy)
             if inspect:
@@ -768,6 +768,30 @@ def read_upload_redacted(
     # and then `redact_bytes` inspected the same bytes again -- and inspection
     # expands archives up to `max_expanded_bytes`, beside a training loop.
     raw = _read_source(path, scan_policy=scan_policy, inspect=False)
+    return _redact_read(raw, scan_policy=scan_policy, full_scan=full_scan)
+
+
+def read_upload_redacted_sourced(
+    path, *, scan_policy: ScanPolicy | None = None, full_scan: bool = False
+) -> tuple[bytes, InspectionResult, str]:
+    """`read_upload_redacted`, plus the sha256 of the ORIGINAL bytes.
+
+    Both come from ONE read of the file: the redacted bytes and the hash of
+    the bytes they were redacted from describe the same version of it, even
+    while a writer races the caller. Hashing the file again afterwards could
+    pair the upload with a newer version's hash. The original's hash is what a
+    run READING the file can be matched on -- the stored content hash names
+    bytes no reader ever opened (`meta.source_sha256`, the server's
+    `pre_redaction` basis).
+    """
+    raw = _read_source(path, scan_policy=scan_policy, inspect=False)
+    data, result = _redact_read(raw, scan_policy=scan_policy, full_scan=full_scan)
+    return data, result, hashlib.sha256(raw).hexdigest()
+
+
+def _redact_read(
+    raw: bytes, *, scan_policy: ScanPolicy | None, full_scan: bool
+) -> tuple[bytes, InspectionResult]:
     if full_scan or strict_policy():
         return redact_bytes(raw, scan_policy=scan_policy)
     return redact_quick_bytes(raw)
@@ -883,7 +907,7 @@ def safe_snapshot_file(source, destination) -> None:
     # credential must be gone before the digest is taken.
     raw, _ = read_upload_redacted(source)
     # No destination exists until ALL bytes have passed inspection.
-    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
     with os.fdopen(fd, "wb") as stream:
         stream.write(raw)
         stream.flush()
