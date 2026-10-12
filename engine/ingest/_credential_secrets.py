@@ -191,6 +191,9 @@ _RULES: tuple[_Rule, ...] = (
        ("github_pat_",)),
     # Hugging Face.
     _r("huggingface-token", r"\bhf_[A-Za-z]{34}\b", ("hf_",)),
+    # Capy (capy.ai) API key: `capy_` + 43 characters, org-wide with its
+    # owner's full role (no scopes).
+    _r("capy-api-key", r"\bcapy_[A-Za-z0-9_\-]{43}(?![A-Za-z0-9_\-])", ("capy_",)),
     # Slack.
     _r("slack-token", r"\bxox[baprse]-[A-Za-z0-9\-]{10,250}\b", ("xox",)),
     _r("slack-webhook", r"https://hooks\.slack\.com/services/[A-Za-z0-9/]{20,120}",
