@@ -74,8 +74,10 @@ from engine.ingest.atif.compare import (
     covered_fragments,
     first_difference,
     fragments_difference,
+    has_images,
     result_data,
 )
+from engine.ingest.atif.fold import fold
 from engine.ingest.atif.fragment import fragment
 from engine.ingest.atif.lines import lines_from_trajectory
 from engine.ingest.atif.models import Trajectory
@@ -87,7 +89,14 @@ from engine.ingest.atif.store import (
     trajectory_key,
     write_trajectory,
 )
-from engine.ingest.atif.uploaded import fold_fragments, fragment_lines, fragment_ordinal
+from engine.ingest.atif.uploaded import (
+    as_version_1,
+    fold_fragments,
+    fragment_lines,
+    fragment_ordinal,
+    fragments_like,
+    image_parts,
+)
 from engine.ingest.handlers.base import make_default_context
 from engine.ingest.normalizer import Normalizer
 from engine.shared import claude_code_extraction as _ext
@@ -350,7 +359,18 @@ def _builders(
                 None,
             )
     reference, folded = built[Builder.REFERENCE], built[Builder.FOLD]
-    diff = _first_difference(_result_data(reference), _result_data(folded))
+    # The frozen builder predates images: compare it with the fold of the
+    # version-1 fragments (engine/ingest/atif/compare.py IMAGES).
+    comparable = (
+        fold(
+            [fragment(e, 1) for e in events if isinstance(e, dict)],
+            session_id=session_id,
+            agent_name=agent,
+        )
+        if has_images(folded)
+        else folded
+    )
+    diff = _first_difference(_result_data(reference), _result_data(comparable))
     return (
         {"builders_same": diff is None, "builders_diff": diff, "builders_error": None},
         reference,
@@ -373,7 +393,14 @@ def _uploaded_builders(
         )
         kept, missing = covered_fragments(fragments, events)
         folded = fold_fragments(kept, session_id, agent)
-        server = [fragment(e) for e in events if isinstance(e, dict)]
+        # In each client fragment's own version; the frozen builder is compared
+        # with the version-1 fragments (engine/ingest/atif/compare.py IMAGES).
+        server = fragments_like(events, kept)
+        comparable = (
+            fold_fragments([as_version_1(f) for f in kept], session_id, agent)
+            if image_parts(kept)
+            else folded
+        )
     except Exception as exc:  # a crash on a real shape fails the gate
         return (
             {
@@ -384,7 +411,7 @@ def _uploaded_builders(
             None,
             None,
         )
-    diff = _first_difference(_result_data(reference), _result_data(folded))
+    diff = _first_difference(_result_data(reference), _result_data(comparable))
     fragments_diff, _differing = fragments_difference(kept, server)
     return (
         {

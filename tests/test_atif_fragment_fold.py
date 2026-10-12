@@ -33,6 +33,8 @@ from engine.ingest.atif.build import Builder, build_and_render, build_trajectory
 from engine.ingest.atif.fold import Unreadable, fold, line_of
 from engine.ingest.atif.fragment import (
     FRAGMENT_VERSION,
+    FRAGMENT_VERSIONS,
+    IMAGE_MEDIA_TYPES,
     Kind,
     PieceType,
     fragment,
@@ -40,6 +42,8 @@ from engine.ingest.atif.fragment import (
 )
 from engine.ingest.atif.lines import lines_from_trajectory
 from engine.ingest.atif.models import Trajectory
+from engine.ingest.atif.store import strip_provenance
+from engine.ingest.atif.uploaded import as_version_1, fragment_lines, fragments_like, image_parts
 from engine.shared.transcript_render import line_from_event, lines_from_events
 from tests.test_atif_build import CASES as BUILD_CASES
 from tests.test_atif_build import FIXTURES as PROTOCOL_V2
@@ -390,6 +394,74 @@ ALL_CASES: dict[str, tuple[list[dict[str, Any]], str]] = {
 NAMES = sorted(ALL_CASES)
 
 
+def _sha(seed: str) -> str:
+    return hashlib.sha256(seed.encode()).hexdigest()
+
+
+def _pasted(seed: str, mime: str = "image/png", **extra: Any) -> dict[str, Any]:
+    """A pasted image as a tap that uploaded it sends it (probe-events/1
+    media_block with `sha256`)."""
+    return {"type": "image", "mimeType": mime, "bytes": 1234, "sha256": _sha(seed), **extra}
+
+
+#: Sessions whose researcher pasted images the tap uploaded. NOT equality cases:
+#: version 2 carries the images, which the frozen builder cannot.
+IMAGE_CASES: dict[str, list[dict[str, Any]]] = {
+    "text then two images then text": [
+        _ev(
+            _user(
+                [
+                    {"type": "text", "text": "what is wrong here?"},
+                    _pasted("a"),
+                    _pasted("b", "image/jpeg"),
+                    {"type": "text", "text": "and here"},
+                ],
+                timestamp="2026-10-12T00:00:00Z",
+            ),
+            0,
+        ),
+        _ev(_assistant([{"type": "text", "text": "the axis"}], inference_id="m1"), 1),
+    ],
+    "an image alone is a prompt": [
+        _ev(_user([_pasted("c", "image/webp")]), 0),
+        _ev(_assistant([{"type": "text", "text": "a cat"}], inference_id="m1"), 1),
+    ],
+    "an image beside a result and other dropped blocks": [
+        _ev(_assistant([{"type": "tool_use", "id": "t1", "name": "Bash"}], inference_id="m1"), 0),
+        _ev(
+            _user(
+                [
+                    {"type": "tool_result", "tool_use_id": "t1", "is_error": True},
+                    {"type": "document"},
+                    {"type": "text", "text": "see"},
+                    _pasted("d", "image/gif"),
+                    {"type": "image", "mimeType": "image/png", "bytes": 9},
+                ]
+            ),
+            1,
+        ),
+    ],
+    "only some images carry a usable digest": [
+        _ev(
+            _user(
+                [
+                    {"type": "text", "text": "three"},
+                    _pasted("e"),
+                    {"type": "image", "mimeType": "image/png", "bytes": 5, "sha256": "ab" * 31},
+                    {"type": "image", "mimeType": "image/png", "sha256": _sha("f").upper()},
+                    {"type": "image", "mimeType": "image/svg+xml", "sha256": _sha("g")},
+                    {"type": "image", "sha256": _sha("h")},
+                ]
+            ),
+            0,
+        ),
+    ],
+    "the same image twice": [
+        _ev(_user([{"type": "text", "text": "again"}, _pasted("i"), _pasted("i")]), 0),
+    ],
+}
+
+
 def _data(built: Any) -> dict[str, Any]:
     return {
         "trajectory": built.trajectory,
@@ -554,20 +626,18 @@ def _keys(fragments: list[dict[str, Any]]) -> set[str]:
 def test_every_key_a_fragment_carries_is_documented() -> None:
     import engine.ingest.atif.fragment as fragment_mod
 
+    every = [*ALL_CASES.values(), *((events, "claude_code") for events in IMAGE_CASES.values())]
     emitted = set()
-    for events, _agent in ALL_CASES.values():
+    for events, _agent in every:
         emitted |= _keys(_fragments(events))
     doc = fragment_mod.__doc__ or ""
     undocumented = sorted(k for k in emitted if k not in doc)
     assert not undocumented, f"document these in fragment.py's schema: {undocumented}"
     # Keys the cases must exercise, not merely allow (the harness goldens end
     # turns with `end_turn` and `tool_use`, which no Line prints).
-    assert {"stop", "stop_reason", "extras", "lineage"} <= emitted
+    assert {"stop", "stop_reason", "extras", "lineage", "media_type", "sha256"} <= emitted
     assert {p.value for p in PieceType} <= {
-        p["type"]
-        for events, _a in ALL_CASES.values()
-        for f in _fragments(events)
-        for p in f.get("parts") or []
+        p["type"] for events, _a in every for f in _fragments(events) for p in f.get("parts") or []
     }
 
 
@@ -578,6 +648,16 @@ VENDORED_PINS: dict[int, dict[str, str]] = {
     1: {
         "engine/ingest/atif/fragment.py": (
             "83cbfbe7341db227592c5a82c37e8a47201890def95e1f852b0478534fff89cb"
+        ),
+        "engine/shared/transcript_render.py": (
+            "c0bb4168f7aa86f89a9c6360d1f120b588458d94ad5e0b84cd9c077942008c9e"
+        ),
+    },
+    # Version 2 (pasted images). The same file still builds version 1, byte
+    # for byte: test_version_1_fragments_are_what_they_were.
+    2: {
+        "engine/ingest/atif/fragment.py": (
+            "b0d5ac850d7c84ff1028d42ee95a04041c80ce1f73b6ea580ec8b00a2516a809"
         ),
         "engine/shared/transcript_render.py": (
             "c0bb4168f7aa86f89a9c6360d1f120b588458d94ad5e0b84cd9c077942008c9e"
@@ -829,7 +909,8 @@ def test_a_field_of_the_wrong_type_makes_the_fragment_unreadable(path: tuple, va
 
 def test_fold_publishes_the_fragment_versions_it_reads() -> None:
     """The door intersects its own setting with this."""
-    assert frozenset({FRAGMENT_VERSION}) == fold_mod.SUPPORTED_FRAGMENT_VERSIONS
+    assert frozenset({1, 2}) == frozenset(FRAGMENT_VERSIONS) == fold_mod.SUPPORTED_FRAGMENT_VERSIONS
+    assert FRAGMENT_VERSION == max(FRAGMENT_VERSIONS) == 2
 
 
 def test_an_unknown_version_is_unreadable_and_named() -> None:
@@ -1184,3 +1265,240 @@ def test_build_and_render_runs_the_builder_it_is_given(
     assert _data(built) == _data(
         build_reference.build_trajectory(INGEST_EVENTS, session_id="s", agent_name="claude_code")
     )
+
+
+# -- version 2: pasted images ---------------------------------------------------------
+
+#: sha256 of every version-1 fragment of every case (in NAMES order, each case's
+#: name then its fragments, compact JSON, key order kept), taken from main
+#: (edd6819) before version 2 existed. Version 1 is what every tap released so
+#: far builds: the same file must keep building it byte for byte.
+V1_FRAGMENTS_SHA256 = "0d952a9883c318a47f3b2cbe5c0ef7a4b1ead2d666f1efac6ff51522c82c8d23"
+
+
+def test_version_1_fragments_are_what_they_were() -> None:
+    digest = hashlib.sha256()
+    count = 0
+    for name in NAMES:
+        events, _agent = ALL_CASES[name]
+        frags = [fragment(e, 1) for e in events if isinstance(e, dict)]
+        count += len(frags)
+        digest.update(
+            json.dumps([name, frags], separators=(",", ":"), ensure_ascii=False).encode()
+        )
+    assert (len(NAMES), count) == (344, 4813)
+    assert digest.hexdigest() == V1_FRAGMENTS_SHA256
+
+
+def test_version_2_is_version_1_plus_image_parts() -> None:
+    """Without its image parts (and `v`), a version-2 fragment IS the version-1
+    fragment, key order included: what the frozen builder is compared with."""
+    every = [*(events for events, _a in ALL_CASES.values()), *IMAGE_CASES.values()]
+    for events in every:
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            v1, v2 = fragment(ev, 1), fragment(ev, 2)
+            assert json.dumps(as_version_1(v2)) == json.dumps(v1)
+            assert fragment_line(v1) == fragment_line(v2), "an image moves no Line"
+    for events, _a in ALL_CASES.values():
+        for ev in events:
+            if isinstance(ev, dict):
+                assert json.dumps(fragment(ev, 2)) == json.dumps({**fragment(ev, 1), "v": 2})
+
+
+@pytest.mark.parametrize("version", [0, 3, "2", True, None])
+def test_only_a_version_this_module_builds_is_built(version: Any) -> None:
+    with pytest.raises(ValueError):
+        fragment(_ev(_user("x"), 0), version)
+
+
+def test_a_pasted_image_with_its_digest_is_an_image_part() -> None:
+    [first, _second] = IMAGE_CASES["text then two images then text"]
+    v2 = fragment(first)
+    assert v2["v"] == FRAGMENT_VERSION == 2
+    assert v2["parts"] == [
+        {"type": "text", "seq": 0, "text": "what is wrong here?"},
+        {"type": "image", "seq": 1, "media_type": "image/png", "sha256": _sha("a")},
+        {"type": "image", "seq": 2, "media_type": "image/jpeg", "sha256": _sha("b")},
+        {"type": "text", "seq": 3, "text": "and here"},
+    ]
+    assert v2["dropped_blocks"] == ["image", "image"], "still named, as version 1 names them"
+    v1 = fragment(first, 1)
+    assert [p["type"] for p in v1["parts"]] == ["text", "text"]
+    assert "1234" not in json.dumps(v2), "never the bytes, nor their size"
+
+
+def test_an_image_without_a_usable_digest_or_type_stays_a_dropped_block() -> None:
+    [only] = IMAGE_CASES["only some images carry a usable digest"]
+    frag = fragment(only)
+    assert [(p["type"], p.get("sha256")) for p in frag["parts"]] == [
+        ("text", None),
+        ("image", _sha("e")),
+    ]
+    assert frag["dropped_blocks"] == ["image"] * 5
+
+
+def _image_steps(built: Any) -> list[dict[str, Any]]:
+    return [
+        s for s in built.trajectory["steps"]
+        if isinstance(s["message"], list) and any(p["type"] == "image" for p in s["message"])
+    ]
+
+
+def test_fold_carries_an_uploaded_image_as_an_atif_image_part() -> None:
+    events = IMAGE_CASES["text then two images then text"]
+    built = _fold(_fragments(events))
+    [step] = _image_steps(built)
+    assert step["source"] == "user" and step["timestamp"] == "2026-10-12T00:00:00Z"
+    assert step["message"] == [
+        {"type": "text", "text": "what is wrong here?"},
+        {"type": "image", "source": {"media_type": "image/png", "path": f"media/{_sha('a')}.png"}},
+        {"type": "image", "source": {"media_type": "image/jpeg", "path": f"media/{_sha('b')}.jpg"}},
+        {"type": "text", "text": "and here"},
+    ]
+    assert "dropped_blocks" not in step["extra"], "a carried image is not dropped"
+    # The index is untouched: the trajectory renders the events' own Lines.
+    assert lines_from_trajectory(built.trajectory) == lines_from_events(events)
+    assert fragment_lines(_fragments(events)).lines == lines_from_events(events)
+    # What readers get keeps the image (provenance is all that goes).
+    stored = strip_provenance(built.trajectory)
+    Trajectory.model_validate(stored)
+    assert stored["steps"][0]["message"][1]["source"]["path"] == f"media/{_sha('a')}.png"
+
+
+def test_an_image_alone_is_a_user_step() -> None:
+    events = IMAGE_CASES["an image alone is a prompt"]
+    built = _fold(_fragments(events))
+    first = built.trajectory["steps"][0]
+    assert first["source"] == "user"
+    assert first["message"] == [
+        {"type": "image", "source": {"media_type": "image/webp", "path": f"media/{_sha('c')}.webp"}}
+    ]
+    # Version 1 makes no step of it, exactly as the frozen builder.
+    v1 = _fold([fragment(e, 1) for e in events])
+    assert v1.trajectory["steps"][0]["source"] == "agent"
+
+
+def test_only_a_carried_image_leaves_dropped_blocks() -> None:
+    built = _fold(_fragments(IMAGE_CASES["an image beside a result and other dropped blocks"]))
+    [step] = _image_steps(built)
+    # One image carried, one without a digest still dropped, the document too.
+    assert step["extra"]["dropped_blocks"] == ["document", "image"]
+    assert [p["type"] for p in step["message"]] == ["text", "image"]
+    assert built.trajectory["steps"][0]["observation"]["results"][0]["extra"]["is_error"] is True
+
+
+@pytest.mark.parametrize("name", sorted(IMAGE_CASES))
+def test_fold_of_version_1_of_image_sessions_is_the_reference(name: str) -> None:
+    events = IMAGE_CASES[name]
+    reference = build_reference.build_trajectory(events, session_id="s", agent_name="claude_code")
+    folded = fold(
+        [as_version_1(f) for f in _fragments(events)], session_id="s", agent_name="claude_code"
+    )
+    assert _data(folded) == _data(reference)
+    assert _data(fold([fragment(e, 1) for e in events], session_id="s", agent_name="claude_code")) == (
+        _data(reference)
+    )
+
+
+def test_the_fold_builder_shows_images_and_the_reference_does_not() -> None:
+    events = IMAGE_CASES["text then two images then text"]
+    folded = build_trajectory(events, session_id="s", agent_name="claude_code", builder="fold")
+    reference = build_trajectory(events, session_id="s", agent_name="claude_code")
+    assert len(_image_steps(folded)) == 1 and not _image_steps(reference)
+
+
+@pytest.mark.parametrize(
+    ("change", "readable"),
+    [
+        ({}, True),
+        ({"sha256": "A" * 64}, False),
+        ({"sha256": "a" * 63}, False),
+        ({"sha256": "../" + "a" * 61}, False),
+        ({"sha256": None}, False),
+        ({"media_type": "image/svg+xml"}, False),
+        ({"media_type": "text/html"}, False),
+        ({"media_type": 5}, False),
+        ({"v": 1}, False),
+    ],
+    ids=str,
+)
+def test_an_image_part_is_read_as_untrusted(change: dict[str, Any], readable: bool) -> None:
+    """Its digest and type become a path a reader fetches: only a type ATIF
+    names and 64 lowercase hex (nothing that leaves `media/`) are readable,
+    and only in version 2."""
+    [frag] = _fragments(IMAGE_CASES["an image alone is a prompt"][:1])
+    target = copy.deepcopy(frag)
+    if "v" in change:
+        target["v"] = change["v"]
+    else:
+        target["parts"][0].update(change)
+    built = _fold([target])
+    assert (built.unparsed == 0) is readable
+    assert bool(_image_steps(built)) is readable
+
+
+def test_the_paths_fold_writes_are_the_keys_the_engine_stores() -> None:
+    from engine.shared.session_suppression import is_own_folder_key, session_folder
+    from kb.session_media import media_key
+
+    folder = session_folder("claude_code", "cust", "sid")
+    for media_type, ext in IMAGE_MEDIA_TYPES.items():
+        key = media_key("claude_code", "cust", "sid", "a" * 64, media_type)
+        assert key == f"{folder}{fold_mod.media_path('a' * 64, media_type)}"
+        assert key.endswith(f"/media/{'a' * 64}.{ext}")
+        assert is_own_folder_key(key, folder), "a session deletion removes it"
+    assert not is_own_folder_key(f"{folder}media/{'a' * 64}.svg", folder)
+    assert not is_own_folder_key(f"{folder}media/x/{'a' * 64}.png", folder)
+
+
+def test_server_fragments_are_built_in_the_clients_version() -> None:
+    """The shadow and the scripts compare a client's fragments with this
+    engine's: a version-1 client (every tap so far) must not read as
+    different because this engine's newest version is 2."""
+    events = [*IMAGE_CASES["text then two images then text"], *ALL_CASES["ingest:EVENTS"][0]]
+    events = [{**e, "line_no": i} for i, e in enumerate(events)]
+    for version in FRAGMENT_VERSIONS:
+        client = [fragment(e, version) for e in events]
+        assert fragments_like(events, client) == client
+    mixed = [fragment(e, 1 + i % 2) for i, e in enumerate(events)]
+    assert fragments_like(events, mixed) == mixed
+    assert image_parts([fragment(e, 2) for e in events]) == 2
+    assert image_parts([fragment(e, 1) for e in events]) == 0
+
+
+@pytest.mark.parametrize("builder", ["fold", "reference"])
+def test_the_shadow_compares_image_sessions_with_the_frozen_builder(builder: str) -> None:
+    from engine.ingest.atif.compare import shadow
+
+    events = [
+        {**e, "line_no": i}
+        for i, e in enumerate(
+            [*IMAGE_CASES["text then two images then text"], *IMAGE_CASES["an image alone is a prompt"]]
+        )
+    ]
+    # Protocol 2: the pass's own build (fold of version 2) carries the images.
+    built = build_trajectory(events, session_id="s", agent_name="claude_code", builder=builder)
+    record = shadow(events, None, built, builder, "s", "claude_code")
+    assert record["same_trajectory"] is True, record["trajectory_diff"]
+    # Protocol 3, a version-2 client: same fragments, and the same trajectory
+    # once the images (which only version 2 has) are set aside.
+    client = [fragment(e, 2) for e in events]
+    own = fold(client, session_id="s", agent_name="claude_code")
+    record = shadow(events, client, own, builder, "s", "claude_code")
+    assert (record["same_fragments"], record["same_trajectory"]) == (True, True), record
+    assert record["images"] == 3
+    # A version-1 client of the same session.
+    v1 = [fragment(e, 1) for e in events]
+    record = shadow(events, v1, fold(v1, session_id="s", agent_name="claude_code"), builder,
+                    "s", "claude_code")
+    assert (record["same_fragments"], record["same_trajectory"], record["images"]) == (
+        True, True, 0
+    )
+    # A client whose image part differs from what its events say still shows.
+    bad = copy.deepcopy(client)
+    bad[0]["parts"][1]["sha256"] = _sha("not-it")
+    record = shadow(events, bad, None, builder, "s", "claude_code")
+    assert record["same_fragments"] is False and record["fragments_differing"] == 1
+    assert record["fragments_diff"]["path"] == "parts[1].sha256"

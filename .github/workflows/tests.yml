@@ -242,6 +242,8 @@ jobs:
       # frozen builder, what the ingest pass serves and stores, and
       # GET /trajectory's tenancy. The protocol3 files run a session uploaded
       # as ATIF fragments through the door, the worker and the scripts.
+      # test_session_media runs pasted images through the upload route, real
+      # presigned PUTs to MinIO, the worker's promotion, deletion and the sweep.
       # Keep comments here, above the step:
       # a `#` inside the folded `run: >-` scalar comments out every file after it.
       - name: Tests (session protocol and bootstrap)
@@ -300,6 +302,7 @@ jobs:
           tests/test_inactive_tenants.py
           tests/test_tenant_purge_coverage.py
           tests/test_session_deletion.py
+          tests/test_session_media.py
 
       # Scoped to the STORAGE suite (Postgres + MinIO), not `tests/` wholesale.
       # The full suite has ~42 pre-existing failures unrelated to storage: tests that

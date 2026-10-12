@@ -27,6 +27,12 @@ frozen builder (build_reference.py) builds:
 The client's fragments are what the pass serves either way: they are the
 client's word, and the events are canary evidence only. A difference is what
 the flip waits on (R3), never a reason to serve something else.
+
+IMAGES (fragment version 2). The frozen builder predates them, so every
+comparison with it reads the version-1 fragments of the same events (version 2
+is version 1 plus image parts: uploaded.as_version_1). The client's fragments
+are compared with this engine's in the version each one declares
+(uploaded.fragments_like), images included; `images` counts the client's.
 """
 
 from __future__ import annotations
@@ -37,7 +43,7 @@ from engine.ingest.atif import build_reference
 from engine.ingest.atif.build import Builder, builder_for
 from engine.ingest.atif.fold import BuildResult, fold
 from engine.ingest.atif.fragment import fragment
-from engine.ingest.atif.uploaded import fragment_ordinal
+from engine.ingest.atif.uploaded import as_version_1, fragment_ordinal, fragments_like, image_parts
 
 #: Root `extra` keys of a stored trajectory.json that stamp the WRITE rather
 #: than come out of the build (scripts/atif_sessions.py compares without them).
@@ -110,7 +116,11 @@ PATH_KEYS = frozenset(
         "codex_extras",
         "pi_extras",
         "kimi_extras",
-        # the fragment (fragment.py, FRAGMENT_VERSION 1)
+        # ATIF image content parts (fold.py)
+        "media_type",
+        "path",
+        # the fragment (fragment.py, FRAGMENT_VERSION 1 and 2)
+        "sha256",
         "v",
         "line",
         "line_no",
@@ -262,10 +272,11 @@ def shadow(
     record: dict[str, Any] = {"events": len(events)}
     if client_fragments is None:
         configured = builder_for(builder)
-        if built is not None and configured is Builder.FOLD:
+        if built is not None and configured is Builder.FOLD and not has_images(built):
             folded = built
         else:
-            server = [fragment(e) for e in events]
+            # Version 1: what the frozen builder can make (IMAGES above).
+            server = [fragment(e, 1) for e in events]
             folded = fold(server, session_id=session_id, agent_name=agent_name)
         if built is not None and configured is Builder.REFERENCE:
             reference = built
@@ -279,11 +290,14 @@ def shadow(
         )
     else:
         kept, missing = covered_fragments(client_fragments, events)
-        diff, differing = fragments_difference(kept, [fragment(e) for e in events])
-        if built is not None and not missing:
+        diff, differing = fragments_difference(kept, fragments_like(events, kept))
+        images = image_parts(kept)
+        if built is not None and not missing and not images:
             folded = built
         else:
-            folded = fold(kept, session_id=session_id, agent_name=agent_name)
+            folded = fold(
+                [as_version_1(f) for f in kept], session_id=session_id, agent_name=agent_name
+            )
         reference = _reference(events, session_id, agent_name)
         record.update(
             fragments=len(client_fragments),
@@ -291,6 +305,7 @@ def shadow(
             same_fragments=diff is None,
             fragments_diff=diff,
             fragments_differing=differing,
+            images=images,
         )
     trajectory_diff = builds_difference(folded, reference)
     record.update(
@@ -302,6 +317,17 @@ def shadow(
         reference_unparsed=reference.unparsed,
     )
     return record
+
+
+def has_images(built: BuildResult) -> bool:
+    """Whether a build carries an image content part (fold of version-2
+    fragments): one the frozen builder cannot make."""
+    return any(
+        isinstance(part, dict) and part.get("type") == "image"
+        for step in built.trajectory.get("steps") or []
+        if isinstance(step.get("message"), list)
+        for part in step["message"]
+    )
 
 
 def _reference(events: list[dict[str, Any]], session_id: str, agent_name: str) -> BuildResult:

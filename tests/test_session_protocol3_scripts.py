@@ -377,7 +377,7 @@ def _p3_batch(**payload: Any) -> bytes:
 
     events = [{"line_no": i, "raw": raw} for i, raw in enumerate(e["raw"] for e in EVENTS[:2])]
     body = {"protocol_version": 3, "fragment_version": 1, "events": events,
-            "fragments": [fragment(e) for e in events]}
+            "fragments": [fragment(e, 1) for e in events]}
     body.update(payload)
     return orjson.dumps({"payload": body})
 

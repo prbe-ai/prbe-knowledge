@@ -58,8 +58,7 @@ from typing import Any
 
 import orjson
 
-from engine.ingest.atif.fragment import fragment
-from engine.ingest.atif.uploaded import fragment_lines
+from engine.ingest.atif.uploaded import fragment_lines, fragments_like
 from engine.ingest.probe_events.project import dropped_paths, project_event
 from engine.shared import storage
 from engine.shared.constants import AGENT_SESSION_SOURCES
@@ -106,7 +105,9 @@ def strip_batch(
         return None, "clean", 0, []
     if lines_from_events(stripped) != lines_from_events(events):
         return None, "lines_changed", 0, dropped
-    if "fragments" in payload and _fragments_of(stripped) != _fragments_of(events):
+    if "fragments" in payload and _fragments_of(stripped, payload["fragments"]) != _fragments_of(
+        events, payload["fragments"]
+    ):
         return None, "fragments_changed", 0, dropped
     # Everything else in the payload -- a protocol-3 batch's fragments included
     # -- is kept as it is.
@@ -134,7 +135,7 @@ def _drop_fragment_events(
         return None, "no_events", 0, []
     if not isinstance(fragments, list) or fragment_lines(fragments).degraded:
         return None, "degraded", 0, []
-    if _canonical(_fragments_of(events)) != _canonical(fragments):
+    if _canonical(_fragments_of(events, fragments)) != _canonical(fragments):
         return None, "fragments_differ", 0, []
     new_payload = {k: v for k, v in payload.items() if k != "events"}
     new_envelope = {**envelope, "payload": new_payload} if "payload" in envelope else new_payload
@@ -159,8 +160,10 @@ def _canonical(value: Any) -> bytes:
     return orjson.dumps(value, option=orjson.OPT_SORT_KEYS)
 
 
-def _fragments_of(events: list[Any]) -> list[dict[str, Any]]:
-    return [fragment(e) for e in events if isinstance(e, dict)]
+def _fragments_of(events: list[Any], stored: Any) -> list[dict[str, Any]]:
+    """This engine's fragments of `events`, each in the version of the stored
+    fragment at its ordinal (a batch's fragments are compared as sent)."""
+    return fragments_like(events, stored if isinstance(stored, list) else [])
 
 
 async def _blocked(customer_id: str, source: str, session_id: str) -> str | None:

@@ -30,7 +30,13 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from engine.ingest.atif.fold import BuildResult, fold, line_of
-from engine.ingest.atif.fragment import Kind, fragment
+from engine.ingest.atif.fragment import (
+    FRAGMENT_VERSION,
+    FRAGMENT_VERSIONS,
+    Kind,
+    PieceType,
+    fragment,
+)
 from engine.shared.transcript_render import Line
 
 #: The longest Line text the pass reads from one fragment. The event path has
@@ -113,6 +119,57 @@ def fragment_lines(fragments: Iterable[Any]) -> FragmentLines:
 def _named(value: object) -> bool:
     """An error a fragment reports: a non-empty string (as fold reads `error`)."""
     return isinstance(value, str) and bool(value)
+
+
+def fragments_like(events: list[Any], client: list[Any]) -> list[dict[str, Any]]:
+    """This engine's fragment of each event, built in the version the client's
+    fragment at the same ordinal declares (`v`), so the two compare field for
+    field; FRAGMENT_VERSION where the client has none this engine builds.
+    Non-object events are skipped, as everywhere else."""
+    versions: dict[int, int] = {}
+    for item in client:
+        ordinal = fragment_ordinal(item)
+        version = item.get("v") if isinstance(item, dict) else None
+        if ordinal is not None and type(version) is int and version in FRAGMENT_VERSIONS:
+            versions.setdefault(ordinal, version)
+    out: list[dict[str, Any]] = []
+    for ev in events:
+        if isinstance(ev, dict):
+            line_no = ev.get("line_no")
+            version = versions.get(line_no, FRAGMENT_VERSION) if type(line_no) is int else None
+            out.append(fragment(ev, FRAGMENT_VERSION if version is None else version))
+    return out
+
+
+def as_version_1(item: Any) -> Any:
+    """A version-2 fragment as the version-1 fragment of the same event: its
+    image parts removed (fragment.py: version 2 is version 1 plus those), `v`
+    set to 1. The frozen builder (build_reference.py) predates images, so a
+    comparison with it reads this. Anything else is returned as it is."""
+    if not (isinstance(item, dict) and type(item.get("v")) is int and item["v"] == 2):
+        return item
+    out = {**item, "v": 1}
+    parts = item.get("parts")
+    if isinstance(parts, list):
+        kept = [
+            p for p in parts if not (isinstance(p, dict) and p.get("type") == PieceType.IMAGE.value)
+        ]
+        if kept:
+            out["parts"] = kept
+        else:
+            del out["parts"]
+    return out
+
+
+def image_parts(fragments: Iterable[Any]) -> int:
+    """How many image parts `fragments` carry (version 2)."""
+    return sum(
+        1
+        for item in fragments
+        if isinstance(item, dict) and isinstance(item.get("parts"), list)
+        for part in item["parts"]
+        if isinstance(part, dict) and part.get("type") == PieceType.IMAGE.value
+    )
 
 
 def session_fragments(fragments: list[Any], events: list[Any]) -> list[Any]:
