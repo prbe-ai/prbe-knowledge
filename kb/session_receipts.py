@@ -127,18 +127,29 @@ def protocol2_retired(customer_id: str, settings: Settings | None = None) -> boo
     )
 
 
+def media_enabled(customer_id: str, settings: Settings | None = None) -> bool:
+    """May this customer upload pasted images now (kb/session_media.py)?"""
+    s = settings or get_settings()
+    return s.session_media_all or customer_id in _csv(s.session_media_customers)
+
+
 def accepts(customer_id: str, settings: Settings | None = None) -> dict:
     """What a client may start a NEW stream with. An existing stream keeps the
-    protocol it was pinned to, whatever this says."""
+    protocol it was pinned to, whatever this says. `media: true`, only for a
+    customer images are enabled for, tells the client it may upload pasted
+    images (kb/session_media.py); absent, it keeps their placeholders."""
     s = settings or get_settings()
     protocols = [] if protocol2_retired(customer_id, s) else [PROTOCOL_EVENTS]
     if protocol3_enabled(customer_id, s):
         protocols.append(PROTOCOL_FRAGMENTS)
-    return {
+    out: dict = {
         "protocols": protocols,
         "fragment_versions": fragment_versions(s),
         "events": s.session_protocol3_events,
     }
+    if media_enabled(customer_id, s):
+        out["media"] = True
+    return out
 
 
 def payload_protocol(payload: dict) -> int:
@@ -516,6 +527,13 @@ async def accept(payload: dict, customer: str, source: SourceSystem, store) -> d
             snapshot_end,
             snapshot_hash,
         )
+        # The pasted images this batch names are owed a promotion from the
+        # moment it is accepted (kb/session_media.py): stamped in the same
+        # commit, so the sweep can retry what a worker pass failed to promote.
+        from kb.session_media import mark_named, named_media
+
+        if named := named_media(payload):
+            await mark_named(conn, customer, source.value, sid, named)
         return {"status": "accepted", "protocol_version": protocol, "receipt": _receipt(row)}
 
 

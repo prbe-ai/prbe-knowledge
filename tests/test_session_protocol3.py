@@ -38,7 +38,7 @@ from structlog.testing import capture_logs
 from engine.ingest.atif import compare as compare_mod
 from engine.ingest.atif import uploaded
 from engine.ingest.atif.fold import fold
-from engine.ingest.atif.fragment import FRAGMENT_VERSION, fragment
+from engine.ingest.atif.fragment import fragment
 from engine.ingest.atif.mode import render_mode
 from engine.ingest.atif.store import trajectory_key
 from engine.ingest.handlers.base import make_default_context
@@ -102,6 +102,12 @@ SESSIONS: dict[str, tuple[list[dict[str, Any]], str]] = {
 NAMES = sorted(SESSIONS)
 
 
+#: What every tap released so far builds and stamps (`fragment_version`), and
+#: the only version the door accepts by default (SESSION_FRAGMENT_VERSIONS=1).
+#: Version 2 (pasted images) is sent once the door also lists it.
+TAP_FRAGMENT_VERSION = 1
+
+
 def _numbered(events: list[Any]) -> list[dict[str, Any]]:
     """As the door requires: object events, ordinals 0..n-1."""
     return [dict(e, line_no=i) for i, e in enumerate(e for e in events if isinstance(e, dict))]
@@ -115,6 +121,7 @@ def session_batches(
     cuts: list[int] | None = None,
     with_events: bool = False,
     finalize: bool = True,
+    fragment_version: int = TAP_FRAGMENT_VERSION,
 ) -> list[dict[str, Any]]:
     """A session's batches as a tap sends them: the events split at `cuts`,
     then (unless `finalize` is False) the finalize that certifies the cursor."""
@@ -145,8 +152,8 @@ def session_batches(
         )
         chunk = copy.deepcopy(events[a:b])
         if protocol == SessionProtocol.FRAGMENTS:
-            body["fragments"] = [fragment(e) for e in chunk]
-            body["fragment_version"] = FRAGMENT_VERSION
+            body["fragments"] = [fragment(e, fragment_version) for e in chunk]
+            body["fragment_version"] = fragment_version
             if with_events:
                 body["events"] = chunk
         else:
@@ -169,7 +176,7 @@ def session_batches(
             **IDENTITY,
         )
         if protocol == SessionProtocol.FRAGMENTS:
-            end["fragment_version"] = FRAGMENT_VERSION
+            end["fragment_version"] = fragment_version
         out.append(end)
     return out
 
@@ -386,7 +393,10 @@ async def test_a_finalize_ends_the_session_and_a_later_batch_reopens_it(worker: 
         source_line_end=n + 1,
         prefix_sha256="c" * 64,
         fragments=[
-            fragment({"line_no": n, "raw": {"type": "user", "message": {"content": "more"}}})
+            fragment(
+                {"line_no": n, "raw": {"type": "user", "message": {"content": "more"}}},
+                TAP_FRAGMENT_VERSION,
+            )
         ],
     )
     del tail["finalize"]
@@ -530,11 +540,22 @@ def _compared(logs: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("version", [1, 2])
 @pytest.mark.parametrize("name", [n for n in NAMES if n.startswith(("golden:", "journal:"))])
-async def test_the_shadow_agrees_when_the_canary_events_match(worker: Worker, name: str) -> None:
+async def test_the_shadow_agrees_when_the_canary_events_match(
+    worker: Worker, name: str, version: int
+) -> None:
+    """In either fragment version a tap may send (2 once the door lists it)."""
     events, source = SESSIONS[name]
     sid = str(uuid4())
-    await worker.upload(P3, source, session_batches(events, protocol=3, sid=sid, with_events=True))
+    worker.configure(session_fragment_versions="1,2")
+    await worker.upload(
+        P3,
+        source,
+        session_batches(
+            events, protocol=3, sid=sid, with_events=True, fragment_version=version
+        ),
+    )
     with capture_logs() as logs:
         await worker.run(P3, source, sid)
     [line] = _compared(logs)
@@ -746,7 +767,7 @@ async def test_a_clients_fallback_fragment_keeps_its_place_and_fails_nothing(
     sid = str(uuid4())
     batches = session_batches(events, protocol=3, sid=sid)
     batches[1]["fragments"][0] = {
-        "v": FRAGMENT_VERSION,
+        "v": TAP_FRAGMENT_VERSION,
         "line": {"line_no": batches[1]["event_start"], "text": ""},
         "error": "KeyError",
     }

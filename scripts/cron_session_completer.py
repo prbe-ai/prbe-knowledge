@@ -18,6 +18,11 @@ being ended is simply live again (the end signal is no longer the newest key),
 and is re-ended and re-mined once when it next goes idle. Sessions whose newest
 key is already an end signal are skipped, so re-running is free: the sweep ends
 each idle session once, not once per run.
+
+Each run then sweeps staged pasted images (kb/session_media.py
+`sweep_media_staging`): staged objects older than a day, promoted or not, and
+the rows of images never promoted. `--dry-run` counts them instead; a customer
+the sweep could not finish fails the run, after every other one is swept.
 """
 from __future__ import annotations
 
@@ -27,6 +32,7 @@ import asyncio
 from engine.shared.config import get_settings
 from engine.shared.db import init_pool
 from kb.session_completer import enqueue_idle_session_finalizers
+from kb.session_media import sweep_media_staging
 
 #: Same floor as session-finalizer-nightly.yml.
 MIN_IDLE_MINUTES = 60
@@ -99,6 +105,10 @@ async def _main(argv: list[str] | None = None) -> None:
             f"{verb} {n} finalize events "
             f"(idle_minutes={idle_minutes} limit={args.limit})"
         )
+        swept = await sweep_media_staging(dry_run=args.dry_run)
+        print(f"media staging sweep: {swept} (dry_run={args.dry_run})")
+        if swept.get("customers_failed") or swept.get("objects_failed"):
+            raise SystemExit("media staging sweep did not finish; see session_media.sweep_failed")
     finally:
         from engine.shared.db import close_pool
 

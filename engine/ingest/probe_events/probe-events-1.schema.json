@@ -152,7 +152,12 @@
       "properties": {
         "type": { "enum": ["image", "audio", "video"] },
         "mimeType": { "type": "string", "maxLength": 200 },
-        "bytes": { "type": "integer", "minimum": 0 }
+        "bytes": { "type": "integer", "minimum": 0 },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "The SHA-256 of the image's bytes, set only when the client uploaded them (the server advertised `accepts.media`): the engine stores the image at `media/<sha256>.<ext>` in the session's folder. Absent otherwise."
+        }
       }
     },
     "media_url_block": {

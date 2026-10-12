@@ -51,12 +51,17 @@ extracted from it (`parent_doc_id`), their chunks, failed_chunks, acl_snapshots
 and inferred_edges_queue rows; the session's Document and AgentSession graph
 nodes with every edge touching them (surviving endpoints' `degree` decremented),
 their provenance, post-write-queue and pending_edges rows; its ingestion_queue
-row(s), ingestion_events, session_streams and session_batch_receipts. By author,
+row(s), ingestion_events, session_streams, session_batch_receipts and
+session_media. By author,
 the person's Person node too, when nothing but these sessions asserts it.
 
 Raw objects: `raw/<src>/<customer>/sessions-v2/<sid>/` (protocol-2 batches),
-`raw/<src>/<customer>/<sid>/` (the idle sweep's finalize marker and the
-extraction cache), and every protocol-1 batch. Those live under a DATE folder
+`raw/<src>/<customer>/<sid>/` (the idle sweep's finalize marker, the
+extraction cache, `trajectory.json` and the promoted pasted images under
+`media/`), `raw/<src>/<customer>/media-staging/<sid>/` (images uploaded and not
+promoted, kb/session_media.py; one uploaded on a URL handed out before the
+deletion can land after it and is swept within a day), and every protocol-1
+batch. Those live under a DATE folder
 (`raw/<src>/<customer>/YYYY/MM/DD/<sid>:<seq>.json`, kb/ingestion_app._payload_key)
 shared with every other session, so they are found through the rows that
 reference them -- queue `payload_s3_key(s)`, receipts, ingestion_events -- and
@@ -107,7 +112,9 @@ from engine.shared.session_signals import is_cron_marker_key, storage_id
 from engine.shared.session_suppression import (
     LEGACY_EVENT_SUFFIX_SQL,
     LEGAL_HOLD_VALUE_SQL,
+    MEDIA_STAGING_FOLDER,
     lock_session,
+    media_staging_prefix,
     own_folder_keys,
     read_legal_hold,
     session_folder,
@@ -115,6 +122,7 @@ from engine.shared.session_suppression import (
 )
 from engine.shared.storage import get_store
 from kb.admin_routes import verify_internal_knowledge_key
+from kb.session_media import delete_session_media_rows, session_media_count
 
 log = structlog.get_logger(__name__)
 
@@ -137,8 +145,8 @@ AGENT_SOURCES: tuple[str, ...] = tuple(s.value for s in AGENT_SESSION_SOURCES)
 _SESSION_ID_RE = re.compile(r"\A[A-Za-z0-9._-]{8,200}\Z")
 #: Names that sit at the session-folder level of `raw/<src>/<customer>/` and
 #: are NOT sessions. Deleting `raw/<src>/<customer>/sessions-v2/` would erase
-#: every protocol-2 session of the tenant.
-_RESERVED_IDS = frozenset({"sessions-v2"})
+#: every protocol-2 session of the tenant, `.../media-staging/` every staged image.
+_RESERVED_IDS = frozenset({"sessions-v2", MEDIA_STAGING_FOLDER})
 
 #: How long a run waits before sweeping again when a worker was mid-pass on the
 #: session. Most passes end well within it. One that outlasts it (a long
@@ -226,14 +234,22 @@ class SessionRef:
         return f"raw/{self.source}/{customer_id}/sessions-v2/{self.session_id}/"
 
     def folder(self, customer_id: str) -> str:
-        """The idle-sweep marker and extraction cache. NOT everything under it
-        is this session's (session_suppression.is_own_folder_key)."""
+        """The idle-sweep marker, extraction cache, trajectory and promoted
+        images. NOT everything under it is this session's
+        (session_suppression.is_own_folder_key)."""
         return session_folder(self.source, customer_id, self.session_id)
+
+    def media_staging_prefix(self, customer_id: str) -> str:
+        """Images uploaded and not promoted (kb/session_media.py). Only this
+        session's: staged images belong to UUID sessions. Trailing `/` is
+        load-bearing."""
+        return media_staging_prefix(self.source, customer_id, self.session_id)
 
     async def raw_keys(self, store: Any, bucket: str, customer_id: str) -> set[str]:
         """Every object under this session's own prefixes that exists now."""
         return {
             *await store.list_keys(bucket, self.v2_prefix(customer_id)),
+            *await store.list_keys(bucket, self.media_staging_prefix(customer_id)),
             *await own_folder_keys(store, bucket, self.folder(customer_id)),
         }
 
@@ -654,6 +670,7 @@ async def inventory(
         ref.session_id,
     )
     c["session_batch_receipts"] = len(receipts)
+    c["session_media"] = await session_media_count(conn, customer_id, ref.source, ref.session_id)
     inv.counts = {k: int(v or 0) for k, v in c.items()}
     return inv
 
@@ -757,6 +774,7 @@ async def _delete_rows(conn: Any, customer_id: str, ref: SessionRef, inv: Invent
         ref.source,
         ref.session_id,
     )
+    d["session_media"] = await delete_session_media_rows(conn, customer_id, ref.source, ref.session_id)
     return {k: v for k, v in d.items() if v}
 
 
@@ -897,8 +915,9 @@ async def _delete_objects(
     """Phase 3: journaled keys, then the session's own prefixes. Returns
     (objects deleted, keys that failed, own objects still there)."""
     deleted, failed = await store.delete_named_keys(bucket, keys)
-    d, _errors = await store.delete_prefix(bucket, ref.v2_prefix(customer_id))
-    deleted += d
+    for prefix in (ref.v2_prefix(customer_id), ref.media_staging_prefix(customer_id)):
+        d, _errors = await store.delete_prefix(bucket, prefix)
+        deleted += d
     n, bad = await store.delete_named_keys(
         bucket, await own_folder_keys(store, bucket, ref.folder(customer_id))
     )

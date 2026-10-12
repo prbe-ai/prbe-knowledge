@@ -218,30 +218,49 @@ async def is_session_deleted(customer_id: str, source: str, queue_event_id: str)
 
 #: The session's ATIF document (engine/ingest/atif/store.py), in its folder.
 TRAJECTORY_FILE = "trajectory.json"
+#: The session's pasted images, `media/<sha256>.<ext>` in its folder
+#: (kb/session_media.py promotes them there).
+MEDIA_FOLDER = "media/"
+#: Where an image waits, per session, between its upload and the batch that
+#: names it: `raw/<src>/<customer>/media-staging/<session>/<sha256>`. A folder
+#: of the customer's source folder, NOT of the session's, so a session id can
+#: never be it (kb/session_deletion.py `_RESERVED_IDS`).
+MEDIA_STAGING_FOLDER = "media-staging"
+_MEDIA_NAME = re.compile(r"[0-9a-f]{64}\.(?:jpg|png|gif|webp)\Z")
 
 
 def session_folder(source: str, customer_id: str, session_id: str) -> str:
     """`raw/<src>/<customer>/<session>/`: the idle sweep's `finalize.marker`
     (session_signals.cron_marker_key), the extraction cache
-    (extraction_cache.SegmentCache) and `trajectory.json`
-    (engine/ingest/atif/store.py). Trailing `/` is load-bearing."""
+    (extraction_cache.SegmentCache), `trajectory.json`
+    (engine/ingest/atif/store.py) and `media/` (kb/session_media.py). Trailing
+    `/` is load-bearing."""
     return f"raw/{source}/{customer_id}/{session_id}/"
+
+
+def media_staging_prefix(source: str, customer_id: str, session_id: str) -> str:
+    """This session's staged images (kb/session_media.py). Trailing `/` is
+    load-bearing: without it, session `ab`'s prefix would also hold `abc`'s."""
+    return f"raw/{source}/{customer_id}/{MEDIA_STAGING_FOLDER}/{session_id}/"
 
 
 def is_own_folder_key(key: str, folder: str) -> bool:
     """Is `key`, listed under `folder`, this session's own object?
 
     Every writer (the idle sweep's marker, the extraction cache,
-    trajectory.json) builds the folder from the RAW session id, and protocol 1
-    accepts `/` in one: session `X/y` keeps its objects under
-    `raw/<src>/<customer>/X/y/`, which is inside session `X`'s folder. Only the
-    shapes this session writes itself are its own.
+    trajectory.json, the promoted images) builds the folder from the RAW
+    session id, and protocol 1 accepts `/` in one: session `X/y` keeps its
+    objects under `raw/<src>/<customer>/X/y/`, which is inside session `X`'s
+    folder. Only the shapes this session writes itself are its own.
     """
     if not key.startswith(folder):
         return False
     rest = key[len(folder):]
     if rest in ("finalize.marker", TRAJECTORY_FILE):
         return True
+    media = rest.removeprefix(MEDIA_FOLDER)
+    if media != rest:
+        return bool(_MEDIA_NAME.match(media))
     cache = rest.removeprefix("extraction-cache/")
     return cache != rest and cache.endswith(".json") and "/" not in cache
 
@@ -294,7 +313,8 @@ async def reopen_deletion(exc: SessionDeleted, why: str, *, status: str = "faile
 
 async def sweep_session_folders(store: Any, exc: SessionDeleted) -> tuple[int, int]:
     """Delete each refused session's own objects under
-    `raw/<src>/<customer>/<session>/`. Returns (deleted, failed).
+    `raw/<src>/<customer>/<session>/`, and its staged images. Returns
+    (deleted, failed).
 
     A worker already mining a session when it was deleted keeps saving
     extraction-cache answers there until its write is refused, which can be
@@ -306,8 +326,11 @@ async def sweep_session_folders(store: Any, exc: SessionDeleted) -> tuple[int, i
     deleted = failed = 0
     for session_id in sorted(exc.session_ids):
         folder = session_folder(exc.source, exc.customer_id, session_id)
+        staged = await store.list_keys(
+            bucket, media_staging_prefix(exc.source, exc.customer_id, session_id)
+        )
         n, bad = await store.delete_named_keys(
-            bucket, await own_folder_keys(store, bucket, folder)
+            bucket, [*await own_folder_keys(store, bucket, folder), *staged]
         )
         deleted += n
         failed += len(bad)

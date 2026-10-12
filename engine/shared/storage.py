@@ -9,9 +9,11 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import boto3
+from boto3.s3.transfer import TransferConfig
 from botocore.client import Config as BotoConfig
 from botocore.exceptions import BotoCoreError, ClientError
 
@@ -83,6 +85,44 @@ class ObjectRead:
 
     body: bytes | None
     etag: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ObjectHead:
+    """What `ObjectStore.head` saw: the object's size, its stored SHA-256
+    checksum (base64, as S3 reports it) when the store keeps one, its type."""
+
+    size: int
+    checksum_sha256: str | None
+    content_type: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ObjectEntry:
+    """One listed object: key, size and when it was last written."""
+
+    key: str
+    size: int
+    last_modified: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class PresignedRequest:
+    """A request a client makes straight to the store, without credentials.
+
+    `headers` are part of the signature: the client sends exactly these, or
+    the store refuses the request."""
+
+    method: str
+    url: str
+    headers: dict[str, str]
+    expires_at: datetime
+
+
+#: Above this a server-side copy goes in parts (UploadPartCopy). A single
+#: CopyObject is capped at 5 GiB by S3 and a little under it by R2.
+_COPY_MULTIPART_THRESHOLD = 1024**3
+_COPY_PART_BYTES = 512 * 1024**2
 
 
 def _make_client(
@@ -268,6 +308,108 @@ class ObjectStore:
 
         return await asyncio.to_thread(_head)
 
+    async def head(self, bucket: str, key: str) -> ObjectHead | None:
+        """The object's size, stored SHA-256 checksum and type; None when it
+        does not exist (or its bucket does not)."""
+        def _head() -> ObjectHead | None:
+            try:
+                resp = self._client.head_object(Bucket=bucket, Key=key, ChecksumMode="ENABLED")
+            except ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code", "")
+                if code in {"404", "NoSuchKey", "NotFound", "NoSuchBucket"}:
+                    return None
+                raise StorageUnavailable(f"head_object failed: {exc}") from exc
+            except BotoCoreError as exc:
+                raise StorageUnavailable(f"head_object failed: {exc}") from exc
+            return ObjectHead(
+                size=int(resp.get("ContentLength") or 0),
+                checksum_sha256=resp.get("ChecksumSHA256") or None,
+                content_type=resp.get("ContentType") or None,
+            )
+
+        return await asyncio.to_thread(_head)
+
+    async def copy(self, bucket: str, source_key: str, key: str, *, content_type: str) -> None:
+        """Server-side copy inside one bucket; the copy's Content-Type is
+        `content_type` (metadata replaced, not copied). Nothing passes through
+        this process. Raises StorageNotFound when the source is gone."""
+        def _copy() -> None:
+            try:
+                self._client.copy(
+                    {"Bucket": bucket, "Key": source_key},
+                    bucket,
+                    key,
+                    ExtraArgs={"ContentType": content_type, "MetadataDirective": "REPLACE"},
+                    Config=TransferConfig(
+                        multipart_threshold=_COPY_MULTIPART_THRESHOLD,
+                        multipart_chunksize=_COPY_PART_BYTES,
+                        use_threads=False,
+                    ),
+                )
+            except ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code", "")
+                if code in {"404", "NoSuchKey", "NotFound"}:
+                    raise StorageNotFound(f"{bucket}/{source_key}") from exc
+                raise StorageUnavailable(f"copy failed: {exc}") from exc
+            except BotoCoreError as exc:
+                raise StorageUnavailable(f"copy failed: {exc}") from exc
+
+        await asyncio.to_thread(_copy)
+
+    def presign_put(
+        self,
+        bucket: str,
+        key: str,
+        *,
+        size: int,
+        checksum_sha256: str,
+        content_type: str,
+        expires_in: int,
+    ) -> PresignedRequest:
+        """A presigned PUT of exactly `size` bytes whose SHA-256 is
+        `checksum_sha256` (base64). SigV4 signs Content-Length, Content-Type and
+        x-amz-checksum-sha256, so the store refuses any other length, type or
+        digest, and a body whose digest is not the signed one (MinIO, S3 and R2
+        verify a sent checksum). Local signing, no network call."""
+        url = self._client.generate_presigned_url(
+            "put_object",
+            Params={
+                "Bucket": bucket,
+                "Key": key,
+                "ContentLength": size,
+                "ContentType": content_type,
+                "ChecksumSHA256": checksum_sha256,
+            },
+            ExpiresIn=expires_in,
+        )
+        return PresignedRequest(
+            method="PUT",
+            url=url,
+            headers={
+                "Content-Length": str(size),
+                "Content-Type": content_type,
+                "x-amz-checksum-sha256": checksum_sha256,
+            },
+            expires_at=datetime.now(UTC) + timedelta(seconds=expires_in),
+        )
+
+    def presign_get(
+        self, bucket: str, key: str, *, response_content_type: str, expires_in: int
+    ) -> PresignedRequest:
+        """A presigned GET whose response carries `response_content_type`,
+        whatever the object was stored with. Local signing, no network call."""
+        url = self._client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": bucket, "Key": key, "ResponseContentType": response_content_type},
+            ExpiresIn=expires_in,
+        )
+        return PresignedRequest(
+            method="GET",
+            url=url,
+            headers={},
+            expires_at=datetime.now(UTC) + timedelta(seconds=expires_in),
+        )
+
     async def delete(self, bucket: str, key: str) -> None:
         """Delete one object. Missing buckets/keys are treated as already gone."""
         def _delete() -> None:
@@ -331,6 +473,33 @@ class ObjectStore:
                     return []
                 raise StorageUnavailable(f"list_objects_v2 failed: {exc}") from exc
             return keys
+
+        return await asyncio.to_thread(_list)
+
+    async def list_entries(self, bucket: str, prefix: str) -> list[ObjectEntry]:
+        """`list_keys` with each object's size and last-modified time. A
+        missing bucket lists nothing."""
+        def _list() -> list[ObjectEntry]:
+            entries: list[ObjectEntry] = []
+            paginator = self._client.get_paginator("list_objects_v2")
+            try:
+                for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                    for obj in page.get("Contents", []) or []:
+                        entries.append(
+                            ObjectEntry(
+                                key=obj["Key"],
+                                size=int(obj.get("Size") or 0),
+                                last_modified=obj["LastModified"],
+                            )
+                        )
+            except ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code", "")
+                if code in {"NoSuchBucket", "404", "NotFound"}:
+                    return []
+                raise StorageUnavailable(f"list_objects_v2 failed: {exc}") from exc
+            except BotoCoreError as exc:
+                raise StorageUnavailable(f"list_objects_v2 failed: {exc}") from exc
+            return entries
 
         return await asyncio.to_thread(_list)
 

@@ -87,12 +87,32 @@ A key that does not apply is absent. Unknown keys are ignored by fold.
     the event adds its Line and nothing else: its raw is not an object, or it is
     an assistant event without a message object (which does not end a model call)
 
+THE FRAGMENT (FRAGMENT_VERSION 2)
+---------------------------------
+Version 1 plus pasted images, and nothing else. A user event's top-level
+`image` block that carries the SHA-256 of its bytes as `sha256` (64 lowercase
+hex: the client uploaded the bytes, kb/session_media.py) and a `mimeType` in
+IMAGE_MEDIA_TYPES is ALSO a part, in block order:
+
+  user
+    parts           image        media_type str (IMAGE_MEDIA_TYPES), sha256 str
+
+Its type stays in `dropped_blocks` exactly as in version 1, so a version-2
+fragment without its image parts, `v` set to 1, IS the version-1 fragment of
+the same event. An image block without a usable `sha256` or type is a dropped
+block only, as in version 1. The Line is the same in both versions: an image
+renders no text.
+
+`fragment(event, version=...)` builds any version in FRAGMENT_VERSIONS; a
+client builds the one the server's `accepts.fragment_versions` holds.
+
 Never in a fragment: a tool call's input (arguments), a tool's output, an
-image, any other block's content.
+image's bytes, any other block's content.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import fields
 from enum import Enum
 from typing import Any
@@ -101,7 +121,22 @@ from engine.shared.transcript_render import Line, line_from_event, renders_stop,
 
 #: Bumped when a fragment's meaning changes. fold reads every version it lists
 #: as supported, mixed within one session (a tap can update mid-session).
-FRAGMENT_VERSION = 1
+#: The newest version: what `fragment` builds unless told otherwise.
+FRAGMENT_VERSION = 2
+#: Every version `fragment` can build, oldest first.
+FRAGMENT_VERSIONS = (1, 2)
+#: The first version whose user parts carry pasted images.
+IMAGES_SINCE = 2
+
+#: Image types a fragment carries (ATIF's ImageSource), each with the file
+#: extension its stored copy is named with.
+IMAGE_MEDIA_TYPES = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/gif": "gif",
+    "image/webp": "webp",
+}
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}\Z")
 
 
 class Kind(str, Enum):
@@ -123,6 +158,8 @@ class PieceType(str, Enum):
     THINKING = "thinking"
     TOOL_CALL = "tool_call"
     TOOL_RESULT = "tool_result"
+    #: Version 2 on: a pasted image the client uploaded.
+    IMAGE = "image"
 
 
 #: probe-events/1 `origin` of a command the researcher typed, not the model.
@@ -161,14 +198,17 @@ USAGE_KEYS = (
 )
 
 
-def fragment(event: dict[str, Any]) -> dict[str, Any]:
-    """The fragment of one merged event (`{"line_no", "raw"}`). Never raises on
-    an event's content: a shape it cannot map is recorded in `error`, one the
-    renderer cannot render in `line_error`."""
+def fragment(event: dict[str, Any], version: int = FRAGMENT_VERSION) -> dict[str, Any]:
+    """The fragment of one merged event (`{"line_no", "raw"}`), in `version`
+    (one of FRAGMENT_VERSIONS). Never raises on an event's content: a shape it
+    cannot map is recorded in `error`, one the renderer cannot render in
+    `line_error`."""
     if not isinstance(event, dict):
         # Every consumer skips a non-object event (no Line, no step).
         raise TypeError("fragment() takes one merged event object")
-    out: dict[str, Any] = {"v": FRAGMENT_VERSION}
+    if type(version) is not int or version not in FRAGMENT_VERSIONS:
+        raise ValueError(f"fragment version {version!r} is not one of {FRAGMENT_VERSIONS}")
+    out: dict[str, Any] = {"v": version}
     try:
         line = line_from_event(event)
         line_error = None
@@ -185,7 +225,7 @@ def fragment(event: dict[str, Any]) -> dict[str, Any]:
     # Per-event isolation, as the builder's: a shape never seen before costs
     # this event, not the session. What was mapped before the failure stays.
     try:
-        _MAPPERS[kind](out, raw)
+        _MAPPERS[kind](out, raw, version)
     except Exception as exc:
         out["error"] = type(exc).__name__
     return out
@@ -316,7 +356,7 @@ def _stamp_and_extras(out: dict[str, Any], raw: dict[str, Any]) -> None:
         out["lineage"] = lineage
 
 
-def _user(out: dict[str, Any], raw: dict[str, Any]) -> None:
+def _user(out: dict[str, Any], raw: dict[str, Any], version: int) -> None:
     msg = raw.get("message")
     if not isinstance(msg, dict):
         # Still a user event: it ends the model call in progress.
@@ -336,6 +376,7 @@ def _user(out: dict[str, Any], raw: dict[str, Any]) -> None:
         return
     parts: list[dict[str, Any]] = []
     dropped: list[str] = []
+    images = version >= IMAGES_SINCE
     try:
         for seq, b in enumerate(content):
             if not isinstance(b, dict):
@@ -347,8 +388,14 @@ def _user(out: dict[str, Any], raw: dict[str, Any]) -> None:
                     parts.append({"type": PieceType.TEXT.value, "seq": seq, "text": cleaned})
             elif bt == "tool_result":
                 parts.append(_result(seq, b))
-            elif isinstance(bt, str) and len(dropped) < DROPPED_BLOCKS_MAX:
-                dropped.append(bt[:TYPE_NAME_CHARS])
+            else:
+                if images and bt == "image":
+                    image = _image(seq, b)
+                    if image is not None:
+                        parts.append(image)
+                # Version 1's bookkeeping, unchanged in version 2.
+                if isinstance(bt, str) and len(dropped) < DROPPED_BLOCKS_MAX:
+                    dropped.append(bt[:TYPE_NAME_CHARS])
     finally:
         # A block that raised keeps the ones before it, as the builder does.
         if parts:
@@ -356,6 +403,17 @@ def _user(out: dict[str, Any], raw: dict[str, Any]) -> None:
     if dropped and any(p["type"] == PieceType.TEXT for p in parts):
         # The builder notes them on the prompt step, which only text makes.
         out["dropped_blocks"] = dropped
+
+
+def _image(seq: int, block: dict[str, Any]) -> dict[str, Any] | None:
+    """A pasted image whose bytes the client uploaded (version 2), or None:
+    without a sha256 and a type ATIF carries, the image stays a dropped block."""
+    sha256, media_type = block.get("sha256"), block.get("mimeType")
+    if not (isinstance(sha256, str) and _SHA256_HEX.match(sha256)):
+        return None
+    if not (isinstance(media_type, str) and media_type in IMAGE_MEDIA_TYPES):
+        return None
+    return {"type": PieceType.IMAGE.value, "seq": seq, "media_type": media_type, "sha256": sha256}
 
 
 def _result(seq: int, block: dict[str, Any]) -> dict[str, Any]:
@@ -373,7 +431,7 @@ def _result(seq: int, block: dict[str, Any]) -> dict[str, Any]:
     return piece
 
 
-def _assistant(out: dict[str, Any], raw: dict[str, Any]) -> None:
+def _assistant(out: dict[str, Any], raw: dict[str, Any], _version: int) -> None:
     msg = raw["message"]
     inference = short(raw.get("inference_id"), EXTRA_VALUE_CHARS)
     if inference:
@@ -449,7 +507,7 @@ def _call(seq: int, block: dict[str, Any]) -> dict[str, Any]:
     return piece
 
 
-def _system(out: dict[str, Any], raw: dict[str, Any]) -> None:
+def _system(out: dict[str, Any], raw: dict[str, Any], _version: int) -> None:
     content = raw.get("content")
     if isinstance(content, str) and content:
         out["message"] = content
@@ -465,7 +523,7 @@ def _system(out: dict[str, Any], raw: dict[str, Any]) -> None:
             out["agent_version"] = version
 
 
-def _other(out: dict[str, Any], raw: dict[str, Any]) -> None:
+def _other(out: dict[str, Any], raw: dict[str, Any], _version: int) -> None:
     event_type = raw.get("type")
     if isinstance(event_type, str):
         out["event_type"] = event_type

@@ -763,6 +763,20 @@ class ClaudeCodeConnector(Connector):
             hydrated["events"] = []
         return hydrated
 
+    async def after_fetch(self, event: WebhookEvent, hydrated: Mapping[str, Any]) -> None:
+        """The worker's pass promotes the pasted images this session's
+        accepted batches name (kb/session_media.py): staged bytes move into the
+        session's folder only once a batch naming them was accepted, and never
+        for a deleted session. Nothing to do, and no query, when no batch names
+        one."""
+        from kb.session_media import named_media, promote_named_media
+
+        named = named_media(hydrated)
+        if named:
+            await promote_named_media(
+                event.customer_id, self.source_system.value, hydrated["session_id"], named
+            )
+
     async def normalize(
         self,
         event: WebhookEvent,

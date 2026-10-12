@@ -25,6 +25,14 @@ fragment of the session holds: a repeated one is unreadable and its line has
 no number, so the first fragment keeps the slot. Fragments are folded in the
 order given; putting them in ordinal order is the caller's.
 
+IMAGES (fragment version 2). A user event's image part becomes an ATIF image
+content part of its prompt step's message, in block order:
+`{"type": "image", "source": {"media_type", "path": "media/<sha256>.<ext>"}}`,
+the path relative to the session's folder, where kb/session_media.py promotes
+the uploaded bytes. Its type leaves the step's `dropped_blocks` (the fragment
+still names it there, as version 1 does). An image renders no text, so it has
+no provenance and moves no Line; a version-1 fragment never carries one.
+
 OUTPUT is a plain dict that validates against the vendored models in
 `engine.ingest.atif.models`. Readers (the session API, the dashboard, `probe
 session export`) get it from R2; nothing about search changes.
@@ -69,6 +77,7 @@ every one is a line, and one it cannot map becomes an `unparsed` system step
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -78,8 +87,10 @@ from typing import Any
 from engine.ingest.atif.fragment import (
     DROPPED_BLOCKS_MAX,
     EXTRA_VALUE_CHARS,
-    FRAGMENT_VERSION,
+    FRAGMENT_VERSIONS,
     HARNESS_EXTRAS,
+    IMAGE_MEDIA_TYPES,
+    IMAGES_SINCE,
     JSON_INT_MAX,
     TYPE_NAME_CHARS,
     USER_SHELL,
@@ -113,7 +124,18 @@ FLAG_COMPACT_SUMMARY = 4
 #: The fragment versions this fold reads; one session may mix them. Public: the
 #: door accepts a protocol-3 batch only in versions it lists here (intersected
 #: with whatever the door's own setting allows).
-SUPPORTED_FRAGMENT_VERSIONS: frozenset[int] = frozenset({FRAGMENT_VERSION})
+SUPPORTED_FRAGMENT_VERSIONS: frozenset[int] = frozenset(FRAGMENT_VERSIONS)
+
+#: Where a session's pasted images sit, relative to its folder
+#: (`raw/<src>/<customer>/<session>/`, kb/session_media.py): an image part's
+#: `source.path` is `media/<sha256>.<ext>`.
+MEDIA_DIR = "media"
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def media_path(sha256: str, media_type: str) -> str:
+    """An image's path in its session folder: `media/<sha256>.<ext>`."""
+    return f"{MEDIA_DIR}/{sha256}.{IMAGE_MEDIA_TYPES[media_type]}"
 
 #: Unparsed events reported per build; the count covers the rest.
 _UNPARSED_LOGGED = 20
@@ -263,6 +285,9 @@ class _Piece:
     id_text: str | None = None
     is_error: bool = False
     result_bytes: int | None = None
+    #: image (version 2)
+    media_type: str = ""
+    sha256: str = ""
 
 
 @dataclass(slots=True)
@@ -294,12 +319,17 @@ class _Event:
         return self.event_type if self.kind is Kind.OTHER else self.kind.value
 
 
-#: Piece types (their wire strings) each kind may carry.
+#: Piece types (their wire strings) each kind may carry in version 1.
 _PIECES_BY_KIND = {
     Kind.USER: frozenset({PieceType.TEXT.value, PieceType.TOOL_RESULT.value}),
     Kind.ASSISTANT: frozenset(
         {PieceType.TEXT.value, PieceType.THINKING.value, PieceType.TOOL_CALL.value}
     ),
+}
+#: Version 2 on: a user event's parts may also be images.
+_PIECES_BY_KIND_WITH_IMAGES = {
+    **_PIECES_BY_KIND,
+    Kind.USER: _PIECES_BY_KIND[Kind.USER] | {PieceType.IMAGE.value},
 }
 
 
@@ -333,8 +363,9 @@ def _read(fragment: dict[str, Any], line: Line) -> _Event:
     if event.kind is not Kind.ASSISTANT:
         # An assistant's string content is a text part.
         event.message = _opt_str(fragment, "message")
-    if event.kind in _PIECES_BY_KIND:
-        event.parts = _read_parts(fragment.get("parts"), _PIECES_BY_KIND[event.kind])
+    pieces = _PIECES_BY_KIND_WITH_IMAGES if version >= IMAGES_SINCE else _PIECES_BY_KIND
+    if event.kind in pieces:
+        event.parts = _read_parts(fragment.get("parts"), pieces[event.kind])
     if event.kind is Kind.USER:
         event.compaction = fragment.get("compaction") is True
         dropped = fragment.get("dropped_blocks")
@@ -384,6 +415,13 @@ def _read_piece(value: Any, allowed: frozenset[str]) -> _Piece:
         piece.name = name
         piece.summary = _opt_str(value, "summary") or None
         piece.stats = call_stats(value.get("stats"))
+    elif piece.type is PieceType.IMAGE:
+        # Both become the image's path: only a type ATIF names and a digest
+        # that cannot leave the session's media folder are readable.
+        media_type, sha256 = value.get("media_type"), value.get("sha256")
+        _need(isinstance(media_type, str) and media_type in IMAGE_MEDIA_TYPES)
+        _need(isinstance(sha256, str) and bool(_SHA256_HEX.match(sha256)))
+        piece.media_type, piece.sha256 = media_type, sha256
     else:
         piece.call_id = _opt_str(value, "call_id") or None
         piece.id_text = _opt_str(value, "id_text") or None
@@ -510,6 +548,7 @@ class _Folder:
         step: int | None = None
         text_parts: list[dict[str, Any]] = []
         orphan: int | None = None
+        images = 0
         for piece in ev.parts:
             if piece.type is PieceType.TEXT:
                 if not piece.text:
@@ -518,6 +557,21 @@ class _Folder:
                     step = self._prompt_step(ev, text_parts)
                 text_parts.append({"type": "text", "text": piece.text})
                 self._part(step, line, piece.seq, PART_USER, len(text_parts) - 1, speaker)
+            elif piece.type is PieceType.IMAGE:
+                # Part of the prompt, in block order; it renders no text, so
+                # it has no `probe_parts` entry and moves no Line.
+                if step is None:
+                    step = self._prompt_step(ev, text_parts)
+                text_parts.append(
+                    {
+                        "type": "image",
+                        "source": {
+                            "media_type": piece.media_type,
+                            "path": media_path(piece.sha256, piece.media_type),
+                        },
+                    }
+                )
+                images += 1
             else:
                 target = self.calls.get(piece.call_id) if piece.call_id else None
                 if target is None:
@@ -533,8 +587,15 @@ class _Folder:
                     target = orphan
                 index = self._add_result(target, piece, linked=target != orphan)
                 self._part(target, line, piece.seq, PART_RESULT, index)
-        if ev.dropped_blocks and step is not None:
-            self.steps[step]["extra"]["dropped_blocks"] = list(ev.dropped_blocks)
+        dropped = list(ev.dropped_blocks or ())
+        for _ in range(images):
+            # Version 2 names a carried image in `dropped_blocks` too (as
+            # version 1 does): it is not dropped from the document.
+            if "image" not in dropped:
+                break
+            dropped.remove("image")
+        if dropped and step is not None:
+            self.steps[step]["extra"]["dropped_blocks"] = dropped
 
     def _prompt_step(self, ev: _Event, message: Any) -> int:
         extra: dict[str, Any] = {"probe_parts": []}

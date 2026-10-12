@@ -244,6 +244,16 @@ class Normalizer:
 
         token = await self._load_token(customer_id, source_system)
         hydrated = await connector.fetch_supplementary(event, token)
+        try:
+            await connector.after_fetch(event, hydrated)
+        except Exception as exc:
+            # Never the pass's failure: what it did not do, a later pass retries.
+            log.warning(
+                "normalizer.after_fetch_failed",
+                customer=customer_id,
+                source=source_system.value,
+                error=f"{type(exc).__name__}: {str(exc)[:200]}",
+            )
         result = await connector.normalize(event, hydrated)
 
         if result.is_empty:

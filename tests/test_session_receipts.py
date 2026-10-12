@@ -889,10 +889,31 @@ def test_the_receipt_digest_covers_fragments_and_their_version():
         ),
         (
             # A typo drops its entry; it never takes the receipts read down.
-            # Version 2 is listed but this fold reads only 1: not advertised.
-            {"session_protocol3_all": True, "session_fragment_versions": "2, 1,x,\u00b2,"},
+            # Version 3 is listed but this fold reads only 1 and 2: not advertised.
+            {"session_protocol3_all": True, "session_fragment_versions": "3, 1,x,\u00b2,"},
             "tenant-a",
             {"protocols": [2, 3], "fragment_versions": [1], "events": True},
+        ),
+        (
+            {"session_protocol3_all": True, "session_fragment_versions": "2,1"},
+            "tenant-a",
+            {"protocols": [2, 3], "fragment_versions": [1, 2], "events": True},
+        ),
+        (
+            # Pasted images: advertised only where enabled, absent elsewhere.
+            {"session_media_customers": "tenant-z, tenant-a"},
+            "tenant-a",
+            {"protocols": [2], "fragment_versions": [1], "events": True, "media": True},
+        ),
+        (
+            {"session_media_customers": "tenant-z"},
+            "tenant-a",
+            {"protocols": [2], "fragment_versions": [1], "events": True},
+        ),
+        (
+            {"session_media_all": True},
+            "tenant-a",
+            {"protocols": [2], "fragment_versions": [1], "events": True, "media": True},
         ),
     ],
 )
@@ -968,14 +989,18 @@ def test_a_protocol_3_finalize_carries_no_fragments_or_events():
 
 
 def test_the_fragment_versions_accepted_follow_the_setting(protocol3):
-    # Listing only 2 refuses 1; and 2 is refused too while fold reads only 1.
-    protocol3(session_fragment_versions="2")
-    for version in (1, 2):
+    # Listing only 2 refuses 1; and 3 is refused while fold reads only 1 and 2.
+    protocol3(session_fragment_versions="2,3")
+    for version in (1, 3):
         with pytest.raises(HTTPException) as error:
             sr.validate_payload(fragments_batch(fragment_version=version))
         assert "unsupported fragment version" in error.value.detail
+    sr.validate_payload(fragments_batch(fragment_version=2))
     protocol3(session_fragment_versions="1")
     sr.validate_payload(fragments_batch(fragment_version=1))
+    with pytest.raises(HTTPException) as error:
+        sr.validate_payload(fragments_batch(fragment_version=2))
+    assert "unsupported fragment version" in error.value.detail
 
 
 @pytest.mark.asyncio

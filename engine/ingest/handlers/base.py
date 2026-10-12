@@ -190,6 +190,15 @@ class Connector(ABC):
         """
         return {}
 
+    async def after_fetch(self, event: WebhookEvent, hydrated: Mapping[str, Any]) -> None:
+        """Work the WORKER owes a source once it has read a queue row, before
+        normalizing it -- the coding-agent sessions promote the pasted images
+        their batches name (kb/session_media.py). Only the worker's pass calls
+        it (engine/ingest/normalizer.py); scripts that re-read sessions call
+        fetch_supplementary and normalize and so stay read-only. Default no-op.
+        An exception is logged and swallowed: it never fails the pass."""
+        return None
+
     # ---- 4. normalization --------------------------------------------------
 
     @abstractmethod

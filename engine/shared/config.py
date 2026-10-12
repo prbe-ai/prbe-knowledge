@@ -222,6 +222,19 @@ class Settings(BaseSettings):
     #: only at versions it cannot build falls back to protocol 2, is refused,
     #: and stops capturing new sessions (only its local log says so).
     session_protocol2_new_streams: bool = Field(default=True)
+    #: Pasted images of a captured session (kb/session_media.py). A customer
+    #: listed here, or every customer with SESSION_MEDIA_ALL, is advertised
+    #: `accepts.media` on the receipts read and may ask for an upload URL;
+    #: anyone else is refused 403 `media_disabled`. Withdrawing it stops new
+    #: uploads only: images already stored stay readable. Comma-separated
+    #: customer ids (the canary); off for everyone by default.
+    session_media_customers: str = Field(default="")
+    #: Advertise and accept pasted images for every customer (the flip).
+    session_media_all: bool = Field(default=False)
+    #: Bytes of images one customer may be handed upload URLs for in any
+    #: rolling 24 hours (default 50 GiB); past it the upload route answers
+    #: 429 `media_budget` and the client keeps its placeholder.
+    session_media_daily_bytes: int = Field(default=50 * 1024**3)
     #: Reuse a segment's extraction when the same session re-ends with that
     #: segment unchanged (engine/shared/extraction_cache.py). Off = no cache
     #: read or write; every segment is mined, as before.
