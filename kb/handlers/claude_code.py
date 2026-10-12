@@ -2209,3 +2209,29 @@ class KimiCodeConnector(ClaudeCodeConnector):
     _doc_id_prefix: ClassVar[str] = "kimi_code"
     _agent_label: ClassVar[str] = "kimi_code"
     _session_title_prefix: ClassVar[str] = "Kimi Code session"
+
+
+@register_connector(SourceSystem.CAPY)
+class CapyConnector(ClaudeCodeConnector):
+    """Capy (capy.ai, a cloud coding agent) sessions, shimmed into
+    Claude-Code shape by the tap's sanitizer. Inherits all parsing /
+    fetch_supplementary / normalize logic from ClaudeCodeConnector — only the
+    source label and doc-id prefix differ so dashboard queries can
+    distinguish provenance.
+
+    A Capy transcript carries only the researcher's messages, the assistant's
+    replies and a one-line summary per tool call: no tool arguments or
+    results, no thinking and no compactions, so there is nothing
+    Capy-specific to parse and no `_capy_extras` key.
+    """
+
+    source_system: ClassVar[SourceSystem] = SourceSystem.CAPY
+    display_name: ClassVar[str] = "Capy"
+    # Source profile (doc_type_prefix "claude_code.", priority 60, 0.5
+    # multiplier, 7d half-life) is inherited from ClaudeCodeConnector on
+    # purpose, exactly as Codex, pi and Kimi Code inherit it: same doc shape,
+    # same coalescing semantics, same staleness curve — only the provenance
+    # label differs.
+    _doc_id_prefix: ClassVar[str] = "capy"
+    _agent_label: ClassVar[str] = "capy"
+    _session_title_prefix: ClassVar[str] = "Capy session"

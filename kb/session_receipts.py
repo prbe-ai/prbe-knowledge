@@ -42,7 +42,7 @@ from kb.admin_routes import verify_internal_knowledge_key
 
 router = APIRouter(prefix="/api/sessions", dependencies=[Depends(verify_internal_knowledge_key)])
 EMPTY_HASH = hashlib.sha256(b"").hexdigest()
-_SOURCES = {"claude_code", "codex", "pi", "kimi_code"}
+_SOURCES = {"claude_code", "codex", "pi", "kimi_code", "capy"}
 #: Session upload protocols: 2 sends sanitized probe-events/1 `events`; 3 sends
 #: one ATIF `fragments` entry per event (and `events` only when asked to).
 PROTOCOL_EVENTS = 2

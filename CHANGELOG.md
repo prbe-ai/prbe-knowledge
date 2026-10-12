@@ -75,6 +75,21 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Added
 
+- **Capy is a session source (`capy`), beside Claude Code, Codex, pi and Kimi Code.**
+  `SourceSystem.CAPY` ("Capy") and `CapyConnector`, a subclass of `ClaudeCodeConnector` like
+  `KimiCodeConnector`: research-os's tap uploads Capy (capy.ai) sessions already sanitized into
+  the shared session shape, so only the provenance (`source_system`, `capy:` doc ids, "Capy
+  session" titles, the extraction prompt's agent name) differs. Batches arrive at the existing
+  `POST /webhooks/capy`; receipts read at `GET /api/sessions/capy/<id>/receipts`. Doc types stay
+  `claude_code.*` and the queue tier, 0.5 score multiplier and 7-day half-life are inherited. It
+  joins every hand-written agent list (webhook coalescing, idle finalizer, per-device stats,
+  receipts, disconnect gate, grounding, synthesis and Jev session class, metadata backfill
+  `--source`), each pinned by `tests/test_agent_session_source_sets.py`. A search may name `capy`
+  as a source once this is deployed (an unknown id is a 422), so the engine ships first. Not
+  mirrored from Kimi Code: shell-command marking (#626) and compaction recognition (#632), since
+  a Capy transcript has neither a researcher-typed shell command nor a compaction record. No
+  migration: no table constrains `source_system`.
+
 - **`/retrieve/direct` has an `id` channel: identifiers the user typed, resolved by exact lookup, with no model call.** Keyword search (`channels: ["bm25"]`) missed pure identifiers that agentic search pins: on research, a run UUID and a GitHub PR link both came back from `semantic=true` and not from keyword. `channels: ["bm25", "id"]` now finds both.
   - **How:** the agentic id-pins lane, as a channel. `detect_identifiers` reads the raw query (regex only), `lookup_identifiers` resolves what it found inside the request's scope (sources, source_keys, doc_types, project; latest versions; drafts hidden), and `resolve_pins` keeps the best document per identifier, at most `max(1, top_k // 2)`, taking identifiers in the order they were typed (detection groups them by kind; `DetectedIdentifier.start` now records where each was typed). Hits pass the same live-document gate, carry their first body chunk, and report `matched_via` channel `id`. They take part in the rank fusion and are also placed first, in typed order, as the agentic lane puts its pins first: on rank alone an id hit ties a document BM25 ranked first.
   - **Nothing to resolve is not a failure:** a query with no identifier, or only an inferred one that does not expand uniquely (a short hex prefix, a bare `#N` in several repos), adds nothing and is not reported lost. A lookup error or timeout is reported in `lost_channels` as `id`, like the other channels.

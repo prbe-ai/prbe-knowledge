@@ -698,6 +698,7 @@ _AGENT_LABELS = {
     "codex": "Codex",
     "pi": "pi",
     "kimi_code": "Kimi Code",
+    "capy": "Capy",
 }
 
 #: Authorship of a decision. Ordered from most to least human involvement.

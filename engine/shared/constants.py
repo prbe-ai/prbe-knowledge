@@ -28,6 +28,11 @@ class SourceSystem(StrEnum):
     # Kimi Code (Moonshot AI's coding agent) sessions arrive shimmed into
     # Claude-Code shape by the tap's sanitizer, exactly like Codex and pi above.
     KIMI_CODE = "kimi_code"
+    # Capy (capy.ai, a cloud coding agent) sessions arrive shimmed into
+    # Claude-Code shape by the tap's sanitizer, exactly like the agents above.
+    # Its transcripts carry only user messages, assistant replies and one-line
+    # tool summaries: no tool arguments or results, thinking or compactions.
+    CAPY = "capy"
     MANUAL_UPLOAD = "manual_upload"
     CUSTOM_INGEST = "custom_ingest"
     CODE_GRAPH = "code_graph"
@@ -43,6 +48,7 @@ AGENT_SESSION_SOURCES: tuple[SourceSystem, ...] = (
     SourceSystem.CODEX,
     SourceSystem.PI,
     SourceSystem.KIMI_CODE,
+    SourceSystem.CAPY,
 )
 
 
@@ -63,6 +69,7 @@ SOURCE_DISPLAY_NAMES: dict[SourceSystem, str] = {
     SourceSystem.CODEX: "Codex",
     SourceSystem.PI: "pi",
     SourceSystem.KIMI_CODE: "Kimi Code",
+    SourceSystem.CAPY: "Capy",
     SourceSystem.MANUAL_UPLOAD: "Manual upload",
     SourceSystem.CUSTOM_INGEST: "Custom Ingest",
     SourceSystem.CODE_GRAPH: "Code",
@@ -973,7 +980,8 @@ WORKER_DRAIN_STALL_THRESHOLD_SECONDS = 180.0
 #                                    just now: slack, github, linear, notion,
 #                                    granola, sentry, manual uploads, incidents
 #    60  PRIORITY_AGENT_CAPTURE      automatic coding-agent transcripts:
-#                                    claude_code, codex, pi, kimi_code
+#                                    claude_code, codex, pi, kimi_code,
+#                                    capy
 #    50  PRIORITY_BACKGROUND         backfills and code_graph; never blocks
 #                                    anything live
 #

@@ -316,6 +316,22 @@ async def test_kimi_code_batches_are_accepted_and_their_receipts_readable(databa
 
 
 @pytest.mark.asyncio
+async def test_capy_batches_are_accepted_and_their_receipts_readable(database):
+    """research-os forwards Capy batches here and reads them back through
+    GET /api/sessions/capy/<id>/receipts. That door names its agents by hand,
+    so a source missing from it accepts batches and then 422s the read."""
+    _tenant, admin = database
+    store = Store()
+    body = batch()
+    accepted = await sr.accept(body, "tenant-a", SourceSystem.CAPY, store)
+    assert accepted["status"] == "accepted"
+    assert all(key.startswith("raw/capy/tenant-a/") for _bucket, key in store.blobs)
+    assert await admin.fetchval("SELECT source_system FROM ingestion_queue") == "capy"
+    read = await sr.receipts("capy", body["session_id"], "tenant-a", -1, 200)
+    assert read["stream"]["event_end"] == 2 and read["receipts"][0] == accepted["receipt"]
+
+
+@pytest.mark.asyncio
 async def test_legacy_coverage_cannot_be_blindly_replayed(database):
     _tenant, admin = database
     body = batch()

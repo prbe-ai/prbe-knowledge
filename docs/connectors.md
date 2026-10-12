@@ -14,6 +14,7 @@ Probe ingests from these sources:
 | `codex`          | API             | Codex session ingest                          |
 | `pi`             | API             | pi session ingest                             |
 | `kimi_code`      | API             | Kimi Code session ingest                      |
+| `capy`           | API             | Capy session ingest                           |
 | `granola`        | API             | Granola meeting-notes ingest                  |
 | `manual_upload`  | API             | upload a file/document directly               |
 

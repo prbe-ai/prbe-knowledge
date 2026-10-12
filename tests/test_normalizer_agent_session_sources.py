@@ -51,6 +51,16 @@ def test_kimi_code_defers_to_session_complete_like_pi() -> None:
     assert _inferred_edge_doc_ids(SourceSystem.KIMI_CODE, doc_ids, [_doc(True)]) == doc_ids
 
 
+def test_capy_defers_to_session_complete_like_kimi_code() -> None:
+    """Capy sessions are re-persisted on every batch exactly like Kimi Code's,
+    so they must take the deferred path too: nothing mid-session, everything
+    once the session completes."""
+    doc_ids = ["capy:cust-1:s-1", "capy:cust-1:s-1:decision:0"]
+
+    assert _inferred_edge_doc_ids(SourceSystem.CAPY, doc_ids, [_doc(False)]) == []
+    assert _inferred_edge_doc_ids(SourceSystem.CAPY, doc_ids, [_doc(True)]) == doc_ids
+
+
 def test_non_agent_source_is_unaffected_by_pi_addition() -> None:
     """Sanity: widening _AGENT_SESSION_SOURCES to include pi must not touch
     the per-doc (non-agent) path other sources take."""
