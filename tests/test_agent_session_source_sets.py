@@ -28,8 +28,8 @@ from kb.handlers.claude_code import ClaudeCodeConnector
 _AGENTS = {s.value for s in AGENT_SESSION_SOURCES}
 
 
-def test_the_canonical_tuple_names_all_four_agents() -> None:
-    assert set(AGENT_SESSION_SOURCES) == {"claude_code", "codex", "pi", "kimi_code"}
+def test_the_canonical_tuple_names_all_five_agents() -> None:
+    assert set(AGENT_SESSION_SOURCES) == {"claude_code", "codex", "pi", "kimi_code", "capy"}
 
 
 @pytest.mark.parametrize("source", AGENT_SESSION_SOURCES, ids=str)

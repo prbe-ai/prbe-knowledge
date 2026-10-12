@@ -1,4 +1,4 @@
-"""Periodic finalizer for agent-session sources (Claude Code, Codex, pi, Kimi Code) that go idle.
+"""Periodic finalizer for idle agent-session sources (Claude Code, Codex, pi, Kimi Code, Capy).
 
 A session is mined only once it has ENDED (engine.shared.session_signals: the
 newest key on its queue row is an end signal). Clients end their own sessions;
@@ -63,6 +63,7 @@ AGENT_SOURCES = (
     SourceSystem.CODEX,
     SourceSystem.PI,
     SourceSystem.KIMI_CODE,
+    SourceSystem.CAPY,
 )
 
 #: How many times the sweep re-queues a session whose last pass was partial.

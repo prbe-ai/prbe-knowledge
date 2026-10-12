@@ -300,7 +300,7 @@ def test_importing_the_script_registers_the_session_connectors() -> None:
     out = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=120
     )
-    for source in ("claude_code", "codex", "pi", "kimi_code"):
+    for source in ("claude_code", "codex", "pi", "kimi_code", "capy"):
         assert source in out.stdout, out.stdout
 
 

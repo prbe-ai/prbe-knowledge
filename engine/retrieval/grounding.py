@@ -340,6 +340,7 @@ _SOURCE_SYSTEM_TO_ENTITY_TYPE: Final[dict[str, str]] = {
     "codex": "session",
     "pi": "session",
     "kimi_code": "session",
+    "capy": "session",
     "granola": "document",
     "sentry": "error_group",
     "pagerduty": "incident",

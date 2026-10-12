@@ -39,6 +39,7 @@ _DEVICE_PAIRED_SOURCES = frozenset(
         SourceSystem.CODEX.value,
         SourceSystem.PI.value,
         SourceSystem.KIMI_CODE.value,
+        SourceSystem.CAPY.value,
     }
 )
 

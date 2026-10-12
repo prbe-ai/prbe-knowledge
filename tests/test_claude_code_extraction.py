@@ -875,6 +875,34 @@ async def test_kimi_code_agent_label_reaches_the_extraction_system_prompt(monkey
     assert "coding agent" not in system_message
 
 
+@pytest.mark.asyncio
+async def test_capy_agent_label_reaches_the_extraction_system_prompt(monkeypatch) -> None:
+    """Same wiring as the pi test above, for Capy: CapyConnector passes its
+    `_agent_label` ("capy") as `agent`, and without an `_AGENT_LABELS` entry
+    every Capy session would be extracted as a generic "coding agent"
+    session."""
+    empty_payload = {"qa": [], "code_change": [], "decision": [], "file_ref": []}
+    fake = AsyncMock(return_value=_litellm_tool_response("emit_units", empty_payload))
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake)
+
+    await extract_units_from_session(
+        session_id="s1",
+        events=[
+            {"line_no": 0, "raw": {
+                "type": "user",
+                "message": {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+            }}
+        ],
+        cwd="/tmp/p",
+        agent="capy",
+    )
+
+    fake.assert_awaited_once()
+    system_message = fake.await_args.kwargs["messages"][0]["content"]
+    assert "one Capy session" in system_message
+    assert "coding agent" not in system_message
+
+
 # ---- what makes a bundle non-authoritative, and what a pass reports ---------
 #
 # `authoritative` decides whether a pass may retire a session's existing units

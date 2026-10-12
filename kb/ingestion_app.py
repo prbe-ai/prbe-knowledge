@@ -744,7 +744,13 @@ _SENSITIVE_HEADERS: frozenset[str] = frozenset(
 # the R2 storage path needs a per-batch suffix so deliveries don't
 # overwrite each other on object storage.
 _COALESCING_AGENT_SOURCES: frozenset[SourceSystem] = frozenset(
-    {SourceSystem.CLAUDE_CODE, SourceSystem.CODEX, SourceSystem.PI, SourceSystem.KIMI_CODE}
+    {
+        SourceSystem.CLAUDE_CODE,
+        SourceSystem.CODEX,
+        SourceSystem.PI,
+        SourceSystem.KIMI_CODE,
+        SourceSystem.CAPY,
+    }
 )
 
 
@@ -755,7 +761,7 @@ def _compose_storage_id(
 ) -> str:
     """Compose the R2 storage namespace key.
 
-    For agent-session sources (claude_code, codex, pi, kimi_code) the queue source_event_id
+    For agent-session sources (claude_code, codex, pi, kimi_code, capy) the queue source_event_id
     is the bare session_id (so the UPSERT can coalesce). The R2 path must
     still be unique per delivery — we suffix it with `:<batch_seq>` so
     each batch writes a distinct envelope and retries with the same
@@ -963,7 +969,7 @@ async def _enqueue(
 
     Two paths:
 
-    1. **agent sessions (claude_code, codex, pi, kimi_code) — coalescing** — multiple
+    1. **agent sessions (claude_code, codex, pi, kimi_code, capy) — coalescing** — multiple
        batches for the same session collapse into a single queue row.
        UPSERT keyed on (customer_id, source_system,
        source_event_id=session_id) appends the new R2 key to

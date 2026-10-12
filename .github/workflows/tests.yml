@@ -281,6 +281,8 @@ jobs:
           tests/handlers/test_pi_registration.py
           tests/handlers/test_kimi_code_registration.py
           tests/test_kimi_code_source_constants.py
+          tests/handlers/test_capy_registration.py
+          tests/test_capy_source_constants.py
           tests/test_agent_session_source_sets.py
           tests/test_secret_redaction.py
           tests/test_secret_persistence_boundaries.py
