@@ -527,6 +527,13 @@ async def accept(payload: dict, customer: str, source: SourceSystem, store) -> d
             snapshot_end,
             snapshot_hash,
         )
+        # The pasted images this batch names are owed a promotion from the
+        # moment it is accepted (kb/session_media.py): stamped in the same
+        # commit, so the sweep can retry what a worker pass failed to promote.
+        from kb.session_media import mark_named, named_media
+
+        if named := named_media(payload):
+            await mark_named(conn, customer, source.value, sid, named)
         return {"status": "accepted", "protocol_version": protocol, "receipt": _receipt(row)}
 
 

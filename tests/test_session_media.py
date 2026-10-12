@@ -11,8 +11,10 @@ this file.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import threading
 import uuid
 from pathlib import Path
 
@@ -331,6 +333,15 @@ async def test_identity_and_auth_are_checked(media) -> None:
             refused = await client.post(f"/api/sessions/claude_code/{_sid()}/media", json=wrong,
                                         headers=_headers(a))
             assert refused.status_code == 422, wrong
+        # The read route builds a key from the same three values.
+        for path in (f"/api/sessions/claude_code/{_sid()}/media/{'A' * 64}",
+                     f"/api/sessions/claude_code/{_sid()}/media/..%2F{'a' * 61}",
+                     f"/api/sessions/claude_code/not-a-uuid/media/{'a' * 64}",
+                     f"/api/sessions/slack/{_sid()}/media/{'a' * 64}"):
+            got = await client.get(path, headers=_headers(a))
+            assert got.status_code in (404, 422) and got.json().get("detail") != {
+                "reason": "media_not_found"
+            }, path
 
 
 @pytest.mark.asyncio
@@ -605,9 +616,9 @@ async def test_a_late_upload_after_deletion_is_never_promoted_and_is_swept(media
     assert getattr(refused.value, "status_code", None) == 410
     assert await sm.promote_named_media(a, CC.value, sid, [_sha(PNG)]) == {}
     assert not await store.exists(bucket, _final(a, sid, _sha(PNG)))
-    # Younger than the window: kept; past it: swept.
-    assert (await sm.sweep_media_staging())["objects"] == 0
-    swept = await sm.sweep_media_staging(older_than_s=0)
+    # The next hourly sweep takes it: its session's deletion is recent, so it
+    # does not wait out the 24-hour staging window.
+    swept = await sm.sweep_media_staging()
     assert swept["objects_deleted"] == 1
     assert not await store.exists(bucket, _staged(a, sid, _sha(PNG)))
 
@@ -682,3 +693,171 @@ async def test_the_completer_cron_runs_the_sweep(media, capsys, monkeypatch) -> 
     out = capsys.readouterr().out
     assert "media staging sweep:" in out and "dry_run=True" in out
     assert await objects(store, a) == [_staged(a, sid, _sha(PNG))], "a dry run deletes nothing"
+
+
+# --- owed promotions (named, not promoted) ---------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_accepted_batch_stamps_its_images_owed_in_the_same_commit(media) -> None:
+    a, _b, _store = media
+    p2, p3, early = _sid(), _sid(), _sid()
+    await upload(a, p2, PNG)
+    await upload(a, p3, PNG)
+    events = [_image_event(0, [(_sha(PNG), "image/png")]), _reply(1)]
+    await accept_all(a, _batches(p2, events)[:1])
+    await accept_all(a, _batches(p3, events, protocol=3, version=2)[:1])
+    for sid in (p2, p3):
+        record = await row(a, sid, _sha(PNG))
+        assert record["named_at"] is not None and record["promoted_at"] is None, sid
+    # Named before its upload was asked for: the worker's pass stamps it.
+    await accept_all(a, _batches(early, events)[:1])
+    await upload(a, early, PNG)
+    assert (await row(a, early, _sha(PNG)))["named_at"] is None
+    await _mine(a, CC, early)
+    record = await row(a, early, _sha(PNG))
+    assert record["named_at"] is not None and record["promoted_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_a_promotion_the_final_pass_failed_is_retried_by_the_sweep(media, monkeypatch) -> None:
+    """The session's last pass cannot promote (the store fails), logs it and
+    completes; nothing else would come back to it. The hourly sweep does."""
+    from engine.shared.exceptions import StorageUnavailable
+
+    a, _b, store = media
+    sid = _sid()
+    await upload(a, sid, PNG)
+    await accept_all(a, _batches(sid, [_image_event(0, [(_sha(PNG), "image/png")]), _reply(1)]))
+
+    async def store_down(*args, **kwargs):
+        raise StorageUnavailable("copy failed: 503")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "copy", store_down)
+        await _mine(a, CC, sid)  # the completing pass: no exception reaches it
+    bucket = await store.bucket_for(a)
+    assert not await store.exists(bucket, _final(a, sid, _sha(PNG)))
+    assert (await row(a, sid, _sha(PNG)))["promoted_at"] is None
+    # A day later (older_than_s=0): the retry promotes before anything is swept.
+    swept = await sm.sweep_media_staging(older_than_s=0)
+    assert swept["retry_promoted"] == 1 and swept["owed"] == 0
+    assert await store.get(bucket, _final(a, sid, _sha(PNG))) == PNG
+    assert (await row(a, sid, _sha(PNG)))["promoted_at"] is not None
+    assert await objects(store, a, media_staging_prefix(CC.value, a, sid)) == []
+
+
+@pytest.mark.asyncio
+async def test_an_owed_image_keeps_its_staged_bytes_for_7_days_then_is_given_up(
+    media, monkeypatch
+) -> None:
+    from engine.shared.exceptions import StorageUnavailable
+
+    a, _b, store = media
+    sid, unnamed = _sid(), _sid()
+    await upload(a, sid, PNG)
+    await upload(a, unnamed, PNG)
+    await accept_all(a, _batches(sid, [_image_event(0, [(_sha(PNG), "image/png")])])[:1])
+
+    async def store_down(*args, **kwargs):
+        raise StorageUnavailable("copy failed: 503")
+
+    monkeypatch.setattr(store, "copy", store_down)
+    bucket = await store.bucket_for(a)
+    # Past 24 hours, still failing: the owed image's bytes and row are kept;
+    # the one no batch named goes as before.
+    swept = await sm.sweep_media_staging(older_than_s=0)
+    assert (swept["retry_failed"], swept["owed"], swept["objects_deleted"]) == (1, 1, 1)
+    assert await store.exists(bucket, _staged(a, sid, _sha(PNG)))
+    assert not await store.exists(bucket, _staged(a, unnamed, _sha(PNG)))
+    assert await row(a, sid, _sha(PNG)) is not None
+    # Named 8 days ago: given up, bytes and row removed.
+    async with db_module.with_tenant(a) as conn:
+        await conn.execute(
+            "UPDATE session_media SET named_at = now() - interval '8 days', "
+            "created_at = now() - interval '8 days'"
+        )
+    swept = await sm.sweep_media_staging(older_than_s=0)
+    assert (swept["owed"], swept["abandoned"], swept["objects_deleted"]) == (0, 1, 1)
+    assert not await store.exists(bucket, _staged(a, sid, _sha(PNG)))
+    assert await row(a, sid, _sha(PNG)) is None
+
+
+# --- the copy and the session lock -------------------------------------------------------------
+
+
+class _HeldCopy:
+    """Holds the store's server-side copy inside its worker thread until
+    released: the shape of a slow copy."""
+
+    def __init__(self, store, monkeypatch) -> None:
+        self.entered, self.release = threading.Event(), threading.Event()
+        real = store._client.copy
+
+        def held(*args, **kwargs):
+            self.entered.set()
+            assert self.release.wait(30), "the test never released the copy"
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(store._client, "copy", held)
+
+    async def wait_entered(self) -> None:
+        for _ in range(500):
+            if self.entered.is_set():
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError("the copy never started")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_the_pass", [False, True], ids=["finishes", "cancelled"])
+async def test_a_deletion_never_finishes_before_a_running_copy_lands(
+    media, monkeypatch, cancel_the_pass: bool
+) -> None:
+    """The copy runs in a thread. If the promotion's await were cancelled (a
+    worker shutting down) and gave up its lock before that thread ended, a
+    deletion could list the session's folder, find nothing and finish, and the
+    copy would then land `media/<sha>.<ext>` for good. The lock is held until
+    the copy has landed, so the deletion always sees it and removes it."""
+    a, _b, store = media
+    sid = _sid()
+    await upload(a, sid, PNG)
+    held = _HeldCopy(store, monkeypatch)
+    promotion = asyncio.create_task(sm.promote_named_media(a, CC.value, sid, [_sha(PNG)]))
+    try:
+        await held.wait_entered()
+        if cancel_the_pass:
+            promotion.cancel()
+        deletion = asyncio.create_task(delete(a, [sid]))
+        done, _ = await asyncio.wait({deletion}, timeout=1.0)
+        assert not done, "the deletion waited for the session lock the copy holds"
+    finally:
+        held.release.set()
+    if cancel_the_pass:
+        with pytest.raises(asyncio.CancelledError):
+            await promotion
+    else:
+        assert await promotion == {sm.Promotion.PROMOTED: 1}
+    outcome = (await deletion)["sessions"][f"claude_code:{sid}"]
+    assert outcome["verified"], outcome
+    assert not [k for k in await objects(store, a) if sid in k], "nothing of the session remains"
+
+
+@pytest.mark.asyncio
+async def test_an_image_object_landing_after_a_deletion_is_swept(media) -> None:
+    """A copy the store finished after its client timed out can land after the
+    deletion listed the folder. The next sweep removes it."""
+    a, _b, store = media
+    sid, kept = _sid(), _sid()
+    await upload(a, kept, PNG)
+    await accept_all(a, _batches(kept, [_image_event(0, [(_sha(PNG), "image/png")])]))
+    await _mine(a, CC, kept)
+    outcome = (await delete(a, [sid]))["sessions"][f"claude_code:{sid}"]
+    assert outcome["verified"], outcome
+    bucket = await store.bucket_for(a)
+    late = _final(a, sid, _sha(PNG))
+    await store.put(bucket, late, PNG, content_type="image/png")
+    swept = await sm.sweep_media_staging()
+    assert swept["objects_deleted"] == 1
+    assert not await store.exists(bucket, late)
+    assert await store.exists(bucket, _final(a, kept, _sha(PNG))), "a live session's image stays"
