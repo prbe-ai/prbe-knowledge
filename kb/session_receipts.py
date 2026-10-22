@@ -382,6 +382,102 @@ def _receipt(row) -> dict:
     }
 
 
+async def _settle(
+    conn, payload: dict, customer: str, source: SourceSystem, digest: str, protocol: int
+) -> tuple[dict | None, bool]:
+    """The answer this batch gets without being stored, from reads alone.
+
+    Raises its 410 or 409, or returns `(the duplicate's answer, False)`, or
+    `(None, new)` for a batch the door will store, `new` when it opens the
+    session's stream (the caller inserts that row).
+    """
+    sid = payload["session_id"]
+    await refuse_deleted(conn, customer, source.value, sid)
+    stream = await conn.fetchrow(
+        "SELECT * FROM session_streams WHERE customer_id=$1 "
+        "AND source_system=$2 AND session_id=$3",
+        customer,
+        source.value,
+        sid,
+    )
+    new = stream is None
+    if new:
+        if await _legacy_exists(conn, customer, source.value, sid):
+            raise HTTPException(
+                409, "legacy transcript requires reconciliation; no bytes replaced"
+            )
+        if payload["batch_seq"] != 0:
+            raise HTTPException(409, "unknown stream; first sequence must be zero")
+        # Only a NEW stream asks: one already pinned to 3 keeps being
+        # accepted after the customer stops being advertised it.
+        if protocol == PROTOCOL_FRAGMENTS and not protocol3_enabled(customer):
+            raise HTTPException(409, PROTOCOL3_NOT_ENABLED)
+        # Same for protocol 2 once it is retired: an open protocol-2 stream
+        # (found above) keeps being accepted; only a new one is refused.
+        if protocol == PROTOCOL_EVENTS and protocol2_retired(customer):
+            raise HTTPException(409, PROTOCOL2_RETIRED)
+        stream = {
+            "stream_id": payload["stream_id"],
+            "protocol_version": protocol,
+            "last_seq": -1,
+            "source_byte_end": 0,
+            "source_line_end": 0,
+            "event_end": 0,
+        }
+    if stream["stream_id"] != payload["stream_id"]:
+        raise HTTPException(409, "session owned by another stream; reconcile receipts first")
+    if stream["protocol_version"] != protocol:
+        raise HTTPException(409, PROTOCOL_MISMATCH)
+    previous = await conn.fetchrow(
+        "SELECT * FROM session_batch_receipts WHERE customer_id=$1 "
+        "AND source_system=$2 AND session_id=$3 AND batch_seq=$4",
+        customer,
+        source.value,
+        sid,
+        payload["batch_seq"],
+    )
+    if previous:
+        if previous["body_sha256"] != digest:
+            raise HTTPException(409, "batch identity already accepted with different content")
+        return {
+            "status": "duplicate",
+            "protocol_version": protocol,
+            "receipt": _receipt(previous),
+        }, False
+    if payload["batch_seq"] != stream["last_seq"] + 1 or any(
+        payload[f"{unit}_start"] != stream[f"{unit}_end"]
+        for unit in ("source_byte", "source_line", "event")
+    ):
+        raise HTTPException(409, "batch does not continue the acknowledged source/event cursor")
+    if payload.get("finalize") and payload["prefix_sha256"] != stream.get(
+        "prefix_sha256", EMPTY_HASH
+    ):
+        raise HTTPException(409, "finalize prefix differs from the accepted source")
+    snapshot_end = payload.get("snapshot_byte_end")
+    snapshot_hash = payload.get("snapshot_sha256")
+    if (
+        stream.get("snapshot_byte_end") is not None
+        and not stream.get("finalized")
+        and (snapshot_end, snapshot_hash)
+        != (
+            stream["snapshot_byte_end"],
+            stream["snapshot_sha256"],
+        )
+    ):
+        raise HTTPException(409, "historical snapshot changed before completion")
+    if snapshot_end is not None:
+        if payload.get("finalize") and payload["source_byte_end"] != snapshot_end:
+            raise HTTPException(409, "historical snapshot is not fully accepted")
+        if (
+            payload["source_byte_end"] == snapshot_end
+            and payload["prefix_sha256"] != snapshot_hash
+        ):
+            raise HTTPException(
+                409, "accepted source differs from the declared historical snapshot"
+            )
+    return None, new
+
+
 async def accept(payload: dict, customer: str, source: SourceSystem, store) -> dict:
     validate_payload(payload)
     protocol = payload_protocol(payload)
@@ -389,6 +485,16 @@ async def accept(payload: dict, customer: str, source: SourceSystem, store) -> d
         raise HTTPException(409, "session capture source is disconnected")
     sid = payload["session_id"]
     digest = hashlib.sha256(canonical_payload(payload)).hexdigest()
+    # Refuse (or answer a duplicate) BEFORE the scrub. The scrub holds the GIL
+    # for the whole body, so it stalls every request on this worker: on
+    # 2026-10-22 a tap re-sending refused 1.1 MB batches every ~10 s held each
+    # for 12-15 s, and uploads and index pushes from every tenant timed out
+    # behind them. Asked again under the session lock below; this pass only
+    # saves the scrub of a batch that answer would refuse anyway.
+    async with with_tenant(customer) as conn:
+        duplicate, _new = await _settle(conn, payload, customer, source, digest, protocol)
+    if duplicate is not None:
+        return duplicate
     # The receipt identifies the original request, which clients retry byte
     # for byte. Only the stored representation changes, not that identity.
     stored_payload = await redact_payload_async(payload)
@@ -396,29 +502,10 @@ async def accept(payload: dict, customer: str, source: SourceSystem, store) -> d
     key = f"raw/{source.value}/{customer}/sessions-v2/{sid}/{payload['batch_seq']}-{digest}.json"
     async with with_tenant(customer) as conn:
         await _lock(conn, customer, source.value, sid)
-        await refuse_deleted(conn, customer, source.value, sid)
-        stream = await conn.fetchrow(
-            "SELECT * FROM session_streams WHERE customer_id=$1 "
-            "AND source_system=$2 AND session_id=$3",
-            customer,
-            source.value,
-            sid,
-        )
-        if stream is None:
-            if await _legacy_exists(conn, customer, source.value, sid):
-                raise HTTPException(
-                    409, "legacy transcript requires reconciliation; no bytes replaced"
-                )
-            if payload["batch_seq"] != 0:
-                raise HTTPException(409, "unknown stream; first sequence must be zero")
-            # Only a NEW stream asks: one already pinned to 3 keeps being
-            # accepted after the customer stops being advertised it.
-            if protocol == PROTOCOL_FRAGMENTS and not protocol3_enabled(customer):
-                raise HTTPException(409, PROTOCOL3_NOT_ENABLED)
-            # Same for protocol 2 once it is retired: an open protocol-2 stream
-            # (found above) keeps being accepted; only a new one is refused.
-            if protocol == PROTOCOL_EVENTS and protocol2_retired(customer):
-                raise HTTPException(409, PROTOCOL2_RETIRED)
+        duplicate, new = await _settle(conn, payload, customer, source, digest, protocol)
+        if duplicate is not None:
+            return duplicate
+        if new:
             await conn.execute(
                 "INSERT INTO session_streams(customer_id,source_system,session_id,stream_id,"
                 "protocol_version,prefix_sha256,uploader_device_id) VALUES($1,$2,$3,$4,$5,$6,$7)",
@@ -430,65 +517,8 @@ async def accept(payload: dict, customer: str, source: SourceSystem, store) -> d
                 EMPTY_HASH,
                 stored_payload.get("device_id"),
             )
-            stream = {
-                "stream_id": payload["stream_id"],
-                "protocol_version": protocol,
-                "last_seq": -1,
-                "source_byte_end": 0,
-                "source_line_end": 0,
-                "event_end": 0,
-            }
-        if stream["stream_id"] != payload["stream_id"]:
-            raise HTTPException(409, "session owned by another stream; reconcile receipts first")
-        if stream["protocol_version"] != protocol:
-            raise HTTPException(409, PROTOCOL_MISMATCH)
-        previous = await conn.fetchrow(
-            "SELECT * FROM session_batch_receipts WHERE customer_id=$1 "
-            "AND source_system=$2 AND session_id=$3 AND batch_seq=$4",
-            customer,
-            source.value,
-            sid,
-            payload["batch_seq"],
-        )
-        if previous:
-            if previous["body_sha256"] != digest:
-                raise HTTPException(409, "batch identity already accepted with different content")
-            return {
-                "status": "duplicate",
-                "protocol_version": protocol,
-                "receipt": _receipt(previous),
-            }
-        if payload["batch_seq"] != stream["last_seq"] + 1 or any(
-            payload[f"{unit}_start"] != stream[f"{unit}_end"]
-            for unit in ("source_byte", "source_line", "event")
-        ):
-            raise HTTPException(409, "batch does not continue the acknowledged source/event cursor")
-        if payload.get("finalize") and payload["prefix_sha256"] != stream.get(
-            "prefix_sha256", EMPTY_HASH
-        ):
-            raise HTTPException(409, "finalize prefix differs from the accepted source")
         snapshot_end = payload.get("snapshot_byte_end")
         snapshot_hash = payload.get("snapshot_sha256")
-        if (
-            stream.get("snapshot_byte_end") is not None
-            and not stream.get("finalized")
-            and (snapshot_end, snapshot_hash)
-            != (
-                stream["snapshot_byte_end"],
-                stream["snapshot_sha256"],
-            )
-        ):
-            raise HTTPException(409, "historical snapshot changed before completion")
-        if snapshot_end is not None:
-            if payload.get("finalize") and payload["source_byte_end"] != snapshot_end:
-                raise HTTPException(409, "historical snapshot is not fully accepted")
-            if (
-                payload["source_byte_end"] == snapshot_end
-                and payload["prefix_sha256"] != snapshot_hash
-            ):
-                raise HTTPException(
-                    409, "accepted source differs from the declared historical snapshot"
-                )
         bucket = await store.bucket_for(customer)
         await store.ensure_bucket(bucket)
         # Include authenticated uploader metadata for display, never as original authorship proof.

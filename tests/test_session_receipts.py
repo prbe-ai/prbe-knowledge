@@ -347,6 +347,39 @@ async def test_legacy_coverage_cannot_be_blindly_replayed(database):
 
 
 @pytest.mark.asyncio
+async def test_a_refused_or_duplicate_resend_is_answered_without_a_scrub(database, monkeypatch):
+    # The scrub holds the GIL for the whole body: a client re-sending a refused
+    # 1.1 MB batch every ~10 s stalled every request on the worker (2026-10-22).
+    store = Store()
+    body = batch()
+    await sr.accept(body, "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    scrubs = 0
+    scrub = sr.redact_payload_async
+
+    async def counting(value):
+        nonlocal scrubs
+        scrubs += 1
+        return await scrub(value)
+
+    monkeypatch.setattr(sr, "redact_payload_async", counting)
+    same = dict(session_id=body["session_id"], stream_id=body["stream_id"])
+    cursor = dict(source_byte_start=30, source_line_start=3, event_start=2, event_end=3)
+    event = [{"line_no": 2, "raw": {"type": "user", "message": {"content": "turn 2"}}}]
+    gap = batch(**same, **cursor, batch_seq=2, source_byte_end=40, source_line_end=4, events=event)
+    other_stream = batch(session_id=body["session_id"], batch_seq=1, **cursor,
+                         source_byte_end=40, source_line_end=4, events=event)
+    assert (await sr.accept(body, "tenant-a", SourceSystem.CLAUDE_CODE, store))["status"] == "duplicate"
+    for refused in (gap, gap, other_stream, batch(batch_seq=1)):
+        with pytest.raises(HTTPException) as error:
+            await sr.accept(refused, "tenant-a", SourceSystem.CLAUDE_CODE, store)
+        assert error.value.status_code == 409
+    assert scrubs == 0 and store.writes == 1
+    following = batch(**same, **cursor, batch_seq=1, source_byte_end=40, source_line_end=4, events=event)
+    assert (await sr.accept(following, "tenant-a", SourceSystem.CLAUDE_CODE, store))["status"] == "accepted"
+    assert scrubs == 1 and store.writes == 2
+
+
+@pytest.mark.asyncio
 async def test_blob_success_transaction_failure_retries_without_false_receipt(database):
     _tenant, admin = database
     body = batch()
